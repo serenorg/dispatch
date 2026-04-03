@@ -1,18 +1,19 @@
 mod conformance;
 mod eval;
+mod inspect;
 mod state;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dispatch_core::{
-    BuildOptions, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
-    CourierEvent, CourierInspection, CourierOperation, CourierPluginManifest, CourierRequest,
-    CourierSession, DockerCourier, JsonlCourierPlugin, Level, LoadedParcel, NativeCourier,
-    ParcelManifest, PullTrustPolicy, ResolvedCourier, SignatureVerification, ToolInvocation,
-    VerificationReport, WasmCourier, build_agentfile, default_courier_registry_path,
-    generate_keypair_files, install_courier_plugin, list_courier_catalog, load_parcel,
-    parse_agentfile, parse_depot_reference, pull_parcel_verified, push_parcel, resolve_courier,
-    sign_parcel, validate_agentfile, verify_parcel, verify_parcel_signature,
+    BuildOptions, BuiltinCourier, CourierBackend, CourierCatalogEntry, CourierEvent,
+    CourierOperation, CourierPluginManifest, CourierRequest, CourierSession, DockerCourier,
+    JsonlCourierPlugin, Level, LoadedParcel, NativeCourier, PullTrustPolicy, ResolvedCourier,
+    SignatureVerification, ToolInvocation, VerificationReport, WasmCourier, build_agentfile,
+    default_courier_registry_path, generate_keypair_files, install_courier_plugin,
+    list_courier_catalog, load_parcel, parse_agentfile, parse_depot_reference,
+    pull_parcel_verified, push_parcel, resolve_courier, sign_parcel, validate_agentfile,
+    verify_parcel, verify_parcel_signature,
 };
 use futures::executor::block_on;
 use std::{
@@ -293,7 +294,7 @@ fn main() -> Result<()> {
             courier,
             registry,
             json,
-        } => inspect(path, courier, registry, json),
+        } => inspect::inspect(path, courier, registry, json),
         Command::Verify {
             path,
             public_keys,
@@ -387,55 +388,6 @@ fn build(path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
     println!("Manifest: {}", built.manifest_path.display());
     println!("Lockfile: {}", built.lockfile_path.display());
     Ok(())
-}
-
-fn inspect(
-    path: PathBuf,
-    courier: Option<String>,
-    registry: Option<PathBuf>,
-    emit_json: bool,
-) -> Result<()> {
-    let manifest_path = resolve_manifest_path(path);
-    let source = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let image: ParcelManifest = serde_json::from_str(&source)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-
-    if emit_json {
-        println!("{}", serde_json::to_string_pretty(&image)?);
-        return Ok(());
-    }
-
-    println!("Digest: {}", image.digest);
-    println!("Name: {}", image.name.as_deref().unwrap_or("<unnamed>"));
-    println!(
-        "Version: {}",
-        image.version.as_deref().unwrap_or("<unspecified>")
-    );
-    println!("Courier Target: {}", image.courier.reference());
-    println!(
-        "Entrypoint: {}",
-        image.entrypoint.as_deref().unwrap_or("<none>")
-    );
-    println!("Instruction files: {}", image.instructions.len());
-    println!("Packaged files: {}", image.files.len());
-    println!("Tools: {}", image.tools.len());
-    println!("Mounts: {}", image.mounts.len());
-    println!("Config: {}", manifest_path.display());
-
-    if let Some(courier) = courier {
-        inspect_for_courier_name(&courier, registry.as_deref(), &manifest_path)?;
-    }
-
-    Ok(())
-}
-
-fn resolve_manifest_path(path: PathBuf) -> PathBuf {
-    if path.is_dir() {
-        path.join("manifest.json")
-    } else {
-        path
-    }
 }
 
 fn verify(path: PathBuf, public_keys: Vec<PathBuf>, emit_json: bool) -> Result<()> {
@@ -696,7 +648,7 @@ fn courier_ls(registry: Option<&Path>, emit_json: bool) -> Result<()> {
 fn courier_inspect(name: &str, registry: Option<&Path>, emit_json: bool) -> Result<()> {
     match resolve_courier(name, registry)? {
         ResolvedCourier::Builtin(courier) => {
-            let entry = builtin_catalog_entry(courier);
+            let entry = inspect::builtin_catalog_entry(courier);
             if emit_json {
                 println!("{}", serde_json::to_string_pretty(&entry)?);
             } else {
@@ -960,63 +912,6 @@ fn persist_session(path: Option<&std::path::Path>, session: &CourierSession) -> 
     Ok(())
 }
 
-fn inspect_for_courier_name(
-    courier_name: &str,
-    registry: Option<&Path>,
-    image_path: &Path,
-) -> Result<()> {
-    match resolve_courier(courier_name, registry)? {
-        ResolvedCourier::Builtin(courier) => inspect_for_builtin_courier(courier, image_path),
-        ResolvedCourier::Plugin(plugin) => {
-            inspect_for_courier(JsonlCourierPlugin::new(plugin), image_path)
-        }
-    }
-}
-
-fn inspect_for_builtin_courier(courier: BuiltinCourier, image_path: &Path) -> Result<()> {
-    match courier {
-        BuiltinCourier::Native => inspect_for_courier(NativeCourier::default(), image_path),
-        BuiltinCourier::Docker => inspect_for_courier(DockerCourier::default(), image_path),
-        BuiltinCourier::Wasm => inspect_for_courier(WasmCourier::default(), image_path),
-    }
-}
-
-fn inspect_for_courier<R: CourierBackend>(courier: R, image_path: &std::path::Path) -> Result<()> {
-    let parcel = load_parcel(image_path)
-        .with_context(|| format!("failed to load parcel {}", image_path.display()))?;
-    block_on(courier.validate_parcel(&parcel)).with_context(|| {
-        format!(
-            "courier `{}` is incompatible with parcel {}",
-            courier.id(),
-            image_path.display()
-        )
-    })?;
-    let capabilities = block_on(courier.capabilities()).with_context(|| {
-        format!(
-            "failed to query courier capabilities for `{}`",
-            courier.id()
-        )
-    })?;
-    let inspection = block_on(courier.inspect(&parcel)).with_context(|| {
-        format!(
-            "failed to inspect parcel {} for courier",
-            image_path.display()
-        )
-    })?;
-
-    print_courier_capabilities(&capabilities);
-    print_courier_inspection(&inspection);
-    Ok(())
-}
-
-fn builtin_catalog_entry(courier: BuiltinCourier) -> CourierCatalogEntry {
-    CourierCatalogEntry::Builtin {
-        name: courier.name().to_string(),
-        kind: courier.kind(),
-        description: courier.description().to_string(),
-    }
-}
-
 fn print_courier_catalog_entry(entry: &CourierCatalogEntry) {
     match entry {
         CourierCatalogEntry::Builtin {
@@ -1064,28 +959,6 @@ fn print_courier_plugin_manifest(plugin: &CourierPluginManifest) {
     if let Some(description) = &plugin.description {
         println!("Description: {description}");
     }
-}
-
-fn print_courier_capabilities(capabilities: &CourierCapabilities) {
-    println!("Courier Backend: {}", capabilities.courier_id);
-    println!("Courier Kind: {:?}", capabilities.kind);
-    println!("Supports Chat: {}", capabilities.supports_chat);
-    println!("Supports Job: {}", capabilities.supports_job);
-    println!("Supports Heartbeat: {}", capabilities.supports_heartbeat);
-    println!(
-        "Supports Local Tools: {}",
-        capabilities.supports_local_tools
-    );
-}
-
-fn print_courier_inspection(inspection: &CourierInspection) {
-    println!(
-        "Validated Entrypoint: {}",
-        inspection.entrypoint.as_deref().unwrap_or("<none>")
-    );
-    println!("Declared Secrets: {}", inspection.required_secrets.len());
-    println!("Declared Mounts: {}", inspection.mounts.len());
-    println!("Declared Local Tools: {}", inspection.local_tools.len());
 }
 
 fn print_verification_report(report: &VerificationReport) {
@@ -1701,7 +1574,7 @@ mod tests {
         let plugin_name = "demo-jsonl";
         install_test_plugin(dir.path(), &registry_path, plugin_name, &parcel_digest);
 
-        super::inspect(
+        crate::inspect::inspect(
             parcel_dir,
             Some(plugin_name.to_string()),
             Some(registry_path),
