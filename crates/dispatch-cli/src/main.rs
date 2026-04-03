@@ -3,16 +3,16 @@ use clap::{Args, Parser, Subcommand};
 use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
     CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierPluginManifest,
-    CourierRequest, CourierSession, DockerCourier, JsonlCourierPlugin, Level, LoadedParcel,
-    NativeCourier, ParcelManifest, PullTrustPolicy, ResolvedCourier, SignatureVerification,
-    ToolInvocation, ToolRunResult, VerificationReport, WasmCourier, build_agentfile,
-    default_courier_registry_path, generate_keypair_files, install_courier_plugin,
-    list_courier_catalog, load_parcel, parse_agentfile, parse_depot_reference,
+    CourierRequest, CourierSession, DockerCourier, EvalSpec, JsonlCourierPlugin, Level,
+    LoadedParcel, NativeCourier, ParcelManifest, PullTrustPolicy, ResolvedCourier,
+    SignatureVerification, ToolInvocation, ToolRunResult, VerificationReport, WasmCourier,
+    build_agentfile, default_courier_registry_path, generate_keypair_files, install_courier_plugin,
+    list_courier_catalog, load_parcel, load_parcel_evals, parse_agentfile, parse_depot_reference,
     pull_parcel_verified, push_parcel, resolve_courier, sign_parcel, validate_agentfile,
     verify_parcel, verify_parcel_signature,
 };
 use futures::executor::block_on;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::BTreeSet,
     fs,
@@ -292,46 +292,6 @@ struct StateGcReport {
     dry_run: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum EvalDocument {
-    Single(Box<EvalSpec>),
-    Cases { cases: Vec<EvalSpec> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct EvalSpec {
-    name: String,
-    input: String,
-    #[serde(default)]
-    entrypoint: Option<String>,
-    #[serde(default)]
-    expects_tool: Option<String>,
-    #[serde(
-        default,
-        alias = "expects_output_contains",
-        alias = "expects_message_contains",
-        alias = "expects_text_contains"
-    )]
-    expects_text: Option<String>,
-    #[serde(default)]
-    expects_text_exact: Option<String>,
-    #[serde(default, alias = "rejects_text_contains")]
-    expects_text_not_contains: Option<String>,
-    #[serde(default)]
-    expects_tool_count: Option<usize>,
-    #[serde(default)]
-    expects_tools: Vec<String>,
-    #[serde(default)]
-    expects_tool_stdout_contains: Option<String>,
-    #[serde(default)]
-    expects_tool_stderr_contains: Option<String>,
-    #[serde(default)]
-    expects_tool_exit_code: Option<i32>,
-    #[serde(default)]
-    expects_error_contains: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct EvalCaseResult {
     name: String,
@@ -569,7 +529,7 @@ fn eval_with_courier<R: CourierBackend>(
     courier_name: &str,
     emit_json: bool,
 ) -> Result<()> {
-    let evals = load_eval_specs(parcel)?;
+    let evals = load_parcel_evals(parcel).context("failed to load parcel evals")?;
     if evals.is_empty() {
         bail!("parcel does not declare any EVAL files");
     }
@@ -595,32 +555,6 @@ fn eval_with_courier<R: CourierBackend>(
     } else {
         bail!("eval failed")
     }
-}
-
-fn load_eval_specs(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)>> {
-    let mut evals = Vec::new();
-    for instruction in &parcel.config.instructions {
-        if !matches!(instruction.kind, dispatch_core::InstructionKind::Eval) {
-            continue;
-        }
-        let path = parcel
-            .parcel_dir
-            .join("context")
-            .join(&instruction.packaged_path);
-        let source = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let parsed: EvalDocument = serde_yaml::from_str(&source)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        match parsed {
-            EvalDocument::Single(spec) => evals.push((instruction.packaged_path.clone(), *spec)),
-            EvalDocument::Cases { cases } => {
-                for spec in cases {
-                    evals.push((instruction.packaged_path.clone(), spec));
-                }
-            }
-        }
-    }
-    Ok(evals)
 }
 
 fn run_eval_case<R: CourierBackend>(
