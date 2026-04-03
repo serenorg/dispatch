@@ -484,6 +484,7 @@ pub trait ChatModelBackend: Send + Sync {
 pub struct ModelRequest {
     pub model: String,
     pub provider: Option<String>,
+    pub context_token_limit: Option<u32>,
     pub instructions: String,
     pub messages: Vec<ConversationMessage>,
     pub tools: Vec<ModelToolDefinition>,
@@ -679,6 +680,7 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
                     .primary
                     .as_ref()
                     .and_then(|m| m.provider.clone()),
+                context_token_limit: configured_context_token_limit(&self.parcel.config.limits),
                 instructions: request.instructions,
                 messages,
                 tools,
@@ -3756,6 +3758,7 @@ fn build_model_requests(
         .map(|model| ModelRequest {
             model: model.id,
             provider: model.provider,
+            context_token_limit: configured_context_token_limit(&image.config.limits),
             instructions: instructions.clone(),
             messages: messages.to_vec(),
             tools: tools.clone(),
@@ -3781,6 +3784,15 @@ fn configured_model_references(policy: &crate::manifest::ModelPolicy) -> Vec<Mod
         provider: std::env::var("LLM_BACKEND").ok(),
     });
     models
+}
+
+fn configured_context_token_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
+    limits
+        .iter()
+        .rev()
+        .find(|limit| limit.scope.eq_ignore_ascii_case("CONTEXT_TOKENS"))
+        .and_then(|limit| limit.value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn select_chat_backend(
@@ -5593,6 +5605,46 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn configured_context_token_limit_uses_last_valid_context_limit() {
+        let limits = vec![
+            crate::manifest::LimitSpec {
+                scope: "ITERATIONS".to_string(),
+                value: "10".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::LimitSpec {
+                scope: "CONTEXT_TOKENS".to_string(),
+                value: "16000".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::LimitSpec {
+                scope: "CONTEXT_TOKENS".to_string(),
+                value: "32000".to_string(),
+                qualifiers: Vec::new(),
+            },
+        ];
+
+        assert_eq!(configured_context_token_limit(&limits), Some(32000));
+    }
+
+    #[test]
+    fn anthropic_max_tokens_uses_context_token_limit_when_present() {
+        let request = ModelRequest {
+            model: "claude-sonnet-4".to_string(),
+            provider: Some("anthropic".to_string()),
+            context_token_limit: Some(16000),
+            instructions: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        };
+
+        assert_eq!(anthropic_max_tokens(&request), 16000);
+    }
+
+    #[test]
     fn normalize_local_tool_input_extracts_function_style_text_payload() {
         let tool = LocalToolSpec {
             alias: "demo".to_string(),
@@ -5613,6 +5665,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "gpt-5-mini".to_string(),
             provider: Some("openai_compatible".to_string()),
+            context_token_limit: None,
             instructions: "Be helpful.".to_string(),
             messages: vec![ConversationMessage {
                 role: "user".to_string(),
@@ -5648,6 +5701,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "claude-sonnet-4".to_string(),
             provider: Some("anthropic".to_string()),
+            context_token_limit: None,
             instructions: String::new(),
             messages: vec![ConversationMessage {
                 role: "user".to_string(),
@@ -5683,6 +5737,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "gemini-2.5-pro".to_string(),
             provider: Some("gemini".to_string()),
+            context_token_limit: None,
             instructions: String::new(),
             messages: vec![ConversationMessage {
                 role: "user".to_string(),

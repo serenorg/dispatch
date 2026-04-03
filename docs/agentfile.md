@@ -447,6 +447,8 @@ LIMIT TOOL_OUTPUT 10000
 LIMIT CONTEXT_TOKENS 16000
 ```
 
+Hosted model backends may use `LIMIT CONTEXT_TOKENS` when the provider supports an explicit token budget field. The reference implementation currently applies it to Anthropic `max_tokens`.
+
 ### Mounts
 
 Mounts are state backends, similar to volumes.

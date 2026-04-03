@@ -5,6 +5,8 @@ struct OpenAiChatCompletionsBackend;
 struct AnthropicMessagesBackend;
 struct GeminiGenerateContentBackend;
 
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 2048;
+
 pub(super) fn default_chat_backend_for_provider(
     provider: Option<&str>,
 ) -> Arc<dyn ChatModelBackend> {
@@ -171,7 +173,7 @@ impl ChatModelBackend for AnthropicMessagesBackend {
         let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
         let payload = serde_json::json!({
             "model": request.model,
-            "max_tokens": 2048,
+            "max_tokens": anthropic_max_tokens(request),
             "system": request.instructions,
             "messages": anthropic_messages(request),
             "tools": request
@@ -194,6 +196,12 @@ impl ChatModelBackend for AnthropicMessagesBackend {
         let body = read_model_json_response(response, self.id())?;
         extract_anthropic_output(&body)
     }
+}
+
+pub(super) fn anthropic_max_tokens(request: &ModelRequest) -> u32 {
+    request
+        .context_token_limit
+        .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS)
 }
 
 impl ChatModelBackend for GeminiGenerateContentBackend {
