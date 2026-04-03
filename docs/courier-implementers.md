@@ -132,3 +132,14 @@ If you are building a new courier, these tests are the minimum target. Add couri
 - keep inspection and validation cheap and deterministic
 
 Dispatch does not require Docker, WASM, or any other execution engine. Those are implementation choices behind the courier boundary.
+
+## WASM Host Model Calls
+
+For `dispatch/wasm`, hosted-model access remains a host responsibility even when the guest initiates the request through the WIT ABI.
+
+Minimum expectations:
+
+- `model-complete` should use the parcel's declared `MODEL` and `FALLBACK` policy unless the guest explicitly requests a model id
+- guest-supplied model ids should be treated as model selection within the host's configured provider policy, not as authority to switch to arbitrary providers
+- if the primary hosted-model request fails before producing a reply, the courier should try declared fallback models in order
+- prompt resolution, declared tool exposure, and memory access remain host-owned even when the guest orchestrates the turn

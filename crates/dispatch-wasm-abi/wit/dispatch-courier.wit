@@ -32,6 +32,8 @@ interface host {
     }
 
     record model-request {
+        /// Optional model id override. The host still applies parcel/provider policy
+        /// when selecting the backend for this request.
         model: option<string>,
         instructions: string,
         messages: list<conversation-message>,
@@ -74,6 +76,8 @@ interface host {
         stderr: string,
     }
 
+    /// Executes a hosted-model request using the host's parcel-aware model policy.
+    /// Hosts may apply declared fallback models before returning an error.
     model-complete: func(request: model-request) -> result<model-response, string>;
     invoke-tool: func(invocation: tool-invocation) -> result<tool-result, string>;
     memory-get: func(namespace: string, key: string) -> result<option<memory-entry>, string>;

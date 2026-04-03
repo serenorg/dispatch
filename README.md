@@ -217,6 +217,8 @@ Non-native courier behavior:
 - `wasm` is a typed component-model courier family with an explicit parcel-side `COMPONENT <path>` contract
 - the WASM courier validates and loads declared Dispatch ABI components, inspects parcels, resolves prompts, and lists declared local tools
 - WASM guests execute `chat`, `job`, and `heartbeat` turns through the Dispatch WIT ABI while keeping prompt resolution, declared local tool discovery, and sqlite memory access host-owned
+- guest `model-complete` calls use the parcel model policy on the host side, including `FALLBACK` models when the primary hosted-model request fails before producing a reply
+- a guest may request a specific model id, but host-side backend selection still comes from the parcel or environment provider configuration rather than from arbitrary guest-supplied provider switches
 - the repo includes a reference guest component targeting the same ABI
 
 Courier registry behavior:
