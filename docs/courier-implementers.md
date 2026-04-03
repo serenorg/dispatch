@@ -126,6 +126,12 @@ The current suite checks:
 
 If you are building a new courier, these tests are the minimum target. Add courier-specific tests in your own crate, but keep the shared public contract passing.
 
+The Dispatch CLI also exposes a generated harness:
+
+- `dispatch courier conformance <name>`
+
+That command builds temporary fixture parcels, runs the shared contract checks against the selected built-in or installed courier, and reports pass/fail per check. Use it as the quickest operator-facing validation pass before you wire courier-specific tests into your own CI.
+
 ## Practical Guidance
 
 - keep the parcel format portable and courier-agnostic

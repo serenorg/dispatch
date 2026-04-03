@@ -302,6 +302,7 @@ Courier registry:
 - `dispatch courier ls` - list built-in backends and installed plugins
 - `dispatch courier inspect <name>` - show courier metadata
 - `dispatch courier install <manifest>` - install a plugin manifest
+- `dispatch courier conformance <name>` - run the public courier contract checks against one backend
 - `dispatch run --courier <name>` - select a backend by name
 - `dispatch run --registry <path>` - use a non-default courier registry
 - plugin installation records the executable SHA256; Dispatch checks that digest before each launch
