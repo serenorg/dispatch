@@ -115,6 +115,9 @@ enum Command {
         path: PathBuf,
         /// Depot reference, e.g. `file:///tmp/depot::org/parcel:v1`
         reference: String,
+        /// Print full JSON instead of a summary
+        #[arg(long)]
+        json: bool,
     },
     /// Pull a parcel from a depot reference
     Pull {
@@ -129,6 +132,9 @@ enum Command {
         /// Apply a trust policy file that matches reference prefixes to public keys
         #[arg(long)]
         trust_policy: Option<PathBuf>,
+        /// Print full JSON instead of a summary
+        #[arg(long)]
+        json: bool,
     },
     /// Execute part of a built parcel locally
     Run(RunArgs),
@@ -413,13 +419,18 @@ fn main() -> Result<()> {
         } => verify(path, public_keys, json),
         Command::Keygen { key_id, output_dir } => keygen(&key_id, output_dir),
         Command::Sign { path, secret_key } => sign(path, &secret_key),
-        Command::Push { path, reference } => push(path, &reference),
+        Command::Push {
+            path,
+            reference,
+            json,
+        } => push(path, &reference, json),
         Command::Pull {
             reference,
             output_dir,
             public_keys,
             trust_policy,
-        } => pull(&reference, output_dir, public_keys, trust_policy),
+            json,
+        } => pull(&reference, output_dir, public_keys, trust_policy, json),
         Command::Run(args) => run(args),
         Command::Courier { command } => courier_command(command),
         Command::State { command } => state_command(command),
@@ -971,16 +982,20 @@ fn sign(path: PathBuf, secret_key: &Path) -> Result<()> {
     Ok(())
 }
 
-fn push(path: PathBuf, reference: &str) -> Result<()> {
+fn push(path: PathBuf, reference: &str, emit_json: bool) -> Result<()> {
     let parcel =
         load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))?;
     let reference = parse_depot_reference(reference)
         .with_context(|| format!("invalid depot reference `{reference}`"))?;
     let pushed = push_parcel(&parcel, &reference)?;
 
-    println!("Pushed parcel {}", pushed.digest);
-    println!("Blob: {}", pushed.blob_location);
-    println!("Tag: {}", pushed.tag_location);
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&pushed)?);
+    } else {
+        println!("Pushed parcel {}", pushed.digest);
+        println!("Blob: {}", pushed.blob_location);
+        println!("Tag: {}", pushed.tag_location);
+    }
     Ok(())
 }
 
@@ -989,6 +1004,7 @@ fn pull(
     output_dir: Option<PathBuf>,
     public_keys: Vec<PathBuf>,
     trust_policy: Option<PathBuf>,
+    emit_json: bool,
 ) -> Result<()> {
     let raw_reference = reference.to_string();
     let reference = parse_depot_reference(reference)
@@ -1003,7 +1019,7 @@ fn pull(
     let public_keys = merge_public_keys(public_keys, policy_keys);
     let output_root = output_dir.unwrap_or_else(default_pull_output_root);
     let pulled = pull_parcel(&reference, &output_root)?;
-    if !public_keys.is_empty() || require_signatures {
+    let verification = if !public_keys.is_empty() || require_signatures {
         if require_signatures && public_keys.is_empty() {
             bail!(
                 "trust policy requires signatures for `{}` but no public keys matched",
@@ -1034,11 +1050,28 @@ fn pull(
             print_signature_verifications(&signature_checks);
             bail!("pulled parcel failed verification");
         }
-    }
+        Some((integrity, signature_checks))
+    } else {
+        None
+    };
 
-    println!("Pulled parcel {}", pulled.digest);
-    println!("Parcel dir: {}", pulled.parcel_dir.display());
-    println!("Manifest: {}", pulled.manifest_path.display());
+    if emit_json {
+        let (integrity, signatures) = verification
+            .map(|(integrity, signatures)| (Some(integrity), Some(signatures)))
+            .unwrap_or((None, None));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "pulled": pulled,
+                "integrity": integrity,
+                "signatures": signatures,
+            }))?
+        );
+    } else {
+        println!("Pulled parcel {}", pulled.digest);
+        println!("Parcel dir: {}", pulled.parcel_dir.display());
+        println!("Manifest: {}", pulled.manifest_path.display());
+    }
     Ok(())
 }
 
@@ -2470,14 +2503,21 @@ mod tests {
             "push",
             "manifest.json",
             "file:///tmp/depot::acme/monitor:v1",
+            "--json",
         ])
         .unwrap();
 
-        let Command::Push { path, reference } = cli.command else {
+        let Command::Push {
+            path,
+            reference,
+            json,
+        } = cli.command
+        else {
             panic!("expected push command");
         };
         assert_eq!(path, Path::new("manifest.json"));
         assert_eq!(reference, "file:///tmp/depot::acme/monitor:v1");
+        assert!(json);
     }
 
     #[test]
@@ -2488,6 +2528,7 @@ mod tests {
             "file:///tmp/depot::acme/monitor:v1",
             "--output-dir",
             "/tmp/parcels",
+            "--json",
         ])
         .unwrap();
 
@@ -2496,6 +2537,7 @@ mod tests {
             output_dir,
             public_keys,
             trust_policy,
+            json,
         } = cli.command
         else {
             panic!("expected pull command");
@@ -2504,6 +2546,7 @@ mod tests {
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/parcels")));
         assert!(public_keys.is_empty());
         assert!(trust_policy.is_none());
+        assert!(json);
     }
 
     #[test]
@@ -2849,8 +2892,8 @@ mod tests {
         );
         let pull_root = dir.path().join("pulled");
 
-        super::push(parcel_dir.clone(), &depot_ref).unwrap();
-        super::pull(&depot_ref, Some(pull_root.clone()), Vec::new(), None).unwrap();
+        super::push(parcel_dir.clone(), &depot_ref, false).unwrap();
+        super::pull(&depot_ref, Some(pull_root.clone()), Vec::new(), None, false).unwrap();
 
         let pulled_manifest = pull_root.join(&parcel_digest).join("manifest.json");
         assert!(pulled_manifest.exists());
@@ -2976,9 +3019,16 @@ mod tests {
         let secret_key = keys_dir.join("release.dispatch-secret.json");
         let public_key = keys_dir.join("release.dispatch-public.json");
         super::sign(parcel_dir.clone(), &secret_key).unwrap();
-        super::push(parcel_dir, &depot_ref).unwrap();
+        super::push(parcel_dir, &depot_ref, false).unwrap();
 
-        super::pull(&depot_ref, Some(pull_root.clone()), vec![public_key], None).unwrap();
+        super::pull(
+            &depot_ref,
+            Some(pull_root.clone()),
+            vec![public_key],
+            None,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2996,7 +3046,7 @@ mod tests {
         super::keygen("release", Some(keys_dir.clone())).unwrap();
         let secret_key = keys_dir.join("release.dispatch-secret.json");
         super::sign(parcel_dir.clone(), &secret_key).unwrap();
-        super::push(parcel_dir, &depot_ref).unwrap();
+        super::push(parcel_dir, &depot_ref, false).unwrap();
         fs::write(
             &policy_path,
             "rules:\n  - repository_prefix: \"acme/trusted-fixture\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
@@ -3008,6 +3058,7 @@ mod tests {
             Some(pull_root.clone()),
             Vec::new(),
             Some(policy_path),
+            false,
         )
         .unwrap();
         assert!(
@@ -3031,15 +3082,21 @@ mod tests {
         let policy_path = dir.path().join("trust-policy.yaml");
 
         super::keygen("release", Some(keys_dir.clone())).unwrap();
-        super::push(parcel_dir, &depot_ref).unwrap();
+        super::push(parcel_dir, &depot_ref, false).unwrap();
         fs::write(
             &policy_path,
             "rules:\n  - repository_prefix: \"acme/unsigned-fixture\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
         )
         .unwrap();
 
-        let error =
-            super::pull(&depot_ref, Some(pull_root), Vec::new(), Some(policy_path)).unwrap_err();
+        let error = super::pull(
+            &depot_ref,
+            Some(pull_root),
+            Vec::new(),
+            Some(policy_path),
+            false,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()

@@ -178,6 +178,8 @@ cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<diges
 # Push/pull to a depot
 dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
 dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
+dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
 dispatch push examples/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
@@ -333,6 +335,7 @@ State management:
 
 - `dispatch push <parcel> <reference>` - publish a parcel into a depot
 - `dispatch pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
+- `dispatch push ... --json` / `dispatch pull ... --json` - emit machine-readable depot results
 - `dispatch pull <reference> --public-key <path>` - require detached signature verification during fetch
 - `dispatch pull <reference> --trust-policy <path>` - apply pull-time signature requirements by reference prefix
 - v1 depot references include:
