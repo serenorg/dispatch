@@ -118,6 +118,7 @@ The current suite checks:
 
 - courier/parcel compatibility validation
 - session binding to parcel digests
+- built-in mount resolution on `open_session()`
 - prompt resolution behavior
 - local tool listing behavior
 - basic chat execution for the native courier

@@ -1,6 +1,7 @@
 use dispatch_core::{
-    BuildOptions, CourierBackend, CourierEvent, CourierKind, CourierOperation, CourierRequest,
-    CourierResponse, DockerCourier, NativeCourier, ToolConfig, build_agentfile, load_parcel,
+    BuildOptions, CourierBackend, CourierError, CourierEvent, CourierKind, CourierOperation,
+    CourierRequest, CourierResponse, DockerCourier, MountKind, NativeCourier, ToolConfig,
+    build_agentfile, load_parcel,
 };
 use std::fs;
 use tempfile::tempdir;
@@ -210,4 +211,127 @@ ENTRYPOINT chat
         }
         other => panic!("expected local tool, got {other:?}"),
     }
+}
+
+#[test]
+fn native_courier_conformance_resolves_declared_mounts_on_open_session() {
+    let fixture = build_fixture(
+        "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+MOUNT ARTIFACTS local
+ENTRYPOINT chat
+",
+        &[("SOUL.md", "Soul body")],
+    );
+    let courier = NativeCourier::default();
+
+    let session = futures::executor::block_on(courier.open_session(&fixture.image)).unwrap();
+    assert_eq!(session.resolved_mounts.len(), 3);
+    assert!(
+        session
+            .resolved_mounts
+            .iter()
+            .any(|mount| mount.kind == MountKind::Session && mount.driver == "sqlite")
+    );
+    assert!(
+        session
+            .resolved_mounts
+            .iter()
+            .any(|mount| mount.kind == MountKind::Memory && mount.driver == "sqlite")
+    );
+    assert!(
+        session
+            .resolved_mounts
+            .iter()
+            .any(|mount| mount.kind == MountKind::Artifacts && mount.driver == "local")
+    );
+}
+
+#[test]
+fn conformance_validate_parcel_rejects_incompatible_courier_targets() {
+    let native_fixture = build_fixture(
+        "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+ENTRYPOINT chat
+",
+        &[("SOUL.md", "Soul body")],
+    );
+    let docker_fixture = build_fixture(
+        "\
+FROM dispatch/docker:latest
+SOUL SOUL.md
+ENTRYPOINT chat
+",
+        &[("SOUL.md", "Soul body")],
+    );
+
+    let native = NativeCourier::default();
+    let docker = DockerCourier::default();
+
+    let native_error =
+        futures::executor::block_on(native.validate_parcel(&docker_fixture.image)).unwrap_err();
+    assert!(matches!(
+        native_error,
+        CourierError::IncompatibleCourier {
+            courier,
+            parcel_courier,
+            ..
+        } if courier == "native" && parcel_courier == docker_fixture.image.config.courier.reference()
+    ));
+
+    let docker_error =
+        futures::executor::block_on(docker.validate_parcel(&native_fixture.image)).unwrap_err();
+    assert!(matches!(
+        docker_error,
+        CourierError::IncompatibleCourier {
+            courier,
+            parcel_courier,
+            ..
+        } if courier == "docker" && parcel_courier == native_fixture.image.config.courier.reference()
+    ));
+}
+
+#[test]
+fn conformance_run_rejects_sessions_bound_to_other_parcels() {
+    let first = build_fixture(
+        "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+ENTRYPOINT chat
+",
+        &[("SOUL.md", "First soul")],
+    );
+    let second = build_fixture(
+        "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+ENTRYPOINT chat
+",
+        &[("SOUL.md", "Second soul")],
+    );
+    let courier = NativeCourier::default();
+
+    let session = futures::executor::block_on(courier.open_session(&first.image)).unwrap();
+    let error = futures::executor::block_on(courier.run(
+        &second.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat {
+                input: "hello".to_string(),
+            },
+        },
+    ))
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CourierError::SessionParcelMismatch {
+            session_parcel_digest,
+            parcel_digest
+        } if parcel_digest == second.image.config.digest && session_parcel_digest == first.image.config.digest
+    ));
 }
