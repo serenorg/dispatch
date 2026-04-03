@@ -146,6 +146,12 @@ Build output:
 
 The built manifest now includes a `$schema` pointer and is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
 
+Parcel format compatibility:
+
+- `load_parcel` validates `manifest.json` against the bundled Dispatch JSON Schema before parsing it into typed structures
+- the reference implementation supports exactly `format_version: 1`
+- couriers must reject parcels whose `$schema` or `format_version` they do not explicitly support
+
 `verify` behavior:
 
 - recomputes the parcel manifest digest from the normalized manifest content
@@ -221,6 +227,12 @@ Depot behavior:
 - pushed parcels are stored by digest under `blobs/parcels/<digest>/`
 - pushed tags are stored under `refs/<org>/<parcel>/tags/<tag>.json`
 - the first depot implementation is intentionally local/file-backed; remote depot protocols come later
+
+Mount behavior:
+
+- built-in couriers resolve declared mounts during `open_session`
+- `MOUNT SESSION sqlite` creates a parcel-scoped sqlite database and persists `CourierSession` state on open plus after each turn
+- unsupported mount drivers fail fast when a courier session opens
 
 Optional environment variables for the native OpenAI-backed chat path:
 

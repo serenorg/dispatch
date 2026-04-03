@@ -46,6 +46,13 @@ The build produces:
 
 Implementations should provide a verification path that can recompute the manifest digest and validate packaged file hashes against the built parcel metadata.
 
+Format compatibility:
+
+- every parcel declares a `$schema` URL and an integer `format_version`
+- couriers must validate parcels against the schema they claim to support before execution
+- couriers must reject parcels with unsupported schema URLs or format versions
+- the Dispatch reference implementation currently supports `format_version: 1`
+
 ### Parcel vs Mounts
 
 Immutable parcel content:
@@ -436,6 +443,12 @@ MOUNT SESSION sqlite
 MOUNT SESSION postgres
 ```
 
+Semantics:
+
+- `memory` is process-local session state with no durable backing
+- `sqlite` is a durable session mount; built-in couriers persist `CourierSession` state into the resolved sqlite database when a session opens and after each turn
+- unsupported drivers must fail when the courier opens a session instead of being silently ignored
+
 #### `MOUNT MEMORY`
 
 ```dockerfile
@@ -444,12 +457,23 @@ MOUNT MEMORY sqlite
 MOUNT MEMORY pgvector
 ```
 
+Semantics:
+
+- `none` means no durable long-term memory backend
+- `sqlite` reserves a local durable memory database path for couriers that implement memory persistence
+- `pgvector` is a declared remote memory backend target for couriers that support it
+
 #### `MOUNT ARTIFACTS`
 
 ```dockerfile
 MOUNT ARTIFACTS local
 MOUNT ARTIFACTS s3
 ```
+
+Semantics:
+
+- `local` resolves to a parcel-scoped local artifacts directory for built-in couriers
+- other artifact drivers are courier-specific and must fail fast when unsupported
 
 ### Evaluation
 

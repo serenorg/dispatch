@@ -6,6 +6,8 @@ use crate::{
     plugins::CourierPluginManifest,
 };
 use dispatch_wasm_abi::ABI as DISPATCH_WASM_COMPONENT_ABI;
+use jsonschema::Validator;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,6 +17,7 @@ use std::{
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
@@ -26,6 +29,7 @@ use wasmtime::{
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static PARCEL_SCHEMA_VALIDATOR: OnceLock<Validator> = OnceLock::new();
 
 mod wasm_bindings {
     wasmtime::component::bindgen!({
@@ -90,6 +94,8 @@ pub enum CourierError {
     },
     #[error("required secret `{name}` is not present in the environment")]
     MissingSecret { name: String },
+    #[error("parcel manifest `{path}` does not conform to the Dispatch parcel schema: {message}")]
+    InvalidParcelSchema { path: String, message: String },
     #[error("courier `{courier}` does not support mount `{kind:?}` with driver `{driver}`")]
     UnsupportedMount {
         courier: String,
@@ -207,6 +213,12 @@ pub enum CourierError {
     ModelBackendRequest(String),
     #[error("model backend returned an unexpected response: {0}")]
     ModelBackendResponse(String),
+    #[error("failed to persist sqlite mount `{path}`: {source}")]
+    PersistSqliteMount {
+        path: String,
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -736,7 +748,14 @@ pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
         path: manifest_path.display().to_string(),
         source,
     })?;
-    let config = serde_json::from_str::<ParcelManifest>(&source).map_err(|source| {
+    let manifest_json = serde_json::from_str::<serde_json::Value>(&source).map_err(|source| {
+        CourierError::ParseParcelManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        }
+    })?;
+    validate_parcel_schema(&manifest_path, &manifest_json)?;
+    let config = serde_json::from_value::<ParcelManifest>(manifest_json).map_err(|source| {
         CourierError::ParseParcelManifest {
             path: manifest_path.display().to_string(),
             source,
@@ -959,6 +978,44 @@ fn resolve_builtin_mounts(
     Ok(mounts)
 }
 
+fn validate_parcel_schema(
+    manifest_path: &Path,
+    manifest_json: &serde_json::Value,
+) -> Result<(), CourierError> {
+    let validator = parcel_schema_validator();
+    let mut errors = validator.iter_errors(manifest_json);
+    if let Some(first) = errors.next() {
+        let mut messages = vec![format_schema_error(&first)];
+        for error in errors.take(7) {
+            messages.push(format_schema_error(&error));
+        }
+        return Err(CourierError::InvalidParcelSchema {
+            path: manifest_path.display().to_string(),
+            message: messages.join("; "),
+        });
+    }
+    Ok(())
+}
+
+fn parcel_schema_validator() -> &'static Validator {
+    PARCEL_SCHEMA_VALIDATOR.get_or_init(|| {
+        let schema = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../schemas/parcel.v1.json"
+        ))
+        .expect("embedded parcel schema must be valid JSON");
+        jsonschema::validator_for(&schema).expect("embedded parcel schema must compile")
+    })
+}
+
+fn format_schema_error(error: &jsonschema::ValidationError<'_>) -> String {
+    let path = error.instance_path().to_string();
+    if path.is_empty() {
+        error.to_string()
+    } else {
+        format!("{path}: {error}")
+    }
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<(), CourierError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CourierError::ReadFile {
@@ -977,6 +1034,66 @@ fn touch_file(path: &Path) -> Result<(), CourierError> {
         path: path.display().to_string(),
         source,
     })
+}
+
+fn persist_session_mounts(session: &CourierSession) -> Result<(), CourierError> {
+    for mount in &session.resolved_mounts {
+        if mount.kind == MountKind::Session && mount.driver == "sqlite" {
+            persist_session_sqlite(Path::new(&mount.target_path), session)?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), CourierError> {
+    let connection = Connection::open(path).map_err(|source| CourierError::PersistSqliteMount {
+        path: path.display().to_string(),
+        source,
+    })?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS dispatch_sessions (
+                session_id TEXT PRIMARY KEY,
+                parcel_digest TEXT NOT NULL,
+                entrypoint TEXT,
+                turn_count INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );",
+        )
+        .map_err(|source| CourierError::PersistSqliteMount {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let payload = serde_json::to_string(session).map_err(|error| {
+        CourierError::ModelBackendResponse(format!(
+            "failed to serialize courier session for sqlite persistence: {error}"
+        ))
+    })?;
+    connection
+        .execute(
+            concat!(
+                "INSERT INTO dispatch_sessions ",
+                "(session_id, parcel_digest, entrypoint, turn_count, payload_json) ",
+                "VALUES (?1, ?2, ?3, ?4, ?5) ",
+                "ON CONFLICT(session_id) DO UPDATE SET ",
+                "parcel_digest = excluded.parcel_digest, ",
+                "entrypoint = excluded.entrypoint, ",
+                "turn_count = excluded.turn_count, ",
+                "payload_json = excluded.payload_json"
+            ),
+            params![
+                session.id,
+                session.parcel_digest,
+                session.entrypoint,
+                session.turn_count as i64,
+                payload,
+            ],
+        )
+        .map_err(|source| CourierError::PersistSqliteMount {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(())
 }
 
 fn forwarded_tool_env(parcel: &LoadedParcel, input: Option<&str>) -> Vec<(String, String)> {
@@ -1210,7 +1327,7 @@ impl CourierBackend for NativeCourier {
             validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("native-{parcel_digest}-{sequence}");
-            Ok(CourierSession {
+            let session = CourierSession {
                 resolved_mounts: resolve_builtin_mounts(image, "native", &session_id)?,
                 id: session_id,
                 parcel_digest,
@@ -1218,7 +1335,9 @@ impl CourierBackend for NativeCourier {
                 turn_count: 0,
                 history: Vec::new(),
                 backend_state: None,
-            })
+            };
+            persist_session_mounts(&session)?;
+            Ok(session)
         }
     }
 
@@ -1240,7 +1359,10 @@ impl CourierBackend for NativeCourier {
             match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id,
-                    session,
+                    session: {
+                        persist_session_mounts(&session)?;
+                        session
+                    },
                     events: vec![
                         CourierEvent::PromptResolved {
                             text: resolve_prompt_text(image)?,
@@ -1250,7 +1372,10 @@ impl CourierBackend for NativeCourier {
                 }),
                 CourierOperation::ListLocalTools => Ok(CourierResponse {
                     courier_id,
-                    session,
+                    session: {
+                        persist_session_mounts(&session)?;
+                        session
+                    },
                     events: vec![
                         CourierEvent::LocalToolsListed {
                             tools: list_local_tools(image),
@@ -1264,7 +1389,10 @@ impl CourierBackend for NativeCourier {
 
                     Ok(CourierResponse {
                         courier_id,
-                        session,
+                        session: {
+                            persist_session_mounts(&session)?;
+                            session
+                        },
                         events: vec![
                             CourierEvent::ToolCallStarted {
                                 invocation,
@@ -1298,6 +1426,7 @@ impl CourierBackend for NativeCourier {
                     });
                     chat_turn.events.push(CourierEvent::Done);
 
+                    persist_session_mounts(&session)?;
                     Ok(CourierResponse {
                         courier_id,
                         session,
@@ -1390,7 +1519,7 @@ impl CourierBackend for DockerCourier {
             validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("docker-{parcel_digest}-{sequence}");
-            Ok(CourierSession {
+            let session = CourierSession {
                 resolved_mounts: resolve_builtin_mounts(image, "docker", &session_id)?,
                 id: session_id,
                 parcel_digest,
@@ -1398,7 +1527,9 @@ impl CourierBackend for DockerCourier {
                 turn_count: 0,
                 history: Vec::new(),
                 backend_state: None,
-            })
+            };
+            persist_session_mounts(&session)?;
+            Ok(session)
         }
     }
 
@@ -1423,7 +1554,10 @@ impl CourierBackend for DockerCourier {
             match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id: "docker".to_string(),
-                    session,
+                    session: {
+                        persist_session_mounts(&session)?;
+                        session
+                    },
                     events: vec![
                         CourierEvent::PromptResolved {
                             text: resolve_prompt_text(image)?,
@@ -1433,7 +1567,10 @@ impl CourierBackend for DockerCourier {
                 }),
                 CourierOperation::ListLocalTools => Ok(CourierResponse {
                     courier_id: "docker".to_string(),
-                    session,
+                    session: {
+                        persist_session_mounts(&session)?;
+                        session
+                    },
                     events: vec![
                         CourierEvent::LocalToolsListed {
                             tools: list_local_tools(image),
@@ -1452,7 +1589,10 @@ impl CourierBackend for DockerCourier {
 
                     Ok(CourierResponse {
                         courier_id: "docker".to_string(),
-                        session,
+                        session: {
+                            persist_session_mounts(&session)?;
+                            session
+                        },
                         events: vec![
                             CourierEvent::ToolCallStarted {
                                 invocation,
@@ -1911,7 +2051,7 @@ impl CourierBackend for WasmCourier {
 
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("wasm-{}-{sequence}", parcel.config.digest);
-            Ok(CourierSession {
+            let session = CourierSession {
                 resolved_mounts: resolve_builtin_mounts(&parcel, "wasm", &session_id)?,
                 id: session_id,
                 parcel_digest: parcel.config.digest.clone(),
@@ -1919,7 +2059,9 @@ impl CourierBackend for WasmCourier {
                 turn_count: 0,
                 history: Vec::new(),
                 backend_state: None,
-            })
+            };
+            persist_session_mounts(&session)?;
+            Ok(session)
         }
     }
 
@@ -1946,7 +2088,10 @@ impl CourierBackend for WasmCourier {
             match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id: "wasm".to_string(),
-                    session,
+                    session: {
+                        persist_session_mounts(&session)?;
+                        session
+                    },
                     events: vec![
                         CourierEvent::PromptResolved {
                             text: resolve_prompt_text(&parcel)?,
@@ -1956,7 +2101,10 @@ impl CourierBackend for WasmCourier {
                 }),
                 CourierOperation::ListLocalTools => Ok(CourierResponse {
                     courier_id: "wasm".to_string(),
-                    session,
+                    session: {
+                        persist_session_mounts(&session)?;
+                        session
+                    },
                     events: vec![
                         CourierEvent::LocalToolsListed {
                             tools: list_local_tools(&parcel),
@@ -2005,6 +2153,7 @@ impl CourierBackend for WasmCourier {
                         })?;
 
                     apply_wasm_turn_to_session(&mut session, &operation, &result);
+                    persist_session_mounts(&session)?;
                     Ok(CourierResponse {
                         courier_id: "wasm".to_string(),
                         session,
@@ -2087,7 +2236,7 @@ impl CourierBackend for StubCourier {
             validate_required_secrets(image)?;
             ensure_mounts_supported(courier_id, image.config.mounts.as_slice(), &[])?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-            Ok(CourierSession {
+            let session = CourierSession {
                 id: format!("{courier_id}-{parcel_digest}-{sequence}"),
                 parcel_digest,
                 entrypoint,
@@ -2095,7 +2244,8 @@ impl CourierBackend for StubCourier {
                 history: Vec::new(),
                 resolved_mounts: Vec::new(),
                 backend_state: None,
-            })
+            };
+            Ok(session)
         }
     }
 
@@ -2180,6 +2330,7 @@ fn run_native_task_operation(
     });
     turn.events.push(CourierEvent::Done);
 
+    persist_session_mounts(&session)?;
     Ok(CourierResponse {
         courier_id,
         session,
@@ -3093,6 +3244,8 @@ fn hash_file_sha256(path: &Path) -> Result<String, CourierError> {
 mod tests {
     use super::*;
     use crate::{BuildOptions, build_agentfile};
+    use rusqlite::Connection;
+    use serde_json::Value;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -4655,6 +4808,81 @@ ENTRYPOINT job
         assert_eq!(inspection.mounts[0].driver, "sqlite");
         assert_eq!(inspection.local_tools.len(), 1);
         assert_eq!(inspection.local_tools[0].alias, "demo");
+    }
+
+    #[test]
+    fn load_parcel_rejects_manifests_that_fail_schema_validation() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+ENTRYPOINT chat
+",
+            &[("SOUL.md", "You are schema-checked.")],
+        );
+
+        let manifest_path = test_image.image.parcel_dir.join("manifest.json");
+        let mut manifest =
+            serde_json::from_slice::<Value>(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["tools"] = Value::String("not-an-array".to_string());
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_parcel(&test_image.image.parcel_dir).unwrap_err();
+        assert!(matches!(error, CourierError::InvalidParcelSchema { .. }));
+    }
+
+    #[test]
+    fn native_courier_persists_session_sqlite_mounts() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let sqlite_mount = session
+            .resolved_mounts
+            .iter()
+            .find(|mount| mount.kind == MountKind::Session && mount.driver == "sqlite")
+            .expect("expected sqlite session mount");
+        let connection = Connection::open(&sqlite_mount.target_path).unwrap();
+        let (turn_count, payload_json): (i64, String) = connection
+            .query_row(
+                "SELECT turn_count, payload_json FROM dispatch_sessions WHERE session_id = ?1",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(turn_count, 0);
+        let persisted: CourierSession = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(persisted.id, session.id);
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "hello".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        let updated_turn_count: i64 = connection
+            .query_row(
+                "SELECT turn_count FROM dispatch_sessions WHERE session_id = ?1",
+                [&response.session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_turn_count, 1);
     }
 
     #[test]
