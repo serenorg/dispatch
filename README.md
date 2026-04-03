@@ -206,7 +206,7 @@ Non-native courier behavior:
 - the Docker courier can validate parcel/courier compatibility, inspect parcels, resolve prompts, list local tools, and execute `--tool`
 - `wasm` is a typed component-model courier family with an explicit parcel-side `COMPONENT <path>` contract
 - the WASM courier validates and loads declared Dispatch ABI components, inspects parcels, resolves prompts, and lists declared local tools
-- WASM guests now execute `chat`, `job`, and `heartbeat` turns through the Dispatch WIT ABI while keeping prompt resolution and declared local tool discovery host-owned
+- WASM guests execute `chat`, `job`, and `heartbeat` turns through the Dispatch WIT ABI while keeping prompt resolution, declared local tool discovery, and sqlite memory access host-owned
 - the repo includes a reference guest component targeting the same ABI
 
 Courier registry behavior:
@@ -232,8 +232,8 @@ Depot behavior:
 Mount behavior:
 
 - built-in couriers resolve declared mounts during `open_session`
-- `MOUNT SESSION sqlite` creates a parcel-scoped sqlite database and persists `CourierSession` state on open plus after each turn
-- `MOUNT MEMORY sqlite` resolves a durable parcel-scoped memory database path for couriers that implement memory persistence; the mount contract exists now even though the generic memory API surface is still narrow
+- `MOUNT SESSION sqlite` creates a session-scoped sqlite database and persists `CourierSession` state on open plus after each turn
+- `MOUNT MEMORY sqlite` resolves a durable parcel-scoped sqlite database for built-in courier memory APIs
 - unsupported mount drivers fail fast when a courier session opens
 
 Optional environment variables for the native OpenAI-backed chat path:

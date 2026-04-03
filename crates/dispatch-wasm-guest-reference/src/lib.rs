@@ -52,6 +52,104 @@ fn handle_chat(
 ) -> Result<TurnResult, String> {
     let trimmed = input.trim();
 
+    if let Some(rest) = trimmed.strip_prefix("remember ").map(str::trim) {
+        let mut parts = rest.splitn(2, ' ');
+        let key_ref = parts.next().unwrap_or_default().trim();
+        let value = parts.next().unwrap_or_default().trim();
+        if key_ref.is_empty() || value.is_empty() {
+            return Ok(TurnResult {
+                backend_state: Some(next_state),
+                events: vec![message(
+                    "assistant",
+                    "usage: remember <key|namespace:key> <value>".to_string(),
+                )],
+            });
+        }
+        let (namespace, key) = parse_memory_ref(key_ref);
+        let replaced = host::memory_put(&namespace, &key, value)
+            .map_err(|error| format!("memory put failed: {error}"))?;
+        let content = if replaced {
+            format!("updated memory {}:{}", namespace, key)
+        } else {
+            format!("remembered {}:{}", namespace, key)
+        };
+        return Ok(TurnResult {
+            backend_state: Some(next_state),
+            events: vec![message("assistant", content)],
+        });
+    }
+
+    if let Some(key_ref) = trimmed.strip_prefix("recall ").map(str::trim) {
+        if key_ref.is_empty() {
+            return Ok(TurnResult {
+                backend_state: Some(next_state),
+                events: vec![message(
+                    "assistant",
+                    "usage: recall <key|namespace:key>".to_string(),
+                )],
+            });
+        }
+        let (namespace, key) = parse_memory_ref(key_ref);
+        let content = match host::memory_get(&namespace, &key)
+            .map_err(|error| format!("memory get failed: {error}"))?
+        {
+            Some(entry) => format!("{}:{} = {}", entry.namespace, entry.key, entry.value),
+            None => format!("no memory entry for {}:{}", namespace, key),
+        };
+        return Ok(TurnResult {
+            backend_state: Some(next_state),
+            events: vec![message("assistant", content)],
+        });
+    }
+
+    if let Some(key_ref) = trimmed.strip_prefix("forget ").map(str::trim) {
+        if key_ref.is_empty() {
+            return Ok(TurnResult {
+                backend_state: Some(next_state),
+                events: vec![message(
+                    "assistant",
+                    "usage: forget <key|namespace:key>".to_string(),
+                )],
+            });
+        }
+        let (namespace, key) = parse_memory_ref(key_ref);
+        let deleted = host::memory_delete(&namespace, &key)
+            .map_err(|error| format!("memory delete failed: {error}"))?;
+        let content = if deleted {
+            format!("forgot {}:{}", namespace, key)
+        } else {
+            format!("no memory entry for {}:{}", namespace, key)
+        };
+        return Ok(TurnResult {
+            backend_state: Some(next_state),
+            events: vec![message("assistant", content)],
+        });
+    }
+
+    if let Some(prefix_ref) = trimmed.strip_prefix("memory").map(str::trim) {
+        let (namespace, prefix) = if prefix_ref.is_empty() {
+            ("default".to_string(), None)
+        } else {
+            let (namespace, key_prefix) = parse_memory_ref(prefix_ref);
+            (namespace, Some(key_prefix))
+        };
+        let entries = host::memory_list(&namespace, prefix.as_deref())
+            .map_err(|error| format!("memory list failed: {error}"))?;
+        let content = if entries.is_empty() {
+            format!("no memory entries in namespace `{namespace}`")
+        } else {
+            entries
+                .into_iter()
+                .map(|entry| format!("{}:{} = {}", entry.namespace, entry.key, entry.value))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        return Ok(TurnResult {
+            backend_state: Some(next_state),
+            events: vec![message("assistant", content)],
+        });
+    }
+
     if let Some(alias) = trimmed
         .strip_prefix("tool ")
         .map(str::trim)
@@ -104,20 +202,17 @@ fn handle_chat(
             })
             .collect::<Vec<_>>();
 
+        let mut next_messages = Some(messages);
         let mut previous_response_id = None;
         let mut tool_outputs = Vec::new();
         for _round in 0..8 {
             let reply = host::model_complete(&host::ModelRequest {
                 model: parcel.primary_model.clone(),
                 instructions: parcel.prompt.clone(),
-                messages: if previous_response_id.is_some() {
-                    Vec::new()
-                } else {
-                    messages.clone()
-                },
+                messages: next_messages.take().unwrap_or_default(),
                 tools: tools.clone(),
                 tool_outputs,
-                previous_response_id: previous_response_id.clone(),
+                previous_response_id: previous_response_id.take(),
             })
             .map_err(|error| format!("model import failed: {error}"))?;
 
@@ -156,10 +251,11 @@ fn handle_chat(
                 continue;
             }
 
+            let backend = reply.backend;
             let mut events = Vec::new();
             if reply.text.is_none() {
                 events.push(GuestEvent::BackendFallback(BackendFallback {
-                    backend: reply.backend.clone(),
+                    backend,
                     error: "model returned no text".to_string(),
                 }));
             }
@@ -201,6 +297,15 @@ fn message(role: &str, content: String) -> GuestEvent {
         role: role.to_string(),
         content,
     })
+}
+
+fn parse_memory_ref(token: &str) -> (String, String) {
+    match token.split_once(':') {
+        Some((namespace, key)) if !namespace.is_empty() && !key.is_empty() => {
+            (namespace.to_string(), key.to_string())
+        }
+        _ => ("default".to_string(), token.to_string()),
+    }
 }
 
 export!(Component);

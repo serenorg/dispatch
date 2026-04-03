@@ -6,6 +6,13 @@ interface host {
         content: string,
     }
 
+    record memory-entry {
+        namespace: string,
+        key: string,
+        value: string,
+        updated-at: u64,
+    }
+
     record local-tool {
         alias: string,
         description: option<string>,
@@ -69,6 +76,10 @@ interface host {
 
     model-complete: func(request: model-request) -> result<model-response, string>;
     invoke-tool: func(invocation: tool-invocation) -> result<tool-result, string>;
+    memory-get: func(namespace: string, key: string) -> result<option<memory-entry>, string>;
+    memory-put: func(namespace: string, key: string, value: string) -> result<bool, string>;
+    memory-delete: func(namespace: string, key: string) -> result<bool, string>;
+    memory-list: func(namespace: string, prefix: option<string>) -> result<list<memory-entry>, string>;
 }
 
 interface guest {

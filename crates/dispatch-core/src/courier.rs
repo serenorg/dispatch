@@ -20,6 +20,7 @@ use std::{
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use wasmtime::{
@@ -213,9 +214,10 @@ pub enum CourierError {
     ModelBackendRequest(String),
     #[error("model backend returned an unexpected response: {0}")]
     ModelBackendResponse(String),
-    #[error("failed to persist sqlite mount `{path}`: {source}")]
-    PersistSqliteMount {
+    #[error("failed to access sqlite mount `{path}` during `{operation}`: {source}")]
+    SqliteMount {
         path: String,
+        operation: &'static str,
         #[source]
         source: rusqlite::Error,
     },
@@ -390,6 +392,7 @@ struct WasmHostState {
 
 struct WasmHost {
     parcel: LoadedParcel,
+    session: CourierSession,
     chat_backend: Arc<dyn ChatModelBackend>,
 }
 
@@ -682,6 +685,65 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
             stderr: result.stderr,
         })
     }
+
+    fn memory_get(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> Result<Option<wasm_bindings::dispatch::courier::host::MemoryEntry>, String> {
+        memory_get(&self.session, &namespace, &key)
+            .map(|entry| {
+                entry.map(
+                    |entry| wasm_bindings::dispatch::courier::host::MemoryEntry {
+                        namespace: entry.namespace,
+                        key: entry.key,
+                        value: entry.value,
+                        updated_at: entry.updated_at,
+                    },
+                )
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn memory_put(
+        &mut self,
+        namespace: String,
+        key: String,
+        value: String,
+    ) -> Result<bool, String> {
+        memory_put(&self.session, &namespace, &key, &value)
+            .map(|replaced| replaced.unwrap_or(false))
+            .map_err(|error| error.to_string())
+    }
+
+    fn memory_delete(&mut self, namespace: String, key: String) -> Result<bool, String> {
+        memory_delete(&self.session, &namespace, &key)
+            .map(|deleted| deleted.unwrap_or(false))
+            .map_err(|error| error.to_string())
+    }
+
+    fn memory_list(
+        &mut self,
+        namespace: String,
+        prefix: Option<String>,
+    ) -> Result<Vec<wasm_bindings::dispatch::courier::host::MemoryEntry>, String> {
+        memory_list(&self.session, &namespace, prefix.as_deref())
+            .map(|entries| {
+                entries
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(
+                        |entry| wasm_bindings::dispatch::courier::host::MemoryEntry {
+                            namespace: entry.namespace,
+                            key: entry.key,
+                            value: entry.value,
+                            updated_at: entry.updated_at,
+                        },
+                    )
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl WasiView for WasmHostState {
@@ -853,16 +915,39 @@ pub fn run_local_tool(
     tool_name: &str,
     input: Option<&str>,
 ) -> Result<ToolRunResult, CourierError> {
-    let tool = resolve_local_tool(parcel, tool_name)?;
+    run_local_tool_with_env(parcel, tool_name, input, process_env_lookup)
+}
 
-    execute_local_tool(parcel, &tool, input)
+fn run_local_tool_with_env<F>(
+    parcel: &LoadedParcel,
+    tool_name: &str,
+    input: Option<&str>,
+    env_lookup: F,
+) -> Result<ToolRunResult, CourierError>
+where
+    F: FnMut(&str) -> Option<String> + Copy,
+{
+    let tool = resolve_local_tool_with_env(parcel, tool_name, env_lookup)?;
+
+    execute_local_tool_with_env(parcel, &tool, input, env_lookup)
 }
 
 fn resolve_local_tool(
     parcel: &LoadedParcel,
     tool_name: &str,
 ) -> Result<LocalToolSpec, CourierError> {
-    validate_required_secrets(parcel)?;
+    resolve_local_tool_with_env(parcel, tool_name, process_env_lookup)
+}
+
+fn resolve_local_tool_with_env<F>(
+    parcel: &LoadedParcel,
+    tool_name: &str,
+    env_lookup: F,
+) -> Result<LocalToolSpec, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    validate_required_secrets_with(parcel, env_lookup)?;
     list_local_tools(parcel)
         .into_iter()
         .find(|tool| tool.alias == tool_name || tool.packaged_path == tool_name)
@@ -872,8 +957,18 @@ fn resolve_local_tool(
 }
 
 fn validate_required_secrets(parcel: &LoadedParcel) -> Result<(), CourierError> {
+    validate_required_secrets_with(parcel, process_env_lookup)
+}
+
+fn validate_required_secrets_with<F>(
+    parcel: &LoadedParcel,
+    mut env_lookup: F,
+) -> Result<(), CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     for secret in &parcel.config.secrets {
-        if secret.required && std::env::var(&secret.name).is_err() {
+        if secret.required && env_lookup(&secret.name).is_none() {
             return Err(CourierError::MissingSecret {
                 name: secret.name.clone(),
             });
@@ -881,6 +976,10 @@ fn validate_required_secrets(parcel: &LoadedParcel) -> Result<(), CourierError> 
     }
 
     Ok(())
+}
+
+fn process_env_lookup(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 fn ensure_mounts_supported(
@@ -906,14 +1005,14 @@ fn resolve_builtin_mounts(
     session_id: &str,
 ) -> Result<Vec<ResolvedMount>, CourierError> {
     let mut mounts = Vec::with_capacity(parcel.config.mounts.len());
-    let state_root = parcel
+    let parcel_state_root = parcel
         .parcel_dir
         .parent()
         .and_then(Path::parent)
         .unwrap_or(parcel.parcel_dir.as_path())
         .join("state")
-        .join(&parcel.config.digest)
-        .join(session_id);
+        .join(&parcel.config.digest);
+    let session_state_root = parcel_state_root.join("sessions").join(session_id);
 
     for mount in &parcel.config.mounts {
         let resolved = match (mount.kind, mount.driver.as_str()) {
@@ -924,7 +1023,7 @@ fn resolve_builtin_mounts(
                 metadata: BTreeMap::from([("storage".to_string(), "memory".to_string())]),
             },
             (MountKind::Session, "sqlite") => {
-                let path = state_root.join("session.sqlite");
+                let path = session_state_root.join("session.sqlite");
                 ensure_parent_dir(&path)?;
                 touch_file(&path)?;
                 ResolvedMount {
@@ -941,7 +1040,7 @@ fn resolve_builtin_mounts(
                 metadata: BTreeMap::new(),
             },
             (MountKind::Memory, "sqlite") => {
-                let path = state_root.join("memory.sqlite");
+                let path = parcel_state_root.join("memory.sqlite");
                 ensure_parent_dir(&path)?;
                 touch_file(&path)?;
                 ResolvedMount {
@@ -952,7 +1051,7 @@ fn resolve_builtin_mounts(
                 }
             }
             (MountKind::Artifacts, "local") => {
-                let path = state_root.join("artifacts");
+                let path = parcel_state_root.join("artifacts");
                 fs::create_dir_all(&path).map_err(|source| CourierError::ReadFile {
                     path: path.display().to_string(),
                     source,
@@ -1046,8 +1145,9 @@ fn persist_session_mounts(session: &CourierSession) -> Result<(), CourierError> 
 }
 
 fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), CourierError> {
-    let connection = Connection::open(path).map_err(|source| CourierError::PersistSqliteMount {
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
         path: path.display().to_string(),
+        operation: "open",
         source,
     })?;
     connection
@@ -1060,8 +1160,9 @@ fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), C
                 payload_json TEXT NOT NULL
             );",
         )
-        .map_err(|source| CourierError::PersistSqliteMount {
+        .map_err(|source| CourierError::SqliteMount {
             path: path.display().to_string(),
+            operation: "create_session_table",
             source,
         })?;
     let payload = serde_json::to_string(session).map_err(|error| {
@@ -1089,17 +1190,328 @@ fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), C
                 payload,
             ],
         )
-        .map_err(|source| CourierError::PersistSqliteMount {
+        .map_err(|source| CourierError::SqliteMount {
             path: path.display().to_string(),
+            operation: "upsert_session",
             source,
         })?;
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MemoryEntry {
+    namespace: String,
+    key: String,
+    value: String,
+    updated_at: u64,
+}
+
+fn memory_mount_path(session: &CourierSession) -> Option<&Path> {
+    session
+        .resolved_mounts
+        .iter()
+        .find(|mount| mount.kind == MountKind::Memory && mount.driver == "sqlite")
+        .map(|mount| Path::new(&mount.target_path))
+}
+
+fn ensure_memory_sqlite(connection: &Connection, path: &Path) -> Result<(), CourierError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS dispatch_memory (
+                parcel_digest TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(parcel_digest, namespace, key)
+            );",
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "create_memory_table",
+            source,
+        })
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn memory_get(
+    session: &CourierSession,
+    namespace: &str,
+    key: &str,
+) -> Result<Option<MemoryEntry>, CourierError> {
+    let Some(path) = memory_mount_path(session) else {
+        return Ok(None);
+    };
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_get",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    connection
+        .query_row(
+            concat!(
+                "SELECT namespace, key, value, updated_at ",
+                "FROM dispatch_memory ",
+                "WHERE parcel_digest = ?1 AND namespace = ?2 AND key = ?3"
+            ),
+            params![session.parcel_digest, namespace, key],
+            |row| {
+                Ok(MemoryEntry {
+                    namespace: row.get(0)?,
+                    key: row.get(1)?,
+                    value: row.get(2)?,
+                    updated_at: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            source => Err(CourierError::SqliteMount {
+                path: path.display().to_string(),
+                operation: "query_memory_get",
+                source,
+            }),
+        })
+}
+
+fn memory_put(
+    session: &CourierSession,
+    namespace: &str,
+    key: &str,
+    value: &str,
+) -> Result<Option<bool>, CourierError> {
+    let Some(path) = memory_mount_path(session) else {
+        return Ok(None);
+    };
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_put",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    let existed = memory_get(session, namespace, key)?.is_some();
+    connection
+        .execute(
+            concat!(
+                "INSERT INTO dispatch_memory ",
+                "(parcel_digest, namespace, key, value, updated_at) ",
+                "VALUES (?1, ?2, ?3, ?4, ?5) ",
+                "ON CONFLICT(parcel_digest, namespace, key) DO UPDATE SET ",
+                "value = excluded.value, ",
+                "updated_at = excluded.updated_at"
+            ),
+            params![
+                session.parcel_digest,
+                namespace,
+                key,
+                value,
+                current_unix_timestamp() as i64,
+            ],
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "upsert_memory_put",
+            source,
+        })?;
+    Ok(Some(existed))
+}
+
+fn memory_delete(
+    session: &CourierSession,
+    namespace: &str,
+    key: &str,
+) -> Result<Option<bool>, CourierError> {
+    let Some(path) = memory_mount_path(session) else {
+        return Ok(None);
+    };
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_delete",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    let deleted = connection
+        .execute(
+            concat!(
+                "DELETE FROM dispatch_memory ",
+                "WHERE parcel_digest = ?1 AND namespace = ?2 AND key = ?3"
+            ),
+            params![session.parcel_digest, namespace, key],
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "delete_memory_entry",
+            source,
+        })?;
+    Ok(Some(deleted > 0))
+}
+
+fn memory_list(
+    session: &CourierSession,
+    namespace: &str,
+    prefix: Option<&str>,
+) -> Result<Option<Vec<MemoryEntry>>, CourierError> {
+    let Some(path) = memory_mount_path(session) else {
+        return Ok(None);
+    };
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_list",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    let prefix_like = format!("{}%", prefix.unwrap_or_default());
+    let mut statement = connection
+        .prepare(concat!(
+            "SELECT namespace, key, value, updated_at ",
+            "FROM dispatch_memory ",
+            "WHERE parcel_digest = ?1 AND namespace = ?2 AND key LIKE ?3 ",
+            "ORDER BY key ASC"
+        ))
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "prepare_memory_list",
+            source,
+        })?;
+    let rows = statement
+        .query_map(
+            params![session.parcel_digest, namespace, prefix_like],
+            |row| {
+                Ok(MemoryEntry {
+                    namespace: row.get(0)?,
+                    key: row.get(1)?,
+                    value: row.get(2)?,
+                    updated_at: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "query_memory_list",
+            source,
+        })?;
+    let mut entries = Vec::new();
+    for entry in rows {
+        entries.push(entry.map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "read_memory_list",
+            source,
+        })?);
+    }
+    Ok(Some(entries))
+}
+
+fn parse_memory_ref(token: &str) -> (&str, &str) {
+    match token.split_once(':') {
+        Some((namespace, key)) if !namespace.is_empty() && !key.is_empty() => (namespace, key),
+        _ => ("default", token),
+    }
+}
+
+fn handle_native_memory_command(
+    session: &CourierSession,
+    command: &str,
+) -> Result<String, CourierError> {
+    let Some(rest) = command.strip_prefix("/memory") else {
+        return Ok("Usage: /memory <put|get|delete|list> ...".to_string());
+    };
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return Ok("Usage: /memory <put|get|delete|list> ...".to_string());
+    }
+    if memory_mount_path(session).is_none() {
+        return Ok("No sqlite memory mount is configured for this parcel.".to_string());
+    }
+
+    let mut parts = trimmed.splitn(3, ' ');
+    let verb = parts.next().unwrap_or_default();
+    match verb {
+        "put" => {
+            let key_ref = parts.next().unwrap_or_default().trim();
+            let value = parts.next().unwrap_or_default().trim();
+            if key_ref.is_empty() || value.is_empty() {
+                return Ok("Usage: /memory put <key|namespace:key> <value>".to_string());
+            }
+            let (namespace, key) = parse_memory_ref(key_ref);
+            let replaced = memory_put(session, namespace, key, value)?.unwrap_or(false);
+            Ok(if replaced {
+                format!("Updated memory {}:{}", namespace, key)
+            } else {
+                format!("Stored memory {}:{}", namespace, key)
+            })
+        }
+        "get" => {
+            let key_ref = parts.next().unwrap_or_default().trim();
+            if key_ref.is_empty() {
+                return Ok("Usage: /memory get <key|namespace:key>".to_string());
+            }
+            let (namespace, key) = parse_memory_ref(key_ref);
+            match memory_get(session, namespace, key)? {
+                Some(entry) => Ok(format!(
+                    "{}:{} = {}",
+                    entry.namespace, entry.key, entry.value
+                )),
+                None => Ok(format!("No memory entry for {}:{}", namespace, key)),
+            }
+        }
+        "delete" => {
+            let key_ref = parts.next().unwrap_or_default().trim();
+            if key_ref.is_empty() {
+                return Ok("Usage: /memory delete <key|namespace:key>".to_string());
+            }
+            let (namespace, key) = parse_memory_ref(key_ref);
+            let deleted = memory_delete(session, namespace, key)?.unwrap_or(false);
+            Ok(if deleted {
+                format!("Deleted memory {}:{}", namespace, key)
+            } else {
+                format!("No memory entry for {}:{}", namespace, key)
+            })
+        }
+        "list" => {
+            let key_ref = parts.next().unwrap_or_default().trim();
+            let (namespace, prefix) = if key_ref.is_empty() {
+                ("default", None)
+            } else {
+                let (namespace, key) = parse_memory_ref(key_ref);
+                (namespace, Some(key))
+            };
+            let entries = memory_list(session, namespace, prefix)?.unwrap_or_default();
+            if entries.is_empty() {
+                return Ok(format!("No memory entries in namespace `{namespace}`."));
+            }
+            Ok(entries
+                .into_iter()
+                .map(|entry| format!("{}:{} = {}", entry.namespace, entry.key, entry.value))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        _ => Ok("Usage: /memory <put|get|delete|list> ...".to_string()),
+    }
+}
+
 fn forwarded_tool_env(parcel: &LoadedParcel, input: Option<&str>) -> Vec<(String, String)> {
+    forwarded_tool_env_with(parcel, input, process_env_lookup)
+}
+
+fn forwarded_tool_env_with<F>(
+    parcel: &LoadedParcel,
+    input: Option<&str>,
+    mut env_lookup: F,
+) -> Vec<(String, String)>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut env = Vec::new();
     for var in ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"] {
-        if let Ok(value) = std::env::var(var) {
+        if let Some(value) = env_lookup(var) {
             env.push((var.to_string(), value));
         }
     }
@@ -1107,7 +1519,7 @@ fn forwarded_tool_env(parcel: &LoadedParcel, input: Option<&str>) -> Vec<(String
         env.push((entry.name.clone(), entry.value.clone()));
     }
     for secret in &parcel.config.secrets {
-        if let Ok(value) = std::env::var(&secret.name) {
+        if let Some(value) = env_lookup(&secret.name) {
             env.push((secret.name.clone(), value));
         }
     }
@@ -1124,6 +1536,18 @@ fn execute_local_tool(
     tool: &LocalToolSpec,
     input: Option<&str>,
 ) -> Result<ToolRunResult, CourierError> {
+    execute_local_tool_with_env(parcel, tool, input, process_env_lookup)
+}
+
+fn execute_local_tool_with_env<F>(
+    parcel: &LoadedParcel,
+    tool: &LocalToolSpec,
+    input: Option<&str>,
+    env_lookup: F,
+) -> Result<ToolRunResult, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
     if !tool_path.exists() {
         return Err(CourierError::MissingToolFile {
@@ -1149,7 +1573,7 @@ fn execute_local_tool(
     // subprocesses. Only declared ENV vars, the image's required secrets, and
     // the minimal system variables needed to locate interpreters are forwarded.
     command.env_clear();
-    for (name, value) in forwarded_tool_env(parcel, input) {
+    for (name, value) in forwarded_tool_env_with(parcel, input, env_lookup) {
         command.env(name, value);
     }
 
@@ -2126,8 +2550,13 @@ impl CourierBackend for WasmCourier {
                         _ => unreachable!(),
                     };
                     let guest_operation = wasm_operation(&operation).expect("guest operation");
-                    let (mut store, guest, parcel_context) =
-                        instantiate_wasm_guest(&engine, &component_cache, &parcel, chat_backend)?;
+                    let (mut store, guest, parcel_context) = instantiate_wasm_guest(
+                        &engine,
+                        &component_cache,
+                        &parcel,
+                        &session,
+                        chat_backend,
+                    )?;
                     let result = guest
                         .dispatch_courier_guest()
                         .call_handle_operation(
@@ -2435,6 +2864,7 @@ fn instantiate_wasm_guest(
     engine: &Engine,
     component_cache: &Arc<Mutex<BTreeMap<String, Component>>>,
     parcel: &LoadedParcel,
+    session: &CourierSession,
     chat_backend: Arc<dyn ChatModelBackend>,
 ) -> Result<
     (
@@ -2473,6 +2903,7 @@ fn instantiate_wasm_guest(
         WasmHostState {
             host: WasmHost {
                 parcel: parcel.clone(),
+                session: session.clone(),
                 chat_backend,
             },
             wasi_ctx: WasiCtx::builder().build(),
@@ -2787,8 +3218,15 @@ fn execute_native_turn(
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/help") {
         return Ok(ChatTurnResult {
             reply:
-                "Native chat is a reference backend. Available commands: /prompt, /tools, /help."
+                "Native chat is a reference backend. Available commands: /prompt, /tools, /memory, /help."
                     .to_string(),
+            events: Vec::new(),
+        });
+    }
+
+    if matches!(mode, NativeTurnMode::Chat) && trimmed.starts_with("/memory") {
+        return Ok(ChatTurnResult {
+            reply: handle_native_memory_command(session, trimmed)?,
             events: Vec::new(),
         });
     }
@@ -2847,9 +3285,6 @@ fn execute_native_turn(
                         args: tool.args.clone(),
                     });
                     let tool_result = execute_local_tool(image, tool, Some(&tool_call.input))?;
-                    events.push(CourierEvent::ToolCallFinished {
-                        result: tool_result.clone(),
-                    });
                     let combined_output = if tool_result.exit_code == 0 {
                         if tool_result.stderr.trim().is_empty() {
                             tool_result.stdout.clone()
@@ -2867,6 +3302,9 @@ fn execute_native_turn(
                             tool_result.exit_code, tool_result.stdout, tool_result.stderr
                         )
                     };
+                    events.push(CourierEvent::ToolCallFinished {
+                        result: tool_result,
+                    });
                     tool_outputs.push(ModelToolOutput {
                         call_id: tool_call.call_id,
                         output: combined_output,
@@ -2960,7 +3398,6 @@ fn build_model_request(
         messages: messages.to_vec(),
         tools: local_tools
             .iter()
-            .cloned()
             .map(|tool| build_model_tool_definition(image, tool))
             .collect::<Result<Vec<_>, _>>()?,
         tool_outputs: Vec::new(),
@@ -2970,23 +3407,26 @@ fn build_model_request(
 
 fn build_model_tool_definition(
     image: &LoadedParcel,
-    tool: LocalToolSpec,
+    tool: &LocalToolSpec,
 ) -> Result<ModelToolDefinition, CourierError> {
-    let description = tool.description.unwrap_or_else(|| {
+    let description = tool.description.clone().unwrap_or_else(|| {
         format!(
             "Local Dispatch tool `{}` packaged at `{}`. Provide free-form text or JSON input appropriate for the tool.",
             tool.alias, tool.packaged_path
         )
     });
-    let format = match (tool.input_schema_packaged_path, tool.input_schema_sha256) {
+    let format = match (
+        tool.input_schema_packaged_path.as_deref(),
+        tool.input_schema_sha256.as_deref(),
+    ) {
         (Some(source), expected_sha256) => ModelToolFormat::JsonSchema {
-            schema: load_tool_schema(image, &tool.alias, &source, expected_sha256.as_deref())?,
+            schema: load_tool_schema(image, &tool.alias, source, expected_sha256)?,
         },
         (None, _) => ModelToolFormat::Text,
     };
 
     Ok(ModelToolDefinition {
-        name: tool.alias,
+        name: tool.alias.clone(),
         description,
         format,
     })
@@ -3330,6 +3770,15 @@ mod tests {
             }),
             plugin_path,
         )
+    }
+
+    fn mount_path<'a>(session: &'a CourierSession, kind: MountKind, driver: &str) -> &'a str {
+        session
+            .resolved_mounts
+            .iter()
+            .find(|mount| mount.kind == kind && mount.driver == driver)
+            .map(|mount| mount.target_path.as_str())
+            .expect("expected resolved mount")
     }
 
     #[derive(Default)]
@@ -3852,6 +4301,61 @@ ENTRYPOINT heartbeat
     }
 
     #[test]
+    fn wasm_courier_reference_guest_memory_persists_across_sessions() {
+        static REFERENCE_GUEST: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/dispatch-wasm-guest-reference.wasm"
+        ));
+
+        let test_image = build_test_image_with_binary_files(
+            "\
+FROM dispatch/wasm:latest
+COMPONENT components/reference.wasm
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+ENTRYPOINT chat
+",
+            &[],
+            &[("components/reference.wasm", REFERENCE_GUEST)],
+        );
+        let courier = WasmCourier::default();
+
+        let first_session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let first_response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: first_session,
+                operation: CourierOperation::Chat {
+                    input: "remember profile:name Christian".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            first_response.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "remembered profile:name"
+        ));
+
+        let second_session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let second_response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: second_session,
+                operation: CourierOperation::Chat {
+                    input: "recall profile:name".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            second_response.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "profile:name = Christian"
+        ));
+    }
+
+    #[test]
     fn docker_courier_can_resolve_prompt_and_list_tools() {
         let test_image = build_test_image(
             "\
@@ -4162,6 +4666,89 @@ ENTRYPOINT chat
             response.events.first(),
             Some(CourierEvent::Message { role, content })
                 if role == "assistant" && content.contains("hello courier")
+        ));
+    }
+
+    #[test]
+    fn builtin_mounts_scope_session_state_per_session_and_memory_per_parcel() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+MOUNT ARTIFACTS local
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let first_session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let second_session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let first_session_db = mount_path(&first_session, MountKind::Session, "sqlite");
+        let second_session_db = mount_path(&second_session, MountKind::Session, "sqlite");
+        let first_memory_db = mount_path(&first_session, MountKind::Memory, "sqlite");
+        let second_memory_db = mount_path(&second_session, MountKind::Memory, "sqlite");
+        let first_artifacts = mount_path(&first_session, MountKind::Artifacts, "local");
+        let second_artifacts = mount_path(&second_session, MountKind::Artifacts, "local");
+
+        assert_ne!(first_session_db, second_session_db);
+        assert!(first_session_db.contains("/sessions/"));
+        assert!(second_session_db.contains("/sessions/"));
+        assert_eq!(first_memory_db, second_memory_db);
+        assert!(first_memory_db.ends_with("memory.sqlite"));
+        assert_eq!(first_artifacts, second_artifacts);
+        assert!(first_artifacts.ends_with("artifacts"));
+    }
+
+    #[test]
+    fn native_courier_memory_sqlite_persists_across_sessions() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let first_session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let first_response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: first_session,
+                operation: CourierOperation::Chat {
+                    input: "/memory put profile:name Christian".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            first_response.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "Stored memory profile:name"
+        ));
+
+        let second_session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let second_response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: second_session,
+                operation: CourierOperation::Chat {
+                    input: "/memory get profile:name".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            second_response.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "profile:name = Christian"
         ));
     }
 
@@ -4941,12 +5528,18 @@ ENTRYPOINT job
             )],
         );
 
-        unsafe {
-            std::env::set_var("CAST_VISIBLE_SECRET", "secret-value");
-            std::env::set_var("CAST_HIDDEN_ENV", "hidden-value");
-        }
+        let host_env = BTreeMap::from([
+            (
+                "CAST_VISIBLE_SECRET".to_string(),
+                "secret-value".to_string(),
+            ),
+            ("CAST_HIDDEN_ENV".to_string(), "hidden-value".to_string()),
+        ]);
 
-        let result = run_local_tool(&test_image.image, "envcheck", None).unwrap();
+        let result = run_local_tool_with_env(&test_image.image, "envcheck", None, |name| {
+            host_env.get(name).cloned()
+        })
+        .unwrap();
 
         assert!(result.stdout.contains("visible_env=visible"));
         assert!(result.stdout.contains("visible_secret=secret-value"));

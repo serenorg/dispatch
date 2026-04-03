@@ -18,7 +18,7 @@ TOOL LOCAL tools/echo.sh AS echo DESCRIPTION "Echo the provided input back for d
 COMPONENT components/reference-guest.wasm
 
 MOUNT SESSION sqlite
-MOUNT MEMORY none
+MOUNT MEMORY sqlite
 MOUNT ARTIFACTS local
 
 ENV TZ=UTC

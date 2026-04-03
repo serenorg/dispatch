@@ -466,7 +466,7 @@ MOUNT MEMORY pgvector
 Semantics:
 
 - `none` means no durable long-term memory backend
-- `sqlite` resolves a local durable memory database path for couriers that implement memory persistence
+- `sqlite` resolves a parcel-scoped local durable memory database for built-in courier memory APIs
 - `pgvector` is a declared remote memory backend target for couriers that support it
 - unsupported memory drivers must fail when the courier opens a session instead of being silently ignored
 
