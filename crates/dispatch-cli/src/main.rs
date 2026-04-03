@@ -610,6 +610,14 @@ fn run_eval_case<R: CourierBackend>(
             return result;
         }
     };
+    if session.parcel_digest != parcel.config.digest {
+        result.error = Some(format!(
+            "courier returned session for parcel {} while evaluating {}",
+            session.parcel_digest, parcel.config.digest
+        ));
+        apply_eval_expectations(&mut result, spec, &[]);
+        return result;
+    }
 
     let response = match block_on(courier.run(parcel, CourierRequest { session, operation })) {
         Ok(response) => response,
@@ -619,7 +627,6 @@ fn run_eval_case<R: CourierBackend>(
             return result;
         }
     };
-
     let mut text_observations = Vec::new();
     for event in &response.events {
         match event {
@@ -638,6 +645,14 @@ fn run_eval_case<R: CourierBackend>(
             CourierEvent::TextDelta { content } => text_observations.push(content.clone()),
             _ => {}
         }
+    }
+    if response.session.parcel_digest != parcel.config.digest {
+        result.error = Some(format!(
+            "courier returned response session for parcel {} while evaluating {}",
+            response.session.parcel_digest, parcel.config.digest
+        ));
+        apply_eval_expectations(&mut result, spec, &text_observations);
+        return result;
     }
 
     apply_eval_expectations(&mut result, spec, &text_observations);
@@ -2978,6 +2993,39 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn eval_rejects_session_digest_mismatch() {
+        let dir = tempdir().unwrap();
+        let source_dir = build_test_eval_source(dir.path());
+        let built = build_agentfile(
+            &source_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: source_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let registry_path = dir.path().join("plugins.json");
+        install_eval_test_plugin_with_session_digests(
+            dir.path(),
+            &registry_path,
+            "demo-eval-plugin-mismatch",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            &built.digest,
+        );
+
+        let error = super::eval(
+            source_dir,
+            "demo-eval-plugin-mismatch",
+            Some(registry_path),
+            false,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("eval failed"));
+    }
+
     #[test]
     fn courier_conformance_runs_against_native() {
         super::courier_conformance("native", None, false).unwrap();
@@ -3331,6 +3379,23 @@ ENTRYPOINT chat\n",
         name: &str,
         parcel_digest: &str,
     ) {
+        install_eval_test_plugin_with_session_digests(
+            root,
+            registry_path,
+            name,
+            parcel_digest,
+            parcel_digest,
+        );
+    }
+
+    #[cfg(unix)]
+    fn install_eval_test_plugin_with_session_digests(
+        root: &Path,
+        registry_path: &Path,
+        name: &str,
+        open_session_digest: &str,
+        done_session_digest: &str,
+    ) {
         let script_path = root.join("eval-plugin.sh");
         let script = concat!(
             "#!/bin/sh\n",
@@ -3343,19 +3408,20 @@ ENTRYPOINT chat\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"inspect\"'; then\n",
             "  printf '%s\\n' '{\"kind\":\"inspection\",\"inspection\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}'\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"open_session\"'; then\n",
-            "  printf '%s\\n' '{\"kind\":\"session\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"session\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__OPEN_DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}'\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"run\"'; then\n",
             "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"tool_call_started\",\"invocation\":{\"name\":\"system_time\",\"input\":null},\"command\":\"builtin\",\"args\":[]}}'\n",
             "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"tool_call_finished\",\"result\":{\"tool\":\"system_time\",\"command\":\"builtin\",\"args\":[],\"exit_code\":0,\"stdout\":\"2026-04-03T00:00:00Z\",\"stderr\":\"\"}}}'\n",
             "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"plugin reply\"}}'\n",
-            "  printf '%s\\n' '{\"kind\":\"done\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{\"role\":\"user\",\"content\":\"What time is it?\"},{\"role\":\"assistant\",\"content\":\"plugin reply\"}]}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"done\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DONE_DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{\"role\":\"user\",\"content\":\"What time is it?\"},{\"role\":\"assistant\",\"content\":\"plugin reply\"}]}}'\n",
             "else\n",
             "  printf '%s\\n' '{\"kind\":\"error\",\"error\":{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}'\n",
             "  exit 1\n",
             "fi\n",
             "done\n"
         )
-        .replace("__DIGEST__", parcel_digest);
+        .replace("__OPEN_DIGEST__", open_session_digest)
+        .replace("__DONE_DIGEST__", done_session_digest);
         fs::write(&script_path, script).unwrap();
         let mut permissions = fs::metadata(&script_path).unwrap().permissions();
         permissions.set_mode(0o755);
