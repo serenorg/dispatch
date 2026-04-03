@@ -201,6 +201,7 @@ Native courier behavior:
 - `LLM_BACKEND=openai_compatible` uses a Chat Completions-compatible endpoint such as OpenRouter, Together, Fireworks, LiteLLM, or a self-hosted OpenAI-compatible server
 - if the parcel does not declare `MODEL <id>`, Dispatch falls back to `LLM_MODEL` for the native and WASM hosted-model paths
 - if the parcel model does not declare `PROVIDER <backend>`, Dispatch falls back to `LLM_BACKEND` for backend selection
+- `FALLBACK <id> [PROVIDER <backend>]` entries are tried in order when the primary hosted-model request fails before producing a reply
 - declared local tools are exposed to that model-backed path as tool definitions for the selected backend
 - custom tool calls are executed locally and their outputs are sent back to the model before the assistant reply is finalized
 - tool execution is surfaced as ordered courier events during the chat turn

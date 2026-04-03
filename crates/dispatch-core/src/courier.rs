@@ -479,9 +479,11 @@ pub trait ChatModelBackend: Send + Sync {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ModelRequest {
     pub model: String,
+    pub provider: Option<String>,
     pub instructions: String,
     pub messages: Vec<ConversationMessage>,
     pub tools: Vec<ModelToolDefinition>,
+    pub pending_tool_calls: Vec<ModelToolCall>,
     pub tool_outputs: Vec<ModelToolOutput>,
     pub previous_response_id: Option<String>,
 }
@@ -519,6 +521,7 @@ pub struct ModelToolCall {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ModelToolOutput {
     pub call_id: String,
+    pub name: String,
     pub output: String,
     pub kind: ModelToolKind,
 }
@@ -642,6 +645,7 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
             .into_iter()
             .map(|output| ModelToolOutput {
                 call_id: output.call_id,
+                name: String::new(),
                 output: output.output,
                 kind: match output.kind {
                     wasm_bindings::dispatch::courier::host::ModelToolKind::Custom => {
@@ -657,9 +661,17 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
             .chat_backend
             .generate(&ModelRequest {
                 model,
+                provider: self
+                    .parcel
+                    .config
+                    .models
+                    .primary
+                    .as_ref()
+                    .and_then(|m| m.provider.clone()),
                 instructions: request.instructions,
                 messages,
                 tools,
+                pending_tool_calls: Vec::new(),
                 tool_outputs,
                 previous_response_id: request.previous_response_id,
             })
@@ -819,15 +831,32 @@ fn default_chat_backend_for_model(primary: Option<&ModelReference>) -> Arc<dyn C
     default_chat_backend_for_model_with(primary, process_env_lookup)
 }
 
+fn default_chat_backend_for_provider(provider: Option<&str>) -> Arc<dyn ChatModelBackend> {
+    default_chat_backend_for_provider_with(provider, process_env_lookup)
+}
+
 fn default_chat_backend_for_model_with<F>(
     primary: Option<&ModelReference>,
+    env_lookup: F,
+) -> Arc<dyn ChatModelBackend>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    default_chat_backend_for_provider_with(
+        primary.and_then(|model| model.provider.as_deref()),
+        env_lookup,
+    )
+}
+
+fn default_chat_backend_for_provider_with<F>(
+    provider: Option<&str>,
     mut env_lookup: F,
 ) -> Arc<dyn ChatModelBackend>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    match primary
-        .and_then(|model| model.provider.clone())
+    match provider
+        .map(ToString::to_string)
         .or_else(|| env_lookup("LLM_BACKEND"))
         .unwrap_or_else(|| "openai".to_string())
         .to_ascii_lowercase()
@@ -2023,9 +2052,7 @@ impl CourierBackend for NativeCourier {
         let courier_id = self.id().to_string();
         let operation = request.operation;
         let mut session = request.session;
-        let chat_backend = self.chat_backend_override.clone().unwrap_or_else(|| {
-            default_chat_backend_for_model(image.config.models.primary.as_ref())
-        });
+        let chat_backend_override = self.chat_backend_override.clone();
 
         async move {
             validate_native_parcel(image)?;
@@ -2090,7 +2117,7 @@ impl CourierBackend for NativeCourier {
                         image,
                         &session,
                         &input,
-                        chat_backend.as_ref(),
+                        chat_backend_override.as_ref(),
                         NativeTurnMode::Chat,
                     )?;
                     session.history.push(ConversationMessage {
@@ -2114,7 +2141,7 @@ impl CourierBackend for NativeCourier {
                     image,
                     session,
                     courier_id,
-                    chat_backend.as_ref(),
+                    chat_backend_override.as_ref(),
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
                 ),
@@ -2122,7 +2149,7 @@ impl CourierBackend for NativeCourier {
                     image,
                     session,
                     courier_id,
-                    chat_backend.as_ref(),
+                    chat_backend_override.as_ref(),
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
                 ),
@@ -2995,7 +3022,7 @@ fn run_native_task_operation(
     image: &LoadedParcel,
     mut session: CourierSession,
     courier_id: String,
-    chat_backend: &dyn ChatModelBackend,
+    chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
     mode: NativeTurnMode,
     input: String,
 ) -> Result<CourierResponse, CourierError> {
@@ -3003,7 +3030,7 @@ fn run_native_task_operation(
         role: "user".to_string(),
         content: input.clone(),
     });
-    let mut turn = execute_native_turn(image, &session, &input, chat_backend, mode)?;
+    let mut turn = execute_native_turn(image, &session, &input, chat_backend_override, mode)?;
     session.history.push(ConversationMessage {
         role: "assistant".to_string(),
         content: turn.reply.clone(),
@@ -3437,7 +3464,7 @@ fn execute_native_turn(
     image: &LoadedParcel,
     session: &CourierSession,
     input: &str,
-    chat_backend: &dyn ChatModelBackend,
+    chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
     mode: NativeTurnMode,
 ) -> Result<ChatTurnResult, CourierError> {
     let trimmed = input.trim();
@@ -3487,7 +3514,9 @@ fn execute_native_turn(
         });
     }
 
-    if let Some(mut request) = build_model_request(image, &session.history, &local_tools)? {
+    let requests = build_model_requests(image, &session.history, &local_tools)?;
+    if let Some(mut request) = requests.first().cloned() {
+        let mut remaining_requests = requests.into_iter().skip(1).collect::<Vec<_>>();
         // Validate required secrets once before any tool execution.
         for secret in &image.config.secrets {
             if secret.required && std::env::var(&secret.name).is_err() {
@@ -3498,10 +3527,12 @@ fn execute_native_turn(
         }
         const MAX_TOOL_ROUNDS: u32 = 8;
         let mut rounds = 0u32;
+        let mut backend = select_chat_backend(chat_backend_override, &request);
+        let mut candidate_locked = false;
         loop {
             if rounds >= MAX_TOOL_ROUNDS {
                 events.push(CourierEvent::BackendFallback {
-                    backend: chat_backend.id().to_string(),
+                    backend: backend.id().to_string(),
                     error: format!(
                         "tool call loop reached {} rounds without a final reply; falling back to local reference reply",
                         MAX_TOOL_ROUNDS
@@ -3511,12 +3542,44 @@ fn execute_native_turn(
             }
             rounds += 1;
 
-            let reply = match chat_backend.generate(&request) {
+            let reply = match backend.generate(&request) {
                 Ok(Some(reply)) => reply,
-                Ok(None) => break,
+                Ok(None) => {
+                    if !candidate_locked
+                        && let Some(next_request) = remaining_requests.first().cloned()
+                    {
+                        events.push(CourierEvent::BackendFallback {
+                            backend: backend.id().to_string(),
+                            error: format!(
+                                "model `{}` returned no reply; trying fallback model `{}`",
+                                request.model, next_request.model
+                            ),
+                        });
+                        request = next_request;
+                        backend = select_chat_backend(chat_backend_override, &request);
+                        remaining_requests.remove(0);
+                        continue;
+                    }
+                    break;
+                }
                 Err(error) => {
+                    if !candidate_locked
+                        && let Some(next_request) = remaining_requests.first().cloned()
+                    {
+                        events.push(CourierEvent::BackendFallback {
+                            backend: backend.id().to_string(),
+                            error: format!(
+                                "{error}; trying fallback model `{}`",
+                                next_request.model
+                            ),
+                        });
+                        request = next_request;
+                        backend = select_chat_backend(chat_backend_override, &request);
+                        remaining_requests.remove(0);
+                        continue;
+                    }
                     events.push(CourierEvent::BackendFallback {
-                        backend: chat_backend.id().to_string(),
+                        backend: backend.id().to_string(),
                         error: error.to_string(),
                     });
                     break;
@@ -3524,6 +3587,7 @@ fn execute_native_turn(
             };
 
             if !reply.tool_calls.is_empty() {
+                candidate_locked = true;
                 let reply_tool_calls = reply.tool_calls.clone();
                 let mut tool_outputs = Vec::with_capacity(reply.tool_calls.len());
                 for tool_call in reply.tool_calls {
@@ -3580,22 +3644,20 @@ fn execute_native_turn(
                     });
                     tool_outputs.push(ModelToolOutput {
                         call_id: tool_call.call_id,
+                        name: tool_call.name,
                         output: combined_output,
                         kind: tool_call.kind,
                     });
                 }
 
-                if chat_backend.supports_previous_response_id() {
+                if backend.supports_previous_response_id() {
                     request.messages.clear();
+                    request.pending_tool_calls.clear();
                     request.tool_outputs = tool_outputs;
                     request.previous_response_id = reply.response_id;
                 } else {
-                    request.messages = build_followup_messages_for_tool_outputs(
-                        request.messages,
-                        &reply_tool_calls,
-                        &tool_outputs,
-                    );
-                    request.tool_outputs.clear();
+                    request.pending_tool_calls = reply_tool_calls;
+                    request.tool_outputs = tool_outputs;
                     request.previous_response_id = None;
                 }
                 continue;
@@ -3666,14 +3728,26 @@ fn format_heartbeat_payload(payload: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
 fn build_model_request(
     image: &LoadedParcel,
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
 ) -> Result<Option<ModelRequest>, CourierError> {
-    let Some(model) = configured_model_id(image.config.models.primary.as_ref()) else {
-        return Ok(None);
-    };
+    Ok(build_model_requests(image, messages, local_tools)?
+        .into_iter()
+        .next())
+}
+
+fn build_model_requests(
+    image: &LoadedParcel,
+    messages: &[ConversationMessage],
+    local_tools: &[LocalToolSpec],
+) -> Result<Vec<ModelRequest>, CourierError> {
+    let model_refs = configured_model_references(&image.config.models);
+    if model_refs.is_empty() {
+        return Ok(Vec::new());
+    }
     let builtin_tools = list_native_builtin_tools(image);
     let mut tools = local_tools
         .iter()
@@ -3684,15 +3758,47 @@ fn build_model_request(
             .iter()
             .map(build_builtin_model_tool_definition),
     );
+    let instructions = resolve_prompt_text(image)?;
+    Ok(model_refs
+        .into_iter()
+        .map(|model| ModelRequest {
+            model: model.id,
+            provider: model.provider,
+            instructions: instructions.clone(),
+            messages: messages.to_vec(),
+            tools: tools.clone(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        })
+        .collect())
+}
 
-    Ok(Some(ModelRequest {
-        model,
-        instructions: resolve_prompt_text(image)?,
-        messages: messages.to_vec(),
-        tools,
-        tool_outputs: Vec::new(),
-        previous_response_id: None,
-    }))
+fn configured_model_references(policy: &crate::manifest::ModelPolicy) -> Vec<ModelReference> {
+    let mut models = Vec::new();
+    if let Some(primary) = &policy.primary {
+        models.push(primary.clone());
+        models.extend(policy.fallbacks.iter().cloned());
+        return models;
+    }
+    let Some(model) = configured_model_id(None) else {
+        return models;
+    };
+    models.push(ModelReference {
+        id: model,
+        provider: std::env::var("LLM_BACKEND").ok(),
+    });
+    models
+}
+
+fn select_chat_backend(
+    chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
+    request: &ModelRequest,
+) -> Arc<dyn ChatModelBackend> {
+    match chat_backend_override {
+        Some(backend) => backend.clone(),
+        None => default_chat_backend_for_provider(request.provider.as_deref()),
+    }
 }
 
 fn build_model_tool_definition(
@@ -4022,6 +4128,22 @@ fn openai_chat_completions_messages(request: &ModelRequest) -> Vec<serde_json::V
         }));
     }
     messages.extend(request.messages.iter().map(openai_chat_completions_message));
+    if !request.pending_tool_calls.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "tool_calls": request
+                .pending_tool_calls
+                .iter()
+                .map(openai_chat_completions_tool_call)
+                .collect::<Vec<_>>(),
+        }));
+    }
+    messages.extend(
+        request
+            .tool_outputs
+            .iter()
+            .map(openai_chat_completions_tool_output_message),
+    );
     messages
 }
 
@@ -4068,46 +4190,23 @@ fn openai_tool_output_item(output: &ModelToolOutput) -> serde_json::Value {
     }
 }
 
-fn build_followup_messages_for_tool_outputs(
-    mut messages: Vec<ConversationMessage>,
-    tool_calls: &[ModelToolCall],
-    tool_outputs: &[ModelToolOutput],
-) -> Vec<ConversationMessage> {
-    if !tool_calls.is_empty() {
-        let tool_call_lines = tool_calls
-            .iter()
-            .map(|call| {
-                format!(
-                    "tool_call id={} name={} kind={:?} input={}",
-                    call.call_id, call.name, call.kind, call.input
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        messages.push(ConversationMessage {
-            role: "assistant".to_string(),
-            content: format!("Tool call request:\n{tool_call_lines}"),
-        });
-    }
+fn openai_chat_completions_tool_call(call: &ModelToolCall) -> serde_json::Value {
+    serde_json::json!({
+        "id": call.call_id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": call.input,
+        },
+    })
+}
 
-    if !tool_outputs.is_empty() {
-        let tool_output_lines = tool_outputs
-            .iter()
-            .map(|output| {
-                format!(
-                    "tool_result id={} kind={:?}\n{}",
-                    output.call_id, output.kind, output.output
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        messages.push(ConversationMessage {
-            role: "user".to_string(),
-            content: format!("Tool results:\n{tool_output_lines}"),
-        });
-    }
-
-    messages
+fn openai_chat_completions_tool_output_message(output: &ModelToolOutput) -> serde_json::Value {
+    serde_json::json!({
+        "role": "tool",
+        "tool_call_id": output.call_id,
+        "content": output.output,
+    })
 }
 
 fn model_api_key(primary: &str, fallback: &str) -> Option<String> {
@@ -4157,7 +4256,7 @@ fn function_parameters_for_tool(tool: &ModelToolDefinition) -> serde_json::Value
 }
 
 fn anthropic_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
-    request
+    let mut messages = request
         .messages
         .iter()
         .map(|message| {
@@ -4171,7 +4270,28 @@ fn anthropic_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
                 ],
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !request.pending_tool_calls.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": request
+                .pending_tool_calls
+                .iter()
+                .map(anthropic_tool_call_block)
+                .collect::<Vec<_>>(),
+        }));
+    }
+    if !request.tool_outputs.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": request
+                .tool_outputs
+                .iter()
+                .map(anthropic_tool_result_block)
+                .collect::<Vec<_>>(),
+        }));
+    }
+    messages
 }
 
 fn anthropic_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
@@ -4182,8 +4302,27 @@ fn anthropic_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
     })
 }
 
+fn anthropic_tool_call_block(call: &ModelToolCall) -> serde_json::Value {
+    let input = serde_json::from_str::<serde_json::Value>(&call.input)
+        .unwrap_or_else(|_| serde_json::json!({ "input": call.input }));
+    serde_json::json!({
+        "type": "tool_use",
+        "id": call.call_id,
+        "name": call.name,
+        "input": input,
+    })
+}
+
+fn anthropic_tool_result_block(output: &ModelToolOutput) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": output.call_id,
+        "content": output.output,
+    })
+}
+
 fn gemini_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
-    request
+    let mut messages = request
         .messages
         .iter()
         .map(|message| {
@@ -4196,7 +4335,28 @@ fn gemini_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
                 ],
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !request.pending_tool_calls.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "model",
+            "parts": request
+                .pending_tool_calls
+                .iter()
+                .map(gemini_tool_call_part)
+                .collect::<Vec<_>>(),
+        }));
+    }
+    if !request.tool_outputs.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "parts": request
+                .tool_outputs
+                .iter()
+                .map(gemini_tool_response_part)
+                .collect::<Vec<_>>(),
+        }));
+    }
+    messages
 }
 
 fn gemini_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
@@ -4204,6 +4364,28 @@ fn gemini_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
         "name": tool.name,
         "description": tool.description,
         "parameters": function_parameters_for_tool(tool),
+    })
+}
+
+fn gemini_tool_call_part(call: &ModelToolCall) -> serde_json::Value {
+    let args = serde_json::from_str::<serde_json::Value>(&call.input)
+        .unwrap_or_else(|_| serde_json::json!({ "input": call.input }));
+    serde_json::json!({
+        "functionCall": {
+            "name": call.name,
+            "args": args,
+        }
+    })
+}
+
+fn gemini_tool_response_part(output: &ModelToolOutput) -> serde_json::Value {
+    serde_json::json!({
+        "functionResponse": {
+            "name": output.name,
+            "response": {
+                "output": output.output,
+            }
+        }
     })
 }
 
@@ -6203,6 +6385,112 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn openai_chat_completions_messages_include_structured_tool_followup() {
+        let request = ModelRequest {
+            model: "gpt-5-mini".to_string(),
+            provider: Some("openai_compatible".to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: vec![ModelToolCall {
+                call_id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                input: "{\"id\":\"123\"}".to_string(),
+                kind: ModelToolKind::Function,
+            }],
+            tool_outputs: vec![ModelToolOutput {
+                call_id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                output: "found".to_string(),
+                kind: ModelToolKind::Function,
+            }],
+            previous_response_id: None,
+        };
+
+        let messages = openai_chat_completions_messages(&request);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "lookup");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["content"], "found");
+    }
+
+    #[test]
+    fn anthropic_messages_include_tool_use_and_tool_result_blocks() {
+        let request = ModelRequest {
+            model: "claude-sonnet-4".to_string(),
+            provider: Some("anthropic".to_string()),
+            instructions: String::new(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: vec![ModelToolCall {
+                call_id: "toolu_1".to_string(),
+                name: "lookup".to_string(),
+                input: "{\"id\":\"123\"}".to_string(),
+                kind: ModelToolKind::Function,
+            }],
+            tool_outputs: vec![ModelToolOutput {
+                call_id: "toolu_1".to_string(),
+                name: "lookup".to_string(),
+                output: "found".to_string(),
+                kind: ModelToolKind::Function,
+            }],
+            previous_response_id: None,
+        };
+
+        let messages = anthropic_messages(&request);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][0]["name"], "lookup");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn gemini_messages_include_function_call_and_response_parts() {
+        let request = ModelRequest {
+            model: "gemini-2.5-pro".to_string(),
+            provider: Some("gemini".to_string()),
+            instructions: String::new(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: vec![ModelToolCall {
+                call_id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                input: "{\"id\":\"123\"}".to_string(),
+                kind: ModelToolKind::Function,
+            }],
+            tool_outputs: vec![ModelToolOutput {
+                call_id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                output: "found".to_string(),
+                kind: ModelToolKind::Function,
+            }],
+            previous_response_id: None,
+        };
+
+        let messages = gemini_messages(&request);
+        assert_eq!(messages[1]["role"], "model");
+        assert_eq!(messages[1]["parts"][0]["functionCall"]["name"], "lookup");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
+    }
+
+    #[test]
     fn native_courier_chat_uses_backend_when_model_is_declared() {
         let test_image = build_test_image(
             "\
@@ -6359,16 +6647,14 @@ ENTRYPOINT chat
         let calls = backend.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert!(calls[1].previous_response_id.is_none());
-        assert!(calls[1].tool_outputs.is_empty());
-        assert_eq!(calls[1].messages.len(), 3);
+        assert_eq!(calls[1].tool_outputs.len(), 1);
+        assert_eq!(calls[1].pending_tool_calls.len(), 1);
+        assert_eq!(calls[1].messages.len(), 1);
         assert_eq!(calls[1].messages[0].role, "user");
         assert_eq!(calls[1].messages[0].content, "use the tool");
-        assert_eq!(calls[1].messages[1].role, "assistant");
-        assert!(calls[1].messages[1].content.contains("tool_call id=call_1"));
-        assert!(calls[1].messages[1].content.contains("name=demo"));
-        assert_eq!(calls[1].messages[2].role, "user");
-        assert!(calls[1].messages[2].content.contains("Tool results:"));
-        assert!(calls[1].messages[2].content.contains("tool-output"));
+        assert_eq!(calls[1].pending_tool_calls[0].call_id, "call_1");
+        assert_eq!(calls[1].pending_tool_calls[0].name, "demo");
+        assert!(calls[1].tool_outputs[0].output.contains("tool-output"));
         drop(calls);
 
         assert!(matches!(
@@ -6446,6 +6732,62 @@ ENTRYPOINT chat
                 if content.contains("Native chat reference reply")
         ));
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_courier_chat_uses_fallback_model_after_primary_backend_error() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL primary-model
+FALLBACK fallback-model
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let backend = Arc::new(FakeChatBackend {
+            replies: Mutex::new(vec![
+                Err("temporary backend failure".to_string()),
+                Ok(Some(ModelReply {
+                    text: Some("fallback answer".to_string()),
+                    backend: "fake".to_string(),
+                    response_id: None,
+                    tool_calls: Vec::new(),
+                })),
+            ]),
+            calls: Mutex::new(Vec::new()),
+            supports_previous_response_id: false,
+        });
+        let courier = NativeCourier::with_chat_backend(backend.clone());
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "fallback please".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].model, "primary-model");
+        assert_eq!(calls[1].model, "fallback-model");
+        drop(calls);
+        assert!(matches!(
+            response.events.first(),
+            Some(CourierEvent::BackendFallback { backend, error })
+                if backend == "fake"
+                    && error.contains("temporary backend failure")
+                    && error.contains("fallback model `fallback-model`")
+        ));
+        assert!(matches!(
+            response.events.get(1),
+            Some(CourierEvent::Message { content, .. }) if content == "fallback answer"
+        ));
     }
 
     #[test]
@@ -6637,6 +6979,7 @@ ENTRYPOINT chat
         assert_eq!(calls[1].previous_response_id.as_deref(), Some("resp_1"));
         assert!(calls[1].messages.is_empty());
         assert_eq!(calls[1].tool_outputs.len(), 1);
+        assert_eq!(calls[1].tool_outputs[0].name, "memory_put");
         assert!(
             calls[1].tool_outputs[0]
                 .output
@@ -6644,6 +6987,7 @@ ENTRYPOINT chat
         );
         assert_eq!(calls[2].previous_response_id.as_deref(), Some("resp_2"));
         assert_eq!(calls[2].tool_outputs.len(), 1);
+        assert_eq!(calls[2].tool_outputs[0].name, "memory_get");
         assert!(
             calls[2].tool_outputs[0]
                 .output

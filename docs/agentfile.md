@@ -323,6 +323,8 @@ FALLBACK gpt-5.4-nano
 FALLBACK claude-sonnet-4-6 PROVIDER anthropic
 ```
 
+Fallback models are attempted in declaration order when the primary hosted-model request fails before producing a reply. A fallback may use a different provider than the primary model.
+
 #### `ROUTING`
 
 ```dockerfile
