@@ -24,6 +24,7 @@ pub enum PluginRequest {
     OpenSession {
         parcel_dir: String,
     },
+    Shutdown,
     Run {
         parcel_dir: String,
         session: CourierSession,
@@ -112,5 +113,17 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed: PluginResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn shutdown_request_round_trips_json() {
+        let request = PluginRequestEnvelope {
+            protocol_version: COURIER_PLUGIN_PROTOCOL_VERSION,
+            request: PluginRequest::Shutdown,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: PluginRequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request);
     }
 }

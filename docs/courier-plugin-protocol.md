@@ -58,6 +58,7 @@ Current request kinds:
 - `validate_parcel`
 - `inspect`
 - `open_session`
+- `shutdown`
 - `run`
 
 For parcel-aware requests, Dispatch passes the absolute built parcel directory in `parcel_dir`.
@@ -69,6 +70,7 @@ The key rule is session affinity.
 - `capabilities`, `validate_parcel`, and `inspect` may still be handled as one-shot requests
 - `open_session` creates a session and may leave the plugin process running
 - `run` requests for that session are sent to the same process
+- `shutdown` gives a persistent plugin process one explicit chance to flush state and exit cleanly
 
 Dispatch keeps one persistent process per open plugin session.
 
@@ -76,7 +78,7 @@ Plugins should therefore:
 
 - treat stdin as a request stream, not a single request body
 - keep session-local state in memory after `open_session`
-- continue reading requests until stdin closes or the process is terminated
+- continue reading requests until `shutdown`, stdin close, or process termination
 
 ## Responses
 

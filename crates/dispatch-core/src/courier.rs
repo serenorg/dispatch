@@ -573,8 +573,9 @@ pub struct JsonlCourierPlugin {
     state: Arc<JsonlCourierPluginState>,
 }
 
-#[derive(Default)]
 struct JsonlCourierPluginState {
+    courier_name: String,
+    protocol_version: u32,
     sessions: Mutex<BTreeMap<String, PersistentPluginProcess>>,
 }
 
@@ -649,8 +650,12 @@ impl Default for WasmCourier {
 impl JsonlCourierPlugin {
     pub fn new(manifest: CourierPluginManifest) -> Self {
         Self {
+            state: Arc::new(JsonlCourierPluginState {
+                courier_name: manifest.name.clone(),
+                protocol_version: manifest.protocol_version,
+                sessions: Mutex::new(BTreeMap::new()),
+            }),
             manifest,
-            state: Arc::new(JsonlCourierPluginState::default()),
         }
     }
 }
@@ -679,7 +684,11 @@ impl Drop for JsonlCourierPluginState {
     fn drop(&mut self) {
         if let Ok(mut sessions) = self.sessions.lock() {
             for (_, mut process) in std::mem::take(&mut *sessions) {
-                let _ = shutdown_persistent_plugin_process(&mut process);
+                let _ = shutdown_persistent_plugin_process(
+                    &mut process,
+                    &self.courier_name,
+                    self.protocol_version,
+                );
             }
         }
     }
@@ -2760,7 +2769,11 @@ impl JsonlCourierPlugin {
                     message: "plugin session state is poisoned".to_string(),
                 })?;
         if let Some(mut existing) = sessions.remove(&session_id) {
-            let _ = shutdown_persistent_plugin_process(&mut existing);
+            let _ = shutdown_persistent_plugin_process(
+                &mut existing,
+                &self.manifest.name,
+                self.manifest.protocol_version,
+            );
         }
         sessions.insert(session_id, process);
         Ok(())
@@ -2794,7 +2807,11 @@ impl JsonlCourierPlugin {
             Ok(session) => Ok((session, events)),
             Err(error) => {
                 let mut process = sessions.remove(&session_id).expect("session just existed");
-                let _ = shutdown_persistent_plugin_process(&mut process);
+                let _ = shutdown_persistent_plugin_process(
+                    &mut process,
+                    &self.manifest.name,
+                    self.manifest.protocol_version,
+                );
                 Err(error)
             }
         }
@@ -2929,9 +2946,15 @@ fn read_plugin_run_completion<R: std::io::BufRead>(
 
 fn shutdown_persistent_plugin_process(
     process: &mut PersistentPluginProcess,
+    courier_name: &str,
+    protocol_version: u32,
 ) -> Result<(), CourierError> {
+    let _ = process.write_request(protocol_version, courier_name, PluginRequest::Shutdown);
+    let _ = process.read_response(courier_name);
     let _ = process.stdin.flush();
-    let _ = process.child.kill();
+    if process.child.try_wait().ok().flatten().is_none() {
+        let _ = process.child.kill();
+    }
     let mut stderr = String::new();
     use std::io::Read as _;
     let _ = process.stderr.read_to_string(&mut stderr);
@@ -2939,7 +2962,7 @@ fn shutdown_persistent_plugin_process(
         .child
         .wait()
         .map_err(|source| CourierError::WaitPlugin {
-            courier: "<persistent>".to_string(),
+            courier: courier_name.to_string(),
             source,
         })?;
     Ok(())
@@ -4506,6 +4529,36 @@ mod tests {
         )
     }
 
+    fn build_test_shutdown_plugin_courier(
+        dir: &tempfile::TempDir,
+        digest: &str,
+    ) -> (JsonlCourierPlugin, std::path::PathBuf) {
+        let plugin_path = dir.path().join("shutdown-plugin.sh");
+        let shutdowns_path = dir.path().join("plugin-shutdowns.log");
+        let script = format!(
+            "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-shutdown\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from shutdown plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-shutdown\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello\"}},{{\"role\":\"assistant\",\"content\":\"from shutdown plugin\"}}]}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf 'shutdown\\n' >> '{}'\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\nexit 0\n;;\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-shutdown-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-shutdown-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
+            shutdowns_path.display()
+        );
+        fs::write(&plugin_path, &script).unwrap();
+        fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        (
+            JsonlCourierPlugin::new(CourierPluginManifest {
+                name: "demo-shutdown-plugin".to_string(),
+                version: "0.1.0".to_string(),
+                protocol_version: 1,
+                transport: crate::plugins::PluginTransport::Jsonl,
+                description: Some("Demo shutdown courier plugin".to_string()),
+                exec: crate::plugins::CourierPluginExec {
+                    command: plugin_path.display().to_string(),
+                    args: Vec::new(),
+                },
+                installed_sha256: Some(encode_hex(Sha256::digest(script.as_bytes()))),
+            }),
+            shutdowns_path,
+        )
+    }
+
     fn mount_path<'a>(session: &'a CourierSession, kind: MountKind, driver: &str) -> &'a str {
         session
             .resolved_mounts
@@ -4828,6 +4881,38 @@ ENTRYPOINT chat
             Some(CourierEvent::Message { role, content })
                 if role == "assistant" && content == "from plugin turn 2"
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jsonl_plugin_sends_shutdown_to_persistent_process_on_drop() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/custom:latest
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let dir = tempdir().unwrap();
+        let (courier, shutdowns_path) =
+            build_test_shutdown_plugin_courier(&dir, &test_image.image.config.digest);
+
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let _ = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "hello".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        drop(courier);
+
+        let shutdowns = fs::read_to_string(shutdowns_path).unwrap();
+        assert!(shutdowns.contains("shutdown"));
     }
 
     #[test]

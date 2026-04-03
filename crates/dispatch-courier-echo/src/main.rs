@@ -40,9 +40,13 @@ fn run_stdio() -> Result<(), String> {
             ));
         }
 
+        let should_shutdown = matches!(envelope.request, PluginRequest::Shutdown);
         for response in handle_request(envelope.request)? {
             emit_response(&response)
                 .map_err(|error| format!("failed to write response: {error}"))?;
+        }
+        if should_shutdown {
+            break;
         }
     }
     Ok(())
@@ -119,6 +123,11 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                 }),
             }])
         }
+        PluginRequest::Shutdown => Ok(vec![PluginResponse::Result {
+            capabilities: None,
+            inspection: None,
+            session: None,
+        }]),
         PluginRequest::Run {
             parcel_dir,
             session,
