@@ -1,22 +1,37 @@
 # Dispatch
 
-Dispatch is a Docker-style packaging and courier system for agents.
+Dispatch is an open packaging, courier, and signing standard for agents.
 
-`Agentfile` is the authored build format inside Dispatch, similar to how `Dockerfile` fits inside Docker.
+The core idea: an agent should be a self-describing, verifiable artifact - separate from the infrastructure that runs it. Build it once. Run it anywhere a courier exists.
 
-The goal is to make agents:
+```
+Agentfile  ->  dispatch build  ->  parcel (artifact)  ->  dispatch run  ->  courier
+```
 
-- buildable
-- portable
-- versioned
-- reproducible
-- deployable across couriers
+The **WASM courier** is the most differentiated part. A guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) runs in any WASM host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
 
-Instead of treating an agent as "some prompt plus some tools plus some hidden execution config", `Agentfile` makes the build contract explicit.
+## Why Dispatch
+
+Most agent "frameworks" solve the programming problem. Dispatch solves the packaging problem.
+
+Without a standard artifact format:
+
+- an agent's prompt, tools, model policy, and security constraints live in ad-hoc code
+- the author and the executor must share runtime assumptions
+- deploying to a new environment means rewriting configuration
+- verifying that what runs matches what was authored is manual or impossible
+
+With Dispatch:
+
+- `Agentfile` is the canonical authored spec - human-editable, diff-friendly, reviewable
+- `dispatch build` produces a content-addressed parcel with a verifiable manifest
+- `dispatch verify` re-hashes every file and checks detached signatures
+- `dispatch run` selects a courier backend and executes - the parcel carries its contract with it
+- couriers can be native, Docker, WASM, or custom; the parcel format is independent of which one runs it
+
+The practical applications: deploying untrusted third-party agents in a sandboxed WASM host, running agents at the edge without a container runtime, distributing agents through a depot network with integrity guarantees, and letting authors declare model policy and tool permissions explicitly rather than via ambient prompt text.
 
 ## Vocabulary
-
-Dispatch uses a consistent operational vocabulary:
 
 - an `Agentfile` builds a **parcel**
 - a parcel is described by `manifest.json`
@@ -24,18 +39,17 @@ Dispatch uses a consistent operational vocabulary:
 - a **courier** executes a parcel
 - a **depot** stores parcels
 - a running parcel execution is a **dispatch**
-- future multi-agent orchestration can be modeled as a **route** or **convoy**
 
-## Core Idea
+## Agentfile
+
+`Agentfile` is the authored build format inside Dispatch, similar to how `Dockerfile` fits inside Docker - line-oriented, diff-friendly, composable.
 
 An agent project has:
 
 - an `Agentfile`
-- optional instruction files like `IDENTITY.md`, `SOUL.md`, `SKILL.md`, `AGENTS.md`, `USER.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`
+- optional instruction files: `IDENTITY.md`, `SOUL.md`, `SKILL.md`, `AGENTS.md`, `USER.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`
 - an explicit `COMPONENT` for `dispatch/wasm` parcels
 - local tools, reference assets, evals, and code
-
-The `Agentfile` is the canonical authored manifest, similar to a `Dockerfile`.
 
 Example (`examples/basic/Agentfile`):
 
@@ -82,57 +96,82 @@ ENTRYPOINT chat
 ```
 
 
-## Implementation
+## WASM Courier
 
-The repo includes:
+The WASM courier is where Dispatch's portability story is most concrete.
 
-- a real `Agentfile` parser
-- heredoc support for inline prompt bodies
-- a semantic validator for core instructions
-- a working `dispatch lint` command
-- a working `dispatch build` command
-- a working `dispatch inspect` command
-- a working `dispatch verify` command
-- a working `dispatch run` command for local prompt resolution and declared local tool execution
-- working native `chat`, `job`, and `heartbeat` operations with session history and event-based courier responses
-- digest-addressed parcel artifact output under `.dispatch/parcels/<digest>/`
-- an explicit courier trait layer for pluggable backends
-- a typed `manifest.json` manifest with a published JSON Schema
-- typed framework provenance for authoring metadata such as `FRAMEWORK adk-rust TARGET wasm`
-- an explicit `COMPONENT` contract for `dispatch/wasm` parcels
-- a typed WIT package for the Dispatch WASM guest ABI
-- a reference external JSONL courier plugin in `crates/dispatch-courier-echo`
+A `dispatch/wasm` parcel contains a WASM component compiled against the Dispatch WIT ABI:
 
-Run it:
+```wit
+// dispatch:courier@0.0.1 - full definition in crates/dispatch-wasm-abi/wit/
+interface host {
+    model-complete: func(request: model-request) -> result<model-response, string>;
+    invoke-tool:    func(invocation: tool-invocation) -> result<tool-result, string>;
+    memory-get:     func(namespace: string, key: string) -> result<option<memory-entry>, string>;
+    memory-put:     func(namespace: string, key: string, value: string) -> result<bool, string>;
+    memory-delete:  func(namespace: string, key: string) -> result<bool, string>;
+    memory-list:    func(namespace: string, prefix: option<string>) -> result<list<memory-entry>, string>;
+}
+```
+
+The guest component implements `open-session` and `handle-operation`. The host owns:
+
+- **model routing** - the guest can request a model ID, but provider and API key selection come from the parcel manifest and host environment
+- **tool execution** - the host invokes declared local tools; the guest cannot access tools outside the parcel manifest
+- **memory** - the host provides durable parcel-scoped sqlite storage; the guest sees it as a namespace/key/value API
+- **sandboxing** - WASM memory isolation applies by default; the guest cannot access host resources unless the host imports them
+
+This separation enables:
+
+- running untrusted third-party agent components with bounded resource access
+- edge and serverless deployment with no container daemon
+- multi-tenant agent execution on a shared host
+- auditing what a guest can actually do based on the parcel manifest and WIT imports, not inferred from prompt text
+
+The `dispatch-wasm-guest-reference` crate shows how to build a guest component with multi-round tool calling, `previous_response_id` chain management, and session state. Any language that compiles to WASM with WIT component support can implement a guest.
+
+## Getting Started
+
+Build and run the reference examples:
 
 ```bash
+# Lint an Agentfile
 cargo run -p dispatch -- lint examples/basic
-cargo run -p dispatch -- lint examples/heartbeat-monitor
 cargo run -p dispatch -- lint examples/wasm-reference
+
+# Build a parcel
 cargo run -p dispatch -- build examples/basic
-cargo run -p dispatch -- build examples/heartbeat-monitor
 cargo run -p dispatch -- build examples/wasm-reference
+
+# Inspect a built parcel
 cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest>
 cargo run -p dispatch -- inspect examples/wasm-reference/.dispatch/parcels/<digest> --courier wasm
-cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest> --courier native
-cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest> --courier remote-worker --registry .dispatch/couriers.json
+
+# Verify parcel integrity
 cargo run -p dispatch -- verify examples/basic/.dispatch/parcels/<digest>
+
+# Sign a parcel
 cargo run -p dispatch -- keygen --key-id release --output-dir .dispatch/keys
 cargo run -p dispatch -- sign examples/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
 cargo run -p dispatch -- verify examples/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
-cargo run -p dispatch -- courier ls
-cargo run -p dispatch -- courier inspect docker
-cargo run -p dispatch-courier-echo -- --stdio
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --print-prompt
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --courier native --print-prompt
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --courier remote-worker --registry .dispatch/couriers.json --chat "hello"
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --session-file .dispatch/session.json --chat "hello"
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --session-file .dispatch/session.json --interactive
-cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat "tick"
+
+# Run a parcel (native courier, requires LLM_API_KEY or provider env vars)
+cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --chat "hello"
+cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --interactive
+
+# Run a WASM parcel
+cargo run -p dispatch -- run examples/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
+
+# Run a heartbeat
 cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
+
+# List and invoke tools
 cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
 cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
-cargo run -p dispatch -- run examples/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
+
+# Push/pull to a file depot
+dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0
 ```
 
 Print the parsed AST:
@@ -141,233 +180,143 @@ Print the parsed AST:
 cargo run -p dispatch -- lint examples/basic --json
 ```
 
-Build output:
+## Parcel Format
 
-- `manifest.json` - typed parcel manifest
-- `parcel.lock` - file and digest metadata
+A built parcel contains:
+
+- `manifest.json` - typed parcel manifest with `$schema` pointer
+- `parcel.lock` - file and digest integrity metadata
 - `context/` - packaged build content referenced by the `Agentfile`
+- `signatures/<key_id>.json` - detached Ed25519 signatures (optional)
 
-The built manifest now includes a `$schema` pointer and is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
+The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
 
 Parcel format compatibility:
 
-- `load_parcel` validates `manifest.json` against the bundled Dispatch JSON Schema before parsing it into typed structures
+- `load_parcel` validates `manifest.json` against the bundled Dispatch JSON Schema before parsing
 - the reference implementation supports exactly `format_version: 1`
-- couriers must reject parcels whose `$schema` or `format_version` they do not explicitly support
+- couriers must reject parcels whose `$schema` or `format_version` they do not support
 
 `verify` behavior:
 
-- recomputes the parcel manifest digest from the normalized manifest content
+- recomputes the parcel manifest digest from normalized manifest content
 - validates `parcel.lock` digest, layout metadata, and file list
 - re-hashes every packaged file under `context/`
 - optionally verifies detached Ed25519 signatures with `--public-key <path>`
 - fails if packaged files are missing or modified
 
-`run` behavior:
+## Native Courier
 
-- `--courier <name>` resolves either a built-in backend or an installed courier plugin by name
-- `--registry <path>` lets `dispatch run` resolve plugins from a non-default courier registry file
-- `--interactive` starts a multi-turn local chat session in the terminal
-- `--session-file <path>` persists and resumes `CourierSession` state across separate CLI invocations
-- `--chat <text>` sends one chat turn through the native reference courier
-- `--job <payload>` executes the parcel `job` entrypoint through the native courier
-- `--heartbeat [payload]` executes the parcel `heartbeat` entrypoint through the native courier
-- `--print-prompt` resolves the courier prompt stack from packaged instruction files
-- `--list-tools` lists declared local tools from the built parcel
-- `--tool <name>` executes one declared local tool from the packaged parcel context
-- required `SECRET` declarations are enforced before local tool execution
-- `dispatch run` validates that the parcel courier target matches the selected backend before opening a courier session
+The native courier runs the parcel directly on the local machine as a host process with a model-backed chat loop.
 
-Tool declaration behavior:
+Model backend selection:
 
-- `TOOL ... DESCRIPTION "..."` preserves authored tool guidance in the built manifest
-- `TOOL LOCAL ... SCHEMA <file>` packages a JSON input schema with the tool and records its digest in the manifest
-- native model-backed chat uses that description when exposing local tools to the model
-- schema-backed local tools are exposed as structured function tools to model backends that support typed function calling
-- if no description is declared, Dispatch falls back to a generic packaged-path description
-- couriers should only expose declared parcel tools; packaged prompt text must never imply tool capabilities that are not present in the parcel manifest
+- if the parcel declares `MODEL <id> PROVIDER <backend>`, that provider is used
+- if no parcel-level provider, `LLM_BACKEND` selects the backend: `openai`, `anthropic`, `gemini`, `openai_compatible`
+- `FALLBACK <id> [PROVIDER <backend>]` entries are tried in order when the primary backend fails before producing a reply
 
-Framework provenance behavior:
+Supported backends:
 
-- `FRAMEWORK <name> [VERSION <version>] [TARGET <target>]` records typed authoring metadata in the built parcel manifest
-- framework provenance describes how an agent was built, not which courier executes it
-- parcels can declare metadata such as `FRAMEWORK adk-rust VERSION 0.5.0 TARGET wasm`
+| Backend | API | Environment |
+|---------|-----|-------------|
+| `openai` | OpenAI Responses API | `OPENAI_API_KEY` |
+| `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
+| `gemini` | Gemini generateContent | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| `openai_compatible` | Chat Completions | `LLM_API_KEY` + `LLM_BASE_URL` |
 
-Native courier behavior:
+`LLM_API_KEY` and `LLM_BASE_URL` take precedence over provider-specific vars. Provider-specific vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) are checked as fallbacks when the `LLM_*` vars are not set.
 
-- if the parcel declares `MODEL <id> [PROVIDER <backend>]` and provider credentials are present, Dispatch can call a hosted model backend from the native courier
-- `LLM_BACKEND=openai` uses the OpenAI Responses API
-- `LLM_BACKEND=anthropic` uses the Anthropic Messages API
-- `LLM_BACKEND=gemini` uses the Gemini `generateContent` API
-- `LLM_BACKEND=openai_compatible` uses a Chat Completions-compatible endpoint such as OpenRouter, Together, Fireworks, LiteLLM, or a self-hosted OpenAI-compatible server
-- if the parcel does not declare `MODEL <id>`, Dispatch falls back to `LLM_MODEL` for the native and WASM hosted-model paths
-- if the parcel model does not declare `PROVIDER <backend>`, Dispatch falls back to `LLM_BACKEND` for backend selection
-- `FALLBACK <id> [PROVIDER <backend>]` entries are tried in order when the primary hosted-model request fails before producing a reply
-- declared local tools are exposed to that model-backed path as tool definitions for the selected backend
-- custom tool calls are executed locally and their outputs are sent back to the model before the assistant reply is finalized
-- tool execution is surfaced as ordered courier events during the chat turn
-- backend request failures are surfaced as courier events and then fall back to the local reference reply
-- otherwise it falls back to the local reference reply path
-- `/prompt`, `/tools`, and `/help` are handled locally without a model call
+`run` flags:
 
-Non-native courier behavior:
+- `--interactive` - multi-turn chat session in the terminal
+- `--session-file <path>` - persist and resume session state across invocations
+- `--chat <text>` - single chat turn
+- `--job <payload>` - execute the parcel `job` entrypoint
+- `--heartbeat [payload]` - execute the parcel `heartbeat` entrypoint
+- `--print-prompt` - resolve and print the courier prompt stack
+- `--list-tools` - list declared local tools
+- `--tool <name>` - execute one declared local tool
+- `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
 
-- `docker` is a courier backend for declared local tool execution via the Docker CLI
-- the Docker courier can validate parcel/courier compatibility, inspect parcels, resolve prompts, list local tools, and execute `--tool`
-- `wasm` is a typed component-model courier family with an explicit parcel-side `COMPONENT <path>` contract
-- the WASM courier validates and loads declared Dispatch ABI components, inspects parcels, resolves prompts, and lists declared local tools
-- WASM guests execute `chat`, `job`, and `heartbeat` turns through the Dispatch WIT ABI while keeping prompt resolution, declared local tool discovery, and sqlite memory access host-owned
-- guest `model-complete` calls use the parcel model policy on the host side, including `FALLBACK` models when the primary hosted-model request fails before producing a reply
-- a guest may request a specific model id, but host-side backend selection still comes from the parcel or environment provider configuration rather than from arbitrary guest-supplied provider switches
-- the repo includes a reference guest component targeting the same ABI
+## Courier Architecture
 
-Courier registry behavior:
+Dispatch defines the parcel format and courier contract. Multiple couriers can implement that contract:
 
-- `dispatch courier ls` lists built-in backends and installed courier plugins
-- `dispatch courier inspect <name>` shows either built-in courier metadata or an installed plugin manifest
-- `dispatch courier install <manifest>` installs a courier plugin manifest into the local registry
-- installed JSONL courier plugins can now be executed through `dispatch run --courier <name>` and `dispatch inspect --courier <name>`
-- `dispatch run` and `dispatch inspect` both support `--registry <path>` when you want to target a non-default courier registry
-- external plugins execute through the stream-first JSONL plugin protocol defined in `docs/courier-plugin-protocol-v1.md`
-- plugin installation resolves the executable path and records its SHA256 digest; Dispatch checks that digest before each plugin launch
-- `crates/dispatch-courier-echo` is the in-repo reference implementation of that protocol
+- **native** - executes the parcel as a host process with model-backed chat; reference implementation in `crates/dispatch-core`
+- **docker** - executes local tools via Docker CLI; validates compatibility, inspects, resolves prompts
+- **wasm** - typed component-model courier using the Dispatch WIT ABI; see [WASM Courier](#wasm-courier)
+- **plugins** - external JSONL courier plugins launched as subprocesses; protocol in `docs/courier-plugin-protocol-v1.md`
 
-Depot behavior:
+The courier/plugin boundary lives in [`crates/dispatch-core/src/courier.rs`](crates/dispatch-core/src/courier.rs).
 
-- `dispatch push <parcel> <reference>` publishes a built parcel into a file-backed depot
-- `dispatch pull <reference>` resolves a tagged parcel reference back into local `.dispatch/parcels/`
-- v1 depot references use the form `file:///absolute/path/to/depot::org/parcel:v1`
-- pushed parcels are stored by digest under `blobs/parcels/<digest>/`
-- pushed tags are stored under `refs/<org>/<parcel>/tags/<tag>.json`
-- the first depot implementation is intentionally local/file-backed; remote depot protocols come later
-
-Mount behavior:
-
-- built-in couriers resolve declared mounts during `open_session`
-- `MOUNT SESSION sqlite` creates a session-scoped sqlite database and persists `CourierSession` state on open plus after each turn
-- `MOUNT MEMORY sqlite` resolves a durable parcel-scoped sqlite database for built-in courier memory APIs
-- the native reference courier currently exposes declared builtin `memory_get`, `memory_put`, `memory_delete`, and `memory_list` capabilities to model-backed turns when `MOUNT MEMORY sqlite` is configured
-- memory operations fail explicitly when the parcel does not declare a usable memory mount
-- built-in courier state lives under the standard `.dispatch/state/<digest>/` layout when parcels are opened from a normal build output tree, or under `<parcel-parent>/.dispatch-state/<digest>/` for custom parcel locations
-- `DISPATCH_STATE_ROOT` overrides the built-in courier state root completely when you need an explicit shared state location
-- `dispatch state ls` lists known digest-scoped state directories and whether a matching local parcel is present
-- `dispatch state gc` removes orphaned state directories that no longer have a matching local parcel
-- `dispatch state migrate <old-digest> <new-digest>` copies built-in courier state when a rebuilt parcel gets a new digest
-- unsupported mount drivers fail fast when a courier session opens
-
-Optional environment variables for the native model-backed chat path:
-
-- `LLM_BACKEND` - selects the native hosted-model backend; currently `openai`, `anthropic`, `gemini`, and `openai_compatible`
-- `LLM_MODEL` - provider-neutral model identifier used when the parcel does not declare `MODEL <id>`
-- `LLM_API_KEY` - provider-neutral API key used by `openai_compatible` and accepted as a fallback by `openai`, `anthropic`, and `gemini`
-- `LLM_BASE_URL` - provider-neutral base URL used by `openai_compatible` and accepted as a fallback by `openai`, `anthropic`, and `gemini`
-- `OPENAI_API_KEY` - enables the `openai` backend and is accepted as a fallback by `openai_compatible`
-- `OPENAI_BASE_URL` - overrides the default `https://api.openai.com` for the `openai` backend and is accepted as a fallback by `openai_compatible`
-- `ANTHROPIC_API_KEY` - enables the `anthropic` backend
-- `ANTHROPIC_BASE_URL` - overrides the default `https://api.anthropic.com` for the `anthropic` backend
-- `GEMINI_API_KEY` or `GOOGLE_API_KEY` - enables the `gemini` backend
-- `GEMINI_BASE_URL` - overrides the default `https://generativelanguage.googleapis.com/v1beta` for the `gemini` backend
-
-Optional environment variables for the Docker courier:
-
-- `DISPATCH_DOCKER_BIN` - overrides the Docker CLI binary path
-- `DISPATCH_DOCKER_IMAGE` - overrides the helper container image used for local tool execution
-
-## Courier Direction
-
-Dispatch should define a standard for packaging and executing agents, but it should not require Docker itself.
-
-The right model is:
-
-- `Agentfile` defines the authored build language
-- Dispatch defines the parcel format and courier contract
-- multiple couriers can implement that contract
-- Docker/container execution is one courier
-- a native courier is another courier that executes the parcel directly on the local machine as a host-process backend, without Docker or WASM isolation
-- WASM/worker-style couriers are additional couriers
-
-That keeps the standard portable.
-
-Frameworks like ADK are useful authoring and implementation targets, but they are not courier families. An ADK-authored agent can be packaged as a Dispatch parcel and then executed through a Dispatch courier such as `native`, `docker`, or `wasm`.
-
-For `dispatch/wasm` parcels, the compiled component is an explicit part of the parcel contract. The parcel manifest records the packaged component path, its digest, and the Dispatch courier ABI it targets.
-
-## Courier Interface
-
-The courier/plugin boundary now lives in [`crates/dispatch-core/src/courier.rs`](crates/dispatch-core/src/courier.rs).
-
-Core pieces:
+Core traits and types:
 
 - `CourierBackend` - trait every courier backend implements
 - `CourierSession` - dispatch-owned session identity and turn state
 - `CourierRequest` / `CourierResponse` - courier operation envelope
-- `CourierEvent` - ordered event stream emitted for each courier turn
+- `CourierEvent` - ordered event stream emitted per turn
 - `CourierCapabilities` / `CourierInspection` - backend introspection
-- `ToolInvocation` / `ToolRunResult` - stable local tool execution envelope
-- `MountProvider`, `MountRequest`, `ResolvedMount` - mount abstraction for session, memory, and artifacts
-- `NativeCourier` - reference implementation
+- `MountProvider`, `MountRequest`, `ResolvedMount` - mount abstraction
 
-Resolved prompt/tool invariant:
-
-- prompt resolution is driven by packaged parcel content only
-- couriers should only expose tools declared in the parcel manifest
-- a courier must not advertise or execute undeclared local tools based on prompt text, ambient filesystem state, or backend defaults
-
-This is the intended extension model for:
-
-- native local couriers
-- Docker/container couriers
-- WASM couriers
-- remote worker couriers
-
-For courier implementers, see:
+For courier implementers:
 
 - [`docs/courier-implementers.md`](docs/courier-implementers.md)
 - [`docs/courier-plugin-protocol-v1.md`](docs/courier-plugin-protocol-v1.md)
 - [`crates/dispatch-core/tests/courier_conformance.rs`](crates/dispatch-core/tests/courier_conformance.rs)
 
+Courier registry:
+
+- `dispatch courier ls` - list built-in backends and installed plugins
+- `dispatch courier inspect <name>` - show courier metadata
+- `dispatch courier install <manifest>` - install a plugin manifest
+- `dispatch run --courier <name>` - select a backend by name
+- `dispatch run --registry <path>` - use a non-default courier registry
+- plugin installation records the executable SHA256; Dispatch checks that digest before each launch
+
+## Mounts
+
+State is not baked into the parcel. Sessions, memory, and artifacts are mounts declared in the `Agentfile`.
+
+- `MOUNT SESSION sqlite` - session-scoped sqlite; persists `CourierSession` state per turn
+- `MOUNT MEMORY sqlite` - parcel-scoped sqlite; exposes `memory_get`, `memory_put`, `memory_delete`, `memory_list` to model-backed turns
+- `MOUNT ARTIFACTS local` - parcel-scoped artifact storage
+
+State layout:
+
+- parcels opened from a normal build tree: `.dispatch/state/<digest>/`
+- parcels at custom locations: `<parcel-parent>/.dispatch-state/<digest>/`
+- `DISPATCH_STATE_ROOT` overrides the state root completely
+
+State management:
+
+- `dispatch state ls` - list digest-scoped state directories
+- `dispatch state gc` - remove orphaned state for parcels no longer present
+- `dispatch state migrate <old> <new>` - copy state when a rebuilt parcel gets a new digest
+
+## Depot
+
+- `dispatch push <parcel> <reference>` - publish a parcel into a file-backed depot
+- `dispatch pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
+- v1 depot references: `file:///absolute/path/to/depot::org/parcel:v1`
+- parcels stored by digest under `blobs/parcels/<digest>/`
+- tags stored under `refs/<org>/<parcel>/tags/<tag>.json`
+
 ## Design Principles
 
 - `Agentfile` is line-oriented and human-editable.
 - Dispatch owns the courier/parcel contract; `Agentfile` stays the authored format.
-- Markdown files remain first-class inputs, but not the primary manifest.
 - State is not baked into the parcel. Sessions, memory, and artifacts are mounts.
 - Tools are declared capabilities, not implicit filesystem accidents.
-- A built parcel should have a digest and be runnable by parcel reference.
+- A courier must not advertise or execute undeclared tools based on ambient prompt text.
+- A built parcel should have a digest and be runnable by reference.
+- Couriers must reject parcels whose format version or schema they do not support.
 
 ## Non-Goals
 
 - Replacing Docker or OCI
-- Hiding execution/security policy behind prompt text
+- Hiding execution or security policy behind prompt text
 - Treating agent memory as part of the immutable build artifact
-
-## Initial CLI Shape
-
-```bash
-dispatch lint .
-dispatch build .
-dispatch inspect examples/basic/.dispatch/parcels/<digest>
-dispatch run examples/basic/.dispatch/parcels/<digest> --chat "hello"
-dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/market-monitor:0.1.0
-dispatch pull file:///tmp/dispatch-depot::acme/market-monitor:0.1.0
-dispatch state ls
-dispatch state gc --dry-run
-dispatch state migrate <old-digest> <new-digest>
-```
-
-## Why Not YAML
-
-YAML is fine for structured config, but it is weak as a build language.
-
-`Dockerfile` succeeded because it is:
-
-- line-oriented
-- diff-friendly
-- composable
-- easy to parse
-- easy to teach
-
-`Agentfile` should follow that model.
+- Requiring any specific agent framework or language runtime
 
 ## License
 
