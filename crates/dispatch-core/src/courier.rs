@@ -34,6 +34,10 @@ use wasmtime::{
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+mod model_backends;
+
+use self::model_backends::*;
+
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PARCEL_SCHEMA_VALIDATOR: OnceLock<Validator> = OnceLock::new();
 
@@ -473,7 +477,7 @@ pub trait ChatModelBackend: Send + Sync {
     fn supports_previous_response_id(&self) -> bool {
         false
     }
-    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError>;
+    fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError>;
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -494,6 +498,13 @@ pub struct ModelReply {
     pub backend: String,
     pub response_id: Option<String>,
     pub tool_calls: Vec<ModelToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelGeneration {
+    Reply(ModelReply),
+    NotConfigured { backend: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -675,8 +686,13 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
                 tool_outputs,
                 previous_response_id: request.previous_response_id,
             })
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "model backend returned no reply".to_string())?;
+            .map_err(|error| error.to_string())?;
+        let reply = match reply {
+            ModelGeneration::Reply(reply) => reply,
+            ModelGeneration::NotConfigured { backend, reason } => {
+                return Err(format!("{backend} backend not configured: {reason}"));
+            }
+        };
         Ok(wasm_bindings::dispatch::courier::host::ModelResponse {
             backend: reply.backend,
             text: reply.text,
@@ -822,17 +838,8 @@ impl StubCourier {
     }
 }
 
-struct OpenAiResponsesBackend;
-struct OpenAiChatCompletionsBackend;
-struct AnthropicMessagesBackend;
-struct GeminiGenerateContentBackend;
-
 fn default_chat_backend_for_model(primary: Option<&ModelReference>) -> Arc<dyn ChatModelBackend> {
     default_chat_backend_for_model_with(primary, process_env_lookup)
-}
-
-fn default_chat_backend_for_provider(provider: Option<&str>) -> Arc<dyn ChatModelBackend> {
-    default_chat_backend_for_provider_with(provider, process_env_lookup)
 }
 
 fn default_chat_backend_for_model_with<F>(
@@ -846,28 +853,6 @@ where
         primary.and_then(|model| model.provider.as_deref()),
         env_lookup,
     )
-}
-
-fn default_chat_backend_for_provider_with<F>(
-    provider: Option<&str>,
-    mut env_lookup: F,
-) -> Arc<dyn ChatModelBackend>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    match provider
-        .map(ToString::to_string)
-        .or_else(|| env_lookup("LLM_BACKEND"))
-        .unwrap_or_else(|| "openai".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "anthropic" => Arc::new(AnthropicMessagesBackend),
-        "gemini" | "google" | "google_gemini" => Arc::new(GeminiGenerateContentBackend),
-        "openai_compatible" | "openrouter" | "together" | "fireworks" | "litellm" | "vllm"
-        | "lm_studio" => Arc::new(OpenAiChatCompletionsBackend),
-        _ => Arc::new(OpenAiResponsesBackend),
-    }
 }
 
 pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
@@ -3543,16 +3528,19 @@ fn execute_native_turn(
             rounds += 1;
 
             let reply = match backend.generate(&request) {
-                Ok(Some(reply)) => reply,
-                Ok(None) => {
+                Ok(ModelGeneration::Reply(reply)) => reply,
+                Ok(ModelGeneration::NotConfigured {
+                    backend: not_configured_backend,
+                    reason,
+                }) => {
                     if !candidate_locked
                         && let Some(next_request) = remaining_requests.first().cloned()
                     {
                         events.push(CourierEvent::BackendFallback {
-                            backend: backend.id().to_string(),
+                            backend: not_configured_backend,
                             error: format!(
-                                "model `{}` returned no reply; trying fallback model `{}`",
-                                request.model, next_request.model
+                                "{reason}; trying fallback model `{}`",
+                                next_request.model
                             ),
                         });
                         request = next_request;
@@ -3560,6 +3548,10 @@ fn execute_native_turn(
                         remaining_requests.remove(0);
                         continue;
                     }
+                    events.push(CourierEvent::BackendFallback {
+                        backend: not_configured_backend,
+                        error: reason,
+                    });
                     break;
                 }
                 Err(error) => {
@@ -3899,322 +3891,6 @@ fn load_tool_schema(
     Ok(schema)
 }
 
-impl ChatModelBackend for OpenAiResponsesBackend {
-    fn id(&self) -> &str {
-        "openai_responses"
-    }
-
-    fn supports_previous_response_id(&self) -> bool {
-        true
-    }
-
-    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
-        let api_key = match model_api_key("OPENAI_API_KEY", "LLM_API_KEY") {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        let base_url = model_base_url("OPENAI_BASE_URL", "LLM_BASE_URL", "https://api.openai.com");
-        let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "model": request.model,
-            "instructions": request.instructions,
-            "input": if request.previous_response_id.is_some() {
-                request
-                    .tool_outputs
-                    .iter()
-                    .map(openai_tool_output_item)
-                    .collect::<Vec<_>>()
-            } else {
-                request
-                    .messages
-                    .iter()
-                    .map(openai_input_message)
-                    .collect::<Vec<_>>()
-            },
-            "previous_response_id": request.previous_response_id,
-            "parallel_tool_calls": false,
-            "tools": request
-                .tools
-                .iter()
-                .map(openai_tool_definition)
-                .collect::<Vec<_>>(),
-        });
-
-        let mut response = ureq::post(&url)
-            .header("authorization", &format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
-        let (text, tool_calls) = extract_openai_output(&body)?;
-
-        Ok(Some(ModelReply {
-            text,
-            backend: self.id().to_string(),
-            response_id: body
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
-            tool_calls,
-        }))
-    }
-}
-
-impl ChatModelBackend for OpenAiChatCompletionsBackend {
-    fn id(&self) -> &str {
-        "openai_compatible_chat_completions"
-    }
-
-    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
-        let api_key = match model_api_key("LLM_API_KEY", "OPENAI_API_KEY") {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
-        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "model": request.model,
-            "messages": openai_chat_completions_messages(request),
-            "tools": request
-                .tools
-                .iter()
-                .map(openai_chat_completions_tool_definition)
-                .collect::<Vec<_>>(),
-            "tool_choice": "auto",
-        });
-
-        let mut response = ureq::post(&url)
-            .header("authorization", &format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
-        extract_openai_chat_completions_output(&body)
-    }
-}
-
-impl ChatModelBackend for AnthropicMessagesBackend {
-    fn id(&self) -> &str {
-        "anthropic_messages"
-    }
-
-    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
-        let api_key = match model_api_key("ANTHROPIC_API_KEY", "LLM_API_KEY") {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        let base_url = model_base_url(
-            "ANTHROPIC_BASE_URL",
-            "LLM_BASE_URL",
-            "https://api.anthropic.com",
-        );
-        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "model": request.model,
-            "max_tokens": 2048,
-            "system": request.instructions,
-            "messages": anthropic_messages(request),
-            "tools": request
-                .tools
-                .iter()
-                .map(anthropic_tool_definition)
-                .collect::<Vec<_>>(),
-        });
-
-        let mut response = ureq::post(&url)
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
-        extract_anthropic_output(&body)
-    }
-}
-
-impl ChatModelBackend for GeminiGenerateContentBackend {
-    fn id(&self) -> &str {
-        "google_gemini_generate_content"
-    }
-
-    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
-        let api_key = std::env::var("GEMINI_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
-            .or_else(|| std::env::var("LLM_API_KEY").ok());
-        let api_key = match api_key {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        let base_url = std::env::var("GEMINI_BASE_URL")
-            .ok()
-            .or_else(|| std::env::var("LLM_BASE_URL").ok())
-            .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
-        let model = if request.model.starts_with("models/") {
-            request.model.clone()
-        } else {
-            format!("models/{}", request.model)
-        };
-        let url = format!("{}/{model}:generateContent", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "systemInstruction": {
-                "parts": [{ "text": request.instructions }]
-            },
-            "contents": gemini_messages(request),
-            "tools": [{
-                "functionDeclarations": request
-                    .tools
-                    .iter()
-                    .map(gemini_tool_definition)
-                    .collect::<Vec<_>>()
-            }],
-        });
-
-        let mut response = ureq::post(&url)
-            .header("x-goog-api-key", &api_key)
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
-        extract_gemini_output(&body)
-    }
-}
-
-fn openai_input_message(message: &ConversationMessage) -> serde_json::Value {
-    serde_json::json!({
-        "role": message.role,
-        "content": [
-            {
-                "type": "input_text",
-                "text": message.content,
-            }
-        ],
-    })
-}
-
-fn openai_chat_completions_message(message: &ConversationMessage) -> serde_json::Value {
-    serde_json::json!({
-        "role": message.role,
-        "content": message.content,
-    })
-}
-
-fn openai_chat_completions_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
-    let mut messages = Vec::with_capacity(request.messages.len() + 1);
-    if !request.instructions.trim().is_empty() {
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": request.instructions,
-        }));
-    }
-    messages.extend(request.messages.iter().map(openai_chat_completions_message));
-    if !request.pending_tool_calls.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "assistant",
-            "tool_calls": request
-                .pending_tool_calls
-                .iter()
-                .map(openai_chat_completions_tool_call)
-                .collect::<Vec<_>>(),
-        }));
-    }
-    messages.extend(
-        request
-            .tool_outputs
-            .iter()
-            .map(openai_chat_completions_tool_output_message),
-    );
-    messages
-}
-
-fn openai_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
-    match &tool.format {
-        ModelToolFormat::Text => serde_json::json!({
-            "type": "custom",
-            "name": tool.name,
-            "description": tool.description,
-            "format": { "type": "text" },
-        }),
-        ModelToolFormat::JsonSchema { schema } => serde_json::json!({
-            "type": "function",
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": schema,
-        }),
-    }
-}
-
-fn openai_chat_completions_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": function_parameters_for_tool(tool),
-        },
-    })
-}
-
-fn openai_tool_output_item(output: &ModelToolOutput) -> serde_json::Value {
-    match output.kind {
-        ModelToolKind::Custom => serde_json::json!({
-            "type": "custom_tool_call_output",
-            "call_id": output.call_id,
-            "output": output.output,
-        }),
-        ModelToolKind::Function => serde_json::json!({
-            "type": "function_call_output",
-            "call_id": output.call_id,
-            "output": output.output,
-        }),
-    }
-}
-
-fn openai_chat_completions_tool_call(call: &ModelToolCall) -> serde_json::Value {
-    serde_json::json!({
-        "id": call.call_id,
-        "type": "function",
-        "function": {
-            "name": call.name,
-            "arguments": call.input,
-        },
-    })
-}
-
-fn openai_chat_completions_tool_output_message(output: &ModelToolOutput) -> serde_json::Value {
-    serde_json::json!({
-        "role": "tool",
-        "tool_call_id": output.call_id,
-        "content": output.output,
-    })
-}
-
-fn model_api_key(primary: &str, fallback: &str) -> Option<String> {
-    std::env::var(primary)
-        .ok()
-        .or_else(|| std::env::var(fallback).ok())
-}
-
 fn configured_model_id(primary: Option<&ModelReference>) -> Option<String> {
     configured_model_id_with(primary, process_env_lookup)
 }
@@ -4229,492 +3905,6 @@ where
     primary
         .map(|model| model.id.clone())
         .or_else(|| env_lookup("LLM_MODEL"))
-}
-
-fn model_base_url(primary: &str, fallback: &str, default: &str) -> String {
-    std::env::var(primary)
-        .ok()
-        .or_else(|| std::env::var(fallback).ok())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn function_parameters_for_tool(tool: &ModelToolDefinition) -> serde_json::Value {
-    match &tool.format {
-        ModelToolFormat::Text => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "input": {
-                    "type": "string",
-                    "description": "Free-form text input for the tool."
-                }
-            },
-            "required": ["input"],
-            "additionalProperties": false
-        }),
-        ModelToolFormat::JsonSchema { schema } => schema.clone(),
-    }
-}
-
-fn anthropic_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
-    let mut messages = request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::json!({
-                "role": message.role,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": message.content,
-                    }
-                ],
-            })
-        })
-        .collect::<Vec<_>>();
-    if !request.pending_tool_calls.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": request
-                .pending_tool_calls
-                .iter()
-                .map(anthropic_tool_call_block)
-                .collect::<Vec<_>>(),
-        }));
-    }
-    if !request.tool_outputs.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": request
-                .tool_outputs
-                .iter()
-                .map(anthropic_tool_result_block)
-                .collect::<Vec<_>>(),
-        }));
-    }
-    messages
-}
-
-fn anthropic_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
-    serde_json::json!({
-        "name": tool.name,
-        "description": tool.description,
-        "input_schema": function_parameters_for_tool(tool),
-    })
-}
-
-fn anthropic_tool_call_block(call: &ModelToolCall) -> serde_json::Value {
-    let input = serde_json::from_str::<serde_json::Value>(&call.input)
-        .unwrap_or_else(|_| serde_json::json!({ "input": call.input }));
-    serde_json::json!({
-        "type": "tool_use",
-        "id": call.call_id,
-        "name": call.name,
-        "input": input,
-    })
-}
-
-fn anthropic_tool_result_block(output: &ModelToolOutput) -> serde_json::Value {
-    serde_json::json!({
-        "type": "tool_result",
-        "tool_use_id": output.call_id,
-        "content": output.output,
-    })
-}
-
-fn gemini_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
-    let mut messages = request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::json!({
-                "role": if message.role == "assistant" { "model" } else { "user" },
-                "parts": [
-                    {
-                        "text": message.content,
-                    }
-                ],
-            })
-        })
-        .collect::<Vec<_>>();
-    if !request.pending_tool_calls.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "model",
-            "parts": request
-                .pending_tool_calls
-                .iter()
-                .map(gemini_tool_call_part)
-                .collect::<Vec<_>>(),
-        }));
-    }
-    if !request.tool_outputs.is_empty() {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "parts": request
-                .tool_outputs
-                .iter()
-                .map(gemini_tool_response_part)
-                .collect::<Vec<_>>(),
-        }));
-    }
-    messages
-}
-
-fn gemini_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
-    serde_json::json!({
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": function_parameters_for_tool(tool),
-    })
-}
-
-fn gemini_tool_call_part(call: &ModelToolCall) -> serde_json::Value {
-    let args = serde_json::from_str::<serde_json::Value>(&call.input)
-        .unwrap_or_else(|_| serde_json::json!({ "input": call.input }));
-    serde_json::json!({
-        "functionCall": {
-            "name": call.name,
-            "args": args,
-        }
-    })
-}
-
-fn gemini_tool_response_part(output: &ModelToolOutput) -> serde_json::Value {
-    serde_json::json!({
-        "functionResponse": {
-            "name": output.name,
-            "response": {
-                "output": output.output,
-            }
-        }
-    })
-}
-
-fn extract_openai_output(
-    body: &serde_json::Value,
-) -> Result<(Option<String>, Vec<ModelToolCall>), CourierError> {
-    let outputs = body
-        .get("output")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| CourierError::ModelBackendResponse("missing `output` array".to_string()))?;
-
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for output in outputs {
-        match output.get("type").and_then(serde_json::Value::as_str) {
-            Some("custom_tool_call") => {
-                tool_calls.push(parse_openai_tool_call(output, ModelToolKind::Custom)?);
-                continue;
-            }
-            Some("function_call") => {
-                tool_calls.push(parse_openai_tool_call(output, ModelToolKind::Function)?);
-                continue;
-            }
-            _ => {}
-        }
-
-        let Some(content) = output.get("content").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for item in content {
-            if item.get("type").and_then(serde_json::Value::as_str) == Some("output_text")
-                && let Some(value) = item.get("text").and_then(serde_json::Value::as_str)
-            {
-                text.push_str(value);
-            }
-        }
-    }
-
-    if !tool_calls.is_empty() {
-        return Ok((None, tool_calls));
-    }
-
-    if text.is_empty() {
-        return Err(CourierError::ModelBackendResponse(
-            "response did not contain `output_text` content".to_string(),
-        ));
-    }
-
-    Ok((Some(text), tool_calls))
-}
-
-fn extract_anthropic_output(body: &serde_json::Value) -> Result<Option<ModelReply>, CourierError> {
-    let content = body
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| CourierError::ModelBackendResponse("missing `content` array".to_string()))?;
-
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for item in content {
-        match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("text") => {
-                if let Some(value) = item.get("text").and_then(serde_json::Value::as_str) {
-                    text.push_str(value);
-                }
-            }
-            Some("tool_use") => {
-                let call_id = item
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        CourierError::ModelBackendResponse(
-                            "anthropic tool_use missing `id`".to_string(),
-                        )
-                    })?;
-                let name = item
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        CourierError::ModelBackendResponse(
-                            "anthropic tool_use missing `name`".to_string(),
-                        )
-                    })?;
-                let input = item
-                    .get("input")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                tool_calls.push(ModelToolCall {
-                    call_id: call_id.to_string(),
-                    name: name.to_string(),
-                    input: serde_json::to_string(&input).map_err(|error| {
-                        CourierError::ModelBackendResponse(format!(
-                            "failed to serialize anthropic tool input: {error}"
-                        ))
-                    })?,
-                    kind: ModelToolKind::Function,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    Ok(Some(ModelReply {
-        text: if text.is_empty() { None } else { Some(text) },
-        backend: "anthropic_messages".to_string(),
-        response_id: body
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string),
-        tool_calls,
-    }))
-}
-
-fn extract_gemini_output(body: &serde_json::Value) -> Result<Option<ModelReply>, CourierError> {
-    let candidate = body
-        .get("candidates")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|candidates| candidates.first())
-        .ok_or_else(|| CourierError::ModelBackendResponse("missing `candidates[0]`".to_string()))?;
-    let parts = candidate
-        .get("content")
-        .and_then(|content| content.get("parts"))
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            CourierError::ModelBackendResponse("missing `candidates[0].content.parts`".to_string())
-        })?;
-
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for part in parts {
-        if let Some(value) = part.get("text").and_then(serde_json::Value::as_str) {
-            text.push_str(value);
-        }
-        if let Some(function_call) = part
-            .get("functionCall")
-            .or_else(|| part.get("function_call"))
-        {
-            let name = function_call
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CourierError::ModelBackendResponse(
-                        "gemini functionCall missing `name`".to_string(),
-                    )
-                })?;
-            let args = function_call
-                .get("args")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let call_id = function_call
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
-                .unwrap_or_else(next_generated_tool_call_id);
-            tool_calls.push(ModelToolCall {
-                call_id,
-                name: name.to_string(),
-                input: serde_json::to_string(&args).map_err(|error| {
-                    CourierError::ModelBackendResponse(format!(
-                        "failed to serialize gemini tool args: {error}"
-                    ))
-                })?,
-                kind: ModelToolKind::Function,
-            });
-        }
-    }
-
-    Ok(Some(ModelReply {
-        text: if text.is_empty() { None } else { Some(text) },
-        backend: "google_gemini_generate_content".to_string(),
-        response_id: None,
-        tool_calls,
-    }))
-}
-
-fn parse_openai_tool_call(
-    output: &serde_json::Value,
-    kind: ModelToolKind,
-) -> Result<ModelToolCall, CourierError> {
-    let output_type = output
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("tool_call");
-    let call_id = output
-        .get("call_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            CourierError::ModelBackendResponse(format!("{output_type} missing `call_id`"))
-        })?;
-    let name = output
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            CourierError::ModelBackendResponse(format!("{output_type} missing `name`"))
-        })?;
-    let input_field = match kind {
-        ModelToolKind::Custom => "input",
-        ModelToolKind::Function => "arguments",
-    };
-    let input = output
-        .get(input_field)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            CourierError::ModelBackendResponse(format!("{output_type} missing `{input_field}`"))
-        })?;
-
-    Ok(ModelToolCall {
-        call_id: call_id.to_string(),
-        name: name.to_string(),
-        input: input.to_string(),
-        kind,
-    })
-}
-
-fn extract_openai_chat_completions_output(
-    body: &serde_json::Value,
-) -> Result<Option<ModelReply>, CourierError> {
-    let choice = body
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|choices| choices.first())
-        .ok_or_else(|| CourierError::ModelBackendResponse("missing `choices[0]`".to_string()))?;
-    let message = choice.get("message").ok_or_else(|| {
-        CourierError::ModelBackendResponse("missing `choices[0].message`".to_string())
-    })?;
-
-    let text = match message.get("content") {
-        Some(serde_json::Value::String(text)) => Some(text.clone()),
-        Some(serde_json::Value::Array(parts)) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-                .collect::<String>();
-            if text.is_empty() { None } else { Some(text) }
-        }
-        _ => None,
-    };
-
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(serde_json::Value::as_array)
-        .map(|tool_calls| {
-            tool_calls
-                .iter()
-                .map(parse_openai_chat_completions_tool_call)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    Ok(Some(ModelReply {
-        text,
-        backend: "openai_compatible_chat_completions".to_string(),
-        response_id: None,
-        tool_calls,
-    }))
-}
-
-fn parse_openai_chat_completions_tool_call(
-    value: &serde_json::Value,
-) -> Result<ModelToolCall, CourierError> {
-    let call_id = value
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| CourierError::ModelBackendResponse("tool call missing `id`".to_string()))?;
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("function") => {
-            let function = value.get("function").ok_or_else(|| {
-                CourierError::ModelBackendResponse(
-                    "function tool call missing `function`".to_string(),
-                )
-            })?;
-            let name = function
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CourierError::ModelBackendResponse(
-                        "function tool call missing `function.name`".to_string(),
-                    )
-                })?;
-            let arguments = function
-                .get("arguments")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CourierError::ModelBackendResponse(
-                        "function tool call missing `function.arguments`".to_string(),
-                    )
-                })?;
-            Ok(ModelToolCall {
-                call_id: call_id.to_string(),
-                name: name.to_string(),
-                input: arguments.to_string(),
-                kind: ModelToolKind::Function,
-            })
-        }
-        Some("custom") => {
-            let custom = value.get("custom").ok_or_else(|| {
-                CourierError::ModelBackendResponse("custom tool call missing `custom`".to_string())
-            })?;
-            let name = custom
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CourierError::ModelBackendResponse(
-                        "custom tool call missing `custom.name`".to_string(),
-                    )
-                })?;
-            let input = custom
-                .get("input")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    CourierError::ModelBackendResponse(
-                        "custom tool call missing `custom.input`".to_string(),
-                    )
-                })?;
-            Ok(ModelToolCall {
-                call_id: call_id.to_string(),
-                name: name.to_string(),
-                input: input.to_string(),
-                kind: ModelToolKind::Custom,
-            })
-        }
-        Some(other) => Err(CourierError::ModelBackendResponse(format!(
-            "unsupported chat completion tool call type `{other}`"
-        ))),
-        None => Err(CourierError::ModelBackendResponse(
-            "tool call missing `type`".to_string(),
-        )),
-    }
 }
 
 fn next_generated_tool_call_id() -> String {
@@ -4857,7 +4047,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeChatBackend {
-        replies: Mutex<Vec<Result<Option<ModelReply>, String>>>,
+        replies: Mutex<Vec<Result<ModelGeneration, String>>>,
         calls: Mutex<Vec<ModelRequest>>,
         supports_previous_response_id: bool,
     }
@@ -4865,7 +4055,7 @@ mod tests {
     impl FakeChatBackend {
         fn with_reply(reply: impl Into<String>) -> Self {
             Self {
-                replies: Mutex::new(vec![Ok(Some(ModelReply {
+                replies: Mutex::new(vec![Ok(ModelGeneration::Reply(ModelReply {
                     text: Some(reply.into()),
                     backend: "fake".to_string(),
                     response_id: None,
@@ -4878,7 +4068,18 @@ mod tests {
 
         fn with_replies(replies: Vec<Option<ModelReply>>) -> Self {
             Self {
-                replies: Mutex::new(replies.into_iter().map(Ok).collect()),
+                replies: Mutex::new(
+                    replies
+                        .into_iter()
+                        .map(|reply| match reply {
+                            Some(reply) => Ok(ModelGeneration::Reply(reply)),
+                            None => Ok(ModelGeneration::NotConfigured {
+                                backend: "fake".to_string(),
+                                reason: "not configured".to_string(),
+                            }),
+                        })
+                        .collect(),
+                ),
                 calls: Mutex::new(Vec::new()),
                 supports_previous_response_id: true,
             }
@@ -4886,7 +4087,18 @@ mod tests {
 
         fn with_replies_without_previous_response_id(replies: Vec<Option<ModelReply>>) -> Self {
             Self {
-                replies: Mutex::new(replies.into_iter().map(Ok).collect()),
+                replies: Mutex::new(
+                    replies
+                        .into_iter()
+                        .map(|reply| match reply {
+                            Some(reply) => Ok(ModelGeneration::Reply(reply)),
+                            None => Ok(ModelGeneration::NotConfigured {
+                                backend: "fake".to_string(),
+                                reason: "not configured".to_string(),
+                            }),
+                        })
+                        .collect(),
+                ),
                 calls: Mutex::new(Vec::new()),
                 supports_previous_response_id: false,
             }
@@ -4910,11 +4122,14 @@ mod tests {
             self.supports_previous_response_id
         }
 
-        fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
+        fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError> {
             self.calls.lock().unwrap().push(request.clone());
             let mut replies = self.replies.lock().unwrap();
             if replies.is_empty() {
-                return Ok(None);
+                return Ok(ModelGeneration::NotConfigured {
+                    backend: "fake".to_string(),
+                    reason: "not configured".to_string(),
+                });
             }
             replies.remove(0).map_err(CourierError::ModelBackendRequest)
         }
@@ -6266,9 +5481,12 @@ ENTRYPOINT chat
             ]
         });
 
-        let reply = extract_openai_chat_completions_output(&body)
-            .unwrap()
-            .expect("expected model reply");
+        let reply = match extract_openai_chat_completions_output(&body).unwrap() {
+            ModelGeneration::Reply(reply) => reply,
+            ModelGeneration::NotConfigured { backend, reason } => {
+                panic!("expected model reply, got unconfigured backend {backend}: {reason}");
+            }
+        };
         assert_eq!(reply.backend, "openai_compatible_chat_completions");
         assert!(reply.text.is_none());
         assert_eq!(reply.tool_calls.len(), 2);
@@ -6293,9 +5511,12 @@ ENTRYPOINT chat
             ]
         });
 
-        let reply = extract_anthropic_output(&body)
-            .unwrap()
-            .expect("expected anthropic reply");
+        let reply = match extract_anthropic_output(&body).unwrap() {
+            ModelGeneration::Reply(reply) => reply,
+            ModelGeneration::NotConfigured { backend, reason } => {
+                panic!("expected anthropic reply, got unconfigured backend {backend}: {reason}");
+            }
+        };
         assert_eq!(reply.backend, "anthropic_messages");
         assert_eq!(reply.response_id.as_deref(), Some("msg_123"));
         assert_eq!(reply.text.as_deref(), Some("Let me check."));
@@ -6325,9 +5546,12 @@ ENTRYPOINT chat
             ]
         });
 
-        let reply = extract_gemini_output(&body)
-            .unwrap()
-            .expect("expected gemini reply");
+        let reply = match extract_gemini_output(&body).unwrap() {
+            ModelGeneration::Reply(reply) => reply,
+            ModelGeneration::NotConfigured { backend, reason } => {
+                panic!("expected gemini reply, got unconfigured backend {backend}: {reason}");
+            }
+        };
         assert_eq!(reply.backend, "google_gemini_generate_content");
         assert_eq!(reply.text.as_deref(), Some("Checking..."));
         assert_eq!(reply.tool_calls.len(), 1);
@@ -6691,7 +5915,13 @@ ENTRYPOINT chat
 
         assert!(matches!(
             response.events.first(),
-            Some(CourierEvent::Message { content, .. }) if content.contains("Native chat reference reply")
+            Some(CourierEvent::BackendFallback { backend, error })
+                if backend == "fake" && error.contains("not configured")
+        ));
+        assert!(matches!(
+            response.events.get(1),
+            Some(CourierEvent::Message { content, .. })
+                if content.contains("Native chat reference reply")
         ));
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
     }
@@ -6748,7 +5978,7 @@ ENTRYPOINT chat
         let backend = Arc::new(FakeChatBackend {
             replies: Mutex::new(vec![
                 Err("temporary backend failure".to_string()),
-                Ok(Some(ModelReply {
+                Ok(ModelGeneration::Reply(ModelReply {
                     text: Some("fallback answer".to_string()),
                     backend: "fake".to_string(),
                     response_id: None,
