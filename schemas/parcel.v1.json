@@ -119,6 +119,16 @@
     "models": {
       "$ref": "#/$defs/models"
     },
+    "compaction": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/compaction"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "limits": {
       "type": "array",
       "items": {
@@ -568,6 +578,25 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "compaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interval"
+      ],
+      "properties": {
+        "interval": {
+          "type": "string"
+        },
+        "overlap": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
         }
       }
     },

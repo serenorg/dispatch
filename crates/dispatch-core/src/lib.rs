@@ -32,9 +32,9 @@ pub use eval::{
     EvalDocument, EvalError, EvalSpec, ToolExitExpectation, ToolTextExpectation, load_parcel_evals,
 };
 pub use manifest::{
-    BuiltinToolConfig, CommandSpec, CourierTarget, DISPATCH_WASM_ABI, EnvVar, InstructionConfig,
-    InstructionKind, LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy, ModelReference,
-    MountConfig, MountKind, NetworkRule, PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL,
+    BuiltinToolConfig, CommandSpec, CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
+    InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy,
+    ModelReference, MountConfig, MountKind, NetworkRule, PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL,
     ParcelFileRecord, ParcelManifest, SecretSpec, TimeoutSpec, ToolConfig, Visibility,
     WasmComponentConfig,
 };

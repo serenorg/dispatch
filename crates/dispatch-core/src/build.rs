@@ -1,7 +1,7 @@
 use crate::{
     ParsedAgentfile, Value,
     manifest::{
-        BuiltinToolConfig, CommandSpec, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
+        BuiltinToolConfig, CommandSpec, CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
         FrameworkProvenance, InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig,
         McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind, NetworkRule,
         PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
@@ -132,6 +132,7 @@ struct ProvisionalParcelManifest {
     mounts: Vec<MountConfig>,
     tools: Vec<ToolConfig>,
     models: ModelPolicy,
+    compaction: Option<CompactionConfig>,
     limits: Vec<LimitSpec>,
     timeouts: Vec<TimeoutSpec>,
     network: Vec<NetworkRule>,
@@ -154,6 +155,7 @@ struct ResolvedAgentSpec {
     mounts: Vec<MountConfig>,
     tools: Vec<ToolConfig>,
     models: ModelPolicy,
+    compaction: Option<CompactionConfig>,
     limits: Vec<LimitSpec>,
     timeouts: Vec<TimeoutSpec>,
     network: Vec<NetworkRule>,
@@ -295,6 +297,7 @@ pub fn build_agentfile(
                 }
             }
             "ROUTING" => resolved.models.routing = first_scalar(instruction.args.first()),
+            "COMPACTION" => resolved.compaction = parse_compaction(&instruction.args),
             "LIMIT" => {
                 if let Some(limit) = parse_limit(&instruction.args) {
                     resolved.limits.push(limit);
@@ -399,6 +402,7 @@ pub fn build_agentfile(
         mounts: resolved.mounts,
         tools: resolved.tools,
         models: resolved.models,
+        compaction: resolved.compaction,
         limits: resolved.limits,
         timeouts: resolved.timeouts,
         network: resolved.network,
@@ -450,6 +454,7 @@ pub fn build_agentfile(
         mounts: provisional.mounts,
         tools: provisional.tools,
         models: provisional.models,
+        compaction: provisional.compaction,
         limits: provisional.limits,
         timeouts: provisional.timeouts,
         network: provisional.network,
@@ -601,6 +606,7 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
         mounts: parcel.mounts.clone(),
         tools: parcel.tools.clone(),
         models: parcel.models.clone(),
+        compaction: parcel.compaction.clone(),
         limits: parcel.limits.clone(),
         timeouts: parcel.timeouts.clone(),
         network: parcel.network.clone(),
@@ -909,6 +915,16 @@ fn parse_limit(args: &[Value]) -> Option<LimitSpec> {
         value: tokens[1].clone(),
         qualifiers: tokens[2..].to_vec(),
     })
+}
+
+fn parse_compaction(args: &[Value]) -> Option<CompactionConfig> {
+    let tokens = scalars(args);
+    let interval = tokens.first()?.clone();
+    let overlap = tokens
+        .windows(2)
+        .find(|window| window[0] == "OVERLAP")
+        .and_then(|window| window[1].parse::<u32>().ok());
+    Some(CompactionConfig { interval, overlap })
 }
 
 fn parse_timeout(args: &[Value]) -> Option<TimeoutSpec> {
@@ -1225,6 +1241,35 @@ ENTRYPOINT heartbeat
         assert_eq!(parcel.network[0].target, "api.example.com");
         assert_eq!(parcel.network[0].qualifiers, vec!["via-egress"]);
         assert_eq!(parcel.labels["org.example.display"], "Market Monitor");
+    }
+
+    #[test]
+    fn build_records_compaction_config() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+COMPACTION 200 OVERLAP 32
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        let compaction = parcel.compaction.expect("expected compaction config");
+        assert_eq!(compaction.interval, "200");
+        assert_eq!(compaction.overlap, Some(32));
     }
 
     #[test]

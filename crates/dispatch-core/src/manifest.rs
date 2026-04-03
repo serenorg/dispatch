@@ -26,6 +26,8 @@ pub struct ParcelManifest {
     pub mounts: Vec<MountConfig>,
     pub tools: Vec<ToolConfig>,
     pub models: ModelPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionConfig>,
     pub limits: Vec<LimitSpec>,
     pub timeouts: Vec<TimeoutSpec>,
     pub network: Vec<NetworkRule>,
@@ -237,6 +239,13 @@ pub struct ModelPolicy {
 pub struct ModelReference {
     pub id: String,
     pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionConfig {
+    pub interval: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

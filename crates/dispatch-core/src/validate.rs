@@ -57,8 +57,8 @@ pub fn validate_agentfile(agentfile: &ParsedAgentfile) -> ValidationReport {
                 require_exact_args(instruction, 1, &mut diagnostics)
             }
             "MEMORY" => require_min_args(instruction, 2, &mut diagnostics),
-            "HEARTBEAT" | "TOOL" | "MOUNT" | "TIMEOUT" | "LIMIT" | "ENV" | "SECRET" | "NETWORK"
-            | "LABEL" | "COPY" | "ADD" | "ROUTING" | "PROMPT" => {
+            "HEARTBEAT" | "TOOL" | "MOUNT" | "TIMEOUT" | "LIMIT" | "COMPACTION" | "ENV"
+            | "SECRET" | "NETWORK" | "LABEL" | "COPY" | "ADD" | "ROUTING" | "PROMPT" => {
                 require_min_args(instruction, 1, &mut diagnostics)
             }
             _ => {}
@@ -115,6 +115,7 @@ fn allowed_instructions() -> HashSet<&'static str> {
         "VISIBILITY",
         "TIMEOUT",
         "LIMIT",
+        "COMPACTION",
         "MOUNT",
         "EVAL",
         "TEST",

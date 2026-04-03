@@ -449,6 +449,17 @@ LIMIT CONTEXT_TOKENS 16000
 
 Hosted model backends may use `LIMIT CONTEXT_TOKENS` when the provider supports an explicit token budget field. The reference implementation currently applies it to Anthropic `max_tokens`.
 
+#### `COMPACTION`
+
+```dockerfile
+COMPACTION 200
+COMPACTION 200 OVERLAP 32
+```
+
+`COMPACTION` declares parcel-level event/session compaction policy as framework-neutral metadata.
+Dispatch stores it in the parcel manifest but does not impose compaction behavior by itself.
+Execution environments can use it to tune long-running session history compaction.
+
 ### Mounts
 
 Mounts are state backends, similar to volumes.
