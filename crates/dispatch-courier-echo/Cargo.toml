@@ -1,0 +1,17 @@
+[package]
+name = "dispatch-courier-echo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference JSONL courier plugin for the Dispatch agent parcel standard."
+readme = "../../README.md"
+keywords = ["agents", "courier", "plugin", "dispatch"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+dispatch-core = { path = "../dispatch-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "dispatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for building, verifying, and running Dispatch agent parcels."
+readme = "../../README.md"
+keywords = ["agents", "cli", "packaging", "dispatch"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+dispatch-core = { path = "../dispatch-core" }
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

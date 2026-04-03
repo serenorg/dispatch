@@ -1,0 +1,27 @@
+FROM dispatch/wasm:latest
+
+NAME wasm-reference
+VERSION 0.1.0
+
+IDENTITY IDENTITY.md
+SOUL SOUL.md
+AGENTS AGENTS.md
+USER USER.md
+TOOLS TOOLS.md
+MEMORY POLICY MEMORY.md
+
+MODEL gpt-5-mini
+
+TOOL BUILTIN web_search
+TOOL LOCAL tools/echo.sh AS echo DESCRIPTION "Echo the provided input back for debugging."
+
+COMPONENT components/reference-guest.wasm
+
+MOUNT SESSION sqlite
+MOUNT MEMORY none
+MOUNT ARTIFACTS local
+
+ENV TZ=UTC
+VISIBILITY open
+
+ENTRYPOINT chat

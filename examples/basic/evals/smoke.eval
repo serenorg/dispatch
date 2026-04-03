@@ -1,0 +1,3 @@
+name: smoke
+input: "What time is it?"
+expects_tool: "system_time"

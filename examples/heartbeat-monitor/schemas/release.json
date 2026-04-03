@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mention_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "mention_id"
+  ]
+}

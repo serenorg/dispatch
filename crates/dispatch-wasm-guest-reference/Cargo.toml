@@ -1,0 +1,25 @@
+[package]
+name = "dispatch-wasm-guest-reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference WASM guest component targeting the Dispatch courier ABI."
+readme = "../../README.md"
+keywords = ["agents", "wasm", "courier", "dispatch"]
+categories = ["wasm", "development-tools"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "dispatch:dispatch-wasm-guest-reference"
+
+[package.metadata.component.target]
+path = "../dispatch-wasm-abi/wit"
+world = "courier-guest"
+
+[package.metadata.component.dependencies]

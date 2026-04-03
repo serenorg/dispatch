@@ -1,0 +1,113 @@
+package dispatch:courier@0.1.0;
+
+interface host {
+    record conversation-message {
+        role: string,
+        content: string,
+    }
+
+    record local-tool {
+        alias: string,
+        description: option<string>,
+        input-schema-json: option<string>,
+    }
+
+    enum model-tool-kind {
+        custom,
+        function,
+    }
+
+    record model-tool {
+        name: string,
+        description: string,
+        kind: model-tool-kind,
+        input-schema-json: option<string>,
+    }
+
+    record model-request {
+        model: option<string>,
+        instructions: string,
+        messages: list<conversation-message>,
+        tools: list<model-tool>,
+        previous-response-id: option<string>,
+    }
+
+    record model-tool-call {
+        call-id: string,
+        name: string,
+        input: string,
+        kind: model-tool-kind,
+    }
+
+    record model-response {
+        backend: string,
+        text: option<string>,
+        response-id: option<string>,
+        tool-calls: list<model-tool-call>,
+    }
+
+    record tool-invocation {
+        name: string,
+        input: option<string>,
+    }
+
+    record tool-result {
+        tool: string,
+        command: string,
+        args: list<string>,
+        exit-code: s32,
+        stdout: string,
+        stderr: string,
+    }
+
+    model-complete: func(request: model-request) -> result<model-response, string>;
+    invoke-tool: func(invocation: tool-invocation) -> result<tool-result, string>;
+}
+
+interface guest {
+    use host.{conversation-message, local-tool};
+
+    record parcel-context {
+        parcel-digest: string,
+        entrypoint: option<string>,
+        prompt: string,
+        local-tools: list<local-tool>,
+        primary-model: option<string>,
+    }
+
+    record guest-session {
+        turn-count: u64,
+        history: list<conversation-message>,
+        guest-state: option<string>,
+    }
+
+    variant operation {
+        chat(string),
+        job(string),
+        heartbeat(option<string>),
+    }
+
+    record backend-fallback {
+        backend: string,
+        error: string,
+    }
+
+    variant guest-event {
+        message(conversation-message),
+        text-delta(string),
+        backend-fallback(backend-fallback),
+    }
+
+    record turn-result {
+        guest-state: option<string>,
+        events: list<guest-event>,
+    }
+
+    open-session: func(parcel: parcel-context) -> result<option<string>, string>;
+    handle-operation: func(parcel: parcel-context, session: guest-session, operation: operation) -> result<turn-result, string>;
+}
+
+world courier-guest {
+    import host;
+    export guest;
+}

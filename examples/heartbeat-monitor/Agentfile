@@ -1,0 +1,32 @@
+FROM dispatch/native:latest
+
+NAME room-mention-monitor
+VERSION 0.1.0
+
+IDENTITY IDENTITY.md
+SOUL SOUL.md
+SKILL SKILL.md
+AGENTS AGENTS.md
+USER USER.md
+TOOLS TOOLS.md
+HEARTBEAT EVERY 30s FILE HEARTBEAT.md
+MEMORY POLICY MEMORY.md
+
+MODEL gpt-5-mini
+
+TOOL LOCAL tools/poll_mentions.sh AS poll_mentions DESCRIPTION "Poll the workspace for new room mentions. Input: optional JSON configuration."
+TOOL LOCAL tools/respond.sh AS respond SCHEMA schemas/respond.json DESCRIPTION "Send a response for a mention. Input: JSON payload describing the reply."
+TOOL LOCAL tools/release.sh AS release SCHEMA schemas/release.json DESCRIPTION "Mark a handled mention as released. Input: JSON payload identifying the mention."
+
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+MOUNT ARTIFACTS local
+
+SECRET OZ_WORKSPACE_BASE_URL
+SECRET OZ_WORKSPACE_AGENT_ID
+SECRET OZ_WORKSPACE_AGENT_TOKEN
+
+NETWORK allow workspace.example.com
+VISIBILITY opaque
+
+ENTRYPOINT heartbeat

@@ -1,0 +1,4 @@
+/target
+.agent-shell/
+**/.dispatch/
+**/.agentfile/

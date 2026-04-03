@@ -1,0 +1,36 @@
+FROM dispatch/native:latest
+
+NAME basic-assistant
+VERSION 0.1.0
+
+IDENTITY IDENTITY.md
+SOUL SOUL.md
+SKILL SKILL.md
+AGENTS AGENTS.md
+USER USER.md
+TOOLS TOOLS.md
+MEMORY POLICY MEMORY.md
+
+MODEL gpt-5.4-mini
+FALLBACK gpt-5.4-nano
+
+TOOL BUILTIN system_time
+TOOL BUILTIN web_search
+TOOL BUILTIN topic_lookup
+TOOL BUILTIN human_approval
+
+MOUNT SESSION sqlite
+MOUNT MEMORY none
+MOUNT ARTIFACTS local
+
+ENV TZ=UTC
+VISIBILITY open
+
+LIMIT ITERATIONS 20
+TIMEOUT RUN 300s
+TIMEOUT TOOL 60s
+TIMEOUT LLM 120s
+
+EVAL evals/smoke.eval
+
+ENTRYPOINT chat

@@ -1,0 +1,13 @@
+[package]
+name = "dispatch-wasm-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WIT ABI for Dispatch WASM courier guest components."
+readme = "../../README.md"
+keywords = ["agents", "wasm", "abi", "dispatch"]
+categories = ["wasm", "development-tools"]
+
+[lib]
+path = "src/lib.rs"

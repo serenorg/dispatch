@@ -1,0 +1,600 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dispatch.run/schemas/parcel.v1.json",
+  "title": "Dispatch Parcel Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "format_version",
+    "digest",
+    "source_agentfile",
+    "courier",
+    "instructions",
+    "inline_prompts",
+    "env",
+    "secrets",
+    "mounts",
+    "tools",
+    "models",
+    "limits",
+    "timeouts",
+    "network",
+    "labels",
+    "files"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://dispatch.run/schemas/parcel.v1.json"
+    },
+    "format_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source_agentfile": {
+      "type": "string"
+    },
+    "courier": {
+      "$ref": "#/$defs/courierTarget"
+    },
+    "framework": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/framework"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "entrypoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "instructions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/instruction"
+      }
+    },
+    "inline_prompts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/envVar"
+      }
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/secret"
+      }
+    },
+    "visibility": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "open",
+        "opaque",
+        null
+      ]
+    },
+    "mounts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mount"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tool"
+      }
+    },
+    "models": {
+      "$ref": "#/$defs/models"
+    },
+    "limits": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/limit"
+      }
+    },
+    "timeouts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/timeout"
+      }
+    },
+    "network": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/networkRule"
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    }
+  },
+  "$defs": {
+    "framework": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "courierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference"
+      ],
+      "properties": {
+        "reference": {
+          "type": "string"
+        },
+        "component": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/wasmComponent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "wasmComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "sha256",
+        "abi",
+        "world"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "abi": {
+          "type": "string"
+        },
+        "world": {
+          "type": "string"
+        }
+      }
+    },
+    "instruction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "source",
+        "sha256"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "identity",
+            "soul",
+            "skill",
+            "agents",
+            "user",
+            "tools",
+            "memory",
+            "heartbeat",
+            "eval"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "envVar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "required"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "driver",
+        "options"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "session",
+            "memory",
+            "artifacts"
+          ]
+        },
+        "driver": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "args"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "localTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "alias",
+        "packaged_path",
+        "runner"
+      ],
+      "properties": {
+        "kind": {
+          "const": "local"
+        },
+        "alias": {
+          "type": "string"
+        },
+        "packaged_path": {
+          "type": "string"
+        },
+        "runner": {
+          "$ref": "#/$defs/command"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "sha256"
+          ],
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "builtinTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "capability"
+      ],
+      "properties": {
+        "kind": {
+          "const": "builtin"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "mcpTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "server"
+      ],
+      "properties": {
+        "kind": {
+          "const": "mcp"
+        },
+        "server": {
+          "type": "string"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "tool": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/localTool"
+        },
+        {
+          "$ref": "#/$defs/builtinTool"
+        },
+        {
+          "$ref": "#/$defs/mcpTool"
+        }
+      ]
+    },
+    "modelReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fallbacks"
+      ],
+      "properties": {
+        "primary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/modelReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fallbacks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelReference"
+          }
+        },
+        "routing": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "value",
+        "qualifiers"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "qualifiers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "timeout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "duration",
+        "qualifiers"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "duration": {
+          "type": "string"
+        },
+        "qualifiers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "networkRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "target",
+        "qualifiers"
+      ],
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "qualifiers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "packaged_as",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "packaged_as": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

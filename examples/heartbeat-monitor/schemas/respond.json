@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mention_id": {
+      "type": "string"
+    },
+    "room_id": {
+      "type": "string"
+    },
+    "reply": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "mention_id",
+    "room_id",
+    "reply"
+  ]
+}

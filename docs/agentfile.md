@@ -1,0 +1,590 @@
+# Dispatch Agentfile Specification
+
+## Overview
+
+Dispatch is a packaging and courier standard for agent parcels.
+
+`Agentfile` is the declarative, Dockerfile-style build language used to author Dispatch parcels.
+
+An `Agentfile` defines:
+
+- the base courier target
+- the instruction stack
+- the tool surface
+- state mounts
+- model and routing defaults
+- guardrails
+- eval gates
+- entrypoint behavior
+
+The output of `dispatch build` is an immutable **agent parcel** with a digest.
+
+## Build Model
+
+### Inputs
+
+Build context:
+
+- `Agentfile`
+- referenced markdown files
+- local tools
+- code
+- reference assets
+- eval definitions
+
+### Outputs
+
+The build produces:
+
+- normalized manifest
+- resolved instruction stack
+- packaged tool bundle
+- asset bundle
+- typed parcel manifest
+- parcel digest
+- optional lockfile
+
+Implementations should provide a verification path that can recompute the manifest digest and validate packaged file hashes against the built parcel metadata.
+
+### Parcel vs Mounts
+
+Immutable parcel content:
+
+- prompts and instruction files
+- tool declarations
+- local tool files
+- static assets
+- defaults and policy
+
+State mounts:
+
+- session state
+- long-term memory
+- artifact storage
+- secrets
+
+This is the same split Docker makes between image layers and volumes.
+
+## Courier Contract
+
+The standard should not stop at the parcel artifact. It also needs a courier contract so third parties can implement compatible executors.
+
+At minimum, a courier must be able to:
+
+- load an agent parcel
+- inspect capabilities and requirements
+- open a courier session for a specific parcel
+- resolve instruction files into a courier prompt stack
+- resolve and enforce mounts
+- execute declared tools
+- handle entrypoint modes like `chat`, `job`, and `heartbeat`
+- emit ordered events for each turn so interactive couriers can stream output incrementally
+
+In the Rust reference implementation, this boundary is represented by:
+
+- `CourierBackend`
+- `CourierSession`
+- `CourierRequest`
+- `CourierResponse`
+- `CourierEvent`
+- `CourierCapabilities`
+- `CourierInspection`
+- `MountProvider`
+- `ToolInvocation`
+
+This is the core execution contract for a Dispatch courier.
+
+The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. Otherwise it falls back to a local reference reply path.
+
+### Pluggable Courier Model
+
+An agent parcel should be portable across multiple couriers:
+
+- `native`
+- `docker`
+- `wasm`
+- `custom`
+
+That means the parcel format must remain courier-agnostic.
+
+The courier is an implementation detail. The parcel contract is the standard.
+
+CLI implementations may expose explicit courier selection so the same built parcel can be validated or executed against different backends without changing the parcel itself.
+
+## Syntax
+
+`Agentfile` is line-oriented:
+
+- one instruction per line
+- `#` starts a comment
+- instruction names are uppercase
+- arguments are space-separated
+- quoted strings are allowed
+- multi-line bodies use heredoc blocks
+
+Example:
+
+```dockerfile
+PROMPT <<EOF
+You are a careful market monitoring agent.
+Use tools before answering with live data.
+EOF
+```
+
+## Core Instructions
+
+### Base
+
+#### `FROM`
+
+Selects the target courier family for the built parcel.
+
+```dockerfile
+FROM dispatch/native:latest
+FROM dispatch/wasm:0.1
+```
+
+Semantics:
+
+- required unless the builder injects a default
+- establishes courier compatibility
+- is normalized into `courier.reference` in the built parcel manifest
+- may define default toolchains and instruction loaders
+- couriers should reject execution when `courier.reference` is incompatible with the selected backend
+
+#### `NAME`
+
+```dockerfile
+NAME market-monitor
+```
+
+#### `VERSION`
+
+```dockerfile
+VERSION 0.1.0
+```
+
+#### `FRAMEWORK`
+
+Records optional authoring or toolchain provenance in the built parcel manifest.
+
+```dockerfile
+FRAMEWORK adk-rust
+FRAMEWORK adk-rust VERSION 0.5.0 TARGET wasm
+```
+
+Semantics:
+
+- optional
+- normalized into top-level `framework` metadata in `manifest.json`
+- describes how the parcel was authored or compiled
+- does not affect courier compatibility or backend selection
+
+#### `COMPONENT`
+
+Declares the packaged WebAssembly component for `dispatch/wasm` parcels.
+
+```dockerfile
+COMPONENT components/assistant.wasm
+COMPONENT components/assistant.wasm WORLD courier-guest
+```
+
+Semantics:
+
+- only valid for `dispatch/wasm` courier targets
+- packages the component into the parcel `context/`
+- is normalized into `courier.component` in the built manifest
+- records the packaged component digest plus the Dispatch WASM ABI/world the component targets
+- makes the guest binary an explicit part of the parcel contract instead of relying on implicit file conventions
+- the `dispatch/wasm` courier executes `chat`, `job`, and `heartbeat` by calling into that packaged guest component through the Dispatch WIT ABI
+
+#### `LABEL`
+
+```dockerfile
+LABEL org.opencontainers.image.source="github.com/acme/market-monitor"
+LABEL ai.agent.category="finance"
+```
+
+### Instruction Stack
+
+These instructions attach structured markdown or inline prompt content.
+
+#### `SOUL`
+
+Persona, behavioral invariants, style, and constitutional rules.
+
+```dockerfile
+SOUL SOUL.md
+```
+
+#### `SKILL`
+
+Primary task instructions and operating playbook.
+
+```dockerfile
+SKILL SKILL.md
+```
+
+#### `IDENTITY`
+
+Short public identity and display metadata for the agent.
+
+```dockerfile
+IDENTITY IDENTITY.md
+```
+
+This is optional when `NAME` and `LABEL` are enough, but supported so Dispatch can package common workspace layouts without losing meaning.
+
+#### `AGENTS`
+
+Operating procedures, workflows, routing rules, and rules of engagement.
+
+```dockerfile
+AGENTS AGENTS.md
+```
+
+#### `USER`
+
+Operator or owner context such as preferences, timezone, access boundaries, or other private working assumptions.
+
+```dockerfile
+USER USER.md
+```
+
+This file often contains personal or sensitive context. Treat it as private workspace input, not default-public project metadata.
+
+#### `TOOLS`
+
+Human-authored guidance for how the agent should use its available tools.
+
+```dockerfile
+TOOLS TOOLS.md
+```
+
+#### `HEARTBEAT`
+
+Declares scheduled or recurring execution semantics.
+
+```dockerfile
+HEARTBEAT EVERY 30s FILE HEARTBEAT.md
+HEARTBEAT CRON "*/5 * * * *" FILE HEARTBEAT.md
+```
+
+#### `MEMORY`
+
+Declares memory policy, not the memory contents themselves.
+
+```dockerfile
+MEMORY POLICY MEMORY.md
+```
+
+#### `PROMPT`
+
+Adds inline prompt text.
+
+```dockerfile
+PROMPT "Prefer concise responses."
+```
+
+or:
+
+```dockerfile
+PROMPT <<EOF
+Prefer concise responses.
+Do not claim live data without a tool call.
+EOF
+```
+
+### Models
+
+#### `MODEL`
+
+```dockerfile
+MODEL gpt-5.4-mini
+```
+
+#### `FALLBACK`
+
+```dockerfile
+FALLBACK gpt-5.4-nano
+FALLBACK claude-sonnet-4-6
+```
+
+#### `ROUTING`
+
+```dockerfile
+ROUTING balanced
+ROUTING deep
+ROUTING fast
+```
+
+### Tools
+
+Tools must be explicitly declared.
+
+#### `TOOL LOCAL`
+
+```dockerfile
+TOOL LOCAL tools/fetch_price.py AS fetch_price
+TOOL LOCAL tools/browser.ts AS browse APPROVAL required
+TOOL LOCAL tools/report.py AS report USING python3 -u
+TOOL LOCAL tools/report.py AS report USING python3 -u DESCRIPTION "Generate a report from JSON input."
+TOOL LOCAL tools/report.py AS report SCHEMA schemas/report.json DESCRIPTION "Generate a report from structured JSON input."
+```
+
+Supported clauses:
+
+- `AS <alias>`
+- `USING <command> [args...]`
+- `APPROVAL <policy>`
+- `DESCRIPTION "..."` for model/tooling guidance
+- `SCHEMA <file>` to package a JSON input schema for structured tool invocation
+
+#### `TOOL BUILTIN`
+
+```dockerfile
+TOOL BUILTIN web_search
+TOOL BUILTIN human_approval APPROVAL audit DESCRIPTION "Request a human approval with an audit trail."
+```
+
+#### `TOOL MCP`
+
+```dockerfile
+TOOL MCP slack
+TOOL MCP github APPROVAL required DESCRIPTION "Use the GitHub MCP server for repository operations."
+```
+
+#### `TOOL A2A`
+
+```dockerfile
+TOOL A2A broker-agent ORIGIN https://broker.example.com APPROVAL required
+```
+
+### Files and Assets
+
+#### `COPY`
+
+Copies files from build context into the parcel.
+
+```dockerfile
+COPY refs/ /app/refs/
+COPY tools/ /app/tools/
+```
+
+#### `ADD`
+
+Reserved for remote or archive-aware expansion. Optional in v1.
+
+### Courier Policy
+
+#### `ENV`
+
+```dockerfile
+ENV TZ=UTC
+ENV LOG_LEVEL=info
+```
+
+#### `SECRET`
+
+Declares a required execution secret.
+
+```dockerfile
+SECRET OPENAI_API_KEY
+SECRET DATABASE_URL
+```
+
+#### `NETWORK`
+
+```dockerfile
+NETWORK none
+NETWORK publishers-only
+NETWORK allow api.example.com
+```
+
+#### `VISIBILITY`
+
+```dockerfile
+VISIBILITY open
+VISIBILITY opaque
+```
+
+#### `TIMEOUT`
+
+```dockerfile
+TIMEOUT RUN 300s
+TIMEOUT TOOL 60s
+TIMEOUT LLM 120s
+```
+
+#### `LIMIT`
+
+```dockerfile
+LIMIT ITERATIONS 20
+LIMIT TOOL_CALLS 12
+LIMIT TOOL_OUTPUT 10000
+LIMIT CONTEXT_TOKENS 16000
+```
+
+### Mounts
+
+Mounts are state backends, similar to volumes.
+
+#### `MOUNT SESSION`
+
+```dockerfile
+MOUNT SESSION memory
+MOUNT SESSION sqlite
+MOUNT SESSION postgres
+```
+
+#### `MOUNT MEMORY`
+
+```dockerfile
+MOUNT MEMORY none
+MOUNT MEMORY sqlite
+MOUNT MEMORY pgvector
+```
+
+#### `MOUNT ARTIFACTS`
+
+```dockerfile
+MOUNT ARTIFACTS local
+MOUNT ARTIFACTS s3
+```
+
+### Evaluation
+
+#### `EVAL`
+
+```dockerfile
+EVAL evals/smoke.eval
+EVAL evals/safety.eval REQUIRED
+```
+
+#### `TEST`
+
+Reserved for local build verification commands.
+
+```dockerfile
+TEST tool:fetch_price
+```
+
+### Entrypoint
+
+#### `ENTRYPOINT`
+
+Defines how the agent is invoked.
+
+```dockerfile
+ENTRYPOINT chat
+ENTRYPOINT heartbeat
+ENTRYPOINT job
+ENTRYPOINT http
+```
+
+## Resolution Order
+
+The final prompt stack should resolve in this order:
+
+1. base parcel defaults
+2. `SOUL`
+3. `SKILL`
+4. `MEMORY POLICY`
+5. `HEARTBEAT`
+6. inline `PROMPT`
+7. courier system supplements injected by the selected courier
+
+This order matters and should be deterministic.
+
+## Build-Time Validation
+
+`dispatch build` should fail if:
+
+- referenced files are missing
+- a declared local tool does not exist
+- a built-in tool is unknown
+- a required secret is malformed at deploy time
+- `HEARTBEAT` exists without a schedulable entry mode
+- incompatible mounts are declared
+- unsupported instructions are used by the selected `FROM`
+
+## Normalized Parcel Manifest
+
+Every built parcel should expose a normalized courier config that any backend can consume:
+
+- parcel digest
+- instruction stack
+- resolved tools
+- policy
+- entrypoint
+- mount requirements
+- env and secret declarations
+
+This normalized config is the bridge into:
+
+- local runner
+- container courier
+- worker courier
+- sandbox courier
+- control plane deployment systems
+
+## Layering
+
+Layering should exist, but not dominate v1.
+
+Supported pattern:
+
+```dockerfile
+FROM acme/research-base:1
+SKILL market/SKILL.md
+MODEL gpt-5.4-mini
+```
+
+The derived parcel can override:
+
+- prompt files
+- model defaults
+- tool declarations
+- policy
+
+It should not mutate parent parcel history.
+
+## Lockfile
+
+Optional but recommended:
+
+- `parcel.lock`
+
+It records:
+
+- source file digests
+- normalized instruction stack digest
+- tool resolution
+- base parcel digest
+- output parcel digest
+
+## v1 Scope
+
+In scope:
+
+- parser
+- normalized build graph
+- local build
+- local run
+- parcel digest
+- explicit tool declarations
+- prompt stack resolution
+- session/memory/artifact mounts
+
+Out of scope for v1:
+
+- OCI transport compatibility
+- distributed layer registry
+- binary delta layers
+- arbitrary shell build steps
+
+## Key Decision
+
+`Agentfile` is not a generic programming language.
+
+It is a constrained build language for packaging and running agents reproducibly.
