@@ -13,6 +13,7 @@ use dispatch_core::{
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -124,6 +125,9 @@ enum Command {
         /// Verify detached parcel signatures immediately after pull
         #[arg(long = "public-key")]
         public_keys: Vec<PathBuf>,
+        /// Apply a trust policy file that matches reference prefixes to public keys
+        #[arg(long)]
+        trust_policy: Option<PathBuf>,
     },
     /// Execute part of a built parcel locally
     Run(RunArgs),
@@ -341,6 +345,21 @@ struct EvalReport {
     results: Vec<EvalCaseResult>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct TrustPolicyDocument {
+    #[serde(default)]
+    rules: Vec<TrustPolicyRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct TrustPolicyRule {
+    reference_prefix: String,
+    #[serde(default)]
+    public_keys: Vec<PathBuf>,
+    #[serde(default)]
+    require_signatures: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ConformanceCheck {
     name: String,
@@ -395,7 +414,8 @@ fn main() -> Result<()> {
             reference,
             output_dir,
             public_keys,
-        } => pull(&reference, output_dir, public_keys),
+            trust_policy,
+        } => pull(&reference, output_dir, public_keys, trust_policy),
         Command::Run(args) => run(args),
         Command::Courier { command } => courier_command(command),
         Command::State { command } => state_command(command),
@@ -960,12 +980,29 @@ fn push(path: PathBuf, reference: &str) -> Result<()> {
     Ok(())
 }
 
-fn pull(reference: &str, output_dir: Option<PathBuf>, public_keys: Vec<PathBuf>) -> Result<()> {
+fn pull(
+    reference: &str,
+    output_dir: Option<PathBuf>,
+    public_keys: Vec<PathBuf>,
+    trust_policy: Option<PathBuf>,
+) -> Result<()> {
+    let raw_reference = reference.to_string();
     let reference = parse_depot_reference(reference)
         .with_context(|| format!("invalid depot reference `{reference}`"))?;
+    let (policy_keys, require_signatures) = match trust_policy.as_deref() {
+        Some(policy_path) => resolve_trust_policy_for_reference(&raw_reference, policy_path)?,
+        None => (Vec::new(), false),
+    };
+    let public_keys = merge_public_keys(public_keys, policy_keys);
     let output_root = output_dir.unwrap_or_else(default_pull_output_root);
     let pulled = pull_parcel(&reference, &output_root)?;
-    if !public_keys.is_empty() {
+    if !public_keys.is_empty() || require_signatures {
+        if require_signatures && public_keys.is_empty() {
+            bail!(
+                "trust policy requires signatures for `{}` but no public keys matched",
+                raw_reference
+            );
+        }
         let integrity = verify_parcel(&pulled.parcel_dir).with_context(|| {
             format!(
                 "failed to verify pulled parcel {}",
@@ -1002,6 +1039,44 @@ fn default_pull_output_root() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".dispatch/parcels")
+}
+
+fn resolve_trust_policy_for_reference(
+    reference: &str,
+    policy_path: &Path,
+) -> Result<(Vec<PathBuf>, bool)> {
+    let source = fs::read_to_string(policy_path)
+        .with_context(|| format!("failed to read {}", policy_path.display()))?;
+    let policy: TrustPolicyDocument = serde_yaml::from_str(&source)
+        .with_context(|| format!("failed to parse {}", policy_path.display()))?;
+    let policy_root = policy_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut public_keys = Vec::new();
+    let mut require_signatures = false;
+
+    for rule in policy.rules {
+        if !reference.starts_with(&rule.reference_prefix) {
+            continue;
+        }
+        require_signatures |= rule.require_signatures;
+        for public_key in rule.public_keys {
+            public_keys.push(if public_key.is_absolute() {
+                public_key
+            } else {
+                policy_root.join(public_key)
+            });
+        }
+    }
+
+    Ok((public_keys, require_signatures))
+}
+
+fn merge_public_keys(explicit_keys: Vec<PathBuf>, policy_keys: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    explicit_keys
+        .into_iter()
+        .chain(policy_keys)
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 fn courier_command(command: CourierCommand) -> Result<()> {
@@ -2383,6 +2458,7 @@ mod tests {
             reference,
             output_dir,
             public_keys,
+            trust_policy,
         } = cli.command
         else {
             panic!("expected pull command");
@@ -2390,6 +2466,7 @@ mod tests {
         assert_eq!(reference, "file:///tmp/depot::acme/monitor:v1");
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/parcels")));
         assert!(public_keys.is_empty());
+        assert!(trust_policy.is_none());
     }
 
     #[test]
@@ -2722,7 +2799,7 @@ mod tests {
         let pull_root = dir.path().join("pulled");
 
         super::push(parcel_dir.clone(), &depot_ref).unwrap();
-        super::pull(&depot_ref, Some(pull_root.clone()), Vec::new()).unwrap();
+        super::pull(&depot_ref, Some(pull_root.clone()), Vec::new(), None).unwrap();
 
         let pulled_manifest = pull_root.join(&parcel_digest).join("manifest.json");
         assert!(pulled_manifest.exists());
@@ -2850,7 +2927,73 @@ mod tests {
         super::sign(parcel_dir.clone(), &secret_key).unwrap();
         super::push(parcel_dir, &depot_ref).unwrap();
 
-        super::pull(&depot_ref, Some(pull_root.clone()), vec![public_key]).unwrap();
+        super::pull(&depot_ref, Some(pull_root.clone()), vec![public_key], None).unwrap();
+    }
+
+    #[test]
+    fn pull_can_verify_signatures_via_trust_policy() {
+        let dir = tempdir().unwrap();
+        let (parcel_dir, parcel_digest) = build_test_image(dir.path());
+        let keys_dir = dir.path().join("keys");
+        let depot_ref = format!(
+            "file://{}::acme/trusted-fixture:v1",
+            dir.path().join("depot").display()
+        );
+        let pull_root = dir.path().join("pulled");
+        let policy_path = dir.path().join("trust-policy.yaml");
+
+        super::keygen("release", Some(keys_dir.clone())).unwrap();
+        let secret_key = keys_dir.join("release.dispatch-secret.json");
+        super::sign(parcel_dir.clone(), &secret_key).unwrap();
+        super::push(parcel_dir, &depot_ref).unwrap();
+        fs::write(
+            &policy_path,
+            "rules:\n  - reference_prefix: \"file://\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
+        )
+        .unwrap();
+
+        super::pull(
+            &depot_ref,
+            Some(pull_root.clone()),
+            Vec::new(),
+            Some(policy_path),
+        )
+        .unwrap();
+        assert!(
+            pull_root
+                .join(&parcel_digest)
+                .join("manifest.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn pull_fails_when_trust_policy_requires_signatures_but_none_exist() {
+        let dir = tempdir().unwrap();
+        let (parcel_dir, _) = build_test_image(dir.path());
+        let keys_dir = dir.path().join("keys");
+        let depot_ref = format!(
+            "file://{}::acme/unsigned-fixture:v1",
+            dir.path().join("depot").display()
+        );
+        let pull_root = dir.path().join("pulled");
+        let policy_path = dir.path().join("trust-policy.yaml");
+
+        super::keygen("release", Some(keys_dir.clone())).unwrap();
+        super::push(parcel_dir, &depot_ref).unwrap();
+        fs::write(
+            &policy_path,
+            "rules:\n  - reference_prefix: \"file://\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
+        )
+        .unwrap();
+
+        let error =
+            super::pull(&depot_ref, Some(pull_root), Vec::new(), Some(policy_path)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pulled parcel failed verification")
+        );
     }
 
     #[cfg(unix)]
