@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod parse;
 pub mod plugin_protocol;
 pub mod plugins;
+pub mod signing;
 pub mod validate;
 
 pub use ast::{Instruction, ParsedAgentfile, Value};
@@ -42,5 +43,10 @@ pub use plugins::{
     CourierPluginRegistry, PluginRegistryError, PluginTransport, ResolvedCourier,
     default_courier_registry_path, install_courier_plugin, list_courier_catalog,
     load_courier_registry, resolve_courier,
+};
+pub use signing::{
+    DISPATCH_SIGNATURE_ALGORITHM, GeneratedKeyPair, PARCEL_SIGNATURES_DIR, ParcelSignature,
+    PublicKeyFile, SecretKeyFile, SignatureVerification, SigningError, generate_keypair_files,
+    sign_parcel, verify_parcel_signature,
 };
 pub use validate::{Diagnostic, Level, ValidationReport, validate_agentfile};

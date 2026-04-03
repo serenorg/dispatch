@@ -79,6 +79,7 @@ mod tests {
                         role: "user".to_string(),
                         content: "hello".to_string(),
                     }],
+                    resolved_mounts: Vec::new(),
                     backend_state: None,
                 },
                 operation: CourierOperation::Chat {

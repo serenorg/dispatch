@@ -207,10 +207,7 @@ pub fn build_agentfile(
         match instruction.keyword.as_str() {
             "FROM" => {
                 resolved.courier =
-                    first_scalar(instruction.args.first()).map(|reference| CourierTarget {
-                        reference,
-                        component: None,
-                    });
+                    first_scalar(instruction.args.first()).map(CourierTarget::from_reference);
             }
             "COMPONENT" => {
                 let component = parse_component(&instruction.args);
@@ -226,8 +223,13 @@ pub fn build_agentfile(
                         instruction.span.line_start
                     ))
                 })?;
-
-                courier.component = Some(WasmComponentConfig {
+                if !courier.is_wasm() {
+                    return Err(BuildError::Validation(
+                        "`COMPONENT` is only supported for `dispatch/wasm` courier targets"
+                            .to_string(),
+                    ));
+                }
+                courier.set_component(WasmComponentConfig {
                     packaged_path: source_path,
                     sha256: component_sha256,
                     abi: DISPATCH_WASM_ABI.to_string(),
@@ -572,20 +574,9 @@ fn validate_for_build(parsed: &ParsedAgentfile) -> Result<(), BuildError> {
 }
 
 fn validate_courier_requirements(courier: &CourierTarget) -> Result<(), BuildError> {
-    let is_wasm = courier.reference == "wasm"
-        || courier.reference == "dispatch/wasm"
-        || courier.reference.starts_with("dispatch/wasm:")
-        || courier.reference.starts_with("dispatch/wasm@");
-
-    if is_wasm && courier.component.is_none() {
+    if courier.is_wasm() && courier.component().is_none() {
         return Err(BuildError::Validation(
             "line 1: `FROM dispatch/wasm...` requires a `COMPONENT <path>` instruction".to_string(),
-        ));
-    }
-
-    if !is_wasm && courier.component.is_some() {
-        return Err(BuildError::Validation(
-            "`COMPONENT` is only supported for `dispatch/wasm` courier targets".to_string(),
         ));
     }
 
@@ -1094,7 +1085,7 @@ ENTRYPOINT chat
             serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
 
         assert_eq!(parcel.schema, PARCEL_SCHEMA_URL);
-        assert_eq!(parcel.courier.reference, "dispatch/native:latest");
+        assert_eq!(parcel.courier.reference(), "dispatch/native:latest");
         assert_eq!(
             parcel
                 .framework
@@ -1365,10 +1356,11 @@ ENTRYPOINT chat
             serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
         let component = parcel
             .courier
-            .component
+            .component()
+            .cloned()
             .expect("expected wasm component in courier target");
 
-        assert_eq!(parcel.courier.reference, "dispatch/wasm:latest");
+        assert_eq!(parcel.courier.reference(), "dispatch/wasm:latest");
         assert_eq!(component.packaged_path, "components/assistant.wat");
         assert_eq!(component.abi, DISPATCH_WASM_ABI);
         assert_eq!(component.sha256.len(), 64);

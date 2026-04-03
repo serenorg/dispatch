@@ -43,10 +43,81 @@ pub struct FrameworkProvenance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CourierTarget {
-    pub reference: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub component: Option<WasmComponentConfig>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CourierTarget {
+    Native {
+        reference: String,
+    },
+    Docker {
+        reference: String,
+    },
+    Wasm {
+        reference: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        component: Option<WasmComponentConfig>,
+    },
+    Custom {
+        reference: String,
+    },
+}
+
+impl CourierTarget {
+    pub fn from_reference(reference: String) -> Self {
+        if reference == "native"
+            || reference == "dispatch/native"
+            || reference.starts_with("dispatch/native:")
+            || reference.starts_with("dispatch/native@")
+        {
+            return Self::Native { reference };
+        }
+        if reference == "docker"
+            || reference == "dispatch/docker"
+            || reference.starts_with("dispatch/docker:")
+            || reference.starts_with("dispatch/docker@")
+        {
+            return Self::Docker { reference };
+        }
+        if reference == "wasm"
+            || reference == "dispatch/wasm"
+            || reference.starts_with("dispatch/wasm:")
+            || reference.starts_with("dispatch/wasm@")
+        {
+            return Self::Wasm {
+                reference,
+                component: None,
+            };
+        }
+        Self::Custom { reference }
+    }
+
+    pub fn reference(&self) -> &str {
+        match self {
+            Self::Native { reference }
+            | Self::Docker { reference }
+            | Self::Wasm { reference, .. }
+            | Self::Custom { reference } => reference,
+        }
+    }
+
+    pub fn component(&self) -> Option<&WasmComponentConfig> {
+        match self {
+            Self::Wasm { component, .. } => component.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_component(&mut self, component: WasmComponentConfig) {
+        match self {
+            Self::Wasm {
+                component: slot, ..
+            } => *slot = Some(component),
+            _ => unreachable!("component only applies to wasm courier targets"),
+        }
+    }
+
+    pub fn is_wasm(&self) -> bool {
+        matches!(self, Self::Wasm { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

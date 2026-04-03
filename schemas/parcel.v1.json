@@ -176,12 +176,64 @@
       }
     },
     "courierTarget": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/nativeCourierTarget"
+        },
+        {
+          "$ref": "#/$defs/dockerCourierTarget"
+        },
+        {
+          "$ref": "#/$defs/wasmCourierTarget"
+        },
+        {
+          "$ref": "#/$defs/customCourierTarget"
+        }
+      ]
+    },
+    "nativeCourierTarget": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "kind",
         "reference"
       ],
       "properties": {
+        "kind": {
+          "const": "native"
+        },
+        "reference": {
+          "type": "string"
+        }
+      }
+    },
+    "dockerCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "docker"
+        },
+        "reference": {
+          "type": "string"
+        }
+      }
+    },
+    "wasmCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "wasm"
+        },
         "reference": {
           "type": "string"
         },
@@ -194,6 +246,22 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "customCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "custom"
+        },
+        "reference": {
+          "type": "string"
         }
       }
     },

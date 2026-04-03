@@ -4,10 +4,11 @@ use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
     CourierEvent, CourierInspection, CourierOperation, CourierPluginManifest, CourierRequest,
     CourierSession, DockerCourier, JsonlCourierPlugin, Level, LoadedParcel, NativeCourier,
-    ParcelManifest, ResolvedCourier, ToolInvocation, VerificationReport, WasmCourier,
-    build_agentfile, default_courier_registry_path, install_courier_plugin, list_courier_catalog,
-    load_parcel, parse_agentfile, parse_depot_reference, pull_parcel, push_parcel, resolve_courier,
-    validate_agentfile, verify_parcel,
+    ParcelManifest, ResolvedCourier, SignatureVerification, ToolInvocation, VerificationReport,
+    WasmCourier, build_agentfile, default_courier_registry_path, generate_keypair_files,
+    install_courier_plugin, list_courier_catalog, load_parcel, parse_agentfile,
+    parse_depot_reference, pull_parcel, push_parcel, resolve_courier, sign_parcel,
+    validate_agentfile, verify_parcel, verify_parcel_signature,
 };
 use futures::executor::block_on;
 use std::{
@@ -62,9 +63,29 @@ enum Command {
     Verify {
         /// Path to a parcel directory or a `manifest.json` file
         path: PathBuf,
+        /// Verify a detached parcel signature with the given public key file.
+        #[arg(long = "public-key")]
+        public_keys: Vec<PathBuf>,
         /// Print full verification report as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Generate an Ed25519 signing keypair for parcel signatures
+    Keygen {
+        /// Stable key identifier used in detached signature filenames
+        #[arg(long)]
+        key_id: String,
+        /// Output directory for generated key files
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
+    /// Sign a parcel with a detached signature file
+    Sign {
+        /// Path to a parcel directory or a `manifest.json` file
+        path: PathBuf,
+        /// Path to a generated secret key JSON file
+        #[arg(long = "secret-key")]
+        secret_key: PathBuf,
     },
     /// Push a built parcel to a depot reference
     Push {
@@ -174,7 +195,13 @@ fn main() -> Result<()> {
             registry,
             json,
         } => inspect(path, courier, registry, json),
-        Command::Verify { path, json } => verify(path, json),
+        Command::Verify {
+            path,
+            public_keys,
+            json,
+        } => verify(path, public_keys, json),
+        Command::Keygen { key_id, output_dir } => keygen(&key_id, output_dir),
+        Command::Sign { path, secret_key } => sign(path, &secret_key),
         Command::Push { path, reference } => push(path, &reference),
         Command::Pull {
             reference,
@@ -278,7 +305,7 @@ fn inspect(
         "Version: {}",
         image.version.as_deref().unwrap_or("<unspecified>")
     );
-    println!("Courier Target: {}", image.courier.reference);
+    println!("Courier Target: {}", image.courier.reference());
     println!(
         "Entrypoint: {}",
         image.entrypoint.as_deref().unwrap_or("<none>")
@@ -304,21 +331,67 @@ fn resolve_manifest_path(path: PathBuf) -> PathBuf {
     }
 }
 
-fn verify(path: PathBuf, emit_json: bool) -> Result<()> {
+fn verify(path: PathBuf, public_keys: Vec<PathBuf>, emit_json: bool) -> Result<()> {
     let report =
         verify_parcel(&path).with_context(|| format!("failed to verify {}", path.display()))?;
+    let signature_checks = public_keys
+        .iter()
+        .map(|public_key| {
+            verify_parcel_signature(&path, public_key).with_context(|| {
+                format!(
+                    "failed to verify detached signature for {} with {}",
+                    path.display(),
+                    public_key.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if emit_json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "integrity": report,
+                "signatures": signature_checks,
+            }))?
+        );
     } else {
         print_verification_report(&report);
+        if !signature_checks.is_empty() {
+            print_signature_verifications(&signature_checks);
+        }
     }
 
-    if report.is_ok() {
+    let signatures_ok = signature_checks.iter().all(SignatureVerification::is_ok);
+    if report.is_ok() && signatures_ok {
         Ok(())
     } else {
         bail!("verification failed")
     }
+}
+
+fn keygen(key_id: &str, output_dir: Option<PathBuf>) -> Result<()> {
+    let output_dir = output_dir.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".dispatch/keys")
+    });
+    let generated = generate_keypair_files(&output_dir, key_id)?;
+    println!("Secret key: {}", generated.secret_key_path.display());
+    println!("Public key: {}", generated.public_key_path.display());
+    Ok(())
+}
+
+fn sign(path: PathBuf, secret_key: &Path) -> Result<()> {
+    let signature = sign_parcel(&path, secret_key).with_context(|| {
+        format!(
+            "failed to sign {} with {}",
+            path.display(),
+            secret_key.display()
+        )
+    })?;
+    println!("Signature: {}", signature.display());
+    Ok(())
 }
 
 fn push(path: PathBuf, reference: &str) -> Result<()> {
@@ -820,6 +893,17 @@ fn print_verification_report(report: &VerificationReport) {
     }
 }
 
+fn print_signature_verifications(verifications: &[SignatureVerification]) {
+    println!("Detached Signatures:");
+    for verification in verifications {
+        println!("  Key ID: {}", verification.key_id);
+        println!("  Algorithm: {}", verification.algorithm);
+        println!("  Signature Found: {}", verification.signature_found);
+        println!("  Digest Matches: {}", verification.digest_matches);
+        println!("  Signature Matches: {}", verification.signature_matches);
+    }
+}
+
 fn print_courier_events(events: &[CourierEvent]) {
     for event in events {
         match event {
@@ -871,7 +955,10 @@ mod tests {
         BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
         CourierSession, PluginTransport, build_agentfile,
     };
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     use tempfile::tempdir;
 
     #[cfg(unix)]
@@ -893,6 +980,7 @@ mod tests {
                     content: "world".to_string(),
                 },
             ],
+            resolved_mounts: Vec::new(),
             backend_state: None,
         }
     }
@@ -988,6 +1076,70 @@ mod tests {
         };
         assert_eq!(reference, "file:///tmp/depot::acme/monitor:v1");
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/parcels")));
+    }
+
+    #[test]
+    fn cli_parses_verify_with_public_keys() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "verify",
+            "manifest.json",
+            "--public-key",
+            "release.dispatch-public.json",
+            "--public-key",
+            "ops.dispatch-public.json",
+        ])
+        .unwrap();
+
+        let Command::Verify {
+            path,
+            public_keys,
+            json,
+        } = cli.command
+        else {
+            panic!("expected verify command");
+        };
+        assert_eq!(path, Path::new("manifest.json"));
+        assert_eq!(
+            public_keys,
+            vec![
+                PathBuf::from("release.dispatch-public.json"),
+                PathBuf::from("ops.dispatch-public.json")
+            ]
+        );
+        assert!(!json);
+    }
+
+    #[test]
+    fn cli_parses_keygen_and_sign_commands() {
+        let keygen = Cli::try_parse_from([
+            "dispatch",
+            "keygen",
+            "--key-id",
+            "release",
+            "--output-dir",
+            "/tmp/keys",
+        ])
+        .unwrap();
+        let Command::Keygen { key_id, output_dir } = keygen.command else {
+            panic!("expected keygen command");
+        };
+        assert_eq!(key_id, "release");
+        assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/keys")));
+
+        let sign = Cli::try_parse_from([
+            "dispatch",
+            "sign",
+            "manifest.json",
+            "--secret-key",
+            "release.dispatch-secret.json",
+        ])
+        .unwrap();
+        let Command::Sign { path, secret_key } = sign.command else {
+            panic!("expected sign command");
+        };
+        assert_eq!(path, Path::new("manifest.json"));
+        assert_eq!(secret_key, PathBuf::from("release.dispatch-secret.json"));
     }
 
     #[test]
@@ -1129,6 +1281,20 @@ mod tests {
         assert_eq!(sessionless.config.digest, parcel_digest);
     }
 
+    #[test]
+    fn sign_and_verify_round_trip() {
+        let dir = tempdir().unwrap();
+        let (parcel_dir, _) = build_test_image(dir.path());
+        let keys_dir = dir.path().join("keys");
+
+        super::keygen("release", Some(keys_dir.clone())).unwrap();
+        let secret_key = keys_dir.join("release.dispatch-secret.json");
+        let public_key = keys_dir.join("release.dispatch-public.json");
+
+        super::sign(parcel_dir.clone(), &secret_key).unwrap();
+        super::verify(parcel_dir, vec![public_key], false).unwrap();
+    }
+
     #[cfg(unix)]
     fn build_test_image(root: &Path) -> (std::path::PathBuf, String) {
         let context_dir = root.join("image");
@@ -1201,6 +1367,7 @@ ENTRYPOINT chat\n",
                     command: script_path.display().to_string(),
                     args: Vec::new(),
                 },
+                installed_sha256: None,
             })
             .unwrap(),
         )

@@ -669,6 +669,7 @@ version = "0.1.0"
 dependencies = [
  "dispatch-wasm-abi",
  "futures",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.11.0",

@@ -1,5 +1,6 @@
 use crate::courier::CourierKind;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -29,6 +30,8 @@ pub struct CourierPluginManifest {
     pub transport: PluginTransport,
     pub description: Option<String>,
     pub exec: CourierPluginExec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -96,6 +99,10 @@ pub enum PluginRegistryError {
     BuiltinNameConflict { name: String },
     #[error("courier `{name}` is not installed")]
     UnknownCourier { name: String },
+    #[error(
+        "courier plugin manifest `{path}` references an executable path that is invalid: {message}"
+    )]
+    InvalidExecutablePath { path: String, message: String },
 }
 
 impl BuiltinCourier {
@@ -169,7 +176,7 @@ pub fn install_courier_plugin(
             path: manifest_path.display().to_string(),
             source,
         })?;
-    let manifest: CourierPluginManifest =
+    let mut manifest: CourierPluginManifest =
         serde_json::from_str(&body).map_err(|source| PluginRegistryError::ParseJson {
             path: manifest_path.display().to_string(),
             source,
@@ -184,6 +191,10 @@ pub fn install_courier_plugin(
             name: manifest.name.clone(),
         });
     }
+
+    let exec_path = resolve_plugin_exec_path(manifest_path, &manifest.exec.command)?;
+    manifest.exec.command = exec_path.display().to_string();
+    manifest.installed_sha256 = Some(hash_file_sha256(&exec_path)?);
 
     let registry_path = match registry_path {
         Some(path) => path.to_path_buf(),
@@ -304,6 +315,62 @@ fn validate_plugin_manifest(
     Ok(())
 }
 
+fn resolve_plugin_exec_path(
+    manifest_path: &Path,
+    command: &str,
+) -> Result<PathBuf, PluginRegistryError> {
+    let candidate = PathBuf::from(command);
+    if !candidate.is_absolute() && candidate.components().count() == 1 {
+        return Err(PluginRegistryError::InvalidExecutablePath {
+            path: manifest_path.display().to_string(),
+            message:
+                "exec.command must be an absolute path or a relative path rooted at the manifest directory"
+                    .to_string(),
+        });
+    }
+
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(candidate)
+    };
+
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|source| PluginRegistryError::ReadFile {
+            path: resolved.display().to_string(),
+            source,
+        })?;
+    if !canonical.is_file() {
+        return Err(PluginRegistryError::InvalidExecutablePath {
+            path: manifest_path.display().to_string(),
+            message: format!("exec.command `{}` does not resolve to a file", command),
+        });
+    }
+    Ok(canonical)
+}
+
+fn hash_file_sha256(path: &Path) -> Result<String, PluginRegistryError> {
+    let body = fs::read(path).map_err(|source| PluginRegistryError::ReadFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(encode_hex(Sha256::digest(body)))
+}
+
+fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
 fn catalog_name(entry: &CourierCatalogEntry) -> &str {
     match entry {
         CourierCatalogEntry::Builtin { name, .. } => name,
@@ -314,36 +381,47 @@ fn catalog_name(entry: &CourierCatalogEntry) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
     fn install_courier_plugin_round_trips_registry() {
         let dir = tempdir().unwrap();
+        let script_path = dir.path().join("dispatch-courier-demo.sh");
+        fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
         let manifest_path = dir.path().join("courier-plugin.json");
         let registry_path = dir.path().join("plugins.json");
         fs::write(
             &manifest_path,
-            "{\n\
+            format!(
+                "{{\n\
 \"name\": \"demo-plugin\",\n\
 \"version\": \"0.1.0\",\n\
 \"protocol_version\": 1,\n\
 \"transport\": \"jsonl\",\n\
 \"description\": \"Demo courier plugin\",\n\
-\"exec\": {\n\
-\"command\": \"/usr/local/bin/dispatch-courier-demo\",\n\
+\"exec\": {{\n\
+\"command\": \"{}\",\n\
 \"args\": [\"--stdio\"]\n\
-}\n\
-}",
+}}\n\
+}}",
+                script_path.display()
+            ),
         )
         .unwrap();
 
         let installed = install_courier_plugin(&manifest_path, Some(&registry_path)).unwrap();
         assert_eq!(installed.name, "demo-plugin");
+        assert!(installed.installed_sha256.is_some());
 
         let registry = load_courier_registry(Some(&registry_path)).unwrap();
         assert_eq!(registry.plugins.len(), 1);
         assert_eq!(registry.plugins[0].name, "demo-plugin");
         assert_eq!(registry.plugins[0].transport, PluginTransport::Jsonl);
+        assert!(registry.plugins[0].installed_sha256.is_some());
     }
 
     #[test]

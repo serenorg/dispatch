@@ -114,6 +114,9 @@ cargo run -p dispatch -- inspect examples/wasm-reference/.dispatch/parcels/<dige
 cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest> --courier native
 cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest> --courier remote-worker --registry .dispatch/couriers.json
 cargo run -p dispatch -- verify examples/basic/.dispatch/parcels/<digest>
+cargo run -p dispatch -- keygen --key-id release --output-dir .dispatch/keys
+cargo run -p dispatch -- sign examples/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
+cargo run -p dispatch -- verify examples/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
 cargo run -p dispatch -- courier ls
 cargo run -p dispatch -- courier inspect docker
 cargo run -p dispatch-courier-echo -- --stdio
@@ -148,6 +151,7 @@ The built manifest now includes a `$schema` pointer and is described by [`schema
 - recomputes the parcel manifest digest from the normalized manifest content
 - validates `parcel.lock` digest, layout metadata, and file list
 - re-hashes every packaged file under `context/`
+- optionally verifies detached Ed25519 signatures with `--public-key <path>`
 - fails if packaged files are missing or modified
 
 `run` behavior:
@@ -206,6 +210,7 @@ Courier registry behavior:
 - installed JSONL courier plugins can now be executed through `dispatch run --courier <name>` and `dispatch inspect --courier <name>`
 - `dispatch run` and `dispatch inspect` both support `--registry <path>` when you want to target a non-default courier registry
 - external plugins execute through the stream-first JSONL plugin protocol defined in `docs/courier-plugin-protocol-v1.md`
+- plugin installation resolves the executable path and records its SHA256 digest; Dispatch checks that digest before each plugin launch
 - `crates/dispatch-courier-echo` is the in-repo reference implementation of that protocol
 
 Depot behavior:

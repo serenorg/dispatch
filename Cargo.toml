@@ -27,3 +27,4 @@ ureq = { version = "3", features = ["json"] }
 walkdir = "2"
 wasmtime = "43"
 wasmtime-wasi = "43"
+ring = "0.17"

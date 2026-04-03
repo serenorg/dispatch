@@ -90,6 +90,12 @@ pub enum CourierError {
     },
     #[error("required secret `{name}` is not present in the environment")]
     MissingSecret { name: String },
+    #[error("courier `{courier}` does not support mount `{kind:?}` with driver `{driver}`")]
+    UnsupportedMount {
+        courier: String,
+        kind: MountKind,
+        driver: String,
+    },
     #[error("failed to start tool `{tool}`: {source}")]
     SpawnTool {
         tool: String,
@@ -145,6 +151,14 @@ pub enum CourierError {
         courier: String,
         status: i32,
         stderr: String,
+    },
+    #[error(
+        "courier plugin `{courier}` executable hash changed: expected `{expected_sha256}`, got `{actual_sha256}`"
+    )]
+    PluginExecutableChanged {
+        courier: String,
+        expected_sha256: String,
+        actual_sha256: String,
     },
     #[error("operation `{operation}` is not supported by courier `{courier}`")]
     UnsupportedOperation { courier: String, operation: String },
@@ -232,13 +246,13 @@ pub enum CourierKind {
     Custom,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MountRequest {
     pub parcel_digest: String,
     pub spec: MountConfig,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedMount {
     pub kind: MountKind,
     pub driver: String,
@@ -301,6 +315,8 @@ pub struct CourierSession {
     pub entrypoint: Option<String>,
     pub turn_count: u64,
     pub history: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub resolved_mounts: Vec<ResolvedMount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_state: Option<String>,
 }
@@ -848,6 +864,121 @@ fn validate_required_secrets(parcel: &LoadedParcel) -> Result<(), CourierError> 
     Ok(())
 }
 
+fn ensure_mounts_supported(
+    courier_name: &str,
+    mounts: &[MountConfig],
+    supported_mounts: &[MountKind],
+) -> Result<(), CourierError> {
+    for mount in mounts {
+        if !supported_mounts.contains(&mount.kind) {
+            return Err(CourierError::UnsupportedMount {
+                courier: courier_name.to_string(),
+                kind: mount.kind,
+                driver: mount.driver.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn resolve_builtin_mounts(
+    parcel: &LoadedParcel,
+    courier_name: &str,
+    session_id: &str,
+) -> Result<Vec<ResolvedMount>, CourierError> {
+    let mut mounts = Vec::with_capacity(parcel.config.mounts.len());
+    let state_root = parcel
+        .parcel_dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(parcel.parcel_dir.as_path())
+        .join("state")
+        .join(&parcel.config.digest)
+        .join(session_id);
+
+    for mount in &parcel.config.mounts {
+        let resolved = match (mount.kind, mount.driver.as_str()) {
+            (MountKind::Session, "memory") => ResolvedMount {
+                kind: mount.kind,
+                driver: mount.driver.clone(),
+                target_path: format!("dispatch://session/{session_id}"),
+                metadata: BTreeMap::from([("storage".to_string(), "memory".to_string())]),
+            },
+            (MountKind::Session, "sqlite") => {
+                let path = state_root.join("session.sqlite");
+                ensure_parent_dir(&path)?;
+                touch_file(&path)?;
+                ResolvedMount {
+                    kind: mount.kind,
+                    driver: mount.driver.clone(),
+                    target_path: path.display().to_string(),
+                    metadata: BTreeMap::new(),
+                }
+            }
+            (MountKind::Memory, "none") => ResolvedMount {
+                kind: mount.kind,
+                driver: mount.driver.clone(),
+                target_path: "dispatch://memory/none".to_string(),
+                metadata: BTreeMap::new(),
+            },
+            (MountKind::Memory, "sqlite") => {
+                let path = state_root.join("memory.sqlite");
+                ensure_parent_dir(&path)?;
+                touch_file(&path)?;
+                ResolvedMount {
+                    kind: mount.kind,
+                    driver: mount.driver.clone(),
+                    target_path: path.display().to_string(),
+                    metadata: BTreeMap::new(),
+                }
+            }
+            (MountKind::Artifacts, "local") => {
+                let path = state_root.join("artifacts");
+                fs::create_dir_all(&path).map_err(|source| CourierError::ReadFile {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+                ResolvedMount {
+                    kind: mount.kind,
+                    driver: mount.driver.clone(),
+                    target_path: path.display().to_string(),
+                    metadata: BTreeMap::new(),
+                }
+            }
+            _ => {
+                return Err(CourierError::UnsupportedMount {
+                    courier: courier_name.to_string(),
+                    kind: mount.kind,
+                    driver: mount.driver.clone(),
+                });
+            }
+        };
+        mounts.push(resolved);
+    }
+
+    Ok(mounts)
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), CourierError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| CourierError::ReadFile {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn touch_file(path: &Path) -> Result<(), CourierError> {
+    if path.exists() {
+        return Ok(());
+    }
+    fs::write(path, []).map_err(|source| CourierError::ReadFile {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
 fn forwarded_tool_env(parcel: &LoadedParcel, input: Option<&str>) -> Vec<(String, String)> {
     let mut env = Vec::new();
     for var in ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"] {
@@ -1078,8 +1209,10 @@ impl CourierBackend for NativeCourier {
             validation?;
             validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let session_id = format!("native-{parcel_digest}-{sequence}");
             Ok(CourierSession {
-                id: format!("native-{parcel_digest}-{sequence}"),
+                resolved_mounts: resolve_builtin_mounts(image, "native", &session_id)?,
+                id: session_id,
                 parcel_digest,
                 entrypoint,
                 turn_count: 0,
@@ -1209,7 +1342,7 @@ impl CourierBackend for DockerCourier {
             supports_job: false,
             supports_heartbeat: false,
             supports_local_tools: true,
-            supports_mounts: Vec::new(),
+            supports_mounts: vec![MountKind::Session, MountKind::Memory, MountKind::Artifacts],
         })
     }
 
@@ -1217,7 +1350,7 @@ impl CourierBackend for DockerCourier {
         &self,
         image: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         async move { validate_courier_reference("docker", CourierKind::Docker, &reference) }
     }
 
@@ -1225,7 +1358,7 @@ impl CourierBackend for DockerCourier {
         &self,
         image: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         let inspection = CourierInspection {
             courier_id: self.id().to_string(),
             kind: self.kind(),
@@ -1249,15 +1382,17 @@ impl CourierBackend for DockerCourier {
         &self,
         image: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         let parcel_digest = image.config.digest.clone();
         let entrypoint = image.config.entrypoint.clone();
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
             validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let session_id = format!("docker-{parcel_digest}-{sequence}");
             Ok(CourierSession {
-                id: format!("docker-{parcel_digest}-{sequence}"),
+                resolved_mounts: resolve_builtin_mounts(image, "docker", &session_id)?,
+                id: session_id,
                 parcel_digest,
                 entrypoint,
                 turn_count: 0,
@@ -1280,7 +1415,7 @@ impl CourierBackend for DockerCourier {
             validate_courier_reference(
                 "docker",
                 CourierKind::Docker,
-                &image.config.courier.reference,
+                image.config.courier.reference(),
             )?;
             ensure_session_matches_parcel(image, &session)?;
             session.turn_count += 1;
@@ -1431,6 +1566,12 @@ impl CourierBackend for JsonlCourierPlugin {
         let parcel_dir = canonical_parcel_dir(image);
         async move {
             validate_required_secrets(image)?;
+            let capabilities = courier.capabilities().await?;
+            ensure_mounts_supported(
+                &courier.manifest.name,
+                image.config.mounts.as_slice(),
+                &capabilities.supports_mounts,
+            )?;
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::OpenSession { parcel_dir })? {
                 PluginResponse::Result {
@@ -1561,6 +1702,17 @@ impl JsonlCourierPlugin {
     }
 
     fn spawn_plugin(&self) -> Result<Child, CourierError> {
+        if let Some(expected_sha256) = self.manifest.installed_sha256.as_deref() {
+            let actual_sha256 = hash_file_sha256(Path::new(&self.manifest.exec.command))?;
+            if actual_sha256 != expected_sha256 {
+                return Err(CourierError::PluginExecutableChanged {
+                    courier: self.manifest.name.clone(),
+                    expected_sha256: expected_sha256.to_string(),
+                    actual_sha256,
+                });
+            }
+        }
+
         let mut command = Command::new(&self.manifest.exec.command);
         command
             .args(&self.manifest.exec.args)
@@ -1683,7 +1835,7 @@ impl CourierBackend for WasmCourier {
             supports_job: true,
             supports_heartbeat: true,
             supports_local_tools: true,
-            supports_mounts: Vec::new(),
+            supports_mounts: vec![MountKind::Session, MountKind::Memory, MountKind::Artifacts],
         })
     }
 
@@ -1698,7 +1850,7 @@ impl CourierBackend for WasmCourier {
             validate_courier_reference(
                 "wasm",
                 CourierKind::Wasm,
-                &parcel.config.courier.reference,
+                parcel.config.courier.reference(),
             )?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
@@ -1718,7 +1870,7 @@ impl CourierBackend for WasmCourier {
             validate_courier_reference(
                 "wasm",
                 CourierKind::Wasm,
-                &parcel.config.courier.reference,
+                parcel.config.courier.reference(),
             )?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
@@ -1750,7 +1902,7 @@ impl CourierBackend for WasmCourier {
             validate_courier_reference(
                 "wasm",
                 CourierKind::Wasm,
-                &parcel.config.courier.reference,
+                parcel.config.courier.reference(),
             )?;
             validate_required_secrets(&parcel)?;
             let component_path = resolve_wasm_component_path(&parcel)?;
@@ -1758,8 +1910,10 @@ impl CourierBackend for WasmCourier {
             let _ = load_wasm_component(&engine, &component_cache, &parcel, &component_path)?;
 
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let session_id = format!("wasm-{}-{sequence}", parcel.config.digest);
             Ok(CourierSession {
-                id: format!("wasm-{}-{sequence}", parcel.config.digest),
+                resolved_mounts: resolve_builtin_mounts(&parcel, "wasm", &session_id)?,
+                id: session_id,
                 parcel_digest: parcel.config.digest.clone(),
                 entrypoint: parcel.config.entrypoint.clone(),
                 turn_count: 0,
@@ -1784,7 +1938,7 @@ impl CourierBackend for WasmCourier {
             validate_courier_reference(
                 "wasm",
                 CourierKind::Wasm,
-                &parcel.config.courier.reference,
+                parcel.config.courier.reference(),
             )?;
             ensure_session_matches_parcel(&parcel, &session)?;
             validate_wasm_component_metadata(&parcel)?;
@@ -1889,7 +2043,7 @@ impl CourierBackend for StubCourier {
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
         let courier_id = self.courier_id;
         let kind = self.kind;
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         async move { validate_courier_reference(courier_id, kind, &reference) }
     }
 
@@ -1899,7 +2053,7 @@ impl CourierBackend for StubCourier {
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
         let courier_id = self.courier_id;
         let kind = self.kind;
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         let inspection = CourierInspection {
             courier_id: courier_id.to_string(),
             kind,
@@ -1925,12 +2079,13 @@ impl CourierBackend for StubCourier {
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
         let courier_id = self.courier_id;
         let kind = self.kind;
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         let parcel_digest = image.config.digest.clone();
         let entrypoint = image.config.entrypoint.clone();
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;
             validate_required_secrets(image)?;
+            ensure_mounts_supported(courier_id, image.config.mounts.as_slice(), &[])?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             Ok(CourierSession {
                 id: format!("{courier_id}-{parcel_digest}-{sequence}"),
@@ -1938,6 +2093,7 @@ impl CourierBackend for StubCourier {
                 entrypoint,
                 turn_count: 0,
                 history: Vec::new(),
+                resolved_mounts: Vec::new(),
                 backend_state: None,
             })
         }
@@ -1950,7 +2106,7 @@ impl CourierBackend for StubCourier {
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let courier_id = self.courier_id.to_string();
         let kind = self.kind;
-        let reference = image.config.courier.reference.clone();
+        let reference = image.config.courier.reference().to_string();
         let operation = request.operation;
         let mut session = request.session;
 
@@ -2035,17 +2191,20 @@ fn validate_native_parcel(image: &LoadedParcel) -> Result<(), CourierError> {
     validate_courier_reference(
         "native",
         CourierKind::Native,
-        &image.config.courier.reference,
+        image.config.courier.reference(),
     )
 }
 
 fn validate_wasm_component_metadata(parcel: &LoadedParcel) -> Result<(), CourierError> {
-    let component = parcel.config.courier.component.as_ref().ok_or_else(|| {
-        CourierError::MissingCourierComponent {
-            courier: "wasm".to_string(),
-            parcel_digest: parcel.config.digest.clone(),
-        }
-    })?;
+    let component =
+        parcel
+            .config
+            .courier
+            .component()
+            .ok_or_else(|| CourierError::MissingCourierComponent {
+                courier: "wasm".to_string(),
+                parcel_digest: parcel.config.digest.clone(),
+            })?;
 
     if component.abi != DISPATCH_WASM_COMPONENT_ABI {
         return Err(CourierError::WasmGuest {
@@ -2061,12 +2220,15 @@ fn validate_wasm_component_metadata(parcel: &LoadedParcel) -> Result<(), Courier
 }
 
 fn resolve_wasm_component_path(parcel: &LoadedParcel) -> Result<PathBuf, CourierError> {
-    let component = parcel.config.courier.component.as_ref().ok_or_else(|| {
-        CourierError::MissingCourierComponent {
-            courier: "wasm".to_string(),
-            parcel_digest: parcel.config.digest.clone(),
-        }
-    })?;
+    let component =
+        parcel
+            .config
+            .courier
+            .component()
+            .ok_or_else(|| CourierError::MissingCourierComponent {
+                courier: "wasm".to_string(),
+                parcel_digest: parcel.config.digest.clone(),
+            })?;
     let path = parcel
         .parcel_dir
         .join("context")
@@ -2086,12 +2248,15 @@ fn load_wasm_component(
     parcel: &LoadedParcel,
     path: &Path,
 ) -> Result<Component, CourierError> {
-    let component_config = parcel.config.courier.component.as_ref().ok_or_else(|| {
-        CourierError::MissingCourierComponent {
-            courier: "wasm".to_string(),
-            parcel_digest: parcel.config.digest.clone(),
-        }
-    })?;
+    let component_config =
+        parcel
+            .config
+            .courier
+            .component()
+            .ok_or_else(|| CourierError::MissingCourierComponent {
+                courier: "wasm".to_string(),
+                parcel_digest: parcel.config.digest.clone(),
+            })?;
     if let Some(component) = component_cache
         .lock()
         .expect("wasm component cache lock poisoned")
@@ -2916,6 +3081,14 @@ fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
+fn hash_file_sha256(path: &Path) -> Result<String, CourierError> {
+    let body = fs::read(path).map_err(|source| CourierError::ReadFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(encode_hex(Sha256::digest(&body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2976,7 +3149,7 @@ mod tests {
         dir: &tempfile::TempDir,
         digest: &str,
         error_mode: bool,
-    ) -> JsonlCourierPlugin {
+    ) -> (JsonlCourierPlugin, std::path::PathBuf) {
         let plugin_path = dir.path().join("plugin.sh");
         let script = if error_mode {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"kind\":\"error\",\"error\":{\"code\":\"bad_request\",\"message\":\"plugin rejected request\"}}'\n"
@@ -2986,20 +3159,24 @@ mod tests {
                 "#!/bin/sh\nrequest=$(cat)\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\n"
             )
         };
-        fs::write(&plugin_path, script).unwrap();
+        fs::write(&plugin_path, &script).unwrap();
         fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
 
-        JsonlCourierPlugin::new(CourierPluginManifest {
-            name: "demo-plugin".to_string(),
-            version: "0.1.0".to_string(),
-            protocol_version: 1,
-            transport: crate::plugins::PluginTransport::Jsonl,
-            description: Some("Demo plugin".to_string()),
-            exec: crate::plugins::CourierPluginExec {
-                command: plugin_path.display().to_string(),
-                args: Vec::new(),
-            },
-        })
+        (
+            JsonlCourierPlugin::new(CourierPluginManifest {
+                name: "demo-plugin".to_string(),
+                version: "0.1.0".to_string(),
+                protocol_version: 1,
+                transport: crate::plugins::PluginTransport::Jsonl,
+                description: Some("Demo plugin".to_string()),
+                exec: crate::plugins::CourierPluginExec {
+                    command: plugin_path.display().to_string(),
+                    args: Vec::new(),
+                },
+                installed_sha256: Some(encode_hex(Sha256::digest(script.as_bytes()))),
+            }),
+            plugin_path,
+        )
     }
 
     #[derive(Default)]
@@ -3120,7 +3297,7 @@ ENTRYPOINT chat
 ",
             &[],
         );
-        let courier =
+        let (courier, _) =
             build_test_plugin_courier(&test_image._dir, &test_image.image.config.digest, false);
 
         let capabilities = futures::executor::block_on(courier.capabilities()).unwrap();
@@ -3167,7 +3344,7 @@ ENTRYPOINT chat
 ",
             &[],
         );
-        let courier =
+        let (courier, _) =
             build_test_plugin_courier(&test_image._dir, &test_image.image.config.digest, true);
 
         let error = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap_err();
@@ -3175,6 +3352,28 @@ ENTRYPOINT chat
             error,
             CourierError::PluginProtocol { courier, message }
                 if courier == "demo-plugin" && message.contains("bad_request") && message.contains("plugin rejected request")
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jsonl_plugin_courier_detects_executable_drift() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/custom:latest
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let (courier, plugin_path) =
+            build_test_plugin_courier(&test_image._dir, &test_image.image.config.digest, false);
+        fs::write(&plugin_path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = futures::executor::block_on(courier.capabilities()).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::PluginExecutableChanged { courier, .. } if courier == "demo-plugin"
         ));
     }
 
