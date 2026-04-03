@@ -2443,45 +2443,26 @@ impl CourierBackend for JsonlCourierPlugin {
                 &capabilities.supports_mounts,
             )?;
             let parcel_dir = parcel_dir?;
-            if courier.uses_persistent_processes() {
-                let mut process = courier.spawn_persistent_plugin()?;
-                process.write_request(
-                    courier.manifest.protocol_version,
-                    &courier.manifest.name,
-                    PluginRequest::OpenSession { parcel_dir },
-                )?;
-                match process.read_response(&courier.manifest.name)? {
-                    PluginResponse::Result {
-                        session: Some(session),
-                        ..
-                    } => {
-                        courier.store_persistent_process(session.id.clone(), process)?;
-                        Ok(session)
-                    }
-                    PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
-                        courier: courier.manifest.name.clone(),
-                        message: format!("{}: {}", error.code, error.message),
-                    }),
-                    other => Err(courier.unexpected_plugin_response(
-                        "open_session",
-                        describe_plugin_response(&other),
-                    )),
+            let mut process = courier.spawn_persistent_plugin()?;
+            process.write_request(
+                courier.manifest.protocol_version,
+                &courier.manifest.name,
+                PluginRequest::OpenSession { parcel_dir },
+            )?;
+            match process.read_response(&courier.manifest.name)? {
+                PluginResponse::Result {
+                    session: Some(session),
+                    ..
+                } => {
+                    courier.store_persistent_process(session.id.clone(), process)?;
+                    Ok(session)
                 }
-            } else {
-                match courier.plugin_request(PluginRequest::OpenSession { parcel_dir })? {
-                    PluginResponse::Result {
-                        session: Some(session),
-                        ..
-                    } => Ok(session),
-                    PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
-                        courier: courier.manifest.name.clone(),
-                        message: format!("{}: {}", error.code, error.message),
-                    }),
-                    other => Err(courier.unexpected_plugin_response(
-                        "open_session",
-                        describe_plugin_response(&other),
-                    )),
-                }
+                PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
+                    courier: courier.manifest.name.clone(),
+                    message: format!("{}: {}", error.code, error.message),
+                }),
+                other => Err(courier
+                    .unexpected_plugin_response("open_session", describe_plugin_response(&other))),
             }
         }
     }
@@ -2496,53 +2477,20 @@ impl CourierBackend for JsonlCourierPlugin {
         async move {
             ensure_session_matches_parcel(image, &request.session)?;
             let parcel_dir = parcel_dir?;
-            if courier.uses_persistent_processes() {
-                let session_id = request.session.id.clone();
-                let response = courier.run_persistent_plugin(
-                    session_id,
-                    PluginRequest::Run {
-                        parcel_dir,
-                        session: request.session,
-                        operation: request.operation,
-                    },
-                )?;
-                Ok(CourierResponse {
-                    courier_id: courier.manifest.name.clone(),
-                    session: response.0,
-                    events: response.1,
-                })
-            } else {
-                let mut child = courier.spawn_plugin()?;
-                write_plugin_request(
-                    &mut child,
-                    &courier.manifest.name,
-                    courier.manifest.protocol_version,
-                    PluginRequest::Run {
-                        parcel_dir,
-                        session: request.session,
-                        operation: request.operation,
-                    },
-                    true,
-                )?;
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| CourierError::PluginProtocol {
-                        courier: courier.manifest.name.clone(),
-                        message: "plugin stdout was not captured".to_string(),
-                    })?;
-                let mut reader = BufReader::new(stdout);
-                let mut events = Vec::new();
-                let final_session =
-                    read_plugin_run_completion(&mut reader, &courier.manifest.name, &mut events)?;
-                wait_for_plugin_exit(child, &courier.manifest.name)?;
-
-                Ok(CourierResponse {
-                    courier_id: courier.manifest.name.clone(),
-                    session: final_session,
-                    events,
-                })
-            }
+            let session_id = request.session.id.clone();
+            let response = courier.run_persistent_plugin(
+                session_id,
+                PluginRequest::Run {
+                    parcel_dir,
+                    session: request.session,
+                    operation: request.operation,
+                },
+            )?;
+            Ok(CourierResponse {
+                courier_id: courier.manifest.name.clone(),
+                session: response.0,
+                events: response.1,
+            })
         }
     }
 }
@@ -2623,10 +2571,6 @@ impl JsonlCourierPlugin {
             stdout: BufReader::new(stdout),
             stderr,
         })
-    }
-
-    fn uses_persistent_processes(&self) -> bool {
-        self.manifest.protocol_version >= 2
     }
 
     fn store_persistent_process(
@@ -4319,7 +4263,7 @@ mod tests {
                 .to_string()
         } else {
             format!(
-                "#!/bin/sh\nrequest=$(cat)\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\n"
+                "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n"
             )
         };
         fs::write(&plugin_path, &script).unwrap();
@@ -4342,14 +4286,14 @@ mod tests {
         )
     }
 
-    fn build_test_persistent_plugin_courier(
+    fn build_test_counting_plugin_courier(
         dir: &tempfile::TempDir,
         digest: &str,
     ) -> (JsonlCourierPlugin, std::path::PathBuf, std::path::PathBuf) {
-        let plugin_path = dir.path().join("persistent-plugin.sh");
-        let starts_path = dir.path().join("persistent-plugin-starts.log");
+        let plugin_path = dir.path().join("counting-plugin.sh");
+        let starts_path = dir.path().join("plugin-starts.log");
         let script = format!(
-            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin-v2\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-v2\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-v2\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-v2\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
+            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-counting-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
             starts_path.display()
         );
         fs::write(&plugin_path, &script).unwrap();
@@ -4357,11 +4301,11 @@ mod tests {
 
         (
             JsonlCourierPlugin::new(CourierPluginManifest {
-                name: "demo-plugin-v2".to_string(),
-                version: "0.2.0".to_string(),
-                protocol_version: 2,
+                name: "demo-counting-plugin".to_string(),
+                version: "0.1.0".to_string(),
+                protocol_version: 1,
                 transport: crate::plugins::PluginTransport::Jsonl,
-                description: Some("Demo persistent courier plugin".to_string()),
+                description: Some("Demo counting courier plugin".to_string()),
                 exec: crate::plugins::CourierPluginExec {
                     command: plugin_path.display().to_string(),
                     args: Vec::new(),
@@ -4643,7 +4587,7 @@ ENTRYPOINT chat
 
     #[test]
     #[cfg(unix)]
-    fn jsonl_plugin_protocol_v2_reuses_persistent_process_across_turns() {
+    fn jsonl_plugin_reuses_persistent_process_across_turns() {
         let test_image = build_test_image(
             "\
 FROM dispatch/custom:latest
@@ -4652,7 +4596,7 @@ ENTRYPOINT chat
             &[],
         );
         let (courier, _plugin_path, starts_path) =
-            build_test_persistent_plugin_courier(&test_image._dir, &test_image.image.config.digest);
+            build_test_counting_plugin_courier(&test_image._dir, &test_image.image.config.digest);
 
         let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
         let starts_after_open = fs::read_to_string(&starts_path).unwrap();

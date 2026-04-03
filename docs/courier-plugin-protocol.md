@@ -1,8 +1,8 @@
-# Courier Plugin Protocol v2
+# Courier Plugin Protocol
 
 Dispatch courier plugins are external executables that implement the Dispatch courier contract over stdio.
 
-Protocol v2 keeps the same newline-delimited JSON envelope and response shapes as v1, but adds one important execution rule:
+Dispatch uses newline-delimited JSON envelopes and responses over stdio, with one important execution rule:
 
 - `open_session` may start a persistent plugin process for that session
 - subsequent `run` requests for the same session are sent to the same process over the same stdio stream
@@ -11,23 +11,23 @@ This removes the per-turn process spawn cost for multi-turn chat, job, and heart
 
 ## Transport
 
-Protocol v2 uses newline-delimited JSON over stdio.
+The protocol uses newline-delimited JSON over stdio.
 
 - Dispatch writes one JSON request line at a time to plugin stdin
 - the plugin writes one JSON object per line to stdout
 - stderr is reserved for human-readable diagnostics and logs
 
-Unlike v1, Dispatch may keep stdin/stdout open across multiple requests for one session.
+Dispatch may keep stdin/stdout open across multiple requests for one session.
 
 ## Plugin Manifest
 
-Plugins opt into v2 by declaring:
+Plugins declare the protocol version in their manifest:
 
 ```json
 {
   "name": "remote-worker",
   "version": "0.2.0",
-  "protocol_version": 2,
+  "protocol_version": 1,
   "transport": "jsonl",
   "description": "Execute Dispatch parcels on a remote worker pool.",
   "exec": {
@@ -37,15 +37,15 @@ Plugins opt into v2 by declaring:
 }
 ```
 
-Dispatch currently supports protocol versions `1` and `2`.
+Dispatch currently supports protocol version `1`.
 
 ## Request Envelope
 
-Every request uses the same envelope shape as v1:
+Every request uses the same envelope shape:
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 1,
   "request": {
     "kind": "capabilities"
   }
@@ -64,7 +64,7 @@ For parcel-aware requests, Dispatch passes the absolute built parcel directory i
 
 ## Session Lifecycle
 
-The key v2 rule is session affinity.
+The key rule is session affinity.
 
 - `capabilities`, `validate_parcel`, and `inspect` may still be handled as one-shot requests
 - `open_session` creates a session and may leave the plugin process running
@@ -80,7 +80,7 @@ Plugins should therefore:
 
 ## Responses
 
-Response shapes are unchanged from v1.
+Response shapes are:
 
 Non-streaming requests return one line with `kind: "result"` or `kind: "error"`.
 
@@ -96,19 +96,13 @@ Example `run` stream:
 {"kind":"done","session":{"id":"remote-worker-<digest>-1","parcel_digest":"<digest>","entrypoint":"chat","turn_count":2,"history":[{"role":"user","content":"hello"},{"role":"assistant","content":"hello"}]}}
 ```
 
-## Compatibility Guidance
+## Implementation Guidance
 
-Use protocol v1 if:
+The intended implementation model is:
 
-- your courier is one-shot
-- process startup cost is negligible
-- you want the simplest possible implementation
-
-Use protocol v2 if:
-
-- your courier needs multi-turn performance
-- you keep warm model/tool/runtime state in memory
-- you want one long-lived process per session
+- keep warm model/tool/runtime state in memory per session
+- continue reading requests until stdin closes or the process is terminated
+- avoid per-turn process startup during multi-turn chat, job, and heartbeat flows
 
 ## Trust Model
 

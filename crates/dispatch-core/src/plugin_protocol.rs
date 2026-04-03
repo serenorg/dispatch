@@ -3,7 +3,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const COURIER_PLUGIN_PROTOCOL_VERSION: u32 = 2;
+pub const COURIER_PLUGIN_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginRequestEnvelope {

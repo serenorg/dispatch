@@ -26,22 +26,24 @@ fn main() -> std::process::ExitCode {
 
 fn run_stdio() -> Result<(), String> {
     let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-    let line = match lines.next() {
-        Some(line) => line.map_err(|error| format!("failed to read request: {error}"))?,
-        None => return Ok(()),
-    };
-    let envelope: PluginRequestEnvelope =
-        serde_json::from_str(&line).map_err(|error| format!("invalid request JSON: {error}"))?;
-    if envelope.protocol_version != COURIER_PLUGIN_PROTOCOL_VERSION {
-        return Err(format!(
-            "unsupported protocol version {}",
-            envelope.protocol_version
-        ));
-    }
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|error| format!("failed to read request: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope: PluginRequestEnvelope = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid request JSON: {error}"))?;
+        if envelope.protocol_version != COURIER_PLUGIN_PROTOCOL_VERSION {
+            return Err(format!(
+                "unsupported protocol version {}",
+                envelope.protocol_version
+            ));
+        }
 
-    for response in handle_request(envelope.request)? {
-        emit_response(&response).map_err(|error| format!("failed to write response: {error}"))?;
+        for response in handle_request(envelope.request)? {
+            emit_response(&response)
+                .map_err(|error| format!("failed to write response: {error}"))?;
+        }
     }
     Ok(())
 }

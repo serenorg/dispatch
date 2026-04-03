@@ -1812,7 +1812,7 @@ ENTRYPOINT chat\n",
                 concat!(
                     "#!/bin/sh\n",
                     "set -eu\n",
-                    "IFS= read -r line || exit 1\n",
+                    "while IFS= read -r line; do\n",
                     "if printf '%s' \"$line\" | grep -q '\"kind\":\"capabilities\"'; then\n",
                     "  printf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n",
                     "elif printf '%s' \"$line\" | grep -q '\"kind\":\"validate_parcel\"'; then\n",
@@ -1827,7 +1827,8 @@ ENTRYPOINT chat\n",
                     "else\n",
                     "  printf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}}}'\n",
                     "  exit 1\n",
-                    "fi\n"
+                    "fi\n",
+                    "done\n"
                 ),
                 parcel_digest = parcel_digest
             ),

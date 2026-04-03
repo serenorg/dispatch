@@ -305,11 +305,11 @@ fn validate_plugin_manifest(
             message: "protocol_version must be greater than zero".to_string(),
         });
     }
-    if !matches!(manifest.protocol_version, 1 | 2) {
+    if manifest.protocol_version != 1 {
         return Err(PluginRegistryError::InvalidManifest {
             path: path.display().to_string(),
             message: format!(
-                "protocol_version `{}` is unsupported; expected 1 or 2",
+                "protocol_version `{}` is unsupported; expected 1",
                 manifest.protocol_version
             ),
         });
