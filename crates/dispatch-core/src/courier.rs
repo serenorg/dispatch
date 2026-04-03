@@ -468,6 +468,9 @@ pub trait CourierBackend: Send + Sync {
 
 pub trait ChatModelBackend: Send + Sync {
     fn id(&self) -> &str;
+    fn supports_previous_response_id(&self) -> bool {
+        false
+    }
     fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError>;
 }
 
@@ -3497,6 +3500,7 @@ fn execute_native_turn(
             };
 
             if !reply.tool_calls.is_empty() {
+                let reply_tool_calls = reply.tool_calls.clone();
                 let mut tool_outputs = Vec::with_capacity(reply.tool_calls.len());
                 for tool_call in reply.tool_calls {
                     let invocation = ToolInvocation {
@@ -3555,9 +3559,19 @@ fn execute_native_turn(
                     });
                 }
 
-                request.messages.clear();
-                request.tool_outputs = tool_outputs;
-                request.previous_response_id = reply.response_id;
+                if chat_backend.supports_previous_response_id() {
+                    request.messages.clear();
+                    request.tool_outputs = tool_outputs;
+                    request.previous_response_id = reply.response_id;
+                } else {
+                    request.messages = build_followup_messages_for_tool_outputs(
+                        request.messages,
+                        &reply_tool_calls,
+                        &tool_outputs,
+                    );
+                    request.tool_outputs.clear();
+                    request.previous_response_id = None;
+                }
                 continue;
             }
 
@@ -3735,6 +3749,10 @@ impl ChatModelBackend for OpenAiResponsesBackend {
         "openai_responses"
     }
 
+    fn supports_previous_response_id(&self) -> bool {
+        true
+    }
+
     fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
         let api_key = match std::env::var("OPENAI_API_KEY") {
             Ok(value) => value,
@@ -3835,6 +3853,48 @@ fn openai_tool_output_item(output: &ModelToolOutput) -> serde_json::Value {
             "output": output.output,
         }),
     }
+}
+
+fn build_followup_messages_for_tool_outputs(
+    mut messages: Vec<ConversationMessage>,
+    tool_calls: &[ModelToolCall],
+    tool_outputs: &[ModelToolOutput],
+) -> Vec<ConversationMessage> {
+    if !tool_calls.is_empty() {
+        let tool_call_lines = tool_calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "tool_call id={} name={} kind={:?} input={}",
+                    call.call_id, call.name, call.kind, call.input
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        messages.push(ConversationMessage {
+            role: "assistant".to_string(),
+            content: format!("Tool call request:\n{tool_call_lines}"),
+        });
+    }
+
+    if !tool_outputs.is_empty() {
+        let tool_output_lines = tool_outputs
+            .iter()
+            .map(|output| {
+                format!(
+                    "tool_result id={} kind={:?}\n{}",
+                    output.call_id, output.kind, output.output
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        messages.push(ConversationMessage {
+            role: "user".to_string(),
+            content: format!("Tool results:\n{tool_output_lines}"),
+        });
+    }
+
+    messages
 }
 
 fn extract_openai_output(
@@ -4062,6 +4122,7 @@ mod tests {
     struct FakeChatBackend {
         replies: Mutex<Vec<Result<Option<ModelReply>, String>>>,
         calls: Mutex<Vec<ModelRequest>>,
+        supports_previous_response_id: bool,
     }
 
     impl FakeChatBackend {
@@ -4074,6 +4135,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 }))]),
                 calls: Mutex::new(Vec::new()),
+                supports_previous_response_id: true,
             }
         }
 
@@ -4081,6 +4143,15 @@ mod tests {
             Self {
                 replies: Mutex::new(replies.into_iter().map(Ok).collect()),
                 calls: Mutex::new(Vec::new()),
+                supports_previous_response_id: true,
+            }
+        }
+
+        fn with_replies_without_previous_response_id(replies: Vec<Option<ModelReply>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into_iter().map(Ok).collect()),
+                calls: Mutex::new(Vec::new()),
+                supports_previous_response_id: false,
             }
         }
 
@@ -4088,6 +4159,7 @@ mod tests {
             Self {
                 replies: Mutex::new(vec![Err(error.into())]),
                 calls: Mutex::new(Vec::new()),
+                supports_previous_response_id: true,
             }
         }
     }
@@ -4095,6 +4167,10 @@ mod tests {
     impl ChatModelBackend for FakeChatBackend {
         fn id(&self) -> &str {
             "fake"
+        }
+
+        fn supports_previous_response_id(&self) -> bool {
+            self.supports_previous_response_id
         }
 
         fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
@@ -5499,6 +5575,74 @@ ENTRYPOINT chat
             Some(CourierEvent::ToolCallFinished { result })
                 if result.tool == "demo" && result.stdout.contains("tool-output")
         ));
+        assert!(matches!(
+            response.events.get(2),
+            Some(CourierEvent::Message { content, .. }) if content == "final answer"
+        ));
+        assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+    }
+
+    #[test]
+    fn native_courier_chat_reconstructs_followup_without_response_threading() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT chat
+",
+            &[("tools/demo.sh", "printf 'tool-output'")],
+        );
+        let backend = Arc::new(FakeChatBackend::with_replies_without_previous_response_id(
+            vec![
+                Some(ModelReply {
+                    text: None,
+                    backend: "fake".to_string(),
+                    response_id: Some("resp_1".to_string()),
+                    tool_calls: vec![ModelToolCall {
+                        call_id: "call_1".to_string(),
+                        name: "demo".to_string(),
+                        input: "{\"query\":\"ping\"}".to_string(),
+                        kind: ModelToolKind::Custom,
+                    }],
+                }),
+                Some(ModelReply {
+                    text: Some("final answer".to_string()),
+                    backend: "fake".to_string(),
+                    response_id: Some("resp_2".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+            ],
+        ));
+        let courier = NativeCourier::with_chat_backend(backend.clone());
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "use the tool".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].previous_response_id.is_none());
+        assert!(calls[1].tool_outputs.is_empty());
+        assert_eq!(calls[1].messages.len(), 3);
+        assert_eq!(calls[1].messages[0].role, "user");
+        assert_eq!(calls[1].messages[0].content, "use the tool");
+        assert_eq!(calls[1].messages[1].role, "assistant");
+        assert!(calls[1].messages[1].content.contains("tool_call id=call_1"));
+        assert!(calls[1].messages[1].content.contains("name=demo"));
+        assert_eq!(calls[1].messages[2].role, "user");
+        assert!(calls[1].messages[2].content.contains("Tool results:"));
+        assert!(calls[1].messages[2].content.contains("tool-output"));
+        drop(calls);
+
         assert!(matches!(
             response.events.get(2),
             Some(CourierEvent::Message { content, .. }) if content == "final answer"
