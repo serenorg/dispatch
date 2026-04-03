@@ -130,6 +130,8 @@ This separation enables:
 
 The `dispatch-wasm-guest-reference` crate shows how to build a guest component with multi-round tool calling, `previous_response_id` chain management, and session state. Any language that compiles to WASM with WIT component support can implement a guest.
 
+The reference WASM courier keeps a bounded in-process component cache keyed by component SHA256. Override the cache size with `DISPATCH_WASM_COMPONENT_CACHE_SIZE` if you need a smaller or larger warm set.
+
 ## Getting Started
 
 Build and run the reference examples:

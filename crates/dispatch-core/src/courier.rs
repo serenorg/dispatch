@@ -580,6 +580,19 @@ struct PersistentPluginProcess {
 }
 
 #[derive(Debug, Clone)]
+struct CachedValue<T> {
+    value: T,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BoundedLruCache<T> {
+    max_entries: usize,
+    tick: u64,
+    entries: BTreeMap<String, CachedValue<T>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DockerCourier {
     docker_bin: PathBuf,
     helper_image: String,
@@ -589,7 +602,7 @@ pub struct DockerCourier {
 pub struct WasmCourier {
     engine: Engine,
     chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
-    component_cache: Arc<Mutex<BTreeMap<String, Component>>>,
+    component_cache: Arc<Mutex<BoundedLruCache<Component>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -618,7 +631,9 @@ impl Default for WasmCourier {
         Self {
             engine,
             chat_backend_override: None,
-            component_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            component_cache: Arc::new(Mutex::new(BoundedLruCache::new(
+                wasm_component_cache_limit(),
+            ))),
         }
     }
 }
@@ -871,9 +886,67 @@ impl WasmCourier {
         Self {
             engine,
             chat_backend_override: Some(chat_backend),
-            component_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            component_cache: Arc::new(Mutex::new(BoundedLruCache::new(
+                wasm_component_cache_limit(),
+            ))),
         }
     }
+}
+
+impl<T: Clone> BoundedLruCache<T> {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            tick: 0,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<T> {
+        let entry = self.entries.get(key).cloned()?;
+        self.tick = self.tick.saturating_add(1);
+        if let Some(current) = self.entries.get_mut(key) {
+            current.last_used = self.tick;
+        }
+        Some(entry.value)
+    }
+
+    fn insert(&mut self, key: String, value: T) {
+        if self.max_entries == 0 {
+            return;
+        }
+        self.tick = self.tick.saturating_add(1);
+        self.entries.insert(
+            key,
+            CachedValue {
+                value,
+                last_used: self.tick,
+            },
+        );
+        while self.entries.len() > self.max_entries {
+            let Some(evicted_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&evicted_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+}
+
+fn wasm_component_cache_limit() -> usize {
+    std::env::var("DISPATCH_WASM_COMPONENT_CACHE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16)
 }
 
 impl DockerCourier {
@@ -3262,7 +3335,7 @@ fn resolve_wasm_component_path(parcel: &LoadedParcel) -> Result<PathBuf, Courier
 
 fn load_wasm_component(
     engine: &Engine,
-    component_cache: &Arc<Mutex<BTreeMap<String, Component>>>,
+    component_cache: &Arc<Mutex<BoundedLruCache<Component>>>,
     parcel: &LoadedParcel,
     path: &Path,
 ) -> Result<Component, CourierError> {
@@ -3279,7 +3352,6 @@ fn load_wasm_component(
         .lock()
         .expect("wasm component cache lock poisoned")
         .get(&component_config.sha256)
-        .cloned()
     {
         return Ok(component);
     }
@@ -3300,7 +3372,7 @@ fn load_wasm_component(
 
 fn instantiate_wasm_guest(
     engine: &Engine,
-    component_cache: &Arc<Mutex<BTreeMap<String, Component>>>,
+    component_cache: &Arc<Mutex<BoundedLruCache<Component>>>,
     parcel: &LoadedParcel,
     session: &CourierSession,
     chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
@@ -7102,5 +7174,21 @@ ENTRYPOINT job
         assert!(result.stdout.contains("visible_secret=secret-value"));
         assert!(result.stdout.contains("hidden_env="));
         assert!(!result.stdout.contains("hidden_env=hidden-value"));
+    }
+
+    #[test]
+    fn bounded_lru_cache_evicts_least_recently_used_entries() {
+        let mut cache = BoundedLruCache::new(2);
+        cache.insert("a".to_string(), "one".to_string());
+        cache.insert("b".to_string(), "two".to_string());
+
+        assert_eq!(cache.get("a").as_deref(), Some("one"));
+
+        cache.insert("c".to_string(), "three".to_string());
+
+        assert_eq!(cache.get("a").as_deref(), Some("one"));
+        assert_eq!(cache.get("b"), None);
+        assert_eq!(cache.get("c").as_deref(), Some("three"));
+        assert_eq!(cache.keys(), vec!["a".to_string(), "c".to_string()]);
     }
 }
