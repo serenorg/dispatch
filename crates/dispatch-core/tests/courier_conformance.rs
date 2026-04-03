@@ -4,6 +4,8 @@ use dispatch_core::{
     build_agentfile, load_parcel,
 };
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
 struct FixtureImage {
@@ -38,6 +40,14 @@ fn build_fixture(agentfile: &str, files: &[(&str, &str)]) -> FixtureImage {
 
 fn assert_done(response: &CourierResponse) {
     assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+}
+
+fn assert_assistant_message(response: &CourierResponse) {
+    assert!(
+        response.events.iter().any(
+            |event| matches!(event, CourierEvent::Message { role, .. } if role == "assistant")
+        )
+    );
 }
 
 #[test]
@@ -101,13 +111,86 @@ ENTRYPOINT chat
         },
     ))
     .unwrap();
-    assert!(matches!(
-        chat.events.first(),
-        Some(CourierEvent::Message { role, .. }) if role == "assistant"
-    ));
+    assert_assistant_message(&chat);
     assert_eq!(chat.session.turn_count, 1);
     assert_eq!(chat.session.history.len(), 2);
     assert_done(&chat);
+}
+
+#[test]
+fn native_courier_conformance_supports_job_heartbeat_and_direct_tools() {
+    let job_fixture = build_fixture(
+        "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT job
+",
+        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+    );
+    let heartbeat_fixture = build_fixture(
+        "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT heartbeat
+",
+        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+    );
+    let courier = NativeCourier::default();
+
+    let job_session =
+        futures::executor::block_on(courier.open_session(&job_fixture.image)).unwrap();
+    let job = futures::executor::block_on(courier.run(
+        &job_fixture.image,
+        CourierRequest {
+            session: job_session,
+            operation: CourierOperation::Job {
+                payload: "work item".to_string(),
+            },
+        },
+    ))
+    .unwrap();
+    assert_assistant_message(&job);
+    assert_done(&job);
+
+    let heartbeat_session =
+        futures::executor::block_on(courier.open_session(&heartbeat_fixture.image)).unwrap();
+    let heartbeat = futures::executor::block_on(courier.run(
+        &heartbeat_fixture.image,
+        CourierRequest {
+            session: heartbeat_session,
+            operation: CourierOperation::Heartbeat {
+                payload: Some("tick".to_string()),
+            },
+        },
+    ))
+    .unwrap();
+    assert_assistant_message(&heartbeat);
+    assert_done(&heartbeat);
+
+    let tool_session =
+        futures::executor::block_on(courier.open_session(&job_fixture.image)).unwrap();
+    let tool = futures::executor::block_on(courier.run(
+        &job_fixture.image,
+        CourierRequest {
+            session: tool_session,
+            operation: CourierOperation::InvokeTool {
+                invocation: dispatch_core::ToolInvocation {
+                    name: "demo".to_string(),
+                    input: Some("hello".to_string()),
+                },
+            },
+        },
+    ))
+    .unwrap();
+    assert!(tool.events.iter().any(|event| {
+        matches!(
+            event,
+            CourierEvent::ToolCallFinished { result } if result.tool == "demo" && result.exit_code == 0
+        )
+    }));
+    assert_done(&tool);
 }
 
 #[test]
@@ -169,13 +252,104 @@ ENTRYPOINT chat
         },
     ))
     .unwrap();
-    assert!(matches!(
-        chat.events.first(),
-        Some(CourierEvent::Message { role, .. }) if role == "assistant"
-    ));
+    assert_assistant_message(&chat);
     assert_eq!(chat.session.turn_count, 1);
     assert_eq!(chat.session.history.len(), 2);
     assert_done(&chat);
+}
+
+#[test]
+fn docker_courier_conformance_supports_job_heartbeat_and_direct_tools() {
+    let job_fixture = build_fixture(
+        "\
+FROM dispatch/docker:latest
+SOUL SOUL.md
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT job
+",
+        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+    );
+    let heartbeat_fixture = build_fixture(
+        "\
+FROM dispatch/docker:latest
+SOUL SOUL.md
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT heartbeat
+",
+        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+    );
+    #[cfg(unix)]
+    let docker_bin_dir = tempdir().unwrap();
+    #[cfg(unix)]
+    let courier = {
+        let docker_bin = docker_bin_dir.path().join("docker");
+        fs::write(
+            &docker_bin,
+            "\
+#!/bin/sh
+printf 'ok\\n'
+cat >/dev/null
+",
+        )
+        .unwrap();
+        fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        DockerCourier::new(&docker_bin, "python:3.13-alpine")
+    };
+    #[cfg(not(unix))]
+    let courier = DockerCourier::default();
+
+    let job_session =
+        futures::executor::block_on(courier.open_session(&job_fixture.image)).unwrap();
+    let job = futures::executor::block_on(courier.run(
+        &job_fixture.image,
+        CourierRequest {
+            session: job_session,
+            operation: CourierOperation::Job {
+                payload: "work item".to_string(),
+            },
+        },
+    ))
+    .unwrap();
+    assert_assistant_message(&job);
+    assert_done(&job);
+
+    let heartbeat_session =
+        futures::executor::block_on(courier.open_session(&heartbeat_fixture.image)).unwrap();
+    let heartbeat = futures::executor::block_on(courier.run(
+        &heartbeat_fixture.image,
+        CourierRequest {
+            session: heartbeat_session,
+            operation: CourierOperation::Heartbeat {
+                payload: Some("tick".to_string()),
+            },
+        },
+    ))
+    .unwrap();
+    assert_assistant_message(&heartbeat);
+    assert_done(&heartbeat);
+
+    let tool_session =
+        futures::executor::block_on(courier.open_session(&job_fixture.image)).unwrap();
+    let tool = futures::executor::block_on(courier.run(
+        &job_fixture.image,
+        CourierRequest {
+            session: tool_session,
+            operation: CourierOperation::InvokeTool {
+                invocation: dispatch_core::ToolInvocation {
+                    name: "demo".to_string(),
+                    input: Some("hello".to_string()),
+                },
+            },
+        },
+    ))
+    .unwrap();
+    assert!(tool.events.iter().any(|event| {
+        matches!(
+            event,
+            CourierEvent::ToolCallFinished { result } if result.tool == "demo" && result.exit_code == 0
+        )
+    }));
+    assert_done(&tool);
 }
 
 #[test]
