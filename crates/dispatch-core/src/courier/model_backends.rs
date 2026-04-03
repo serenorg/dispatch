@@ -362,6 +362,66 @@ impl ChatModelBackend for GeminiGenerateContentBackend {
         let body = read_model_json_response(response, self.id())?;
         extract_gemini_output(&body)
     }
+
+    fn generate_with_events(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelGeneration, CourierError> {
+        let api_key = std::env::var("LLM_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .or_else(|| std::env::var("GOOGLE_API_KEY").ok());
+        let api_key = match api_key {
+            Some(value) => value,
+            None => {
+                return Ok(ModelGeneration::NotConfigured {
+                    backend: self.id().to_string(),
+                    reason: "missing LLM_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY".to_string(),
+                });
+            }
+        };
+
+        let base_url = std::env::var("LLM_BASE_URL")
+            .ok()
+            .or_else(|| std::env::var("GEMINI_BASE_URL").ok())
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
+        let model = if request.model.starts_with("models/") {
+            request.model.clone()
+        } else {
+            format!("models/{}", request.model)
+        };
+        let url = format!(
+            "{}/{model}:streamGenerateContent?alt=sse",
+            base_url.trim_end_matches('/')
+        );
+        let mut payload = serde_json::json!({
+            "systemInstruction": {
+                "parts": [{ "text": request.instructions }]
+            },
+            "contents": gemini_messages(request),
+        });
+        if !request.tools.is_empty() {
+            payload["tools"] = serde_json::json!([{
+                "functionDeclarations": request
+                    .tools
+                    .iter()
+                    .map(gemini_tool_definition)
+                    .collect::<Vec<_>>()
+            }]);
+        }
+
+        let response = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("x-goog-api-key", &api_key)
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        read_gemini_streaming_response(response, self.id(), on_event)
+    }
 }
 
 fn openai_input_message(message: &ConversationMessage) -> serde_json::Value {
@@ -814,6 +874,28 @@ fn read_anthropic_streaming_response(
     extract_anthropic_output(&body)
 }
 
+fn read_gemini_streaming_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    backend: &str,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<ModelGeneration, CourierError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = format_provider_error_body(&body);
+        let message = if detail.is_empty() {
+            format!("{backend} HTTP {}", status.as_u16())
+        } else {
+            format!("{backend} HTTP {}: {detail}", status.as_u16())
+        };
+        return Err(CourierError::ModelBackendRequest(message));
+    }
+
+    let reader = BufReader::new(response.body_mut().as_reader());
+    let body = parse_gemini_streaming_events(reader, on_event)?;
+    extract_gemini_output(&body)
+}
+
 fn parse_anthropic_streaming_events<R: BufRead>(
     reader: R,
     on_event: &mut dyn FnMut(ModelStreamEvent),
@@ -947,6 +1029,67 @@ fn parse_anthropic_streaming_events<R: BufRead>(
     Ok(serde_json::json!({
         "id": message_id,
         "content": content,
+    }))
+}
+
+fn parse_gemini_streaming_events<R: BufRead>(
+    reader: R,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<serde_json::Value, CourierError> {
+    let mut text = String::new();
+    let mut tool_calls = Vec::<serde_json::Value>::new();
+
+    for event_data in parse_sse_data_events(reader)? {
+        let data = event_data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        let Some(candidate) = value
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|candidates| candidates.first())
+        else {
+            continue;
+        };
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for part in parts {
+            if let Some(chunk) = part.get("text").and_then(serde_json::Value::as_str) {
+                text.push_str(chunk);
+                on_event(ModelStreamEvent::TextDelta {
+                    content: chunk.to_string(),
+                });
+            }
+            if let Some(function_call) = part
+                .get("functionCall")
+                .or_else(|| part.get("function_call"))
+            {
+                tool_calls.push(serde_json::json!({
+                    "functionCall": function_call.clone(),
+                }));
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(serde_json::json!({ "text": text }));
+    }
+    parts.extend(tool_calls);
+
+    Ok(serde_json::json!({
+        "candidates": [{
+            "content": {
+                "parts": parts,
+            }
+        }]
     }))
 }
 
@@ -1601,6 +1744,29 @@ mod tests {
         assert_eq!(reply.text.as_deref(), Some("hello world"));
         assert_eq!(reply.tool_calls.len(), 1);
         assert_eq!(reply.tool_calls[0].call_id, "toolu_1");
+        assert_eq!(reply.tool_calls[0].name, "lookup");
+        assert_eq!(reply.tool_calls[0].input, "{\"q\":\"ping\"}");
+    }
+
+    #[test]
+    fn parse_gemini_streaming_events_collects_text_and_function_call_parts() {
+        let stream = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"},{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"ping\"}}}]}}]}\n\n"
+        );
+        let mut deltas = Vec::new();
+        let body = parse_gemini_streaming_events(Cursor::new(stream), &mut |event| match event {
+            ModelStreamEvent::TextDelta { content } => deltas.push(content),
+        })
+        .unwrap();
+
+        assert_eq!(deltas, vec!["hello ".to_string(), "world".to_string()]);
+        let reply = extract_gemini_output(&body).unwrap();
+        let ModelGeneration::Reply(reply) = reply else {
+            panic!("expected reply");
+        };
+        assert_eq!(reply.text.as_deref(), Some("hello world"));
+        assert_eq!(reply.tool_calls.len(), 1);
         assert_eq!(reply.tool_calls[0].name, "lookup");
         assert_eq!(reply.tool_calls[0].input, "{\"q\":\"ping\"}");
     }
