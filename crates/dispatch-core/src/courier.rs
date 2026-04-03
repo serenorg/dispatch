@@ -2548,10 +2548,7 @@ impl CourierBackend for JsonlCourierPlugin {
         let courier = self.clone();
         async move {
             match courier.plugin_request(PluginRequest::Capabilities) {
-                Ok(PluginResponse::Result {
-                    capabilities: Some(capabilities),
-                    ..
-                }) => Ok(capabilities),
+                Ok(PluginResponse::Capabilities { capabilities }) => Ok(capabilities),
                 Ok(PluginResponse::Error { error }) => Err(CourierError::PluginProtocol {
                     courier: courier.manifest.name.clone(),
                     message: format!("{}: {}", error.code, error.message),
@@ -2572,7 +2569,7 @@ impl CourierBackend for JsonlCourierPlugin {
         async move {
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::ValidateParcel { parcel_dir })? {
-                PluginResponse::Result { .. } => Ok(()),
+                PluginResponse::Ok => Ok(()),
                 PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
                     courier: courier.manifest.name.clone(),
                     message: format!("{}: {}", error.code, error.message),
@@ -2594,10 +2591,7 @@ impl CourierBackend for JsonlCourierPlugin {
         async move {
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::Inspect { parcel_dir })? {
-                PluginResponse::Result {
-                    inspection: Some(inspection),
-                    ..
-                } => Ok(inspection),
+                PluginResponse::Inspection { inspection } => Ok(inspection),
                 PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
                     courier: courier.manifest.name.clone(),
                     message: format!("{}: {}", error.code, error.message),
@@ -2632,10 +2626,7 @@ impl CourierBackend for JsonlCourierPlugin {
                 PluginRequest::OpenSession { parcel_dir },
             )?;
             match process.read_response(&courier.manifest.name)? {
-                PluginResponse::Result {
-                    session: Some(session),
-                    ..
-                } => {
+                PluginResponse::Session { session } => {
                     courier.store_persistent_process(session.id.clone(), process)?;
                     Ok(session)
                 }
@@ -2846,10 +2837,7 @@ impl JsonlCourierPlugin {
             },
         )?;
         match process.read_response(&self.manifest.name) {
-            Ok(PluginResponse::Result {
-                session: Some(session),
-                ..
-            }) => {
+            Ok(PluginResponse::Session { session }) => {
                 self.store_persistent_process(session.id.clone(), process)?;
                 Ok(session)
             }
@@ -3074,7 +3062,10 @@ fn canonical_parcel_dir(parcel: &LoadedParcel) -> Result<String, CourierError> {
 
 fn describe_plugin_response(response: &PluginResponse) -> &'static str {
     match response {
-        PluginResponse::Result { .. } => "result",
+        PluginResponse::Capabilities { .. } => "capabilities",
+        PluginResponse::Inspection { .. } => "inspection",
+        PluginResponse::Session { .. } => "session",
+        PluginResponse::Ok => "ok",
         PluginResponse::Event { .. } => "event",
         PluginResponse::Done { .. } => "done",
         PluginResponse::Error { .. } => "error",
@@ -4542,7 +4533,7 @@ mod tests {
                 .to_string()
         } else {
             format!(
-                "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n"
+                "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"capabilities\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"ok\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"inspection\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}],\"backend_state\":\"warm|resumed\"}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"ok\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}],\"backend_state\":\"turns:1\"}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n"
             )
         };
         fs::write(&plugin_path, &script).unwrap();
@@ -4572,7 +4563,7 @@ mod tests {
         let plugin_path = dir.path().join("counting-plugin.sh");
         let starts_path = dir.path().join("plugin-starts.log");
         let script = format!(
-            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-counting-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
+            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"capabilities\",\"capabilities\":{{\"courier_id\":\"demo-counting-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}],\"backend_state\":\"turns:1|resumed\"}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"ok\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}],\"backend_state\":\"turns:2\"}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}],\"backend_state\":\"turns:1\"}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
             starts_path.display()
         );
         fs::write(&plugin_path, &script).unwrap();
@@ -4603,7 +4594,7 @@ mod tests {
         let plugin_path = dir.path().join("shutdown-plugin.sh");
         let shutdowns_path = dir.path().join("plugin-shutdowns.log");
         let script = format!(
-            "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-shutdown\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from shutdown plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-shutdown\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello\"}},{{\"role\":\"assistant\",\"content\":\"from shutdown plugin\"}}]}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf 'shutdown\\n' >> '{}'\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\nexit 0\n;;\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-shutdown-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-shutdown-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
+            "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session-shutdown\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from shutdown plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-shutdown\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello\"}},{{\"role\":\"assistant\",\"content\":\"from shutdown plugin\"}}],\"backend_state\":\"turns:1\"}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf 'shutdown\\n' >> '{}'\nprintf '%s\\n' '{{\"kind\":\"ok\"}}'\nexit 0\n;;\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"capabilities\",\"capabilities\":{{\"courier_id\":\"demo-shutdown-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"ok\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"inspection\",\"inspection\":{{\"courier_id\":\"demo-shutdown-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
             shutdowns_path.display()
         );
         fs::write(&plugin_path, &script).unwrap();

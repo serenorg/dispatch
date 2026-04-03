@@ -75,11 +75,13 @@ The key rule is session affinity.
 - `shutdown` gives a persistent plugin process one explicit chance to flush state and exit cleanly
 
 Dispatch keeps one persistent process per open plugin session.
+Dispatch owns that session-to-process affinity; plugins should not assume they can detect or repair host-side violations of it.
 
 Plugins should therefore:
 
 - treat stdin as a request stream, not a single request body
 - keep session-local state in memory after `open_session`
+- persist any opaque plugin-owned resume data in `CourierSession.backend_state`
 - accept `resume_session` when Dispatch needs to reattach to a saved session after a new host process starts
 - continue reading requests until `shutdown`, stdin close, or process termination
 
@@ -87,7 +89,13 @@ Plugins should therefore:
 
 Response shapes are:
 
-Non-streaming requests return one line with `kind: "result"` or `kind: "error"`.
+Non-streaming requests return exactly one line with one of:
+
+- `{"kind":"capabilities","capabilities":...}`
+- `{"kind":"inspection","inspection":...}`
+- `{"kind":"session","session":...}`
+- `{"kind":"ok"}`
+- `{"kind":"error","error":...}`
 
 `run` remains stream-first:
 
@@ -106,8 +114,13 @@ Example `run` stream:
 The intended implementation model is:
 
 - keep warm model/tool/runtime state in memory per session
+- mirror any state needed after a host restart into `CourierSession.backend_state`
 - continue reading requests until stdin closes or the process is terminated
 - avoid per-turn process startup during multi-turn chat, job, and heartbeat flows
+
+If a plugin cannot reconstruct a saved session during `resume_session`, it should return an
+`error` response and let Dispatch surface the failed resume. Dispatch does not retry with a
+different protocol version or silently downgrade `resume_session` into `open_session`.
 
 ## Trust Model
 

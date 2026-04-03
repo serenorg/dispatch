@@ -62,8 +62,8 @@ fn emit_response(response: &PluginResponse) -> io::Result<()> {
 
 fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String> {
     match request {
-        PluginRequest::Capabilities => Ok(vec![PluginResponse::Result {
-            capabilities: Some(CourierCapabilities {
+        PluginRequest::Capabilities => Ok(vec![PluginResponse::Capabilities {
+            capabilities: CourierCapabilities {
                 courier_id: "echo".to_string(),
                 kind: CourierKind::Custom,
                 supports_chat: true,
@@ -71,26 +71,19 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                 supports_heartbeat: true,
                 supports_local_tools: false,
                 supports_mounts: Vec::new(),
-            }),
-            inspection: None,
-            session: None,
+            },
         }]),
         PluginRequest::ValidateParcel { parcel_dir } => {
             let _ = load_parcel(Path::new(&parcel_dir))
                 .map_err(|error| format!("failed to load parcel: {error}"))?;
-            Ok(vec![PluginResponse::Result {
-                capabilities: None,
-                inspection: None,
-                session: None,
-            }])
+            Ok(vec![PluginResponse::Ok])
         }
         PluginRequest::Inspect { parcel_dir } => {
             let parcel = load_parcel(Path::new(&parcel_dir))
                 .map_err(|error| format!("failed to load parcel: {error}"))?;
             let local_tools = list_local_tools(&parcel);
-            Ok(vec![PluginResponse::Result {
-                capabilities: None,
-                inspection: Some(CourierInspection {
+            Ok(vec![PluginResponse::Inspection {
+                inspection: CourierInspection {
                     courier_id: "echo".to_string(),
                     kind: CourierKind::Custom,
                     entrypoint: parcel.config.entrypoint.clone(),
@@ -102,30 +95,27 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                         .collect(),
                     mounts: parcel.config.mounts.clone(),
                     local_tools,
-                }),
-                session: None,
+                },
             }])
         }
         PluginRequest::OpenSession { parcel_dir } => {
             let parcel = load_parcel(Path::new(&parcel_dir))
                 .map_err(|error| format!("failed to load parcel: {error}"))?;
-            Ok(vec![PluginResponse::Result {
-                capabilities: None,
-                inspection: None,
-                session: Some(CourierSession {
+            Ok(vec![PluginResponse::Session {
+                session: CourierSession {
                     id: format!("echo-{}", parcel.config.digest),
                     parcel_digest: parcel.config.digest,
                     entrypoint: parcel.config.entrypoint,
                     turn_count: 0,
                     history: Vec::new(),
                     resolved_mounts: Vec::new(),
-                    backend_state: None,
-                }),
+                    backend_state: Some("open".to_string()),
+                },
             }])
         }
         PluginRequest::ResumeSession {
             parcel_dir,
-            session,
+            mut session,
         } => {
             let parcel = load_parcel(Path::new(&parcel_dir))
                 .map_err(|error| format!("failed to load parcel: {error}"))?;
@@ -135,17 +125,16 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                     session.parcel_digest, parcel.config.digest
                 ));
             }
-            Ok(vec![PluginResponse::Result {
-                capabilities: None,
-                inspection: None,
-                session: Some(session),
-            }])
+            session.backend_state = Some(
+                session
+                    .backend_state
+                    .as_deref()
+                    .map(|value| format!("{value}|resumed"))
+                    .unwrap_or_else(|| "resumed".to_string()),
+            );
+            Ok(vec![PluginResponse::Session { session }])
         }
-        PluginRequest::Shutdown => Ok(vec![PluginResponse::Result {
-            capabilities: None,
-            inspection: None,
-            session: None,
-        }]),
+        PluginRequest::Shutdown => Ok(vec![PluginResponse::Ok]),
         PluginRequest::Run {
             parcel_dir,
             session,
@@ -159,14 +148,14 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
 }
 
 fn handle_run(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     session: CourierSession,
     operation: CourierOperation,
 ) -> Result<Vec<PluginResponse>, String> {
-    if session.parcel_digest != image.config.digest {
+    if session.parcel_digest != parcel.config.digest {
         return Err(format!(
-            "session digest {} does not match image {}",
-            session.parcel_digest, image.config.digest
+            "session digest {} does not match parcel {}",
+            session.parcel_digest, parcel.config.digest
         ));
     }
 
@@ -174,7 +163,7 @@ fn handle_run(
         CourierOperation::ResolvePrompt => Ok(vec![
             PluginResponse::Event {
                 event: CourierEvent::PromptResolved {
-                    text: resolve_prompt_text(image)
+                    text: resolve_prompt_text(parcel)
                         .map_err(|error| format!("failed to resolve prompt: {error}"))?,
                 },
             },
@@ -185,7 +174,7 @@ fn handle_run(
         CourierOperation::ListLocalTools => Ok(vec![
             PluginResponse::Event {
                 event: CourierEvent::LocalToolsListed {
-                    tools: list_local_tools(image),
+                    tools: list_local_tools(parcel),
                 },
             },
             PluginResponse::Done {
@@ -227,6 +216,7 @@ fn message_turn(mut session: CourierSession, input: String, reply: String) -> Ve
         content: reply.clone(),
     });
     session.turn_count += 1;
+    session.backend_state = Some(format!("turns:{}", session.turn_count));
 
     vec![
         PluginResponse::Event {
@@ -254,11 +244,7 @@ mod tests {
     fn capabilities_request_reports_custom_courier() {
         let responses = handle_request(PluginRequest::Capabilities).unwrap();
         assert_eq!(responses.len(), 1);
-        let PluginResponse::Result {
-            capabilities: Some(capabilities),
-            ..
-        } = &responses[0]
-        else {
+        let PluginResponse::Capabilities { capabilities } = &responses[0] else {
             panic!("expected capabilities result");
         };
         assert_eq!(capabilities.courier_id, "echo");
@@ -295,6 +281,31 @@ mod tests {
         assert_eq!(session.turn_count, 1);
         assert_eq!(session.history.len(), 2);
         assert_eq!(session.history[1].content, "echo: hello");
+        assert_eq!(session.backend_state.as_deref(), Some("turns:1"));
+    }
+
+    #[test]
+    fn resume_session_preserves_and_updates_backend_state() {
+        let dir = tempdir().unwrap();
+        let parcel = build_test_image(dir.path());
+        let responses = handle_request(PluginRequest::ResumeSession {
+            parcel_dir: parcel.parcel_dir.display().to_string(),
+            session: CourierSession {
+                id: format!("echo-{}", parcel.config.digest),
+                parcel_digest: parcel.config.digest.clone(),
+                entrypoint: Some("chat".to_string()),
+                turn_count: 1,
+                history: Vec::new(),
+                resolved_mounts: Vec::new(),
+                backend_state: Some("warm".to_string()),
+            },
+        })
+        .unwrap();
+
+        let PluginResponse::Session { session } = &responses[0] else {
+            panic!("expected session response");
+        };
+        assert_eq!(session.backend_state.as_deref(), Some("warm|resumed"));
     }
 
     fn build_test_image(root: &Path) -> LoadedParcel {

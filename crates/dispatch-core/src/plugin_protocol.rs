@@ -39,23 +39,13 @@ pub enum PluginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PluginResponse {
-    Result {
-        #[serde(default)]
-        capabilities: Option<CourierCapabilities>,
-        #[serde(default)]
-        inspection: Option<CourierInspection>,
-        #[serde(default)]
-        session: Option<CourierSession>,
-    },
-    Event {
-        event: CourierEvent,
-    },
-    Done {
-        session: CourierSession,
-    },
-    Error {
-        error: PluginErrorPayload,
-    },
+    Capabilities { capabilities: CourierCapabilities },
+    Inspection { inspection: CourierInspection },
+    Session { session: CourierSession },
+    Ok,
+    Event { event: CourierEvent },
+    Done { session: CourierSession },
+    Error { error: PluginErrorPayload },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,8 +116,8 @@ mod tests {
 
     #[test]
     fn response_round_trips_json() {
-        let response = PluginResponse::Result {
-            capabilities: Some(CourierCapabilities {
+        let response = PluginResponse::Capabilities {
+            capabilities: CourierCapabilities {
                 courier_id: "demo".to_string(),
                 kind: CourierKind::Custom,
                 supports_chat: true,
@@ -135,9 +125,7 @@ mod tests {
                 supports_heartbeat: false,
                 supports_local_tools: false,
                 supports_mounts: Vec::new(),
-            }),
-            inspection: None,
-            session: None,
+            },
         };
 
         let json = serde_json::to_string(&response).unwrap();
