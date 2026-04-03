@@ -209,6 +209,19 @@ expects_tool: system_time
 expects_text_contains: "plugin reply"
 ```
 
+Eval files can also group multiple cases:
+
+```yaml
+cases:
+  - name: smoke
+    input: "What time is it?"
+    expects_tool: system_time
+  - name: exact
+    input: "What time is it?"
+    expects_tool_count: 1
+    expects_text_exact: "plugin reply"
+```
+
 `dispatch eval` runs those packaged cases against a live courier and reports pass/fail per case.
 
 Parcel format compatibility:

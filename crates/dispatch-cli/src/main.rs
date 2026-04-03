@@ -272,7 +272,7 @@ struct StateGcReport {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum EvalDocument {
-    Single(EvalSpec),
+    Single(Box<EvalSpec>),
     Cases { cases: Vec<EvalSpec> },
 }
 
@@ -291,6 +291,16 @@ struct EvalSpec {
         alias = "expects_text_contains"
     )]
     expects_text: Option<String>,
+    #[serde(default)]
+    expects_text_exact: Option<String>,
+    #[serde(default, alias = "rejects_text_contains")]
+    expects_text_not_contains: Option<String>,
+    #[serde(default)]
+    expects_tool_count: Option<usize>,
+    #[serde(default)]
+    expects_tools: Vec<String>,
+    #[serde(default)]
+    expects_error_contains: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -543,7 +553,7 @@ fn load_eval_specs(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)>> {
         let parsed: EvalDocument = serde_yaml::from_str(&source)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         match parsed {
-            EvalDocument::Single(spec) => evals.push((instruction.packaged_path.clone(), spec)),
+            EvalDocument::Single(spec) => evals.push((instruction.packaged_path.clone(), *spec)),
             EvalDocument::Cases { cases } => {
                 for spec in cases {
                     evals.push((instruction.packaged_path.clone(), spec));
@@ -592,6 +602,7 @@ fn run_eval_case<R: CourierBackend>(
         },
         other => {
             result.error = Some(format!("unsupported eval entrypoint `{other}`"));
+            apply_eval_expectations(&mut result, spec, &[]);
             return result;
         }
     };
@@ -600,6 +611,7 @@ fn run_eval_case<R: CourierBackend>(
         Ok(session) => session,
         Err(error) => {
             result.error = Some(error.to_string());
+            apply_eval_expectations(&mut result, spec, &[]);
             return result;
         }
     };
@@ -608,6 +620,7 @@ fn run_eval_case<R: CourierBackend>(
         Ok(response) => response,
         Err(error) => {
             result.error = Some(error.to_string());
+            apply_eval_expectations(&mut result, spec, &[]);
             return result;
         }
     };
@@ -627,14 +640,38 @@ fn run_eval_case<R: CourierBackend>(
         }
     }
 
-    if let Some(expected_tool) = &spec.expects_tool
-        && !result.tool_calls.iter().any(|tool| tool == expected_tool)
+    apply_eval_expectations(&mut result, spec, &text_observations);
+    result
+}
+
+fn apply_eval_expectations(
+    result: &mut EvalCaseResult,
+    spec: &EvalSpec,
+    text_observations: &[String],
+) {
+    let mut expected_tools = spec.expects_tools.clone();
+    if let Some(expected_tool) = &spec.expects_tool {
+        expected_tools.push(expected_tool.clone());
+    }
+
+    for expected_tool in expected_tools {
+        if !result.tool_calls.iter().any(|tool| tool == &expected_tool) {
+            result.failures.push(format!(
+                "expected tool `{expected_tool}` but saw [{}]",
+                result.tool_calls.join(", ")
+            ));
+        }
+    }
+
+    if let Some(expected_tool_count) = spec.expects_tool_count
+        && result.tool_calls.len() != expected_tool_count
     {
         result.failures.push(format!(
-            "expected tool `{expected_tool}` but saw [{}]",
-            result.tool_calls.join(", ")
+            "expected {expected_tool_count} tool call(s) but saw {}",
+            result.tool_calls.len()
         ));
     }
+
     if let Some(expected_text) = &spec.expects_text
         && !text_observations
             .iter()
@@ -645,8 +682,47 @@ fn run_eval_case<R: CourierBackend>(
         ));
     }
 
-    result.passed = result.error.is_none() && result.failures.is_empty();
-    result
+    if let Some(expected_text_exact) = &spec.expects_text_exact
+        && !text_observations
+            .iter()
+            .any(|observed| observed == expected_text_exact)
+    {
+        result.failures.push(format!(
+            "expected assistant text exactly `{expected_text_exact}`"
+        ));
+    }
+
+    if let Some(unexpected_text) = &spec.expects_text_not_contains
+        && text_observations
+            .iter()
+            .any(|observed| observed.contains(unexpected_text))
+    {
+        result.failures.push(format!(
+            "expected assistant text not to contain `{unexpected_text}`"
+        ));
+    }
+
+    let error_expectation_satisfied = if let Some(expected_error) = &spec.expects_error_contains {
+        match &result.error {
+            Some(error) if error.contains(expected_error) => true,
+            Some(error) => {
+                result.failures.push(format!(
+                    "expected error containing `{expected_error}` but saw `{error}`"
+                ));
+                false
+            }
+            None => {
+                result.failures.push(format!(
+                    "expected error containing `{expected_error}` but no error occurred"
+                ));
+                false
+            }
+        }
+    } else {
+        result.error.is_none()
+    };
+
+    result.passed = error_expectation_satisfied && result.failures.is_empty();
 }
 
 fn print_eval_report(report: &EvalReport) {
@@ -2279,7 +2355,23 @@ ENTRYPOINT chat\n",
         fs::write(context_dir.join("SKILL.md"), "You are an eval fixture.\n").unwrap();
         fs::write(
             context_dir.join("evals/smoke.eval"),
-            "name: smoke\ninput: \"What time is it?\"\nexpects_tool: \"system_time\"\nexpects_text_contains: \"plugin reply\"\n",
+            concat!(
+                "cases:\n",
+                "  - name: smoke\n",
+                "    input: \"What time is it?\"\n",
+                "    expects_tool: \"system_time\"\n",
+                "    expects_text_contains: \"plugin reply\"\n",
+                "  - name: exact\n",
+                "    input: \"What time is it?\"\n",
+                "    expects_tools: [\"system_time\"]\n",
+                "    expects_tool_count: 1\n",
+                "    expects_text_exact: \"plugin reply\"\n",
+                "    expects_text_not_contains: \"wrong\"\n",
+                "  - name: invalid-entrypoint\n",
+                "    input: \"\"\n",
+                "    entrypoint: unsupported\n",
+                "    expects_error_contains: \"unsupported eval entrypoint\"\n",
+            ),
         )
         .unwrap();
         context_dir

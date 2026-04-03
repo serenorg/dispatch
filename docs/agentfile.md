@@ -519,13 +519,35 @@ expects_tool: system_time
 expects_text_contains: "plugin reply"
 ```
 
+Multi-case eval file:
+
+```yaml
+cases:
+  - name: smoke
+    input: "What time is it?"
+    expects_tool: system_time
+  - name: exact
+    input: "What time is it?"
+    expects_tool_count: 1
+    expects_text_exact: "plugin reply"
+  - name: invalid-entrypoint
+    input: ""
+    entrypoint: unsupported
+    expects_error_contains: "unsupported eval entrypoint"
+```
+
 Supported fields in the reference runner:
 
 - `name`
 - `input`
 - `entrypoint` (`chat`, `job`, or `heartbeat`; defaults to the parcel entrypoint or `chat`)
 - `expects_tool`
+- `expects_tools`
+- `expects_tool_count`
 - `expects_text_contains`
+- `expects_text_exact`
+- `expects_text_not_contains`
+- `expects_error_contains`
 
 Run packaged evals with:
 
