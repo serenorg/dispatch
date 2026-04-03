@@ -3,9 +3,7 @@ use crate::{
         BuiltinToolConfig, InstructionKind, ModelReference, MountConfig, MountKind, ParcelManifest,
         ToolConfig,
     },
-    plugin_protocol::{
-        COURIER_PLUGIN_PROTOCOL_VERSION, PluginRequest, PluginRequestEnvelope, PluginResponse,
-    },
+    plugin_protocol::{PluginRequest, PluginRequestEnvelope, PluginResponse},
     plugins::CourierPluginManifest,
 };
 use dispatch_wasm_abi::ABI as DISPATCH_WASM_COMPONENT_ABI;
@@ -19,9 +17,9 @@ use std::{
     collections::BTreeMap,
     fs,
     future::Future,
-    io::{BufRead as _, BufReader, Write as _},
+    io::{BufReader, Write as _},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
@@ -566,6 +564,19 @@ pub struct NativeCourier {
 #[derive(Debug, Clone)]
 pub struct JsonlCourierPlugin {
     manifest: CourierPluginManifest,
+    state: Arc<JsonlCourierPluginState>,
+}
+
+#[derive(Default)]
+struct JsonlCourierPluginState {
+    sessions: Mutex<BTreeMap<String, PersistentPluginProcess>>,
+}
+
+struct PersistentPluginProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr: ChildStderr,
 }
 
 #[derive(Debug, Clone)]
@@ -614,7 +625,40 @@ impl Default for WasmCourier {
 
 impl JsonlCourierPlugin {
     pub fn new(manifest: CourierPluginManifest) -> Self {
-        Self { manifest }
+        Self {
+            manifest,
+            state: Arc::new(JsonlCourierPluginState::default()),
+        }
+    }
+}
+
+impl std::fmt::Debug for JsonlCourierPluginState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let session_count = self
+            .sessions
+            .lock()
+            .map(|sessions| sessions.len())
+            .unwrap_or(0);
+        f.debug_struct("JsonlCourierPluginState")
+            .field("session_count", &session_count)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PersistentPluginProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentPluginProcess")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for JsonlCourierPluginState {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            for (_, mut process) in std::mem::take(&mut *sessions) {
+                let _ = shutdown_persistent_plugin_process(&mut process);
+            }
+        }
     }
 }
 
@@ -2399,17 +2443,45 @@ impl CourierBackend for JsonlCourierPlugin {
                 &capabilities.supports_mounts,
             )?;
             let parcel_dir = parcel_dir?;
-            match courier.plugin_request(PluginRequest::OpenSession { parcel_dir })? {
-                PluginResponse::Result {
-                    session: Some(session),
-                    ..
-                } => Ok(session),
-                PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
-                    courier: courier.manifest.name.clone(),
-                    message: format!("{}: {}", error.code, error.message),
-                }),
-                other => Err(courier
-                    .unexpected_plugin_response("open_session", describe_plugin_response(&other))),
+            if courier.uses_persistent_processes() {
+                let mut process = courier.spawn_persistent_plugin()?;
+                process.write_request(
+                    courier.manifest.protocol_version,
+                    &courier.manifest.name,
+                    PluginRequest::OpenSession { parcel_dir },
+                )?;
+                match process.read_response(&courier.manifest.name)? {
+                    PluginResponse::Result {
+                        session: Some(session),
+                        ..
+                    } => {
+                        courier.store_persistent_process(session.id.clone(), process)?;
+                        Ok(session)
+                    }
+                    PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
+                        courier: courier.manifest.name.clone(),
+                        message: format!("{}: {}", error.code, error.message),
+                    }),
+                    other => Err(courier.unexpected_plugin_response(
+                        "open_session",
+                        describe_plugin_response(&other),
+                    )),
+                }
+            } else {
+                match courier.plugin_request(PluginRequest::OpenSession { parcel_dir })? {
+                    PluginResponse::Result {
+                        session: Some(session),
+                        ..
+                    } => Ok(session),
+                    PluginResponse::Error { error } => Err(CourierError::PluginProtocol {
+                        courier: courier.manifest.name.clone(),
+                        message: format!("{}: {}", error.code, error.message),
+                    }),
+                    other => Err(courier.unexpected_plugin_response(
+                        "open_session",
+                        describe_plugin_response(&other),
+                    )),
+                }
             }
         }
     }
@@ -2424,69 +2496,53 @@ impl CourierBackend for JsonlCourierPlugin {
         async move {
             ensure_session_matches_parcel(image, &request.session)?;
             let parcel_dir = parcel_dir?;
-            let mut child = courier.spawn_plugin()?;
-            write_plugin_request(
-                &mut child,
-                &courier.manifest.name,
-                PluginRequest::Run {
-                    parcel_dir,
-                    session: request.session,
-                    operation: request.operation,
-                },
-            )?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| CourierError::PluginProtocol {
-                    courier: courier.manifest.name.clone(),
-                    message: "plugin stdout was not captured".to_string(),
-                })?;
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            let mut events = Vec::new();
-            let final_session = loop {
-                line.clear();
-                let bytes = reader.read_line(&mut line).map_err(|source| {
-                    CourierError::ReadPluginResponse {
+            if courier.uses_persistent_processes() {
+                let session_id = request.session.id.clone();
+                let response = courier.run_persistent_plugin(
+                    session_id,
+                    PluginRequest::Run {
+                        parcel_dir,
+                        session: request.session,
+                        operation: request.operation,
+                    },
+                )?;
+                Ok(CourierResponse {
+                    courier_id: courier.manifest.name.clone(),
+                    session: response.0,
+                    events: response.1,
+                })
+            } else {
+                let mut child = courier.spawn_plugin()?;
+                write_plugin_request(
+                    &mut child,
+                    &courier.manifest.name,
+                    courier.manifest.protocol_version,
+                    PluginRequest::Run {
+                        parcel_dir,
+                        session: request.session,
+                        operation: request.operation,
+                    },
+                    true,
+                )?;
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| CourierError::PluginProtocol {
                         courier: courier.manifest.name.clone(),
-                        source,
-                    }
-                })?;
-                if bytes == 0 {
-                    return Err(CourierError::PluginProtocol {
-                        courier: courier.manifest.name.clone(),
-                        message: "plugin closed stdout before emitting `done`".to_string(),
-                    });
-                }
-                let response: PluginResponse =
-                    serde_json::from_str(line.trim_end()).map_err(|source| {
-                        CourierError::PluginProtocol {
-                            courier: courier.manifest.name.clone(),
-                            message: format!("invalid plugin JSON: {source}"),
-                        }
+                        message: "plugin stdout was not captured".to_string(),
                     })?;
-                match response {
-                    PluginResponse::Event { event } => events.push(event),
-                    PluginResponse::Done { session } => break session,
-                    PluginResponse::Error { error } => {
-                        return Err(CourierError::PluginProtocol {
-                            courier: courier.manifest.name.clone(),
-                            message: format!("{}: {}", error.code, error.message),
-                        });
-                    }
-                    other => {
-                        return Err(courier
-                            .unexpected_plugin_response("run", describe_plugin_response(&other)));
-                    }
-                }
-            };
-            wait_for_plugin_exit(child, &courier.manifest.name)?;
+                let mut reader = BufReader::new(stdout);
+                let mut events = Vec::new();
+                let final_session =
+                    read_plugin_run_completion(&mut reader, &courier.manifest.name, &mut events)?;
+                wait_for_plugin_exit(child, &courier.manifest.name)?;
 
-            Ok(CourierResponse {
-                courier_id: courier.manifest.name.clone(),
-                session: final_session,
-                events,
-            })
+                Ok(CourierResponse {
+                    courier_id: courier.manifest.name.clone(),
+                    session: final_session,
+                    events,
+                })
+            }
         }
     }
 }
@@ -2494,7 +2550,13 @@ impl CourierBackend for JsonlCourierPlugin {
 impl JsonlCourierPlugin {
     fn plugin_request(&self, request: PluginRequest) -> Result<PluginResponse, CourierError> {
         let mut child = self.spawn_plugin()?;
-        write_plugin_request(&mut child, &self.manifest.name, request)?;
+        write_plugin_request(
+            &mut child,
+            &self.manifest.name,
+            self.manifest.protocol_version,
+            request,
+            true,
+        )?;
         let stdout = child
             .stdout
             .take()
@@ -2503,26 +2565,7 @@ impl JsonlCourierPlugin {
                 message: "plugin stdout was not captured".to_string(),
             })?;
         let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let bytes =
-            reader
-                .read_line(&mut line)
-                .map_err(|source| CourierError::ReadPluginResponse {
-                    courier: self.manifest.name.clone(),
-                    source,
-                })?;
-        if bytes == 0 {
-            return Err(CourierError::PluginProtocol {
-                courier: self.manifest.name.clone(),
-                message: "plugin produced no response".to_string(),
-            });
-        }
-        let response: PluginResponse = serde_json::from_str(line.trim_end()).map_err(|source| {
-            CourierError::PluginProtocol {
-                courier: self.manifest.name.clone(),
-                message: format!("invalid plugin JSON: {source}"),
-            }
-        })?;
+        let response = read_plugin_response(&mut reader, &self.manifest.name)?;
         wait_for_plugin_exit(child, &self.manifest.name)?;
         Ok(response)
     }
@@ -2551,6 +2594,95 @@ impl JsonlCourierPlugin {
         })
     }
 
+    fn spawn_persistent_plugin(&self) -> Result<PersistentPluginProcess, CourierError> {
+        let mut child = self.spawn_plugin()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CourierError::PluginProtocol {
+                courier: self.manifest.name.clone(),
+                message: "plugin stdin was not captured".to_string(),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CourierError::PluginProtocol {
+                courier: self.manifest.name.clone(),
+                message: "plugin stdout was not captured".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CourierError::PluginProtocol {
+                courier: self.manifest.name.clone(),
+                message: "plugin stderr was not captured".to_string(),
+            })?;
+        Ok(PersistentPluginProcess {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr,
+        })
+    }
+
+    fn uses_persistent_processes(&self) -> bool {
+        self.manifest.protocol_version >= 2
+    }
+
+    fn store_persistent_process(
+        &self,
+        session_id: String,
+        process: PersistentPluginProcess,
+    ) -> Result<(), CourierError> {
+        let mut sessions =
+            self.state
+                .sessions
+                .lock()
+                .map_err(|_| CourierError::PluginProtocol {
+                    courier: self.manifest.name.clone(),
+                    message: "plugin session state is poisoned".to_string(),
+                })?;
+        if let Some(mut existing) = sessions.remove(&session_id) {
+            let _ = shutdown_persistent_plugin_process(&mut existing);
+        }
+        sessions.insert(session_id, process);
+        Ok(())
+    }
+
+    fn run_persistent_plugin(
+        &self,
+        session_id: String,
+        request: PluginRequest,
+    ) -> Result<(CourierSession, Vec<CourierEvent>), CourierError> {
+        let mut sessions =
+            self.state
+                .sessions
+                .lock()
+                .map_err(|_| CourierError::PluginProtocol {
+                    courier: self.manifest.name.clone(),
+                    message: "plugin session state is poisoned".to_string(),
+                })?;
+        let process =
+            sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| CourierError::PluginProtocol {
+                    courier: self.manifest.name.clone(),
+                    message: format!(
+                        "no persistent plugin process exists for session `{session_id}`"
+                    ),
+                })?;
+        process.write_request(self.manifest.protocol_version, &self.manifest.name, request)?;
+        let mut events = Vec::new();
+        match read_plugin_run_completion(&mut process.stdout, &self.manifest.name, &mut events) {
+            Ok(session) => Ok((session, events)),
+            Err(error) => {
+                let mut process = sessions.remove(&session_id).expect("session just existed");
+                let _ = shutdown_persistent_plugin_process(&mut process);
+                Err(error)
+            }
+        }
+    }
+
     fn unexpected_plugin_response(&self, request_kind: &str, response_kind: &str) -> CourierError {
         CourierError::PluginProtocol {
             courier: self.manifest.name.clone(),
@@ -2562,7 +2694,9 @@ impl JsonlCourierPlugin {
 fn write_plugin_request(
     child: &mut Child,
     courier_name: &str,
+    protocol_version: u32,
     request: PluginRequest,
+    close_stdin: bool,
 ) -> Result<(), CourierError> {
     let stdin = child
         .stdin
@@ -2571,10 +2705,23 @@ fn write_plugin_request(
             courier: courier_name.to_string(),
             message: "plugin stdin was not captured".to_string(),
         })?;
+    write_plugin_request_to(stdin, courier_name, protocol_version, request)?;
+    if close_stdin {
+        let _ = child.stdin.take();
+    }
+    Ok(())
+}
+
+fn write_plugin_request_to<W: std::io::Write>(
+    mut writer: W,
+    courier_name: &str,
+    protocol_version: u32,
+    request: PluginRequest,
+) -> Result<(), CourierError> {
     serde_json::to_writer(
-        &mut *stdin,
+        &mut writer,
         &PluginRequestEnvelope {
-            protocol_version: COURIER_PLUGIN_PROTOCOL_VERSION,
+            protocol_version,
             request,
         },
     )
@@ -2582,19 +2729,102 @@ fn write_plugin_request(
         courier: courier_name.to_string(),
         message: format!("failed to serialize plugin request: {source}"),
     })?;
-    stdin
+    writer
         .write_all(b"\n")
         .map_err(|source| CourierError::WritePluginRequest {
             courier: courier_name.to_string(),
             source,
         })?;
-    stdin
+    writer
         .flush()
         .map_err(|source| CourierError::WritePluginRequest {
             courier: courier_name.to_string(),
             source,
         })?;
-    let _ = child.stdin.take();
+    Ok(())
+}
+
+impl PersistentPluginProcess {
+    fn write_request(
+        &mut self,
+        protocol_version: u32,
+        courier_name: &str,
+        request: PluginRequest,
+    ) -> Result<(), CourierError> {
+        write_plugin_request_to(&mut self.stdin, courier_name, protocol_version, request)
+    }
+
+    fn read_response(&mut self, courier_name: &str) -> Result<PluginResponse, CourierError> {
+        read_plugin_response(&mut self.stdout, courier_name)
+    }
+}
+
+fn read_plugin_response<R: std::io::BufRead>(
+    reader: &mut R,
+    courier_name: &str,
+) -> Result<PluginResponse, CourierError> {
+    let mut line = String::new();
+    let bytes = reader
+        .read_line(&mut line)
+        .map_err(|source| CourierError::ReadPluginResponse {
+            courier: courier_name.to_string(),
+            source,
+        })?;
+    if bytes == 0 {
+        return Err(CourierError::PluginProtocol {
+            courier: courier_name.to_string(),
+            message: "plugin produced no response".to_string(),
+        });
+    }
+    serde_json::from_str(line.trim_end()).map_err(|source| CourierError::PluginProtocol {
+        courier: courier_name.to_string(),
+        message: format!("invalid plugin JSON: {source}"),
+    })
+}
+
+fn read_plugin_run_completion<R: std::io::BufRead>(
+    reader: &mut R,
+    courier_name: &str,
+    events: &mut Vec<CourierEvent>,
+) -> Result<CourierSession, CourierError> {
+    loop {
+        match read_plugin_response(reader, courier_name)? {
+            PluginResponse::Event { event } => events.push(event),
+            PluginResponse::Done { session } => return Ok(session),
+            PluginResponse::Error { error } => {
+                return Err(CourierError::PluginProtocol {
+                    courier: courier_name.to_string(),
+                    message: format!("{}: {}", error.code, error.message),
+                });
+            }
+            other => {
+                return Err(CourierError::PluginProtocol {
+                    courier: courier_name.to_string(),
+                    message: format!(
+                        "unexpected plugin response for `run`: {}",
+                        describe_plugin_response(&other)
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn shutdown_persistent_plugin_process(
+    process: &mut PersistentPluginProcess,
+) -> Result<(), CourierError> {
+    let _ = process.stdin.flush();
+    let _ = process.child.kill();
+    let mut stderr = String::new();
+    use std::io::Read as _;
+    let _ = process.stderr.read_to_string(&mut stderr);
+    process
+        .child
+        .wait()
+        .map_err(|source| CourierError::WaitPlugin {
+            courier: "<persistent>".to_string(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -4112,6 +4342,37 @@ mod tests {
         )
     }
 
+    fn build_test_persistent_plugin_courier(
+        dir: &tempfile::TempDir,
+        digest: &str,
+    ) -> (JsonlCourierPlugin, std::path::PathBuf, std::path::PathBuf) {
+        let plugin_path = dir.path().join("persistent-plugin.sh");
+        let starts_path = dir.path().join("persistent-plugin-starts.log");
+        let script = format!(
+            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin-v2\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-v2\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-v2\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-v2\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
+            starts_path.display()
+        );
+        fs::write(&plugin_path, &script).unwrap();
+        fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        (
+            JsonlCourierPlugin::new(CourierPluginManifest {
+                name: "demo-plugin-v2".to_string(),
+                version: "0.2.0".to_string(),
+                protocol_version: 2,
+                transport: crate::plugins::PluginTransport::Jsonl,
+                description: Some("Demo persistent courier plugin".to_string()),
+                exec: crate::plugins::CourierPluginExec {
+                    command: plugin_path.display().to_string(),
+                    args: Vec::new(),
+                },
+                installed_sha256: Some(encode_hex(Sha256::digest(script.as_bytes()))),
+            }),
+            plugin_path,
+            starts_path,
+        )
+    }
+
     fn mount_path<'a>(session: &'a CourierSession, kind: MountKind, driver: &str) -> &'a str {
         session
             .resolved_mounts
@@ -4377,6 +4638,62 @@ ENTRYPOINT chat
             error,
             CourierError::PluginProtocol { courier, message }
                 if courier == "demo-plugin" && message.contains("bad_request") && message.contains("plugin rejected request")
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jsonl_plugin_protocol_v2_reuses_persistent_process_across_turns() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/custom:latest
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let (courier, _plugin_path, starts_path) =
+            build_test_persistent_plugin_courier(&test_image._dir, &test_image.image.config.digest);
+
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let starts_after_open = fs::read_to_string(&starts_path).unwrap();
+        assert_eq!(starts_after_open.lines().count(), 2);
+
+        let first = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "first".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        let starts_after_first = fs::read_to_string(&starts_path).unwrap();
+        assert_eq!(starts_after_first.lines().count(), 2);
+        assert_eq!(first.session.turn_count, 1);
+        assert!(matches!(
+            first.events.first(),
+            Some(CourierEvent::Message { role, content })
+                if role == "assistant" && content == "from plugin turn 1"
+        ));
+
+        let second = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: first.session,
+                operation: CourierOperation::Chat {
+                    input: "second".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        let starts_after_second = fs::read_to_string(&starts_path).unwrap();
+        assert_eq!(starts_after_second.lines().count(), 2);
+        assert_eq!(second.session.turn_count, 2);
+        assert!(matches!(
+            second.events.first(),
+            Some(CourierEvent::Message { role, content })
+                if role == "assistant" && content == "from plugin turn 2"
         ));
     }
 

@@ -80,6 +80,11 @@ Minimum expectations:
 
 Dispatch currently returns a bounded batch of ordered events per turn. A future courier protocol may stream them incrementally, but the event ordering guarantees should remain stable.
 
+For external JSONL courier plugins:
+
+- protocol v1 is one-shot per request
+- protocol v2 keeps one long-lived subprocess per open session and sends subsequent `run` requests over the same stdio stream
+
 ## Inspection Rules
 
 `inspect()` should be safe and non-mutating.

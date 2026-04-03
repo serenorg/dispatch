@@ -245,7 +245,7 @@ Dispatch defines the parcel format and courier contract. Multiple couriers can i
 - **native** - executes the parcel as a host process with model-backed chat; reference implementation in `crates/dispatch-core`
 - **docker** - executes local tools via Docker CLI; validates compatibility, inspects, resolves prompts
 - **wasm** - typed component-model courier using the Dispatch WIT ABI; see [WASM Courier](#wasm-courier)
-- **plugins** - external JSONL courier plugins launched as subprocesses; protocol in `docs/courier-plugin-protocol-v1.md`
+- **plugins** - external JSONL courier plugins launched as subprocesses; current protocol in `docs/courier-plugin-protocol-v2.md`
 
 The courier/plugin boundary lives in [`crates/dispatch-core/src/courier.rs`](crates/dispatch-core/src/courier.rs).
 
@@ -261,6 +261,7 @@ Core traits and types:
 For courier implementers:
 
 - [`docs/courier-implementers.md`](docs/courier-implementers.md)
+- [`docs/courier-plugin-protocol-v2.md`](docs/courier-plugin-protocol-v2.md)
 - [`docs/courier-plugin-protocol-v1.md`](docs/courier-plugin-protocol-v1.md)
 - [`crates/dispatch-core/tests/courier_conformance.rs`](crates/dispatch-core/tests/courier_conformance.rs)
 
