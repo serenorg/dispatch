@@ -169,9 +169,11 @@ cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<diges
 cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
 cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
 
-# Push/pull to a file depot
+# Push/pull to a depot
 dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
 dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch push examples/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
+dispatch pull https://depot.example.com::acme/basic:0.1.0
 ```
 
 Print the parsed AST:
@@ -295,11 +297,14 @@ State management:
 
 ## Depot
 
-- `dispatch push <parcel> <reference>` - publish a parcel into a file-backed depot
+- `dispatch push <parcel> <reference>` - publish a parcel into a depot
 - `dispatch pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
-- v1 depot references: `file:///absolute/path/to/depot::org/parcel:v1`
-- parcels stored by digest under `blobs/parcels/<digest>/`
-- tags stored under `refs/<org>/<parcel>/tags/<tag>.json`
+- v1 depot references include:
+- `file:///absolute/path/to/depot::org/parcel:v1`
+- `https://depot.example.com::org/parcel:v1`
+- file depots store parcels by digest under `blobs/parcels/<digest>/`
+- file depots store tags under `refs/<org>/<parcel>/tags/<tag>.json`
+- HTTP depots expose parcel blobs at `/v1/parcels/<digest>.tar` and tag lookup at `/v1/tags?repository=<repo>&tag=<tag>`
 
 ## Design Principles
 

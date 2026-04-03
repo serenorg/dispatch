@@ -468,8 +468,8 @@ fn push(path: PathBuf, reference: &str) -> Result<()> {
     let pushed = push_parcel(&parcel, &reference)?;
 
     println!("Pushed parcel {}", pushed.digest);
-    println!("Parcel dir: {}", pushed.parcel_dir.display());
-    println!("Tag: {}", pushed.tag_path.display());
+    println!("Blob: {}", pushed.blob_location);
+    println!("Tag: {}", pushed.tag_location);
     Ok(())
 }
 

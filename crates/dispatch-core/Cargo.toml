@@ -23,6 +23,8 @@ wasmtime-wasi.workspace = true
 ring.workspace = true
 jsonschema.workspace = true
 rusqlite.workspace = true
+tar.workspace = true
+urlencoding.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
