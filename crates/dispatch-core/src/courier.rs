@@ -429,7 +429,7 @@ struct WasmHostState {
 struct WasmHost {
     parcel: LoadedParcel,
     session: CourierSession,
-    chat_backend: Arc<dyn ChatModelBackend>,
+    chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -610,10 +610,6 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
         &mut self,
         request: wasm_bindings::dispatch::courier::host::ModelRequest,
     ) -> Result<wasm_bindings::dispatch::courier::host::ModelResponse, String> {
-        let model = request
-            .model
-            .or_else(|| configured_model_id(self.parcel.config.models.primary.as_ref()))
-            .ok_or_else(|| "no model configured for wasm guest request".to_string())?;
         let messages = request
             .messages
             .into_iter()
@@ -669,56 +665,57 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
                 },
             })
             .collect::<Vec<_>>();
-        let reply = self
-            .chat_backend
-            .generate(&ModelRequest {
-                model,
-                provider: self
-                    .parcel
-                    .config
-                    .models
-                    .primary
-                    .as_ref()
-                    .and_then(|m| m.provider.clone()),
-                context_token_limit: configured_context_token_limit(&self.parcel.config.limits),
-                instructions: request.instructions,
-                messages,
-                tools,
-                pending_tool_calls: Vec::new(),
-                tool_outputs,
-                previous_response_id: request.previous_response_id,
-            })
-            .map_err(|error| error.to_string())?;
-        let reply = match reply {
-            ModelGeneration::Reply(reply) => reply,
-            ModelGeneration::NotConfigured { backend, reason } => {
-                return Err(format!("{backend} backend not configured: {reason}"));
+        let requests = build_wasm_model_requests(
+            &self.parcel,
+            request.model,
+            request.instructions,
+            messages,
+            tools,
+            tool_outputs,
+            request.previous_response_id,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut last_error = None;
+        for model_request in requests {
+            let backend = select_chat_backend(self.chat_backend_override.as_ref(), &model_request);
+            match backend.generate(&model_request) {
+                Ok(ModelGeneration::Reply(reply)) => {
+                    return Ok(wasm_bindings::dispatch::courier::host::ModelResponse {
+                        backend: reply.backend,
+                        text: reply.text,
+                        response_id: reply.response_id,
+                        tool_calls: reply
+                            .tool_calls
+                            .into_iter()
+                            .map(
+                                |call| wasm_bindings::dispatch::courier::host::ModelToolCall {
+                                    call_id: call.call_id,
+                                    name: call.name,
+                                    input: call.input,
+                                    kind: match call.kind {
+                                        ModelToolKind::Custom => {
+                                            wasm_bindings::dispatch::courier::host::ModelToolKind::Custom
+                                        }
+                                        ModelToolKind::Function => {
+                                            wasm_bindings::dispatch::courier::host::ModelToolKind::Function
+                                        }
+                                    },
+                                },
+                            )
+                            .collect(),
+                    });
+                }
+                Ok(ModelGeneration::NotConfigured { backend, reason }) => {
+                    last_error = Some(format!("{backend} backend not configured: {reason}"));
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
             }
-        };
-        Ok(wasm_bindings::dispatch::courier::host::ModelResponse {
-            backend: reply.backend,
-            text: reply.text,
-            response_id: reply.response_id,
-            tool_calls: reply
-                .tool_calls
-                .into_iter()
-                .map(
-                    |call| wasm_bindings::dispatch::courier::host::ModelToolCall {
-                        call_id: call.call_id,
-                        name: call.name,
-                        input: call.input,
-                        kind: match call.kind {
-                            ModelToolKind::Custom => {
-                                wasm_bindings::dispatch::courier::host::ModelToolKind::Custom
-                            }
-                            ModelToolKind::Function => {
-                                wasm_bindings::dispatch::courier::host::ModelToolKind::Function
-                            }
-                        },
-                    },
-                )
-                .collect(),
-        })
+        }
+        let message =
+            last_error.unwrap_or_else(|| "no model configured for wasm guest request".to_string());
+        Err(message)
     }
 
     fn invoke_tool(
@@ -838,23 +835,6 @@ impl StubCourier {
             kind: CourierKind::Wasm,
         }
     }
-}
-
-fn default_chat_backend_for_model(primary: Option<&ModelReference>) -> Arc<dyn ChatModelBackend> {
-    default_chat_backend_for_model_with(primary, process_env_lookup)
-}
-
-fn default_chat_backend_for_model_with<F>(
-    primary: Option<&ModelReference>,
-    env_lookup: F,
-) -> Arc<dyn ChatModelBackend>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    default_chat_backend_for_provider_with(
-        primary.and_then(|model| model.provider.as_deref()),
-        env_lookup,
-    )
 }
 
 pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
@@ -2766,9 +2746,7 @@ impl CourierBackend for WasmCourier {
         let parcel = parcel.clone();
         let operation = request.operation;
         let mut session = request.session;
-        let chat_backend = self.chat_backend_override.clone().unwrap_or_else(|| {
-            default_chat_backend_for_model(parcel.config.models.primary.as_ref())
-        });
+        let chat_backend_override = self.chat_backend_override.clone();
         async move {
             validate_courier_reference(
                 "wasm",
@@ -2824,7 +2802,7 @@ impl CourierBackend for WasmCourier {
                         &component_cache,
                         &parcel,
                         &session,
-                        chat_backend,
+                        chat_backend_override,
                     )?;
                     let result = guest
                         .dispatch_courier_guest()
@@ -3134,7 +3112,7 @@ fn instantiate_wasm_guest(
     component_cache: &Arc<Mutex<BTreeMap<String, Component>>>,
     parcel: &LoadedParcel,
     session: &CourierSession,
-    chat_backend: Arc<dyn ChatModelBackend>,
+    chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
 ) -> Result<
     (
         Store<WasmHostState>,
@@ -3173,7 +3151,7 @@ fn instantiate_wasm_guest(
             host: WasmHost {
                 parcel: parcel.clone(),
                 session: session.clone(),
-                chat_backend,
+                chat_backend_override,
             },
             wasi_ctx: WasiCtx::builder().build(),
             resource_table: ResourceTable::new(),
@@ -3784,6 +3762,55 @@ fn configured_model_references(policy: &crate::manifest::ModelPolicy) -> Vec<Mod
         provider: std::env::var("LLM_BACKEND").ok(),
     });
     models
+}
+
+fn build_wasm_model_requests(
+    parcel: &LoadedParcel,
+    requested_model: Option<String>,
+    instructions: String,
+    messages: Vec<ConversationMessage>,
+    tools: Vec<ModelToolDefinition>,
+    tool_outputs: Vec<ModelToolOutput>,
+    previous_response_id: Option<String>,
+) -> Result<Vec<ModelRequest>, CourierError> {
+    let configured = configured_model_references(&parcel.config.models);
+    let model_refs = match requested_model {
+        Some(model) => {
+            if let Some(index) = configured
+                .iter()
+                .position(|candidate| candidate.id == model)
+            {
+                configured[index..].to_vec()
+            } else {
+                vec![ModelReference {
+                    id: model,
+                    provider: None,
+                }]
+            }
+        }
+        None => configured,
+    };
+
+    if model_refs.is_empty() {
+        return Err(CourierError::ModelBackendRequest(
+            "no model configured for wasm guest request".to_string(),
+        ));
+    }
+
+    Ok(model_refs
+        .into_iter()
+        .map(|model| ModelRequest {
+            model: model.id,
+            provider: model.provider,
+            context_token_limit: configured_context_token_limit(&parcel.config.limits),
+            instructions: instructions.clone(),
+            messages: messages.clone(),
+            tools: tools.clone(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: tool_outputs.clone(),
+            previous_response_id: previous_response_id.clone(),
+        })
+        .collect())
 }
 
 fn configured_context_token_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
@@ -4540,6 +4567,60 @@ ENTRYPOINT chat
         ));
         assert_eq!(tool_response.session.history.len(), 4);
         assert_eq!(tool_response.session.history[2].content, "tool demo");
+    }
+
+    #[test]
+    fn wasm_courier_host_model_complete_uses_fallback_models() {
+        static REFERENCE_GUEST: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/dispatch-wasm-guest-reference.wasm"
+        ));
+
+        let test_image = build_test_image_with_binary_files(
+            "\
+FROM dispatch/wasm:latest
+COMPONENT components/reference.wasm
+SOUL SOUL.md
+MODEL primary-model
+FALLBACK fallback-model
+ENTRYPOINT chat
+",
+            &[("SOUL.md", "Soul body")],
+            &[("components/reference.wasm", REFERENCE_GUEST)],
+        );
+        let backend = Arc::new(FakeChatBackend::with_replies(vec![
+            None,
+            Some(ModelReply {
+                text: Some("fallback wasm reply".to_string()),
+                backend: "fake".to_string(),
+                response_id: None,
+                tool_calls: Vec::new(),
+            }),
+        ]));
+        let courier = WasmCourier::with_chat_backend(backend.clone());
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "model".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            response.events.first(),
+            Some(CourierEvent::Message { role, content })
+                if role == "assistant" && content == "fallback wasm reply"
+        ));
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].model, "primary-model");
+        assert_eq!(calls[1].model, "fallback-model");
     }
 
     #[test]
@@ -5418,7 +5499,7 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_selects_openai_compatible_from_env() {
-        let backend = default_chat_backend_for_model_with(None, |name| match name {
+        let backend = default_chat_backend_for_provider_with(None, |name| match name {
             "LLM_BACKEND" => Some("openai_compatible".to_string()),
             _ => None,
         });
@@ -5429,7 +5510,7 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_selects_anthropic_from_env() {
-        let backend = default_chat_backend_for_model_with(None, |name| match name {
+        let backend = default_chat_backend_for_provider_with(None, |name| match name {
             "LLM_BACKEND" => Some("anthropic".to_string()),
             _ => None,
         });
@@ -5440,7 +5521,7 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_selects_gemini_from_env() {
-        let backend = default_chat_backend_for_model_with(None, |name| match name {
+        let backend = default_chat_backend_for_provider_with(None, |name| match name {
             "LLM_BACKEND" => Some("gemini".to_string()),
             _ => None,
         });
@@ -5451,14 +5532,11 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_prefers_model_provider_over_env() {
-        let model = ModelReference {
-            id: "claude-sonnet-4".to_string(),
-            provider: Some("anthropic".to_string()),
-        };
-        let backend = default_chat_backend_for_model_with(Some(&model), |name| match name {
-            "LLM_BACKEND" => Some("openai".to_string()),
-            _ => None,
-        });
+        let backend =
+            default_chat_backend_for_provider_with(Some("anthropic"), |name| match name {
+                "LLM_BACKEND" => Some("openai".to_string()),
+                _ => None,
+            });
 
         assert_eq!(backend.id(), "anthropic_messages");
     }
