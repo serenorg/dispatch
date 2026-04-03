@@ -60,9 +60,11 @@ TOOL BUILTIN system_time
 TOOL BUILTIN web_search
 TOOL BUILTIN topic_lookup
 TOOL BUILTIN human_approval
+TOOL BUILTIN memory_put
+TOOL BUILTIN memory_get
 
 MOUNT SESSION sqlite
-MOUNT MEMORY none
+MOUNT MEMORY sqlite
 MOUNT ARTIFACTS local
 
 ENV TZ=UTC
@@ -234,6 +236,7 @@ Mount behavior:
 - built-in couriers resolve declared mounts during `open_session`
 - `MOUNT SESSION sqlite` creates a session-scoped sqlite database and persists `CourierSession` state on open plus after each turn
 - `MOUNT MEMORY sqlite` resolves a durable parcel-scoped sqlite database for built-in courier memory APIs
+- the native reference courier currently exposes declared builtin `memory_get`, `memory_put`, `memory_delete`, and `memory_list` capabilities to model-backed turns when `MOUNT MEMORY sqlite` is configured
 - memory operations fail explicitly when the parcel does not declare a usable memory mount
 - built-in courier state lives under the standard `.dispatch/state/<digest>/` layout when parcels are opened from a normal build output tree, or under `<parcel-parent>/.dispatch-state/<digest>/` for custom parcel locations
 - `DISPATCH_STATE_ROOT` overrides the built-in courier state root completely when you need an explicit shared state location

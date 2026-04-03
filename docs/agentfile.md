@@ -107,7 +107,7 @@ Resolved prompt/tool invariant:
 - tool exposure is driven by declared tool entries in the parcel manifest
 - prompt text must not be treated as authority to expose undeclared tools
 
-The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. Otherwise it falls back to a local reference reply path.
+The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools plus the supported built-in memory tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. Otherwise it falls back to a local reference reply path.
 
 ### Pluggable Courier Model
 
@@ -357,7 +357,14 @@ Supported clauses:
 ```dockerfile
 TOOL BUILTIN web_search
 TOOL BUILTIN human_approval APPROVAL audit DESCRIPTION "Request a human approval with an audit trail."
+TOOL BUILTIN memory_put DESCRIPTION "Store a durable profile fact."
+TOOL BUILTIN memory_get DESCRIPTION "Load a durable profile fact."
 ```
+
+Native courier note:
+
+- the native reference courier currently host-implements `memory_get`, `memory_put`, `memory_delete`, and `memory_list` for model-backed turns when a parcel declares `MOUNT MEMORY sqlite`
+- other builtin capabilities remain declarative until a courier provides a concrete implementation
 
 #### `TOOL MCP`
 

@@ -1,5 +1,7 @@
 use crate::{
-    manifest::{InstructionKind, MountConfig, MountKind, ParcelManifest, ToolConfig},
+    manifest::{
+        BuiltinToolConfig, InstructionKind, MountConfig, MountKind, ParcelManifest, ToolConfig,
+    },
     plugin_protocol::{
         COURIER_PLUGIN_PROTOCOL_VERSION, PluginRequest, PluginRequestEnvelope, PluginResponse,
     },
@@ -8,6 +10,7 @@ use crate::{
 use dispatch_wasm_abi::ABI as DISPATCH_WASM_COMPONENT_ABI;
 use jsonschema::Validator;
 use rusqlite::{Connection, params};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -59,6 +62,8 @@ pub enum CourierError {
     UnknownLocalTool { tool: String },
     #[error("tool `{tool}` points to missing packaged file `{path}`")]
     MissingToolFile { tool: String, path: String },
+    #[error("builtin tool `{tool}` received invalid input: {message}")]
+    InvalidBuiltinToolInput { tool: String, message: String },
     #[error("tool `{tool}` schema `{path}` is invalid: {source}")]
     ParseToolSchema {
         tool: String,
@@ -257,6 +262,13 @@ pub struct LocalToolSpec {
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinToolSpec {
+    pub capability: String,
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -923,6 +935,90 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
         .collect()
 }
 
+pub fn list_native_builtin_tools(parcel: &LoadedParcel) -> Vec<BuiltinToolSpec> {
+    parcel
+        .config
+        .tools
+        .iter()
+        .filter_map(|tool| match tool {
+            ToolConfig::Builtin(builtin) => builtin_memory_tool_spec(builtin),
+            _ => None,
+        })
+        .collect()
+}
+
+fn builtin_memory_tool_spec(tool: &BuiltinToolConfig) -> Option<BuiltinToolSpec> {
+    let input_schema = builtin_memory_tool_schema(&tool.capability)?;
+    Some(BuiltinToolSpec {
+        capability: tool.capability.clone(),
+        description: tool.description.clone(),
+        input_schema,
+    })
+}
+
+fn builtin_memory_tool_schema(capability: &str) -> Option<serde_json::Value> {
+    match capability {
+        "memory_get" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "key": { "type": "string" }
+            },
+            "required": ["key"],
+            "additionalProperties": false
+        })),
+        "memory_put" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "key": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["key", "value"],
+            "additionalProperties": false
+        })),
+        "memory_delete" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "key": { "type": "string" }
+            },
+            "required": ["key"],
+            "additionalProperties": false
+        })),
+        "memory_list" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "prefix": { "type": "string" }
+            },
+            "additionalProperties": false
+        })),
+        _ => None,
+    }
+}
+
+fn builtin_memory_tool_description(tool: &BuiltinToolSpec) -> String {
+    tool.description
+        .clone()
+        .unwrap_or_else(|| match tool.capability.as_str() {
+            "memory_get" => {
+                "Read a value from the configured Dispatch memory mount by key.".to_string()
+            }
+            "memory_put" => {
+                "Store or update a value in the configured Dispatch memory mount.".to_string()
+            }
+            "memory_delete" => {
+                "Delete a value from the configured Dispatch memory mount by key.".to_string()
+            }
+            "memory_list" => {
+                "List stored values from the configured Dispatch memory mount by prefix."
+                    .to_string()
+            }
+            _ => format!("Dispatch builtin capability `{}`.", tool.capability),
+        })
+}
+
 pub fn run_local_tool(
     parcel: &LoadedParcel,
     tool_name: &str,
@@ -1448,6 +1544,104 @@ fn parse_memory_ref(token: &str) -> (&str, &str) {
         Some((namespace, key)) if !namespace.is_empty() && !key.is_empty() => (namespace, key),
         _ => ("default", token),
     }
+}
+
+fn default_memory_namespace() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinMemoryGetInput {
+    #[serde(default = "default_memory_namespace")]
+    namespace: String,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinMemoryPutInput {
+    #[serde(default = "default_memory_namespace")]
+    namespace: String,
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinMemoryListInput {
+    #[serde(default = "default_memory_namespace")]
+    namespace: String,
+    prefix: Option<String>,
+}
+
+fn parse_builtin_tool_input<T>(tool: &str, input: &str) -> Result<T, CourierError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str::<T>(input).map_err(|error| CourierError::InvalidBuiltinToolInput {
+        tool: tool.to_string(),
+        message: error.to_string(),
+    })
+}
+
+fn execute_builtin_tool(
+    session: &CourierSession,
+    capability: &str,
+    input: &str,
+) -> Result<ToolRunResult, CourierError> {
+    let stdout = match capability {
+        "memory_get" => {
+            let input: BuiltinMemoryGetInput = parse_builtin_tool_input(capability, input)?;
+            match memory_get(session, &input.namespace, &input.key)? {
+                Some(entry) => format!("{}:{} = {}", entry.namespace, entry.key, entry.value),
+                None => format!("No memory entry for {}:{}", input.namespace, input.key),
+            }
+        }
+        "memory_put" => {
+            let input: BuiltinMemoryPutInput = parse_builtin_tool_input(capability, input)?;
+            let replaced = memory_put(session, &input.namespace, &input.key, &input.value)?;
+            if replaced {
+                format!("Updated memory {}:{}", input.namespace, input.key)
+            } else {
+                format!("Stored memory {}:{}", input.namespace, input.key)
+            }
+        }
+        "memory_delete" => {
+            let input: BuiltinMemoryGetInput = parse_builtin_tool_input(capability, input)?;
+            let deleted = memory_delete(session, &input.namespace, &input.key)?;
+            if deleted {
+                format!("Deleted memory {}:{}", input.namespace, input.key)
+            } else {
+                format!("No memory entry for {}:{}", input.namespace, input.key)
+            }
+        }
+        "memory_list" => {
+            let input: BuiltinMemoryListInput = parse_builtin_tool_input(capability, input)?;
+            let entries = memory_list(session, &input.namespace, input.prefix.as_deref())?;
+            if entries.is_empty() {
+                format!("No memory entries in namespace `{}`.", input.namespace)
+            } else {
+                entries
+                    .into_iter()
+                    .map(|entry| format!("{}:{} = {}", entry.namespace, entry.key, entry.value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        _ => {
+            return Err(CourierError::InvalidBuiltinToolInput {
+                tool: capability.to_string(),
+                message: "unsupported builtin capability for native tool execution".to_string(),
+            });
+        }
+    };
+
+    Ok(ToolRunResult {
+        tool: capability.to_string(),
+        command: "dispatch-builtin".to_string(),
+        args: vec![capability.to_string()],
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+    })
 }
 
 fn handle_native_memory_command(
@@ -3221,6 +3415,7 @@ fn execute_native_turn(
 ) -> Result<ChatTurnResult, CourierError> {
     let trimmed = input.trim();
     let local_tools = list_local_tools(image);
+    let builtin_tools = list_native_builtin_tools(image);
     let mut events = Vec::new();
 
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/prompt") {
@@ -3304,21 +3499,35 @@ fn execute_native_turn(
             if !reply.tool_calls.is_empty() {
                 let mut tool_outputs = Vec::with_capacity(reply.tool_calls.len());
                 for tool_call in reply.tool_calls {
-                    let tool = local_tools
+                    let invocation = ToolInvocation {
+                        name: tool_call.name.clone(),
+                        input: Some(tool_call.input.clone()),
+                    };
+                    let tool_result = if let Some(tool) = local_tools
                         .iter()
                         .find(|t| t.alias == tool_call.name || t.packaged_path == tool_call.name)
-                        .ok_or_else(|| CourierError::UnknownLocalTool {
+                    {
+                        events.push(CourierEvent::ToolCallStarted {
+                            invocation,
+                            command: tool.command.clone(),
+                            args: tool.args.clone(),
+                        });
+                        execute_local_tool(image, tool, Some(&tool_call.input))?
+                    } else if let Some(tool) = builtin_tools
+                        .iter()
+                        .find(|tool| tool.capability == tool_call.name)
+                    {
+                        events.push(CourierEvent::ToolCallStarted {
+                            invocation,
+                            command: "dispatch-builtin".to_string(),
+                            args: vec![tool.capability.clone()],
+                        });
+                        execute_builtin_tool(session, &tool.capability, &tool_call.input)?
+                    } else {
+                        return Err(CourierError::UnknownLocalTool {
                             tool: tool_call.name.clone(),
-                        })?;
-                    events.push(CourierEvent::ToolCallStarted {
-                        invocation: ToolInvocation {
-                            name: tool_call.name.clone(),
-                            input: Some(tool_call.input.clone()),
-                        },
-                        command: tool.command.clone(),
-                        args: tool.args.clone(),
-                    });
-                    let tool_result = execute_local_tool(image, tool, Some(&tool_call.input))?;
+                        });
+                    };
                     let combined_output = if tool_result.exit_code == 0 {
                         if tool_result.stderr.trim().is_empty() {
                             tool_result.stdout.clone()
@@ -3381,12 +3590,12 @@ fn execute_native_turn(
         })
         .count()
         + usize::from(!image.config.inline_prompts.is_empty());
-    let tool_count = local_tools.len();
+    let tool_count = local_tools.len() + builtin_tools.len();
     let prior_messages = session.history.len().saturating_sub(1);
 
     Ok(ChatTurnResult {
         reply: format!(
-            "Native {} reference reply for turn {}. Loaded {} prompt section(s) and {} local tool(s). Prior messages in session: {}. Input: {}",
+            "Native {} reference reply for turn {}. Loaded {} prompt section(s) and {} tool(s). Prior messages in session: {}. Input: {}",
             native_turn_mode_name(mode),
             session.turn_count,
             prompt_sections,
@@ -3425,15 +3634,22 @@ fn build_model_request(
     let Some(primary) = &image.config.models.primary else {
         return Ok(None);
     };
+    let builtin_tools = list_native_builtin_tools(image);
+    let mut tools = local_tools
+        .iter()
+        .map(|tool| build_model_tool_definition(image, tool))
+        .collect::<Result<Vec<_>, _>>()?;
+    tools.extend(
+        builtin_tools
+            .iter()
+            .map(build_builtin_model_tool_definition),
+    );
 
     Ok(Some(ModelRequest {
         model: primary.id.clone(),
         instructions: resolve_prompt_text(image)?,
         messages: messages.to_vec(),
-        tools: local_tools
-            .iter()
-            .map(|tool| build_model_tool_definition(image, tool))
-            .collect::<Result<Vec<_>, _>>()?,
+        tools,
         tool_outputs: Vec::new(),
         previous_response_id: None,
     }))
@@ -3464,6 +3680,16 @@ fn build_model_tool_definition(
         description,
         format,
     })
+}
+
+fn build_builtin_model_tool_definition(tool: &BuiltinToolSpec) -> ModelToolDefinition {
+    ModelToolDefinition {
+        name: tool.capability.clone(),
+        description: builtin_memory_tool_description(tool),
+        format: ModelToolFormat::JsonSchema {
+            schema: tool.input_schema.clone(),
+        },
+    }
 }
 
 fn load_tool_schema(
@@ -4712,7 +4938,7 @@ ENTRYPOINT chat
         assert_eq!(response.session.history[0].content, "hello courier");
         assert_eq!(response.session.history[1].role, "assistant");
         assert!(response.session.history[1].content.contains("turn 1"));
-        assert!(response.session.history[1].content.contains("1 local tool"));
+        assert!(response.session.history[1].content.contains("1 tool"));
         assert!(matches!(
             response.events.first(),
             Some(CourierEvent::Message { role, content })
@@ -5037,6 +5263,63 @@ ENTRYPOINT chat
             }
             other => panic!("expected json schema tool format, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_native_builtin_tools_only_exposes_supported_memory_capabilities() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TOOL BUILTIN memory_put
+TOOL BUILTIN memory_get DESCRIPTION \"Read remembered state.\"
+TOOL BUILTIN web_search
+ENTRYPOINT chat
+",
+            &[],
+        );
+
+        let tools = list_native_builtin_tools(&test_image.image);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].capability, "memory_put");
+        assert_eq!(tools[1].capability, "memory_get");
+        assert_eq!(
+            tools[1].description.as_deref(),
+            Some("Read remembered state.")
+        );
+    }
+
+    #[test]
+    fn build_model_request_includes_supported_builtin_memory_tools() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TOOL BUILTIN memory_put
+TOOL BUILTIN memory_get
+ENTRYPOINT chat
+",
+            &[],
+        );
+
+        let request = build_model_request(
+            &test_image.image,
+            &[ConversationMessage {
+                role: "user".to_string(),
+                content: "remember this".to_string(),
+            }],
+            &[],
+        )
+        .unwrap()
+        .expect("expected model request");
+
+        assert_eq!(request.tools.len(), 2);
+        assert_eq!(request.tools[0].name, "memory_put");
+        assert!(matches!(
+            request.tools[0].format,
+            ModelToolFormat::JsonSchema { .. }
+        ));
+        assert_eq!(request.tools[1].name, "memory_get");
     }
 
     #[test]
@@ -5409,6 +5692,124 @@ ENTRYPOINT chat
         assert_eq!(calls[1].tool_outputs.len(), 1);
         assert_eq!(calls[1].tool_outputs[0].kind, ModelToolKind::Function);
         assert!(calls[1].tool_outputs[0].output.contains("tool-output"));
+        assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+    }
+
+    #[test]
+    fn native_courier_chat_executes_builtin_memory_tools() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TOOL BUILTIN memory_put
+TOOL BUILTIN memory_get
+MOUNT MEMORY sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let backend = Arc::new(FakeChatBackend::with_replies(vec![
+            Some(ModelReply {
+                text: None,
+                backend: "fake".to_string(),
+                response_id: Some("resp_1".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "memory_put".to_string(),
+                    input: "{\"namespace\":\"profile\",\"key\":\"name\",\"value\":\"Christian\"}"
+                        .to_string(),
+                    kind: ModelToolKind::Function,
+                }],
+            }),
+            Some(ModelReply {
+                text: None,
+                backend: "fake".to_string(),
+                response_id: Some("resp_2".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_2".to_string(),
+                    name: "memory_get".to_string(),
+                    input: "{\"namespace\":\"profile\",\"key\":\"name\"}".to_string(),
+                    kind: ModelToolKind::Function,
+                }],
+            }),
+            Some(ModelReply {
+                text: Some("memory complete".to_string()),
+                backend: "fake".to_string(),
+                response_id: Some("resp_3".to_string()),
+                tool_calls: Vec::new(),
+            }),
+        ]));
+        let courier = NativeCourier::with_chat_backend(backend.clone());
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "remember my name".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].tools.len(), 2);
+        assert_eq!(calls[0].tools[0].name, "memory_put");
+        assert_eq!(calls[0].tools[1].name, "memory_get");
+        assert!(matches!(
+            calls[0].tools[0].format,
+            ModelToolFormat::JsonSchema { .. }
+        ));
+        assert_eq!(calls[1].previous_response_id.as_deref(), Some("resp_1"));
+        assert!(calls[1].messages.is_empty());
+        assert_eq!(calls[1].tool_outputs.len(), 1);
+        assert!(
+            calls[1].tool_outputs[0]
+                .output
+                .contains("Stored memory profile:name")
+        );
+        assert_eq!(calls[2].previous_response_id.as_deref(), Some("resp_2"));
+        assert_eq!(calls[2].tool_outputs.len(), 1);
+        assert!(
+            calls[2].tool_outputs[0]
+                .output
+                .contains("profile:name = Christian")
+        );
+        drop(calls);
+
+        assert!(matches!(
+            response.events.first(),
+            Some(CourierEvent::ToolCallStarted { invocation, command, args })
+                if invocation.name == "memory_put"
+                    && command == "dispatch-builtin"
+                    && args == &vec!["memory_put".to_string()]
+        ));
+        assert!(matches!(
+            response.events.get(1),
+            Some(CourierEvent::ToolCallFinished { result })
+                if result.tool == "memory_put"
+                    && result.command == "dispatch-builtin"
+                    && result.stdout.contains("Stored memory profile:name")
+        ));
+        assert!(matches!(
+            response.events.get(2),
+            Some(CourierEvent::ToolCallStarted { invocation, command, args })
+                if invocation.name == "memory_get"
+                    && command == "dispatch-builtin"
+                    && args == &vec!["memory_get".to_string()]
+        ));
+        assert!(matches!(
+            response.events.get(3),
+            Some(CourierEvent::ToolCallFinished { result })
+                if result.tool == "memory_get"
+                    && result.stdout.contains("profile:name = Christian")
+        ));
+        assert!(matches!(
+            response.events.get(4),
+            Some(CourierEvent::Message { content, .. }) if content == "memory complete"
+        ));
         assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
     }
 
