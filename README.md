@@ -240,6 +240,9 @@ Mount behavior:
 - memory operations fail explicitly when the parcel does not declare a usable memory mount
 - built-in courier state lives under the standard `.dispatch/state/<digest>/` layout when parcels are opened from a normal build output tree, or under `<parcel-parent>/.dispatch-state/<digest>/` for custom parcel locations
 - `DISPATCH_STATE_ROOT` overrides the built-in courier state root completely when you need an explicit shared state location
+- `dispatch state ls` lists known digest-scoped state directories and whether a matching local parcel is present
+- `dispatch state gc` removes orphaned state directories that no longer have a matching local parcel
+- `dispatch state migrate <old-digest> <new-digest>` copies built-in courier state when a rebuilt parcel gets a new digest
 - unsupported mount drivers fail fast when a courier session opens
 
 Optional environment variables for the native OpenAI-backed chat path:
@@ -329,6 +332,9 @@ dispatch inspect examples/basic/.dispatch/parcels/<digest>
 dispatch run examples/basic/.dispatch/parcels/<digest> --chat "hello"
 dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/market-monitor:0.1.0
 dispatch pull file:///tmp/dispatch-depot::acme/market-monitor:0.1.0
+dispatch state ls
+dispatch state gc --dry-run
+dispatch state migrate <old-digest> <new-digest>
 ```
 
 ## Why Not YAML
