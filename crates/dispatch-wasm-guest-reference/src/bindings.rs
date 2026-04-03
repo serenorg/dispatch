@@ -100,28 +100,6 @@ pub mod dispatch {
                 }
             }
             #[derive(Clone)]
-            pub struct ModelRequest {
-                pub model: Option<_rt::String>,
-                pub instructions: _rt::String,
-                pub messages: _rt::Vec<ConversationMessage>,
-                pub tools: _rt::Vec<ModelTool>,
-                pub previous_response_id: Option<_rt::String>,
-            }
-            impl ::core::fmt::Debug for ModelRequest {
-                fn fmt(
-                    &self,
-                    f: &mut ::core::fmt::Formatter<'_>,
-                ) -> ::core::fmt::Result {
-                    f.debug_struct("ModelRequest")
-                        .field("model", &self.model)
-                        .field("instructions", &self.instructions)
-                        .field("messages", &self.messages)
-                        .field("tools", &self.tools)
-                        .field("previous-response-id", &self.previous_response_id)
-                        .finish()
-                }
-            }
-            #[derive(Clone)]
             pub struct ModelToolCall {
                 pub call_id: _rt::String,
                 pub name: _rt::String,
@@ -158,6 +136,48 @@ pub mod dispatch {
                         .field("text", &self.text)
                         .field("response-id", &self.response_id)
                         .field("tool-calls", &self.tool_calls)
+                        .finish()
+                }
+            }
+            #[derive(Clone)]
+            pub struct ModelToolOutput {
+                pub call_id: _rt::String,
+                pub output: _rt::String,
+                pub kind: ModelToolKind,
+            }
+            impl ::core::fmt::Debug for ModelToolOutput {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("ModelToolOutput")
+                        .field("call-id", &self.call_id)
+                        .field("output", &self.output)
+                        .field("kind", &self.kind)
+                        .finish()
+                }
+            }
+            #[derive(Clone)]
+            pub struct ModelRequest {
+                pub model: Option<_rt::String>,
+                pub instructions: _rt::String,
+                pub messages: _rt::Vec<ConversationMessage>,
+                pub tools: _rt::Vec<ModelTool>,
+                pub tool_outputs: _rt::Vec<ModelToolOutput>,
+                pub previous_response_id: Option<_rt::String>,
+            }
+            impl ::core::fmt::Debug for ModelRequest {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("ModelRequest")
+                        .field("model", &self.model)
+                        .field("instructions", &self.instructions)
+                        .field("messages", &self.messages)
+                        .field("tools", &self.tools)
+                        .field("tool-outputs", &self.tool_outputs)
+                        .field("previous-response-id", &self.previous_response_id)
                         .finish()
                 }
             }
@@ -222,6 +242,7 @@ pub mod dispatch {
                         instructions: instructions0,
                         messages: messages0,
                         tools: tools0,
+                        tool_outputs: tool_outputs0,
                         previous_response_id: previous_response_id0,
                     } = request;
                     let (result2_0, result2_1, result2_2) = match model0 {
@@ -341,22 +362,69 @@ pub mod dispatch {
                             };
                         }
                     }
-                    let (result14_0, result14_1, result14_2) = match previous_response_id0 {
+                    let vec16 = tool_outputs0;
+                    let len16 = vec16.len();
+                    let layout16 = _rt::alloc::Layout::from_size_align_unchecked(
+                        vec16.len() * (5 * ::core::mem::size_of::<*const u8>()),
+                        ::core::mem::size_of::<*const u8>(),
+                    );
+                    let result16 = if layout16.size() != 0 {
+                        let ptr = _rt::alloc::alloc(layout16).cast::<u8>();
+                        if ptr.is_null() {
+                            _rt::alloc::handle_alloc_error(layout16);
+                        }
+                        ptr
+                    } else {
+                        ::core::ptr::null_mut()
+                    };
+                    for (i, e) in vec16.into_iter().enumerate() {
+                        let base = result16
+                            .add(i * (5 * ::core::mem::size_of::<*const u8>()));
+                        {
+                            let ModelToolOutput {
+                                call_id: call_id13,
+                                output: output13,
+                                kind: kind13,
+                            } = e;
+                            let vec14 = call_id13;
+                            let ptr14 = vec14.as_ptr().cast::<u8>();
+                            let len14 = vec14.len();
+                            *base
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<usize>() = len14;
+                            *base.add(0).cast::<*mut u8>() = ptr14.cast_mut();
+                            let vec15 = output13;
+                            let ptr15 = vec15.as_ptr().cast::<u8>();
+                            let len15 = vec15.len();
+                            *base
+                                .add(3 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>() = len15;
+                            *base
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>() = ptr15.cast_mut();
+                            *base
+                                .add(4 * ::core::mem::size_of::<*const u8>())
+                                .cast::<u8>() = (kind13.clone() as i32) as u8;
+                        }
+                    }
+                    let (result18_0, result18_1, result18_2) = match previous_response_id0 {
                         Some(e) => {
-                            let vec13 = e;
-                            let ptr13 = vec13.as_ptr().cast::<u8>();
-                            let len13 = vec13.len();
-                            (1i32, ptr13.cast_mut(), len13)
+                            let vec17 = e;
+                            let ptr17 = vec17.as_ptr().cast::<u8>();
+                            let len17 = vec17.len();
+                            (1i32, ptr17.cast_mut(), len17)
                         }
                         None => (0i32, ::core::ptr::null_mut(), 0usize),
                     };
-                    let ptr15 = ret_area.0.as_mut_ptr().cast::<u8>();
+                    let ptr19 = ret_area.0.as_mut_ptr().cast::<u8>();
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "dispatch:courier/host@0.1.0")]
+                    #[link(wasm_import_module = "dispatch:courier/host@0.0.1")]
                     unsafe extern "C" {
                         #[link_name = "model-complete"]
-                        fn wit_import16(
+                        fn wit_import20(
                             _: i32,
+                            _: *mut u8,
+                            _: usize,
                             _: *mut u8,
                             _: usize,
                             _: *mut u8,
@@ -372,8 +440,10 @@ pub mod dispatch {
                         );
                     }
                     #[cfg(not(target_arch = "wasm32"))]
-                    unsafe extern "C" fn wit_import16(
+                    unsafe extern "C" fn wit_import20(
                         _: i32,
+                        _: *mut u8,
+                        _: usize,
                         _: *mut u8,
                         _: usize,
                         _: *mut u8,
@@ -390,7 +460,7 @@ pub mod dispatch {
                         unreachable!()
                     }
                     unsafe {
-                        wit_import16(
+                        wit_import20(
                             result2_0,
                             result2_1,
                             result2_2,
@@ -400,137 +470,117 @@ pub mod dispatch {
                             len7,
                             result12,
                             len12,
-                            result14_0,
-                            result14_1,
-                            result14_2,
-                            ptr15,
+                            result16,
+                            len16,
+                            result18_0,
+                            result18_1,
+                            result18_2,
+                            ptr19,
                         )
                     };
-                    let l17 = i32::from(*ptr15.add(0).cast::<u8>());
-                    let result45 = match l17 {
+                    let l21 = i32::from(*ptr19.add(0).cast::<u8>());
+                    let result49 = match l21 {
                         0 => {
                             let e = {
-                                let l18 = *ptr15
+                                let l22 = *ptr19
                                     .add(::core::mem::size_of::<*const u8>())
                                     .cast::<*mut u8>();
-                                let l19 = *ptr15
+                                let l23 = *ptr19
                                     .add(2 * ::core::mem::size_of::<*const u8>())
                                     .cast::<usize>();
-                                let len20 = l19;
-                                let bytes20 = _rt::Vec::from_raw_parts(
-                                    l18.cast(),
-                                    len20,
-                                    len20,
+                                let len24 = l23;
+                                let bytes24 = _rt::Vec::from_raw_parts(
+                                    l22.cast(),
+                                    len24,
+                                    len24,
                                 );
-                                let l21 = i32::from(
-                                    *ptr15
+                                let l25 = i32::from(
+                                    *ptr19
                                         .add(3 * ::core::mem::size_of::<*const u8>())
                                         .cast::<u8>(),
                                 );
-                                let l25 = i32::from(
-                                    *ptr15
+                                let l29 = i32::from(
+                                    *ptr19
                                         .add(6 * ::core::mem::size_of::<*const u8>())
                                         .cast::<u8>(),
                                 );
-                                let l29 = *ptr15
+                                let l33 = *ptr19
                                     .add(9 * ::core::mem::size_of::<*const u8>())
                                     .cast::<*mut u8>();
-                                let l30 = *ptr15
+                                let l34 = *ptr19
                                     .add(10 * ::core::mem::size_of::<*const u8>())
                                     .cast::<usize>();
-                                let base41 = l29;
-                                let len41 = l30;
-                                let mut result41 = _rt::Vec::with_capacity(len41);
-                                for i in 0..len41 {
-                                    let base = base41
+                                let base45 = l33;
+                                let len45 = l34;
+                                let mut result45 = _rt::Vec::with_capacity(len45);
+                                for i in 0..len45 {
+                                    let base = base45
                                         .add(i * (7 * ::core::mem::size_of::<*const u8>()));
-                                    let e41 = {
-                                        let l31 = *base.add(0).cast::<*mut u8>();
-                                        let l32 = *base
+                                    let e45 = {
+                                        let l35 = *base.add(0).cast::<*mut u8>();
+                                        let l36 = *base
                                             .add(::core::mem::size_of::<*const u8>())
                                             .cast::<usize>();
-                                        let len33 = l32;
-                                        let bytes33 = _rt::Vec::from_raw_parts(
-                                            l31.cast(),
-                                            len33,
-                                            len33,
+                                        let len37 = l36;
+                                        let bytes37 = _rt::Vec::from_raw_parts(
+                                            l35.cast(),
+                                            len37,
+                                            len37,
                                         );
-                                        let l34 = *base
+                                        let l38 = *base
                                             .add(2 * ::core::mem::size_of::<*const u8>())
                                             .cast::<*mut u8>();
-                                        let l35 = *base
+                                        let l39 = *base
                                             .add(3 * ::core::mem::size_of::<*const u8>())
                                             .cast::<usize>();
-                                        let len36 = l35;
-                                        let bytes36 = _rt::Vec::from_raw_parts(
-                                            l34.cast(),
-                                            len36,
-                                            len36,
+                                        let len40 = l39;
+                                        let bytes40 = _rt::Vec::from_raw_parts(
+                                            l38.cast(),
+                                            len40,
+                                            len40,
                                         );
-                                        let l37 = *base
+                                        let l41 = *base
                                             .add(4 * ::core::mem::size_of::<*const u8>())
                                             .cast::<*mut u8>();
-                                        let l38 = *base
+                                        let l42 = *base
                                             .add(5 * ::core::mem::size_of::<*const u8>())
                                             .cast::<usize>();
-                                        let len39 = l38;
-                                        let bytes39 = _rt::Vec::from_raw_parts(
-                                            l37.cast(),
-                                            len39,
-                                            len39,
+                                        let len43 = l42;
+                                        let bytes43 = _rt::Vec::from_raw_parts(
+                                            l41.cast(),
+                                            len43,
+                                            len43,
                                         );
-                                        let l40 = i32::from(
+                                        let l44 = i32::from(
                                             *base
                                                 .add(6 * ::core::mem::size_of::<*const u8>())
                                                 .cast::<u8>(),
                                         );
                                         ModelToolCall {
-                                            call_id: _rt::string_lift(bytes33),
-                                            name: _rt::string_lift(bytes36),
-                                            input: _rt::string_lift(bytes39),
-                                            kind: ModelToolKind::_lift(l40 as u8),
+                                            call_id: _rt::string_lift(bytes37),
+                                            name: _rt::string_lift(bytes40),
+                                            input: _rt::string_lift(bytes43),
+                                            kind: ModelToolKind::_lift(l44 as u8),
                                         }
                                     };
-                                    result41.push(e41);
+                                    result45.push(e45);
                                 }
                                 _rt::cabi_dealloc(
-                                    base41,
-                                    len41 * (7 * ::core::mem::size_of::<*const u8>()),
+                                    base45,
+                                    len45 * (7 * ::core::mem::size_of::<*const u8>()),
                                     ::core::mem::size_of::<*const u8>(),
                                 );
                                 ModelResponse {
-                                    backend: _rt::string_lift(bytes20),
-                                    text: match l21 {
+                                    backend: _rt::string_lift(bytes24),
+                                    text: match l25 {
                                         0 => None,
                                         1 => {
                                             let e = {
-                                                let l22 = *ptr15
+                                                let l26 = *ptr19
                                                     .add(4 * ::core::mem::size_of::<*const u8>())
                                                     .cast::<*mut u8>();
-                                                let l23 = *ptr15
+                                                let l27 = *ptr19
                                                     .add(5 * ::core::mem::size_of::<*const u8>())
-                                                    .cast::<usize>();
-                                                let len24 = l23;
-                                                let bytes24 = _rt::Vec::from_raw_parts(
-                                                    l22.cast(),
-                                                    len24,
-                                                    len24,
-                                                );
-                                                _rt::string_lift(bytes24)
-                                            };
-                                            Some(e)
-                                        }
-                                        _ => _rt::invalid_enum_discriminant(),
-                                    },
-                                    response_id: match l25 {
-                                        0 => None,
-                                        1 => {
-                                            let e = {
-                                                let l26 = *ptr15
-                                                    .add(7 * ::core::mem::size_of::<*const u8>())
-                                                    .cast::<*mut u8>();
-                                                let l27 = *ptr15
-                                                    .add(8 * ::core::mem::size_of::<*const u8>())
                                                     .cast::<usize>();
                                                 let len28 = l27;
                                                 let bytes28 = _rt::Vec::from_raw_parts(
@@ -544,26 +594,48 @@ pub mod dispatch {
                                         }
                                         _ => _rt::invalid_enum_discriminant(),
                                     },
-                                    tool_calls: result41,
+                                    response_id: match l29 {
+                                        0 => None,
+                                        1 => {
+                                            let e = {
+                                                let l30 = *ptr19
+                                                    .add(7 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<*mut u8>();
+                                                let l31 = *ptr19
+                                                    .add(8 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<usize>();
+                                                let len32 = l31;
+                                                let bytes32 = _rt::Vec::from_raw_parts(
+                                                    l30.cast(),
+                                                    len32,
+                                                    len32,
+                                                );
+                                                _rt::string_lift(bytes32)
+                                            };
+                                            Some(e)
+                                        }
+                                        _ => _rt::invalid_enum_discriminant(),
+                                    },
+                                    tool_calls: result45,
                                 }
                             };
                             Ok(e)
                         }
                         1 => {
                             let e = {
-                                let l42 = *ptr15
+                                let l46 = *ptr19
                                     .add(::core::mem::size_of::<*const u8>())
                                     .cast::<*mut u8>();
-                                let l43 = *ptr15
+                                let l47 = *ptr19
                                     .add(2 * ::core::mem::size_of::<*const u8>())
                                     .cast::<usize>();
-                                let len44 = l43;
-                                let bytes44 = _rt::Vec::from_raw_parts(
-                                    l42.cast(),
-                                    len44,
-                                    len44,
+                                let len48 = l47;
+                                let bytes48 = _rt::Vec::from_raw_parts(
+                                    l46.cast(),
+                                    len48,
+                                    len48,
                                 );
-                                _rt::string_lift(bytes44)
+                                _rt::string_lift(bytes48)
                             };
                             Err(e)
                         }
@@ -575,7 +647,10 @@ pub mod dispatch {
                     if layout12.size() != 0 {
                         _rt::alloc::dealloc(result12.cast(), layout12);
                     }
-                    result45
+                    if layout16.size() != 0 {
+                        _rt::alloc::dealloc(result16.cast(), layout16);
+                    }
+                    result49
                 }
             }
             #[allow(unused_unsafe, clippy::all)]
@@ -609,7 +684,7 @@ pub mod dispatch {
                     };
                     let ptr4 = ret_area.0.as_mut_ptr().cast::<u8>();
                     #[cfg(target_arch = "wasm32")]
-                    #[link(wasm_import_module = "dispatch:courier/host@0.1.0")]
+                    #[link(wasm_import_module = "dispatch:courier/host@0.0.1")]
                     unsafe extern "C" {
                         #[link_name = "invoke-tool"]
                         fn wit_import5(
@@ -805,7 +880,7 @@ pub mod exports {
                 pub struct GuestSession {
                     pub turn_count: u64,
                     pub history: _rt::Vec<ConversationMessage>,
-                    pub guest_state: Option<_rt::String>,
+                    pub backend_state: Option<_rt::String>,
                 }
                 impl ::core::fmt::Debug for GuestSession {
                     fn fmt(
@@ -815,7 +890,7 @@ pub mod exports {
                         f.debug_struct("GuestSession")
                             .field("turn-count", &self.turn_count)
                             .field("history", &self.history)
-                            .field("guest-state", &self.guest_state)
+                            .field("backend-state", &self.backend_state)
                             .finish()
                     }
                 }
@@ -887,7 +962,7 @@ pub mod exports {
                 }
                 #[derive(Clone)]
                 pub struct TurnResult {
-                    pub guest_state: Option<_rt::String>,
+                    pub backend_state: Option<_rt::String>,
                     pub events: _rt::Vec<GuestEvent>,
                 }
                 impl ::core::fmt::Debug for TurnResult {
@@ -896,7 +971,7 @@ pub mod exports {
                         f: &mut ::core::fmt::Formatter<'_>,
                     ) -> ::core::fmt::Result {
                         f.debug_struct("TurnResult")
-                            .field("guest-state", &self.guest_state)
+                            .field("backend-state", &self.backend_state)
                             .field("events", &self.events)
                             .finish()
                     }
@@ -1411,7 +1486,7 @@ pub mod exports {
                         GuestSession {
                             turn_count: l28 as u64,
                             history: result37,
-                            guest_state: match l38 {
+                            backend_state: match l38 {
                                 0 => None,
                                 1 => {
                                     let e = {
@@ -1446,10 +1521,10 @@ pub mod exports {
                         Ok(e) => {
                             *ptr55.add(0).cast::<u8>() = (0i32) as u8;
                             let TurnResult {
-                                guest_state: guest_state56,
+                                backend_state: backend_state56,
                                 events: events56,
                             } = e;
-                            match guest_state56 {
+                            match backend_state56 {
                                 Some(e) => {
                                     *ptr55
                                         .add(::core::mem::size_of::<*const u8>())
@@ -1691,10 +1766,10 @@ pub mod exports {
                     ) -> Result<TurnResult, _rt::String>;
                 }
                 #[doc(hidden)]
-                macro_rules! __export_dispatch_courier_guest_0_1_0_cabi {
+                macro_rules! __export_dispatch_courier_guest_0_0_1_cabi {
                     ($ty:ident with_types_in $($path_to_types:tt)*) => {
                         const _ : () = { #[unsafe (export_name =
-                        "dispatch:courier/guest@0.1.0#open-session")] unsafe extern "C"
+                        "dispatch:courier/guest@0.0.1#open-session")] unsafe extern "C"
                         fn export_open_session(arg0 : * mut u8, arg1 : usize, arg2 : i32,
                         arg3 : * mut u8, arg4 : usize, arg5 : * mut u8, arg6 : usize,
                         arg7 : * mut u8, arg8 : usize, arg9 : i32, arg10 : * mut u8,
@@ -1702,22 +1777,22 @@ pub mod exports {
                         _export_open_session_cabi::<$ty > (arg0, arg1, arg2, arg3, arg4,
                         arg5, arg6, arg7, arg8, arg9, arg10, arg11) } } #[unsafe
                         (export_name =
-                        "cabi_post_dispatch:courier/guest@0.1.0#open-session")] unsafe
+                        "cabi_post_dispatch:courier/guest@0.0.1#open-session")] unsafe
                         extern "C" fn _post_return_open_session(arg0 : * mut u8,) {
                         unsafe { $($path_to_types)*:: __post_return_open_session::<$ty >
                         (arg0) } } #[unsafe (export_name =
-                        "dispatch:courier/guest@0.1.0#handle-operation")] unsafe extern
+                        "dispatch:courier/guest@0.0.1#handle-operation")] unsafe extern
                         "C" fn export_handle_operation(arg0 : * mut u8,) -> * mut u8 {
                         unsafe { $($path_to_types)*:: _export_handle_operation_cabi::<$ty
                         > (arg0) } } #[unsafe (export_name =
-                        "cabi_post_dispatch:courier/guest@0.1.0#handle-operation")]
+                        "cabi_post_dispatch:courier/guest@0.0.1#handle-operation")]
                         unsafe extern "C" fn _post_return_handle_operation(arg0 : * mut
                         u8,) { unsafe { $($path_to_types)*::
                         __post_return_handle_operation::<$ty > (arg0) } } };
                     };
                 }
                 #[doc(hidden)]
-                pub(crate) use __export_dispatch_courier_guest_0_1_0_cabi;
+                pub(crate) use __export_dispatch_courier_guest_0_0_1_cabi;
                 #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
                 #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
                 struct _RetArea(
@@ -1790,47 +1865,48 @@ macro_rules! __export_courier_guest_impl {
     };
     ($ty:ident with_types_in $($path_to_types_root:tt)*) => {
         $($path_to_types_root)*::
-        exports::dispatch::courier::guest::__export_dispatch_courier_guest_0_1_0_cabi!($ty
+        exports::dispatch::courier::guest::__export_dispatch_courier_guest_0_0_1_cabi!($ty
         with_types_in $($path_to_types_root)*:: exports::dispatch::courier::guest);
     };
 }
 #[doc(inline)]
 pub(crate) use __export_courier_guest_impl as export;
 #[cfg(target_arch = "wasm32")]
-#[unsafe(link_section = "component-type:wit-bindgen:0.41.0:dispatch:courier@0.1.0:courier-guest:encoded world")]
+#[unsafe(link_section = "component-type:wit-bindgen:0.41.0:dispatch:courier@0.0.1:courier-guest:encoded world")]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1385] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xe5\x09\x01A\x02\x01\
-A\x06\x01B\x1d\x01r\x02\x04roles\x07contents\x04\0\x14conversation-message\x03\0\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1455] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xab\x0a\x01A\x02\x01\
+A\x06\x01B\x20\x01r\x02\x04roles\x07contents\x04\0\x14conversation-message\x03\0\
 \0\x01ks\x01r\x03\x05aliass\x0bdescription\x02\x11input-schema-json\x02\x04\0\x0a\
 local-tool\x03\0\x03\x01m\x02\x06custom\x08function\x04\0\x0fmodel-tool-kind\x03\
 \0\x05\x01r\x04\x04names\x0bdescriptions\x04kind\x06\x11input-schema-json\x02\x04\
-\0\x0amodel-tool\x03\0\x07\x01p\x01\x01p\x08\x01r\x05\x05model\x02\x0cinstructio\
-nss\x08messages\x09\x05tools\x0a\x14previous-response-id\x02\x04\0\x0dmodel-requ\
-est\x03\0\x0b\x01r\x04\x07call-ids\x04names\x05inputs\x04kind\x06\x04\0\x0fmodel\
--tool-call\x03\0\x0d\x01p\x0e\x01r\x04\x07backends\x04text\x02\x0bresponse-id\x02\
-\x0atool-calls\x0f\x04\0\x0emodel-response\x03\0\x10\x01r\x02\x04names\x05input\x02\
-\x04\0\x0ftool-invocation\x03\0\x12\x01ps\x01r\x06\x04tools\x07commands\x04args\x14\
-\x09exit-codez\x06stdouts\x06stderrs\x04\0\x0btool-result\x03\0\x15\x01j\x01\x11\
-\x01s\x01@\x01\x07request\x0c\0\x17\x04\0\x0emodel-complete\x01\x18\x01j\x01\x16\
-\x01s\x01@\x01\x0ainvocation\x13\0\x19\x04\0\x0binvoke-tool\x01\x1a\x03\0\x1bdis\
-patch:courier/host@0.1.0\x05\0\x02\x03\0\0\x14conversation-message\x02\x03\0\0\x0a\
-local-tool\x01B\x1a\x02\x03\x02\x01\x01\x04\0\x14conversation-message\x03\0\0\x02\
-\x03\x02\x01\x02\x04\0\x0alocal-tool\x03\0\x02\x01ks\x01p\x03\x01r\x05\x0dparcel\
--digests\x0aentrypoint\x04\x06prompts\x0blocal-tools\x05\x0dprimary-model\x04\x04\
-\0\x0eparcel-context\x03\0\x06\x01p\x01\x01r\x03\x0aturn-countw\x07history\x08\x0b\
-guest-state\x04\x04\0\x0dguest-session\x03\0\x09\x01q\x03\x04chat\x01s\0\x03job\x01\
-s\0\x09heartbeat\x01\x04\0\x04\0\x09operation\x03\0\x0b\x01r\x02\x07backends\x05\
-errors\x04\0\x10backend-fallback\x03\0\x0d\x01q\x03\x07message\x01\x01\0\x0atext\
--delta\x01s\0\x10backend-fallback\x01\x0e\0\x04\0\x0bguest-event\x03\0\x0f\x01p\x10\
-\x01r\x02\x0bguest-state\x04\x06events\x11\x04\0\x0bturn-result\x03\0\x12\x01j\x01\
-\x04\x01s\x01@\x01\x06parcel\x07\0\x14\x04\0\x0copen-session\x01\x15\x01j\x01\x13\
-\x01s\x01@\x03\x06parcel\x07\x07session\x0a\x09operation\x0c\0\x16\x04\0\x10hand\
-le-operation\x01\x17\x04\0\x1cdispatch:courier/guest@0.1.0\x05\x03\x04\0$dispatc\
-h:courier/courier-guest@0.1.0\x04\0\x0b\x13\x01\0\x0dcourier-guest\x03\0\0\0G\x09\
-producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rus\
-t\x060.41.0";
+\0\x0amodel-tool\x03\0\x07\x01r\x04\x07call-ids\x04names\x05inputs\x04kind\x06\x04\
+\0\x0fmodel-tool-call\x03\0\x09\x01p\x0a\x01r\x04\x07backends\x04text\x02\x0bres\
+ponse-id\x02\x0atool-calls\x0b\x04\0\x0emodel-response\x03\0\x0c\x01r\x03\x07cal\
+l-ids\x06outputs\x04kind\x06\x04\0\x11model-tool-output\x03\0\x0e\x01p\x01\x01p\x08\
+\x01p\x0f\x01r\x06\x05model\x02\x0cinstructionss\x08messages\x10\x05tools\x11\x0c\
+tool-outputs\x12\x14previous-response-id\x02\x04\0\x0dmodel-request\x03\0\x13\x01\
+r\x02\x04names\x05input\x02\x04\0\x0ftool-invocation\x03\0\x15\x01ps\x01r\x06\x04\
+tools\x07commands\x04args\x17\x09exit-codez\x06stdouts\x06stderrs\x04\0\x0btool-\
+result\x03\0\x18\x01j\x01\x0d\x01s\x01@\x01\x07request\x14\0\x1a\x04\0\x0emodel-\
+complete\x01\x1b\x01j\x01\x19\x01s\x01@\x01\x0ainvocation\x16\0\x1c\x04\0\x0binv\
+oke-tool\x01\x1d\x03\0\x1bdispatch:courier/host@0.0.1\x05\0\x02\x03\0\0\x14conve\
+rsation-message\x02\x03\0\0\x0alocal-tool\x01B\x1a\x02\x03\x02\x01\x01\x04\0\x14\
+conversation-message\x03\0\0\x02\x03\x02\x01\x02\x04\0\x0alocal-tool\x03\0\x02\x01\
+ks\x01p\x03\x01r\x05\x0dparcel-digests\x0aentrypoint\x04\x06prompts\x0blocal-too\
+ls\x05\x0dprimary-model\x04\x04\0\x0eparcel-context\x03\0\x06\x01p\x01\x01r\x03\x0a\
+turn-countw\x07history\x08\x0dbackend-state\x04\x04\0\x0dguest-session\x03\0\x09\
+\x01q\x03\x04chat\x01s\0\x03job\x01s\0\x09heartbeat\x01\x04\0\x04\0\x09operation\
+\x03\0\x0b\x01r\x02\x07backends\x05errors\x04\0\x10backend-fallback\x03\0\x0d\x01\
+q\x03\x07message\x01\x01\0\x0atext-delta\x01s\0\x10backend-fallback\x01\x0e\0\x04\
+\0\x0bguest-event\x03\0\x0f\x01p\x10\x01r\x02\x0dbackend-state\x04\x06events\x11\
+\x04\0\x0bturn-result\x03\0\x12\x01j\x01\x04\x01s\x01@\x01\x06parcel\x07\0\x14\x04\
+\0\x0copen-session\x01\x15\x01j\x01\x13\x01s\x01@\x03\x06parcel\x07\x07session\x0a\
+\x09operation\x0c\0\x16\x04\0\x10handle-operation\x01\x17\x04\0\x1cdispatch:cour\
+ier/guest@0.0.1\x05\x03\x04\0$dispatch:courier/courier-guest@0.0.1\x04\0\x0b\x13\
+\x01\0\x0dcourier-guest\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-c\
+omponent\x070.227.1\x10wit-bindgen-rust\x060.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

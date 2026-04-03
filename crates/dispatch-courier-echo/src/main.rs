@@ -112,7 +112,7 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                     entrypoint: parcel.config.entrypoint,
                     turn_count: 0,
                     history: Vec::new(),
-                    guest_state: None,
+                    backend_state: None,
                 }),
             }])
         }
@@ -245,7 +245,7 @@ mod tests {
             entrypoint: Some("chat".to_string()),
             turn_count: 0,
             history: Vec::new(),
-            guest_state: None,
+            backend_state: None,
         };
 
         let responses = handle_run(

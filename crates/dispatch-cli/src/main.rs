@@ -893,7 +893,7 @@ mod tests {
                     content: "world".to_string(),
                 },
             ],
-            guest_state: None,
+            backend_state: None,
         }
     }
 

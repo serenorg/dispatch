@@ -79,7 +79,7 @@ mod tests {
                         role: "user".to_string(),
                         content: "hello".to_string(),
                     }],
-                    guest_state: None,
+                    backend_state: None,
                 },
                 operation: CourierOperation::Chat {
                     input: "hello".to_string(),

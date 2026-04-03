@@ -186,7 +186,6 @@ Declares the packaged WebAssembly component for `dispatch/wasm` parcels.
 
 ```dockerfile
 COMPONENT components/assistant.wasm
-COMPONENT components/assistant.wasm WORLD courier-guest
 ```
 
 Semantics:
@@ -194,7 +193,7 @@ Semantics:
 - only valid for `dispatch/wasm` courier targets
 - packages the component into the parcel `context/`
 - is normalized into `courier.component` in the built manifest
-- records the packaged component digest plus the Dispatch WASM ABI/world the component targets
+- records the packaged component digest plus the Dispatch courier ABI the component targets
 - makes the guest binary an explicit part of the parcel contract instead of relying on implicit file conventions
 - the `dispatch/wasm` courier executes `chat`, `job`, and `heartbeat` by calling into that packaged guest component through the Dispatch WIT ABI
 

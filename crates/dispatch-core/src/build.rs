@@ -1,11 +1,11 @@
 use crate::{
     ParsedAgentfile, Value,
     manifest::{
-        BuiltinToolConfig, CommandSpec, CourierTarget, DISPATCH_WASM_ABI, DISPATCH_WASM_WORLD,
-        EnvVar, FrameworkProvenance, InstructionConfig, InstructionKind, LimitSpec,
-        LocalToolConfig, McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind,
-        NetworkRule, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec, TimeoutSpec,
-        ToolConfig, ToolInputSchemaRef, Visibility, WasmComponentConfig,
+        BuiltinToolConfig, CommandSpec, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
+        FrameworkProvenance, InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig,
+        McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind, NetworkRule,
+        PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
+        TimeoutSpec, ToolConfig, ToolInputSchemaRef, Visibility, WasmComponentConfig,
     },
     parse_agentfile,
     validate::{Level, validate_agentfile},
@@ -19,8 +19,6 @@ use std::{
 };
 use thiserror::Error;
 use walkdir::WalkDir;
-
-const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -216,7 +214,7 @@ pub fn build_agentfile(
             }
             "COMPONENT" => {
                 let component = parse_component(&instruction.args);
-                let source_path = component.source.clone();
+                let source_path = component.packaged_path.clone();
                 let resolved_path = resolve_path(&context_dir, &source_path)?;
                 let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
                 let component_sha256 = file_record.sha256.clone();
@@ -230,10 +228,9 @@ pub fn build_agentfile(
                 })?;
 
                 courier.component = Some(WasmComponentConfig {
-                    source: source_path,
+                    packaged_path: source_path,
                     sha256: component_sha256,
                     abi: DISPATCH_WASM_ABI.to_string(),
-                    world: component.world,
                 });
             }
             "NAME" => resolved.name = first_scalar(instruction.args.first()),
@@ -270,12 +267,13 @@ pub fn build_agentfile(
                             package_path(&context_dir, &resolved_path, &mut packaged)?;
                         files.extend(file_record.expand());
                         if let Some(schema) = &local.input_schema {
-                            let resolved_schema_path = resolve_path(&context_dir, &schema.source)?;
+                            let resolved_schema_path =
+                                resolve_path(&context_dir, &schema.packaged_path)?;
                             validate_tool_schema(&resolved_schema_path, &local.alias)?;
                             let schema_record =
                                 package_path(&context_dir, &resolved_schema_path, &mut packaged)?;
                             local.input_schema = Some(ToolInputSchemaRef {
-                                source: schema.source.clone(),
+                                packaged_path: schema.packaged_path.clone(),
                                 sha256: schema_record.sha256.clone(),
                             });
                             files.extend(schema_record.expand());
@@ -330,7 +328,7 @@ pub fn build_agentfile(
                 let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
                 resolved.instructions.push(InstructionConfig {
                     kind: instruction_kind_from_keyword(&instruction.keyword),
-                    source: source_path,
+                    packaged_path: source_path,
                     sha256: file_record.sha256.clone(),
                 });
                 files.extend(file_record.expand());
@@ -344,7 +342,7 @@ pub fn build_agentfile(
                             package_path(&context_dir, &resolved_path, &mut packaged)?;
                         resolved.instructions.push(InstructionConfig {
                             kind: InstructionKind::Memory,
-                            source: maybe_path,
+                            packaged_path: maybe_path,
                             sha256: file_record.sha256.clone(),
                         });
                         files.extend(file_record.expand());
@@ -361,7 +359,7 @@ pub fn build_agentfile(
                     let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
                     resolved.instructions.push(InstructionConfig {
                         kind: InstructionKind::Heartbeat,
-                        source: source_path,
+                        packaged_path: source_path,
                         sha256: file_record.sha256.clone(),
                     });
                     files.extend(file_record.expand());
@@ -382,7 +380,7 @@ pub fn build_agentfile(
 
     let provisional = ProvisionalParcelManifest {
         schema: PARCEL_SCHEMA_URL.to_string(),
-        format_version: FORMAT_VERSION,
+        format_version: PARCEL_FORMAT_VERSION,
         source_agentfile: relative_display(&context_dir, &agentfile_path),
         courier: resolved.courier.ok_or_else(|| {
             BuildError::Validation("line 1: missing required `FROM` instruction".to_string())
@@ -472,7 +470,7 @@ pub fn build_agentfile(
     })?;
 
     let lockfile = ParcelLock {
-        format_version: FORMAT_VERSION,
+        format_version: PARCEL_FORMAT_VERSION,
         digest,
         manifest: "manifest.json".to_string(),
         context_dir: "context".to_string(),
@@ -811,16 +809,13 @@ fn parse_tool(args: &[Value]) -> Option<ToolConfig> {
 }
 
 struct ParsedComponent {
-    source: String,
-    world: String,
+    packaged_path: String,
 }
 
 fn parse_component(args: &[Value]) -> ParsedComponent {
     let tokens = scalars(args);
-    let source = tokens.first().cloned().unwrap_or_default();
-    let world =
-        parse_named_value(&tokens, "WORLD").unwrap_or_else(|| DISPATCH_WASM_WORLD.to_string());
-    ParsedComponent { source, world }
+    let packaged_path = tokens.first().cloned().unwrap_or_default();
+    ParsedComponent { packaged_path }
 }
 
 fn parse_local_tool(tokens: &[String]) -> Option<LocalToolConfig> {
@@ -833,10 +828,11 @@ fn parse_local_tool(tokens: &[String]) -> Option<LocalToolConfig> {
     });
     let approval = parse_named_value(tokens, "APPROVAL");
     let description = parse_named_value(tokens, "DESCRIPTION");
-    let input_schema = parse_named_value(tokens, "SCHEMA").map(|source| ToolInputSchemaRef {
-        source,
-        sha256: String::new(),
-    });
+    let input_schema =
+        parse_named_value(tokens, "SCHEMA").map(|packaged_path| ToolInputSchemaRef {
+            packaged_path,
+            sha256: String::new(),
+        });
     let runner = parse_tool_runner(tokens, &packaged_path);
 
     Some(LocalToolConfig {
@@ -1330,7 +1326,7 @@ ENTRYPOINT chat
                     .input_schema
                     .as_ref()
                     .expect("expected packaged input schema");
-                assert_eq!(schema.source, "schemas/demo.json");
+                assert_eq!(schema.packaged_path, "schemas/demo.json");
                 assert_eq!(schema.sha256, hex_digest(schema_body.as_bytes()));
             }
             other => panic!("expected local tool, got {other:?}"),
@@ -1373,9 +1369,8 @@ ENTRYPOINT chat
             .expect("expected wasm component in courier target");
 
         assert_eq!(parcel.courier.reference, "dispatch/wasm:latest");
-        assert_eq!(component.source, "components/assistant.wat");
+        assert_eq!(component.packaged_path, "components/assistant.wat");
         assert_eq!(component.abi, DISPATCH_WASM_ABI);
-        assert_eq!(component.world, DISPATCH_WASM_WORLD);
         assert_eq!(component.sha256.len(), 64);
     }
 
@@ -1504,5 +1499,35 @@ ENTRYPOINT chat
 
         assert!(!report.is_ok());
         assert!(!report.lockfile_digest_matches);
+    }
+
+    #[test]
+    fn provisional_digest_excludes_embedded_manifest_digest_field() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+SOUL SOUL.md
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+        fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let mut parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(&built.manifest_path).unwrap()).unwrap();
+        let expected_digest = parcel.digest.clone();
+        parcel.digest = "f".repeat(64);
+
+        assert_eq!(provisional_digest(&parcel).unwrap(), expected_digest);
     }
 }

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const PARCEL_SCHEMA_URL: &str = "https://dispatch.run/schemas/parcel.v1.json";
-pub const DISPATCH_WASM_ABI: &str = "dispatch:courier@0.1.0/courier-guest";
-pub const DISPATCH_WASM_WORLD: &str = "courier-guest";
+pub const PARCEL_SCHEMA_URL: &str = "https://schema.dispatch.run/parcel.v1.json";
+pub const PARCEL_FORMAT_VERSION: u32 = 1;
+pub const DISPATCH_WASM_ABI: &str = dispatch_wasm_abi::ABI;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParcelManifest {
@@ -51,10 +51,9 @@ pub struct CourierTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WasmComponentConfig {
-    pub source: String,
+    pub packaged_path: String,
     pub sha256: String,
     pub abi: String,
-    pub world: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,7 +73,7 @@ pub enum InstructionKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstructionConfig {
     pub kind: InstructionKind,
-    pub source: String,
+    pub packaged_path: String,
     pub sha256: String,
 }
 
@@ -120,7 +119,7 @@ pub struct CommandSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolInputSchemaRef {
-    pub source: String,
+    pub packaged_path: String,
     pub sha256: String,
 }
 

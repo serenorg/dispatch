@@ -205,7 +205,7 @@ ENTRYPOINT chat
                 .input_schema
                 .as_ref()
                 .expect("expected input schema in built manifest");
-            assert_eq!(schema.source, "schemas/demo.json");
+            assert_eq!(schema.packaged_path, "schemas/demo.json");
             assert_eq!(schema.sha256.len(), 64);
         }
         other => panic!("expected local tool, got {other:?}"),

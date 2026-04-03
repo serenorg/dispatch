@@ -284,7 +284,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), DepotError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BuildOptions, BuiltParcel, ParcelManifest, build_agentfile};
+    use crate::{BuildOptions, BuiltParcel, ParcelManifest, build_agentfile, verify_parcel};
     use tempfile::tempdir;
 
     fn build_fixture(root: &Path) -> BuiltParcel {
@@ -340,7 +340,7 @@ mod tests {
         let built = build_fixture(dir.path());
         let parcel = load_parcel(&built.parcel_dir).unwrap();
         let depot_root = dir.path().join("depot");
-        let output_root = dir.path().join("pulled");
+        let output_root = dir.path().join("pulled/nested/output");
         let reference =
             parse_depot_reference(&format!("file://{}::acme/monitor:v1", depot_root.display()))
                 .unwrap();
@@ -353,6 +353,7 @@ mod tests {
         let pulled = pull_parcel(&reference, &output_root).unwrap();
         assert_eq!(pulled.digest, parcel.config.digest);
         assert!(pulled.manifest_path.exists());
+        assert!(verify_parcel(&pulled.parcel_dir).unwrap().is_ok());
 
         let pulled_manifest: ParcelManifest =
             serde_json::from_slice(&fs::read(&pulled.manifest_path).unwrap()).unwrap();

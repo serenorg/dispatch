@@ -123,7 +123,9 @@ impl BuiltinCourier {
             Self::Docker => {
                 "Built-in Docker courier for declared local tool execution via the Docker CLI."
             }
-            Self::Wasm => "Built-in stub courier reserved for WASM-backed execution.",
+            Self::Wasm => {
+                "Built-in WASM courier for Dispatch guest components targeting the courier ABI."
+            }
         }
     }
 

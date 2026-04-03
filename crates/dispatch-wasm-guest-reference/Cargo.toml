@@ -10,6 +10,7 @@ keywords = ["agents", "wasm", "courier", "dispatch"]
 categories = ["wasm", "development-tools"]
 
 [dependencies]
+wit-bindgen = "0.41"
 wit-bindgen-rt = { version = "0.41", features = ["bitflags"] }
 
 [lib]

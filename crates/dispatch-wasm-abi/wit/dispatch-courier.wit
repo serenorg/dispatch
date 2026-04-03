@@ -1,4 +1,4 @@
-package dispatch:courier@0.1.0;
+package dispatch:courier@0.0.1;
 
 interface host {
     record conversation-message {
@@ -29,6 +29,7 @@ interface host {
         instructions: string,
         messages: list<conversation-message>,
         tools: list<model-tool>,
+        tool-outputs: list<model-tool-output>,
         previous-response-id: option<string>,
     }
 
@@ -44,6 +45,12 @@ interface host {
         text: option<string>,
         response-id: option<string>,
         tool-calls: list<model-tool-call>,
+    }
+
+    record model-tool-output {
+        call-id: string,
+        output: string,
+        kind: model-tool-kind,
     }
 
     record tool-invocation {
@@ -78,7 +85,7 @@ interface guest {
     record guest-session {
         turn-count: u64,
         history: list<conversation-message>,
-        guest-state: option<string>,
+        backend-state: option<string>,
     }
 
     variant operation {
@@ -99,7 +106,7 @@ interface guest {
     }
 
     record turn-result {
-        guest-state: option<string>,
+        backend-state: option<string>,
         events: list<guest-event>,
     }
 

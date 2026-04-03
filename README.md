@@ -244,7 +244,7 @@ That keeps the standard portable.
 
 Frameworks like ADK are useful authoring and implementation targets, but they are not courier families. An ADK-authored agent can be packaged as a Dispatch parcel and then executed through a Dispatch courier such as `native`, `docker`, or `wasm`.
 
-For `dispatch/wasm` parcels, the compiled component is an explicit part of the parcel contract. The parcel manifest records the packaged component path, its digest, and the Dispatch WIT world/ABI it targets.
+For `dispatch/wasm` parcels, the compiled component is an explicit part of the parcel contract. The parcel manifest records the packaged component path, its digest, and the Dispatch courier ABI it targets.
 
 ## Courier Interface
 

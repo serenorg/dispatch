@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://dispatch.run/schemas/parcel.v1.json",
+  "$id": "https://schema.dispatch.run/parcel.v1.json",
   "title": "Dispatch Parcel Manifest",
   "type": "object",
   "additionalProperties": false,
@@ -25,7 +25,7 @@
   ],
   "properties": {
     "$schema": {
-      "const": "https://dispatch.run/schemas/parcel.v1.json"
+      "const": "https://schema.dispatch.run/parcel.v1.json"
     },
     "format_version": {
       "type": "integer",
@@ -201,13 +201,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source",
+        "packaged_path",
         "sha256",
-        "abi",
-        "world"
+        "abi"
       ],
       "properties": {
-        "source": {
+        "packaged_path": {
           "type": "string"
         },
         "sha256": {
@@ -215,9 +214,6 @@
           "pattern": "^[a-f0-9]{64}$"
         },
         "abi": {
-          "type": "string"
-        },
-        "world": {
           "type": "string"
         }
       }
@@ -227,7 +223,7 @@
       "additionalProperties": false,
       "required": [
         "kind",
-        "source",
+        "packaged_path",
         "sha256"
       ],
       "properties": {
@@ -245,7 +241,7 @@
             "eval"
           ]
         },
-        "source": {
+        "packaged_path": {
           "type": "string"
         },
         "sha256": {
@@ -374,11 +370,11 @@
           ],
           "additionalProperties": false,
           "required": [
-            "source",
+            "packaged_path",
             "sha256"
           ],
           "properties": {
-            "source": {
+            "packaged_path": {
               "type": "string"
             },
             "sha256": {

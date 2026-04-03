@@ -5,10 +5,9 @@ use crate::{
     },
     plugins::CourierPluginManifest,
 };
-use dispatch_wasm_abi::{
-    ABI as DISPATCH_WASM_COMPONENT_ABI, WORLD as DISPATCH_WASM_COMPONENT_WORLD,
-};
+use dispatch_wasm_abi::ABI as DISPATCH_WASM_COMPONENT_ABI;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -16,8 +15,8 @@ use std::{
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use wasmtime::{
@@ -64,6 +63,31 @@ pub enum CourierError {
     },
     #[error("tool `{tool}` schema `{path}` must have a JSON object root")]
     ToolSchemaShape { tool: String, path: String },
+    #[error(
+        "tool `{tool}` schema `{path}` hash mismatch: expected `{expected_sha256}`, got `{actual_sha256}`"
+    )]
+    ToolSchemaDigestMismatch {
+        tool: String,
+        path: String,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+    #[error(
+        "parcel manifest `{path}` declares unsupported schema `{found}`; expected `{expected}`"
+    )]
+    UnsupportedParcelSchema {
+        path: String,
+        found: String,
+        expected: String,
+    },
+    #[error(
+        "parcel manifest `{path}` uses unsupported format_version `{found}`; supported version is `{supported}`"
+    )]
+    UnsupportedParcelFormatVersion {
+        path: String,
+        found: u32,
+        supported: u32,
+    },
     #[error("required secret `{name}` is not present in the environment")]
     MissingSecret { name: String },
     #[error("failed to start tool `{tool}`: {source}")]
@@ -185,7 +209,8 @@ pub struct LocalToolSpec {
     pub command: String,
     pub args: Vec<String>,
     pub description: Option<String>,
-    pub input_schema_source: Option<String>,
+    pub input_schema_packaged_path: Option<String>,
+    pub input_schema_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +254,10 @@ pub struct ToolInvocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+/// Courier operations mix side-effecting turns (`chat`, `job`, `heartbeat`,
+/// `invoke_tool`) with read-style queries (`resolve_prompt`,
+/// `list_local_tools`). Callers should treat the latter as parcel inspection
+/// helpers even though they share the same request envelope.
 pub enum CourierOperation {
     ResolvePrompt,
     ListLocalTools,
@@ -273,7 +302,7 @@ pub struct CourierSession {
     pub turn_count: u64,
     pub history: Vec<ConversationMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guest_state: Option<String>,
+    pub backend_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,6 +483,7 @@ pub struct DockerCourier {
 pub struct WasmCourier {
     engine: Engine,
     chat_backend: Arc<dyn ChatModelBackend>,
+    component_cache: Arc<Mutex<BTreeMap<String, Component>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +520,7 @@ impl Default for WasmCourier {
         Self {
             engine,
             chat_backend: Arc::new(OpenAiResponsesBackend),
+            component_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -554,6 +585,22 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let tool_outputs = request
+            .tool_outputs
+            .into_iter()
+            .map(|output| ModelToolOutput {
+                call_id: output.call_id,
+                output: output.output,
+                kind: match output.kind {
+                    wasm_bindings::dispatch::courier::host::ModelToolKind::Custom => {
+                        ModelToolKind::Custom
+                    }
+                    wasm_bindings::dispatch::courier::host::ModelToolKind::Function => {
+                        ModelToolKind::Function
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
         let reply = self
             .chat_backend
             .generate(&ModelRequest {
@@ -561,7 +608,7 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
                 instructions: request.instructions,
                 messages,
                 tools,
-                tool_outputs: Vec::new(),
+                tool_outputs,
                 previous_response_id: request.previous_response_id,
             })
             .map_err(|error| error.to_string())?
@@ -632,6 +679,7 @@ impl WasmCourier {
         Self {
             engine,
             chat_backend,
+            component_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -678,6 +726,20 @@ pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
             source,
         }
     })?;
+    if config.schema != crate::manifest::PARCEL_SCHEMA_URL {
+        return Err(CourierError::UnsupportedParcelSchema {
+            path: manifest_path.display().to_string(),
+            found: config.schema.clone(),
+            expected: crate::manifest::PARCEL_SCHEMA_URL.to_string(),
+        });
+    }
+    if config.format_version != crate::manifest::PARCEL_FORMAT_VERSION {
+        return Err(CourierError::UnsupportedParcelFormatVersion {
+            path: manifest_path.display().to_string(),
+            found: config.format_version,
+            supported: crate::manifest::PARCEL_FORMAT_VERSION,
+        });
+    }
 
     Ok(LoadedParcel {
         parcel_dir,
@@ -703,7 +765,10 @@ pub fn resolve_prompt_text(parcel: &LoadedParcel) -> Result<String, CourierError
         ) {
             continue;
         }
-        let path = parcel.parcel_dir.join("context").join(&instruction.source);
+        let path = parcel
+            .parcel_dir
+            .join("context")
+            .join(&instruction.packaged_path);
         let body = fs::read_to_string(&path).map_err(|source| CourierError::ReadFile {
             path: path.display().to_string(),
             source,
@@ -734,10 +799,14 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 command: local.runner.command.clone(),
                 args: local.runner.args.clone(),
                 description: local.description.clone(),
-                input_schema_source: local
+                input_schema_packaged_path: local
                     .input_schema
                     .as_ref()
-                    .map(|schema| schema.source.clone()),
+                    .map(|schema| schema.packaged_path.clone()),
+                input_schema_sha256: local
+                    .input_schema
+                    .as_ref()
+                    .map(|schema| schema.sha256.clone()),
             }),
             _ => None,
         })
@@ -1007,6 +1076,7 @@ impl CourierBackend for NativeCourier {
         let entrypoint = image.config.entrypoint.clone();
         async move {
             validation?;
+            validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             Ok(CourierSession {
                 id: format!("native-{parcel_digest}-{sequence}"),
@@ -1014,7 +1084,7 @@ impl CourierBackend for NativeCourier {
                 entrypoint,
                 turn_count: 0,
                 history: Vec::new(),
-                guest_state: None,
+                backend_state: None,
             })
         }
     }
@@ -1184,6 +1254,7 @@ impl CourierBackend for DockerCourier {
         let entrypoint = image.config.entrypoint.clone();
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
+            validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             Ok(CourierSession {
                 id: format!("docker-{parcel_digest}-{sequence}"),
@@ -1191,7 +1262,7 @@ impl CourierBackend for DockerCourier {
                 entrypoint,
                 turn_count: 0,
                 history: Vec::new(),
-                guest_state: None,
+                backend_state: None,
             })
         }
     }
@@ -1359,6 +1430,7 @@ impl CourierBackend for JsonlCourierPlugin {
         let courier = self.clone();
         let parcel_dir = canonical_parcel_dir(image);
         async move {
+            validate_required_secrets(image)?;
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::OpenSession { parcel_dir })? {
                 PluginResponse::Result {
@@ -1620,6 +1692,7 @@ impl CourierBackend for WasmCourier {
         parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
         let engine = self.engine.clone();
+        let component_cache = self.component_cache.clone();
         let parcel = parcel.clone();
         async move {
             validate_courier_reference(
@@ -1629,7 +1702,7 @@ impl CourierBackend for WasmCourier {
             )?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
-            load_wasm_component(&engine, &component_path)?;
+            let _ = load_wasm_component(&engine, &component_cache, &parcel, &component_path)?;
             Ok(())
         }
     }
@@ -1639,6 +1712,7 @@ impl CourierBackend for WasmCourier {
         parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
         let engine = self.engine.clone();
+        let component_cache = self.component_cache.clone();
         let parcel = parcel.clone();
         async move {
             validate_courier_reference(
@@ -1648,7 +1722,7 @@ impl CourierBackend for WasmCourier {
             )?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
-            load_wasm_component(&engine, &component_path)?;
+            let _ = load_wasm_component(&engine, &component_cache, &parcel, &component_path)?;
             Ok(CourierInspection {
                 courier_id: "wasm".to_string(),
                 kind: CourierKind::Wasm,
@@ -1670,6 +1744,7 @@ impl CourierBackend for WasmCourier {
         parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
         let engine = self.engine.clone();
+        let component_cache = self.component_cache.clone();
         let parcel = parcel.clone();
         async move {
             validate_courier_reference(
@@ -1677,9 +1752,10 @@ impl CourierBackend for WasmCourier {
                 CourierKind::Wasm,
                 &parcel.config.courier.reference,
             )?;
+            validate_required_secrets(&parcel)?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
-            load_wasm_component(&engine, &component_path)?;
+            let _ = load_wasm_component(&engine, &component_cache, &parcel, &component_path)?;
 
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             Ok(CourierSession {
@@ -1688,7 +1764,7 @@ impl CourierBackend for WasmCourier {
                 entrypoint: parcel.config.entrypoint.clone(),
                 turn_count: 0,
                 history: Vec::new(),
-                guest_state: None,
+                backend_state: None,
             })
         }
     }
@@ -1699,6 +1775,7 @@ impl CourierBackend for WasmCourier {
         request: CourierRequest,
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let engine = self.engine.clone();
+        let component_cache = self.component_cache.clone();
         let parcel = parcel.clone();
         let operation = request.operation;
         let mut session = request.session;
@@ -1748,7 +1825,7 @@ impl CourierBackend for WasmCourier {
                     };
                     let guest_operation = wasm_operation(&operation).expect("guest operation");
                     let (mut store, guest, parcel_context) =
-                        instantiate_wasm_guest(&engine, &parcel, chat_backend)?;
+                        instantiate_wasm_guest(&engine, &component_cache, &parcel, chat_backend)?;
                     let result = guest
                         .dispatch_courier_guest()
                         .call_handle_operation(
@@ -1853,6 +1930,7 @@ impl CourierBackend for StubCourier {
         let entrypoint = image.config.entrypoint.clone();
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;
+            validate_required_secrets(image)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             Ok(CourierSession {
                 id: format!("{courier_id}-{parcel_digest}-{sequence}"),
@@ -1860,7 +1938,7 @@ impl CourierBackend for StubCourier {
                 entrypoint,
                 turn_count: 0,
                 history: Vec::new(),
-                guest_state: None,
+                backend_state: None,
             })
         }
     }
@@ -1978,15 +2056,6 @@ fn validate_wasm_component_metadata(parcel: &LoadedParcel) -> Result<(), Courier
             ),
         });
     }
-    if component.world != DISPATCH_WASM_COMPONENT_WORLD {
-        return Err(CourierError::WasmGuest {
-            courier: "wasm".to_string(),
-            message: format!(
-                "unsupported WASM world `{}`; expected `{}`",
-                component.world, DISPATCH_WASM_COMPONENT_WORLD
-            ),
-        });
-    }
 
     Ok(())
 }
@@ -1998,7 +2067,10 @@ fn resolve_wasm_component_path(parcel: &LoadedParcel) -> Result<PathBuf, Courier
             parcel_digest: parcel.config.digest.clone(),
         }
     })?;
-    let path = parcel.parcel_dir.join("context").join(&component.source);
+    let path = parcel
+        .parcel_dir
+        .join("context")
+        .join(&component.packaged_path);
     if !path.exists() {
         return Err(CourierError::MissingToolFile {
             tool: "component".to_string(),
@@ -2008,16 +2080,44 @@ fn resolve_wasm_component_path(parcel: &LoadedParcel) -> Result<PathBuf, Courier
     Ok(path)
 }
 
-fn load_wasm_component(engine: &Engine, path: &Path) -> Result<Component, CourierError> {
-    Component::from_file(engine, path).map_err(|source| CourierError::CompileWasmComponent {
-        courier: "wasm".to_string(),
-        path: path.display().to_string(),
-        source,
-    })
+fn load_wasm_component(
+    engine: &Engine,
+    component_cache: &Arc<Mutex<BTreeMap<String, Component>>>,
+    parcel: &LoadedParcel,
+    path: &Path,
+) -> Result<Component, CourierError> {
+    let component_config = parcel.config.courier.component.as_ref().ok_or_else(|| {
+        CourierError::MissingCourierComponent {
+            courier: "wasm".to_string(),
+            parcel_digest: parcel.config.digest.clone(),
+        }
+    })?;
+    if let Some(component) = component_cache
+        .lock()
+        .expect("wasm component cache lock poisoned")
+        .get(&component_config.sha256)
+        .cloned()
+    {
+        return Ok(component);
+    }
+
+    let component = Component::from_file(engine, path).map_err(|source| {
+        CourierError::CompileWasmComponent {
+            courier: "wasm".to_string(),
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    component_cache
+        .lock()
+        .expect("wasm component cache lock poisoned")
+        .insert(component_config.sha256.clone(), component.clone());
+    Ok(component)
 }
 
 fn instantiate_wasm_guest(
     engine: &Engine,
+    component_cache: &Arc<Mutex<BTreeMap<String, Component>>>,
     parcel: &LoadedParcel,
     chat_backend: Arc<dyn ChatModelBackend>,
 ) -> Result<
@@ -2029,7 +2129,7 @@ fn instantiate_wasm_guest(
     CourierError,
 > {
     let component_path = resolve_wasm_component_path(parcel)?;
-    let component = load_wasm_component(engine, &component_path)?;
+    let component = load_wasm_component(engine, component_cache, parcel, &component_path)?;
     let prompt = resolve_prompt_text(parcel)?;
     let local_tools = list_local_tools(parcel);
 
@@ -2088,10 +2188,17 @@ fn wasm_parcel_context(
             .map(|tool| wasm_bindings::dispatch::courier::host::LocalTool {
                 alias: tool.alias.clone(),
                 description: tool.description.clone(),
-                input_schema_json: tool.input_schema_source.as_ref().and_then(|source| {
-                    let path = parcel.parcel_dir.join("context").join(source);
-                    fs::read_to_string(path).ok()
-                }),
+                input_schema_json: match (
+                    tool.input_schema_packaged_path.as_deref(),
+                    tool.input_schema_sha256.as_deref(),
+                ) {
+                    (Some(packaged_path), expected_sha256) => {
+                        load_tool_schema(parcel, &tool.alias, packaged_path, expected_sha256)
+                            .ok()
+                            .and_then(|schema| serde_json::to_string(&schema).ok())
+                    }
+                    (None, _) => None,
+                },
             })
             .collect(),
         primary_model: parcel
@@ -2118,7 +2225,7 @@ fn wasm_guest_session(
                 },
             )
             .collect(),
-        guest_state: session.guest_state.clone(),
+        backend_state: session.backend_state.clone(),
     }
 }
 
@@ -2174,7 +2281,7 @@ fn apply_wasm_turn_to_session(
     result: &wasm_bindings::exports::dispatch::courier::guest::TurnResult,
 ) {
     session.turn_count += 1;
-    session.guest_state = result.guest_state.clone();
+    session.backend_state = result.backend_state.clone();
 
     if let CourierOperation::Chat { input } = operation {
         session.history.push(ConversationMessage {
@@ -2555,11 +2662,11 @@ fn build_model_tool_definition(
             tool.alias, tool.packaged_path
         )
     });
-    let format = match tool.input_schema_source {
-        Some(source) => ModelToolFormat::JsonSchema {
-            schema: load_tool_schema(image, &tool.alias, &source)?,
+    let format = match (tool.input_schema_packaged_path, tool.input_schema_sha256) {
+        (Some(source), expected_sha256) => ModelToolFormat::JsonSchema {
+            schema: load_tool_schema(image, &tool.alias, &source, expected_sha256.as_deref())?,
         },
-        None => ModelToolFormat::Text,
+        (None, _) => ModelToolFormat::Text,
     };
 
     Ok(ModelToolDefinition {
@@ -2572,13 +2679,25 @@ fn build_model_tool_definition(
 fn load_tool_schema(
     image: &LoadedParcel,
     tool: &str,
-    source: &str,
+    packaged_path: &str,
+    expected_sha256: Option<&str>,
 ) -> Result<serde_json::Value, CourierError> {
-    let path = image.parcel_dir.join("context").join(source);
+    let path = image.parcel_dir.join("context").join(packaged_path);
     let body = fs::read(&path).map_err(|source_error| CourierError::ReadFile {
         path: path.display().to_string(),
         source: source_error,
     })?;
+    if let Some(expected_sha256) = expected_sha256 {
+        let actual_sha256 = encode_hex(Sha256::digest(&body));
+        if actual_sha256 != expected_sha256 {
+            return Err(CourierError::ToolSchemaDigestMismatch {
+                tool: tool.to_string(),
+                path: path.display().to_string(),
+                expected_sha256: expected_sha256.to_string(),
+                actual_sha256,
+            });
+        }
+    }
     let schema: serde_json::Value =
         serde_json::from_slice(&body).map_err(|source_error| CourierError::ParseToolSchema {
             tool: tool.to_string(),
@@ -2787,6 +2906,14 @@ fn parse_openai_tool_call(
         input: input.to_string(),
         kind,
     })
+}
+
+fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3182,7 +3309,7 @@ ENTRYPOINT chat
         assert_eq!(inspection.local_tools.len(), 1);
         assert!(session.id.starts_with("wasm-"));
         assert_eq!(session.parcel_digest, test_image.image.config.digest);
-        assert_eq!(session.guest_state, None);
+        assert_eq!(session.backend_state, None);
 
         let prompt = futures::executor::block_on(courier.run(
             &test_image.image,
@@ -3251,7 +3378,7 @@ ENTRYPOINT chat
         assert_eq!(model_response.session.turn_count, 1);
         let expected_model_state = format!("opened:{}:1", test_image.image.config.digest);
         assert_eq!(
-            model_response.session.guest_state.as_deref(),
+            model_response.session.backend_state.as_deref(),
             Some(expected_model_state.as_str())
         );
         assert!(matches!(
@@ -3285,7 +3412,7 @@ ENTRYPOINT chat
         assert_eq!(tool_response.session.turn_count, 2);
         let expected_tool_state = format!("opened:{}:2", test_image.image.config.digest);
         assert_eq!(
-            tool_response.session.guest_state.as_deref(),
+            tool_response.session.backend_state.as_deref(),
             Some(expected_tool_state.as_str())
         );
         assert!(matches!(
@@ -3344,7 +3471,7 @@ ENTRYPOINT heartbeat
         assert_eq!(job_response.session.turn_count, 1);
         let expected_job_state = format!("opened:{}:1", job_image.image.config.digest);
         assert_eq!(
-            job_response.session.guest_state.as_deref(),
+            job_response.session.backend_state.as_deref(),
             Some(expected_job_state.as_str())
         );
 
@@ -3367,7 +3494,7 @@ ENTRYPOINT heartbeat
         assert_eq!(heartbeat_response.session.turn_count, 1);
         let expected_heartbeat_state = format!("opened:{}:1", heartbeat_image.image.config.digest);
         assert_eq!(
-            heartbeat_response.session.guest_state.as_deref(),
+            heartbeat_response.session.backend_state.as_deref(),
             Some(expected_heartbeat_state.as_str())
         );
     }
@@ -3789,6 +3916,40 @@ ENTRYPOINT chat
             }
             other => panic!("expected json schema tool format, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_model_request_rejects_tampered_packaged_tool_schema() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
+ENTRYPOINT chat
+",
+            &[
+                ("tools/demo.sh", "printf ok"),
+                (
+                    "schemas/demo.json",
+                    "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"id\": { \"type\": \"string\" }\n  }\n}",
+                ),
+            ],
+        );
+        fs::write(
+            test_image
+                .image
+                .parcel_dir
+                .join("context/schemas/demo.json"),
+            "{ \"type\": \"array\" }",
+        )
+        .unwrap();
+
+        let local_tools = list_local_tools(&test_image.image);
+        let error = build_model_request(&test_image.image, &[], &local_tools).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::ToolSchemaDigestMismatch { tool, .. } if tool == "demo"
+        ));
     }
 
     #[test]
@@ -4310,6 +4471,27 @@ ENTRYPOINT job
         );
 
         let error = run_local_tool(&test_image.image, "demo", None).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::MissingSecret { name } if name == "CAST_TEST_SECRET_DOES_NOT_EXIST"
+        ));
+    }
+
+    #[test]
+    fn open_session_prefers_secret_validation_to_late_tool_failure() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TOOL LOCAL tools/demo.sh AS demo
+SECRET CAST_TEST_SECRET_DOES_NOT_EXIST
+ENTRYPOINT chat
+",
+            &[("tools/demo.sh", "printf ok")],
+        );
+        let courier = NativeCourier::default();
+
+        let error =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap_err();
         assert!(matches!(
             error,
             CourierError::MissingSecret { name } if name == "CAST_TEST_SECRET_DOES_NOT_EXIST"
