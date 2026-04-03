@@ -1,5 +1,8 @@
 use super::*;
-use std::io::{BufRead, BufReader};
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, BufReader},
+};
 
 struct OpenAiResponsesBackend;
 struct OpenAiChatCompletionsBackend;
@@ -156,6 +159,47 @@ impl ChatModelBackend for OpenAiChatCompletionsBackend {
         let body = read_model_json_response(response, self.id())?;
         extract_openai_chat_completions_output(&body)
     }
+
+    fn generate_with_events(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelGeneration, CourierError> {
+        let api_key = match model_api_key("LLM_API_KEY", "OPENAI_API_KEY") {
+            Some(value) => value,
+            None => {
+                return Ok(ModelGeneration::NotConfigured {
+                    backend: self.id().to_string(),
+                    reason: "missing LLM_API_KEY or OPENAI_API_KEY".to_string(),
+                });
+            }
+        };
+
+        let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "model": request.model,
+            "messages": openai_chat_completions_messages(request),
+            "tools": request
+                .tools
+                .iter()
+                .map(openai_chat_completions_tool_definition)
+                .collect::<Vec<_>>(),
+            "tool_choice": "auto",
+            "stream": true,
+        });
+
+        let response = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("authorization", &format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        read_openai_chat_completions_streaming_response(response, self.id(), on_event)
+    }
 }
 
 impl ChatModelBackend for AnthropicMessagesBackend {
@@ -204,6 +248,53 @@ impl ChatModelBackend for AnthropicMessagesBackend {
 
         let body = read_model_json_response(response, self.id())?;
         extract_anthropic_output(&body)
+    }
+
+    fn generate_with_events(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelGeneration, CourierError> {
+        let api_key = match model_api_key("LLM_API_KEY", "ANTHROPIC_API_KEY") {
+            Some(value) => value,
+            None => {
+                return Ok(ModelGeneration::NotConfigured {
+                    backend: self.id().to_string(),
+                    reason: "missing LLM_API_KEY or ANTHROPIC_API_KEY".to_string(),
+                });
+            }
+        };
+
+        let base_url = model_base_url(
+            "LLM_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+            "https://api.anthropic.com",
+        );
+        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "model": request.model,
+            "max_tokens": anthropic_max_tokens(request),
+            "system": request.instructions,
+            "messages": anthropic_messages(request),
+            "stream": true,
+            "tools": request
+                .tools
+                .iter()
+                .map(anthropic_tool_definition)
+                .collect::<Vec<_>>(),
+        });
+
+        let response = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        read_anthropic_streaming_response(response, self.id(), on_event)
     }
 }
 
@@ -532,6 +623,370 @@ fn process_openai_stream_event(
     }
 
     Ok(())
+}
+
+fn read_openai_chat_completions_streaming_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    backend: &str,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<ModelGeneration, CourierError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = format_provider_error_body(&body);
+        let message = if detail.is_empty() {
+            format!("{backend} HTTP {}", status.as_u16())
+        } else {
+            format!("{backend} HTTP {}: {detail}", status.as_u16())
+        };
+        return Err(CourierError::ModelBackendRequest(message));
+    }
+
+    let reader = BufReader::new(response.body_mut().as_reader());
+    let body = parse_openai_chat_completions_streaming_events(reader, on_event)?;
+    extract_openai_chat_completions_output(&body)
+}
+
+fn parse_openai_chat_completions_streaming_events<R: BufRead>(
+    reader: R,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<serde_json::Value, CourierError> {
+    #[derive(Default)]
+    struct ToolCallAccumulator {
+        id: Option<String>,
+        kind: Option<String>,
+        function_name: Option<String>,
+        function_arguments: String,
+        custom_name: Option<String>,
+        custom_input: String,
+    }
+
+    let mut response_id = None;
+    let mut assistant_text = String::new();
+    let mut tool_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
+
+    for event_data in parse_sse_data_events(reader)? {
+        if event_data == "[DONE]" {
+            break;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(&event_data)
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        if response_id.is_none() {
+            response_id = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+        }
+
+        let Some(choice) = value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            continue;
+        };
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
+
+        match delta.get("content") {
+            Some(serde_json::Value::String(content)) => {
+                assistant_text.push_str(content);
+                on_event(ModelStreamEvent::TextDelta {
+                    content: content.clone(),
+                });
+            }
+            Some(serde_json::Value::Array(parts)) => {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        assistant_text.push_str(text);
+                        on_event(ModelStreamEvent::TextDelta {
+                            content: text.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(delta_calls) = delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for delta_call in delta_calls {
+                let index = delta_call
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let entry = tool_calls.entry(index).or_default();
+                if let Some(id) = delta_call.get("id").and_then(serde_json::Value::as_str) {
+                    entry.id = Some(id.to_string());
+                }
+                if let Some(kind) = delta_call.get("type").and_then(serde_json::Value::as_str) {
+                    entry.kind = Some(kind.to_string());
+                }
+                if let Some(function) = delta_call.get("function") {
+                    if let Some(name) = function.get("name").and_then(serde_json::Value::as_str) {
+                        entry.function_name = Some(name.to_string());
+                    }
+                    if let Some(arguments) = function
+                        .get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        entry.function_arguments.push_str(arguments);
+                    }
+                }
+                if let Some(custom) = delta_call.get("custom") {
+                    if let Some(name) = custom.get("name").and_then(serde_json::Value::as_str) {
+                        entry.custom_name = Some(name.to_string());
+                    }
+                    if let Some(input) = custom.get("input").and_then(serde_json::Value::as_str) {
+                        entry.custom_input.push_str(input);
+                    }
+                }
+            }
+        }
+    }
+
+    let tool_calls = tool_calls
+        .into_values()
+        .map(|call| {
+            let kind = call.kind.unwrap_or_else(|| "function".to_string());
+            match kind.as_str() {
+                "function" => serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function_name,
+                        "arguments": call.function_arguments,
+                    }
+                }),
+                "custom" => serde_json::json!({
+                    "id": call.id,
+                    "type": "custom",
+                    "custom": {
+                        "name": call.custom_name,
+                        "input": call.custom_input,
+                    }
+                }),
+                other => serde_json::json!({
+                    "id": call.id,
+                    "type": other,
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
+        "id": response_id,
+        "choices": [{
+            "message": {
+                "content": if assistant_text.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(assistant_text)
+                },
+                "tool_calls": tool_calls,
+            }
+        }]
+    }))
+}
+
+fn read_anthropic_streaming_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    backend: &str,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<ModelGeneration, CourierError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = format_provider_error_body(&body);
+        let message = if detail.is_empty() {
+            format!("{backend} HTTP {}", status.as_u16())
+        } else {
+            format!("{backend} HTTP {}: {detail}", status.as_u16())
+        };
+        return Err(CourierError::ModelBackendRequest(message));
+    }
+
+    let reader = BufReader::new(response.body_mut().as_reader());
+    let body = parse_anthropic_streaming_events(reader, on_event)?;
+    extract_anthropic_output(&body)
+}
+
+fn parse_anthropic_streaming_events<R: BufRead>(
+    reader: R,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<serde_json::Value, CourierError> {
+    #[derive(Default)]
+    struct AnthropicToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    }
+
+    let mut message_id = None;
+    let mut text = String::new();
+    let mut tool_uses = BTreeMap::<usize, AnthropicToolUse>::new();
+
+    for event_data in parse_sse_events(reader)? {
+        let data = event_data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("message_start") => {
+                message_id = value
+                    .pointer("/message/id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+            }
+            Some("content_block_start") => {
+                let Some(index) = value
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as usize)
+                else {
+                    continue;
+                };
+                let Some(block) = value.get("content_block") else {
+                    continue;
+                };
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use") {
+                    let id = block
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let input_json = block
+                        .get("input")
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| {
+                            CourierError::ModelBackendResponse(format!(
+                                "failed to serialize anthropic stream tool input: {error}"
+                            ))
+                        })?
+                        .unwrap_or_default();
+                    tool_uses.insert(
+                        index,
+                        AnthropicToolUse {
+                            id,
+                            name,
+                            input_json,
+                        },
+                    );
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = value.get("delta") else {
+                    continue;
+                };
+                match delta.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(chunk) = delta.get("text").and_then(serde_json::Value::as_str) {
+                            text.push_str(chunk);
+                            on_event(ModelStreamEvent::TextDelta {
+                                content: chunk.to_string(),
+                            });
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(index) = value
+                            .get("index")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|v| v as usize)
+                            && let Some(tool_use) = tool_uses.get_mut(&index)
+                            && let Some(partial_json) = delta
+                                .get("partial_json")
+                                .and_then(serde_json::Value::as_str)
+                        {
+                            tool_use.input_json.push_str(partial_json);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("error") => {
+                let message = value
+                    .pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("anthropic streaming response failed");
+                return Err(CourierError::ModelBackendRequest(message.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
+    content.extend(tool_uses.into_values().map(|tool_use| {
+        let input = serde_json::from_str::<serde_json::Value>(&tool_use.input_json)
+            .unwrap_or_else(|_| serde_json::json!({ "input": tool_use.input_json }));
+        serde_json::json!({
+            "type": "tool_use",
+            "id": tool_use.id,
+            "name": tool_use.name,
+            "input": input,
+        })
+    }));
+
+    Ok(serde_json::json!({
+        "id": message_id,
+        "content": content,
+    }))
+}
+
+fn parse_sse_data_events<R: BufRead>(reader: R) -> Result<Vec<String>, CourierError> {
+    parse_sse_events(reader)
+}
+
+fn parse_sse_events<R: BufRead>(mut reader: R) -> Result<Vec<String>, CourierError> {
+    let mut events = Vec::new();
+    let mut current = String::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            if !current.is_empty() {
+                events.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(data.trim_start());
+        }
+    }
+
+    if !current.is_empty() {
+        events.push(current);
+    }
+
+    Ok(events)
 }
 
 fn read_model_json_response(
@@ -1082,5 +1537,71 @@ mod tests {
         let (text, tool_calls) = extract_openai_output(&body).unwrap();
         assert_eq!(text.as_deref(), Some("hello world"));
         assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_openai_chat_completions_streaming_events_collects_text_and_tool_calls() {
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl_123\",\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_123\",\"choices\":[{\"delta\":{\"content\":\"world\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_123\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ping\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut deltas = Vec::new();
+        let body =
+            parse_openai_chat_completions_streaming_events(Cursor::new(stream), &mut |event| {
+                match event {
+                    ModelStreamEvent::TextDelta { content } => deltas.push(content),
+                }
+            })
+            .unwrap();
+
+        assert_eq!(deltas, vec!["hello ".to_string(), "world".to_string()]);
+        assert_eq!(body["id"], "chatcmpl_123");
+        let reply = extract_openai_chat_completions_output(&body).unwrap();
+        let ModelGeneration::Reply(reply) = reply else {
+            panic!("expected reply");
+        };
+        assert_eq!(reply.text.as_deref(), Some("hello world"));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].call_id, "call_1");
+        assert_eq!(reply.tool_calls[0].name, "lookup");
+        assert_eq!(reply.tool_calls[0].input, "{\"q\":\"ping\"}");
+    }
+
+    #[test]
+    fn parse_anthropic_streaming_events_collects_text_and_tool_use() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"ping\\\"}\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut deltas = Vec::new();
+        let body =
+            parse_anthropic_streaming_events(Cursor::new(stream), &mut |event| match event {
+                ModelStreamEvent::TextDelta { content } => deltas.push(content),
+            })
+            .unwrap();
+
+        assert_eq!(deltas, vec!["hello ".to_string(), "world".to_string()]);
+        assert_eq!(body["id"], "msg_123");
+        let reply = extract_anthropic_output(&body).unwrap();
+        let ModelGeneration::Reply(reply) = reply else {
+            panic!("expected reply");
+        };
+        assert_eq!(reply.text.as_deref(), Some("hello world"));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].call_id, "toolu_1");
+        assert_eq!(reply.tool_calls[0].name, "lookup");
+        assert_eq!(reply.tool_calls[0].input, "{\"q\":\"ping\"}");
     }
 }
