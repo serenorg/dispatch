@@ -438,6 +438,12 @@ enum NativeTurnMode {
     Heartbeat,
 }
 
+#[derive(Clone, Copy)]
+enum HostToolRunner<'a> {
+    Native,
+    Docker(&'a DockerCourier),
+}
+
 pub trait MountProvider: Send + Sync {
     fn resolve_mount(
         &self,
@@ -592,10 +598,11 @@ struct BoundedLruCache<T> {
     entries: BTreeMap<String, CachedValue<T>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DockerCourier {
     docker_bin: PathBuf,
     helper_image: String,
+    chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
 }
 
 #[derive(Clone)]
@@ -619,6 +626,7 @@ impl Default for DockerCourier {
                 .unwrap_or_else(|| PathBuf::from("docker")),
             helper_image: std::env::var("DISPATCH_DOCKER_IMAGE")
                 .unwrap_or_else(|_| "python:3.13-alpine".to_string()),
+            chat_backend_override: None,
         }
     }
 }
@@ -954,7 +962,13 @@ impl DockerCourier {
         Self {
             docker_bin: docker_bin.into(),
             helper_image: helper_image.into(),
+            chat_backend_override: None,
         }
+    }
+
+    pub fn with_chat_backend(mut self, chat_backend: Arc<dyn ChatModelBackend>) -> Self {
+        self.chat_backend_override = Some(chat_backend);
+        self
     }
 }
 
@@ -2093,6 +2107,20 @@ fn execute_local_tool_in_docker(
     })
 }
 
+fn execute_host_local_tool(
+    parcel: &LoadedParcel,
+    tool: &LocalToolSpec,
+    input: Option<&str>,
+    runner: HostToolRunner<'_>,
+) -> Result<ToolRunResult, CourierError> {
+    match runner {
+        HostToolRunner::Native => execute_local_tool(parcel, tool, input),
+        HostToolRunner::Docker(courier) => {
+            execute_local_tool_in_docker(parcel, tool, input, courier)
+        }
+    }
+}
+
 impl CourierBackend for NativeCourier {
     fn id(&self) -> &str {
         "native"
@@ -2237,12 +2265,14 @@ impl CourierBackend for NativeCourier {
                         role: "user".to_string(),
                         content: input.clone(),
                     });
-                    let mut chat_turn = execute_native_turn(
+                    let mut chat_turn = execute_host_turn(
                         image,
                         &session,
                         &input,
                         chat_backend_override.as_ref(),
                         NativeTurnMode::Chat,
+                        HostToolRunner::Native,
+                        "Native",
                     )?;
                     session.history.push(ConversationMessage {
                         role: "assistant".to_string(),
@@ -2263,21 +2293,23 @@ impl CourierBackend for NativeCourier {
                         events: chat_turn.events,
                     })
                 }
-                CourierOperation::Job { payload } => run_native_task_operation(
+                CourierOperation::Job { payload } => run_host_task_operation(
                     image,
                     session,
-                    courier_id,
                     chat_backend_override.as_ref(),
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
+                    HostToolRunner::Native,
+                    "Native",
                 ),
-                CourierOperation::Heartbeat { payload } => run_native_task_operation(
+                CourierOperation::Heartbeat { payload } => run_host_task_operation(
                     image,
                     session,
-                    courier_id,
                     chat_backend_override.as_ref(),
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
+                    HostToolRunner::Native,
+                    "Native",
                 ),
             }
         }
@@ -2297,9 +2329,9 @@ impl CourierBackend for DockerCourier {
         Ok(CourierCapabilities {
             courier_id: self.id().to_string(),
             kind: self.kind(),
-            supports_chat: false,
-            supports_job: false,
-            supports_heartbeat: false,
+            supports_chat: true,
+            supports_job: true,
+            supports_heartbeat: true,
             supports_local_tools: true,
             supports_mounts: vec![MountKind::Session, MountKind::Memory, MountKind::Artifacts],
         })
@@ -2371,6 +2403,7 @@ impl CourierBackend for DockerCourier {
         let operation = request.operation;
         let mut session = request.session;
         let docker_courier = self.clone();
+        let chat_backend_override = self.chat_backend_override.clone();
 
         async move {
             validate_courier_reference(
@@ -2379,6 +2412,7 @@ impl CourierBackend for DockerCourier {
                 image.config.courier.reference(),
             )?;
             ensure_session_matches_parcel(image, &session)?;
+            ensure_operation_matches_entrypoint(&session, &operation)?;
             session.turn_count += 1;
 
             match operation {
@@ -2434,18 +2468,57 @@ impl CourierBackend for DockerCourier {
                         ],
                     })
                 }
-                CourierOperation::Chat { .. } => Err(CourierError::UnsupportedOperation {
-                    courier: "docker".to_string(),
-                    operation: "chat".to_string(),
-                }),
-                CourierOperation::Job { .. } => Err(CourierError::UnsupportedOperation {
-                    courier: "docker".to_string(),
-                    operation: "job".to_string(),
-                }),
-                CourierOperation::Heartbeat { .. } => Err(CourierError::UnsupportedOperation {
-                    courier: "docker".to_string(),
-                    operation: "heartbeat".to_string(),
-                }),
+                CourierOperation::Chat { input } => {
+                    session.history.push(ConversationMessage {
+                        role: "user".to_string(),
+                        content: input.clone(),
+                    });
+                    let mut chat_turn = execute_host_turn(
+                        image,
+                        &session,
+                        &input,
+                        chat_backend_override.as_ref(),
+                        NativeTurnMode::Chat,
+                        HostToolRunner::Docker(&docker_courier),
+                        "Docker",
+                    )?;
+                    session.history.push(ConversationMessage {
+                        role: "assistant".to_string(),
+                        content: chat_turn.reply.clone(),
+                    });
+                    if !chat_turn.streamed_reply {
+                        chat_turn.events.push(CourierEvent::Message {
+                            role: "assistant".to_string(),
+                            content: chat_turn.reply.clone(),
+                        });
+                    }
+                    chat_turn.events.push(CourierEvent::Done);
+
+                    persist_session_mounts(&session)?;
+                    Ok(CourierResponse {
+                        courier_id: "docker".to_string(),
+                        session,
+                        events: chat_turn.events,
+                    })
+                }
+                CourierOperation::Job { payload } => run_host_task_operation(
+                    image,
+                    session,
+                    chat_backend_override.as_ref(),
+                    NativeTurnMode::Job,
+                    format_job_payload(&payload),
+                    HostToolRunner::Docker(&docker_courier),
+                    "Docker",
+                ),
+                CourierOperation::Heartbeat { payload } => run_host_task_operation(
+                    image,
+                    session,
+                    chat_backend_override.as_ref(),
+                    NativeTurnMode::Heartbeat,
+                    format_heartbeat_payload(payload.as_deref()),
+                    HostToolRunner::Docker(&docker_courier),
+                    "Docker",
+                ),
             }
         }
     }
@@ -3272,19 +3345,28 @@ impl CourierBackend for StubCourier {
     }
 }
 
-fn run_native_task_operation(
+fn run_host_task_operation(
     image: &LoadedParcel,
     mut session: CourierSession,
-    courier_id: String,
     chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
     mode: NativeTurnMode,
     input: String,
+    tool_runner: HostToolRunner<'_>,
+    host_label: &'static str,
 ) -> Result<CourierResponse, CourierError> {
     session.history.push(ConversationMessage {
         role: "user".to_string(),
         content: input.clone(),
     });
-    let mut turn = execute_native_turn(image, &session, &input, chat_backend_override, mode)?;
+    let mut turn = execute_host_turn(
+        image,
+        &session,
+        &input,
+        chat_backend_override,
+        mode,
+        tool_runner,
+        host_label,
+    )?;
     session.history.push(ConversationMessage {
         role: "assistant".to_string(),
         content: turn.reply.clone(),
@@ -3299,7 +3381,7 @@ fn run_native_task_operation(
 
     persist_session_mounts(&session)?;
     Ok(CourierResponse {
-        courier_id,
+        courier_id: host_label.to_ascii_lowercase(),
         session,
         events: turn.events,
     })
@@ -3715,12 +3797,14 @@ fn instruction_heading(kind: InstructionKind) -> &'static str {
     }
 }
 
-fn execute_native_turn(
+fn execute_host_turn(
     image: &LoadedParcel,
     session: &CourierSession,
     input: &str,
     chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
     mode: NativeTurnMode,
+    tool_runner: HostToolRunner<'_>,
+    host_label: &'static str,
 ) -> Result<ChatTurnResult, CourierError> {
     let trimmed = input.trim();
     let local_tools = list_local_tools(image);
@@ -3758,9 +3842,9 @@ fn execute_native_turn(
 
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/help") {
         return Ok(ChatTurnResult {
-            reply:
-                "Native chat is a reference backend. Available commands: /prompt, /tools, /memory, /help."
-                    .to_string(),
+            reply: format!(
+                "{host_label} chat is a reference backend. Available commands: /prompt, /tools, /memory, /help."
+            ),
             events: Vec::new(),
             streamed_reply: false,
         });
@@ -3886,7 +3970,12 @@ fn execute_native_turn(
                             command: tool.command.clone(),
                             args: tool.args.clone(),
                         });
-                        execute_local_tool(image, tool, Some(normalized_input.as_ref()))?
+                        execute_host_local_tool(
+                            image,
+                            tool,
+                            Some(normalized_input.as_ref()),
+                            tool_runner,
+                        )?
                     } else if let Some(tool) = builtin_tools
                         .iter()
                         .find(|tool| tool.capability == tool_call.name)
@@ -3978,7 +4067,8 @@ fn execute_native_turn(
 
     Ok(ChatTurnResult {
         reply: format!(
-            "Native {} reference reply for turn {}. Loaded {} prompt section(s) and {} tool(s). Prior messages in session: {}. Input: {}",
+            "{} {} reference reply for turn {}. Loaded {} prompt section(s) and {} tool(s). Prior messages in session: {}. Input: {}",
+            host_label,
             native_turn_mode_name(mode),
             session.turn_count,
             prompt_sections,
@@ -5234,7 +5324,7 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn docker_courier_rejects_chat_execution() {
+    fn docker_courier_chat_executes_reference_reply_and_records_history() {
         let test_image = build_test_image(
             "\
 FROM dispatch/docker:latest
@@ -5245,7 +5335,7 @@ ENTRYPOINT chat
         let courier = DockerCourier::default();
         let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
 
-        let error = futures::executor::block_on(courier.run(
+        let response = futures::executor::block_on(courier.run(
             &test_image.image,
             CourierRequest {
                 session,
@@ -5254,13 +5344,15 @@ ENTRYPOINT chat
                 },
             },
         ))
-        .unwrap_err();
+        .unwrap();
 
         assert!(matches!(
-            error,
-            CourierError::UnsupportedOperation { courier, operation }
-                if courier == "docker" && operation == "chat"
+            response.events.first(),
+            Some(CourierEvent::Message { content, .. })
+                if content.contains("Docker chat reference reply")
         ));
+        assert_eq!(response.session.turn_count, 1);
+        assert_eq!(response.session.history.len(), 2);
     }
 
     #[test]
@@ -5328,6 +5420,88 @@ ENTRYPOINT job
         assert!(result.stdout.contains("python:3.13-alpine"));
         assert!(result.stdout.contains("tools/demo.sh"));
         assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn docker_courier_chat_executes_model_tool_calls_via_docker_cli() {
+        let dir = tempdir().unwrap();
+        let docker_bin = dir.path().join("docker");
+        fs::write(
+            &docker_bin,
+            "#!/bin/sh\nprintf 'docker-tool-output'\ncat >/dev/null\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let test_image = build_test_image(
+            "\
+FROM dispatch/docker:latest
+MODEL gpt-5-mini
+TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
+ENTRYPOINT chat
+",
+            &[
+                ("tools/demo.sh", "printf ok"),
+                (
+                    "schemas/demo.json",
+                    "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"query\": { \"type\": \"string\" }\n  },\n  \"required\": [\"query\"]\n}",
+                ),
+            ],
+        );
+        let backend = Arc::new(FakeChatBackend::with_replies(vec![
+            Some(ModelReply {
+                text: None,
+                backend: "fake".to_string(),
+                response_id: Some("resp_1".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "demo".to_string(),
+                    input: "{\"query\":\"ping\"}".to_string(),
+                    kind: ModelToolKind::Function,
+                }],
+            }),
+            Some(ModelReply {
+                text: Some("docker final answer".to_string()),
+                backend: "fake".to_string(),
+                response_id: Some("resp_2".to_string()),
+                tool_calls: Vec::new(),
+            }),
+        ]));
+        let courier = DockerCourier::new(&docker_bin, "python:3.13-alpine")
+            .with_chat_backend(backend.clone());
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "use the function tool".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].tool_outputs.len(), 1);
+        assert!(
+            calls[1].tool_outputs[0]
+                .output
+                .contains("docker-tool-output")
+        );
+        drop(calls);
+
+        assert!(matches!(
+            response.events.get(1),
+            Some(CourierEvent::ToolCallFinished { result })
+                if result.tool == "demo" && result.stdout.contains("docker-tool-output")
+        ));
+        assert!(matches!(
+            response.events.iter().rev().nth(1),
+            Some(CourierEvent::Message { content, .. }) if content == "docker final answer"
+        ));
     }
 
     #[test]

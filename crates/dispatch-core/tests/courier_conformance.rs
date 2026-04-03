@@ -111,7 +111,7 @@ ENTRYPOINT chat
 }
 
 #[test]
-fn docker_courier_conformance_supports_inspection_and_non_executing_operations() {
+fn docker_courier_conformance_supports_prompt_tools_and_chat() {
     let fixture = build_fixture(
         "\
 FROM dispatch/docker:latest
@@ -159,7 +159,7 @@ ENTRYPOINT chat
     ));
     assert_done(&tools);
 
-    let error = futures::executor::block_on(courier.run(
+    let chat = futures::executor::block_on(courier.run(
         &fixture.image,
         CourierRequest {
             session,
@@ -168,12 +168,14 @@ ENTRYPOINT chat
             },
         },
     ))
-    .unwrap_err();
+    .unwrap();
     assert!(matches!(
-        error,
-        dispatch_core::CourierError::UnsupportedOperation { courier, operation }
-            if courier == "docker" && operation == "chat"
+        chat.events.first(),
+        Some(CourierEvent::Message { role, .. }) if role == "assistant"
     ));
+    assert_eq!(chat.session.turn_count, 1);
+    assert_eq!(chat.session.history.len(), 2);
+    assert_done(&chat);
 }
 
 #[test]

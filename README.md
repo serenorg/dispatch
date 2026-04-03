@@ -277,7 +277,7 @@ Supported backends:
 Dispatch defines the parcel format and courier contract. Multiple couriers can implement that contract:
 
 - **native** - executes the parcel as a host process with model-backed chat; reference implementation in `crates/dispatch-core`
-- **docker** - executes local tools via Docker CLI; validates compatibility, inspects, resolves prompts
+- **docker** - runs chat/job/heartbeat turns with host-owned model orchestration and Docker-isolated local tools
 - **wasm** - typed component-model courier using the Dispatch WIT ABI; see [WASM Courier](#wasm-courier)
 - **plugins** - external JSONL courier plugins launched as subprocesses; protocol in `docs/courier-plugin-protocol.md`
 
