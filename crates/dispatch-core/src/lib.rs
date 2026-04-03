@@ -28,7 +28,9 @@ pub use depot::{
     DepotError, DepotLocator, DepotReference, DepotTagRecord, PulledParcel, PushedParcel,
     parse_depot_reference, pull_parcel, pull_parcel_verified, push_parcel,
 };
-pub use eval::{EvalDocument, EvalError, EvalSpec, load_parcel_evals};
+pub use eval::{
+    EvalDocument, EvalError, EvalSpec, ToolExitExpectation, ToolTextExpectation, load_parcel_evals,
+};
 pub use manifest::{
     BuiltinToolConfig, CommandSpec, CourierTarget, DISPATCH_WASM_ABI, EnvVar, InstructionConfig,
     InstructionKind, LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy, ModelReference,

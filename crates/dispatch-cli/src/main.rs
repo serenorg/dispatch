@@ -5,11 +5,11 @@ use dispatch_core::{
     CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierPluginManifest,
     CourierRequest, CourierSession, DockerCourier, EvalSpec, JsonlCourierPlugin, Level,
     LoadedParcel, NativeCourier, ParcelManifest, PullTrustPolicy, ResolvedCourier,
-    SignatureVerification, ToolInvocation, ToolRunResult, VerificationReport, WasmCourier,
-    build_agentfile, default_courier_registry_path, generate_keypair_files, install_courier_plugin,
-    list_courier_catalog, load_parcel, load_parcel_evals, parse_agentfile, parse_depot_reference,
-    pull_parcel_verified, push_parcel, resolve_courier, sign_parcel, validate_agentfile,
-    verify_parcel, verify_parcel_signature,
+    SignatureVerification, ToolExitExpectation, ToolInvocation, ToolRunResult, ToolTextExpectation,
+    VerificationReport, WasmCourier, build_agentfile, default_courier_registry_path,
+    generate_keypair_files, install_courier_plugin, list_courier_catalog, load_parcel,
+    load_parcel_evals, parse_agentfile, parse_depot_reference, pull_parcel_verified, push_parcel,
+    resolve_courier, sign_parcel, validate_agentfile, verify_parcel, verify_parcel_signature,
 };
 use futures::executor::block_on;
 use serde::Serialize;
@@ -703,36 +703,46 @@ fn apply_eval_expectations(
     }
 
     if let Some(expected_stdout) = &spec.expects_tool_stdout_contains
-        && !result
-            .tool_results
-            .iter()
-            .any(|tool_result| tool_result.stdout.contains(expected_stdout))
+        && !tool_text_expectation_satisfied(&result.tool_results, expected_stdout, |tool_result| {
+            &tool_result.stdout
+        })
     {
-        result.failures.push(format!(
-            "expected tool stdout containing `{expected_stdout}`"
-        ));
+        result.failures.push(match expected_stdout {
+            ToolTextExpectation::Contains(expected) => {
+                format!("expected tool stdout containing `{expected}`")
+            }
+            ToolTextExpectation::Scoped { tool, contains } => {
+                format!("expected tool `{tool}` stdout containing `{contains}`")
+            }
+        });
     }
 
     if let Some(expected_stderr) = &spec.expects_tool_stderr_contains
-        && !result
-            .tool_results
-            .iter()
-            .any(|tool_result| tool_result.stderr.contains(expected_stderr))
+        && !tool_text_expectation_satisfied(&result.tool_results, expected_stderr, |tool_result| {
+            &tool_result.stderr
+        })
     {
-        result.failures.push(format!(
-            "expected tool stderr containing `{expected_stderr}`"
-        ));
+        result.failures.push(match expected_stderr {
+            ToolTextExpectation::Contains(expected) => {
+                format!("expected tool stderr containing `{expected}`")
+            }
+            ToolTextExpectation::Scoped { tool, contains } => {
+                format!("expected tool `{tool}` stderr containing `{contains}`")
+            }
+        });
     }
 
-    if let Some(expected_exit_code) = spec.expects_tool_exit_code
-        && !result
-            .tool_results
-            .iter()
-            .any(|tool_result| tool_result.exit_code == expected_exit_code)
+    if let Some(expected_exit_code) = &spec.expects_tool_exit_code
+        && !tool_exit_expectation_satisfied(&result.tool_results, expected_exit_code)
     {
-        result
-            .failures
-            .push(format!("expected tool exit code `{expected_exit_code}`"));
+        result.failures.push(match expected_exit_code {
+            ToolExitExpectation::ExitCode(exit_code) => {
+                format!("expected tool exit code `{exit_code}`")
+            }
+            ToolExitExpectation::Scoped { tool, exit_code } => {
+                format!("expected tool `{tool}` exit code `{exit_code}`")
+            }
+        });
     }
 
     let error_expectation_satisfied = if let Some(expected_error) = &spec.expects_error_contains {
@@ -756,6 +766,35 @@ fn apply_eval_expectations(
     };
 
     result.passed = error_expectation_satisfied && result.failures.is_empty();
+}
+
+fn tool_text_expectation_satisfied(
+    tool_results: &[ToolRunResult],
+    expectation: &ToolTextExpectation,
+    field: impl Fn(&ToolRunResult) -> &str,
+) -> bool {
+    match expectation {
+        ToolTextExpectation::Contains(expected) => tool_results
+            .iter()
+            .any(|tool_result| field(tool_result).contains(expected)),
+        ToolTextExpectation::Scoped { tool, contains } => tool_results
+            .iter()
+            .any(|tool_result| tool_result.tool == *tool && field(tool_result).contains(contains)),
+    }
+}
+
+fn tool_exit_expectation_satisfied(
+    tool_results: &[ToolRunResult],
+    expectation: &ToolExitExpectation,
+) -> bool {
+    match expectation {
+        ToolExitExpectation::ExitCode(exit_code) => tool_results
+            .iter()
+            .any(|tool_result| tool_result.exit_code == *exit_code),
+        ToolExitExpectation::Scoped { tool, exit_code } => tool_results
+            .iter()
+            .any(|tool_result| tool_result.tool == *tool && tool_result.exit_code == *exit_code),
+    }
 }
 
 fn print_eval_report(report: &EvalReport) {
@@ -2396,7 +2435,8 @@ mod tests {
     use clap::Parser;
     use dispatch_core::{
         BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
-        CourierSession, PluginTransport, build_agentfile,
+        CourierSession, PluginTransport, ToolExitExpectation, ToolRunResult, ToolTextExpectation,
+        build_agentfile,
     };
     use std::{
         fs,
@@ -2569,6 +2609,59 @@ mod tests {
                 PathBuf::from("/tmp/policy-b.pub"),
             ]
         );
+    }
+
+    #[test]
+    fn scoped_tool_expectations_match_only_the_named_tool() {
+        let tool_results = vec![
+            ToolRunResult {
+                tool: "search".to_string(),
+                command: "search".to_string(),
+                args: Vec::new(),
+                exit_code: 0,
+                stdout: "found result".to_string(),
+                stderr: String::new(),
+            },
+            ToolRunResult {
+                tool: "fetch".to_string(),
+                command: "fetch".to_string(),
+                args: Vec::new(),
+                exit_code: 1,
+                stdout: "found result".to_string(),
+                stderr: "timed out".to_string(),
+            },
+        ];
+
+        assert!(super::tool_text_expectation_satisfied(
+            &tool_results,
+            &ToolTextExpectation::Scoped {
+                tool: "search".to_string(),
+                contains: "result".to_string(),
+            },
+            |tool_result| &tool_result.stdout,
+        ));
+        assert!(!super::tool_text_expectation_satisfied(
+            &tool_results,
+            &ToolTextExpectation::Scoped {
+                tool: "search".to_string(),
+                contains: "timed out".to_string(),
+            },
+            |tool_result| &tool_result.stderr,
+        ));
+        assert!(super::tool_exit_expectation_satisfied(
+            &tool_results,
+            &ToolExitExpectation::Scoped {
+                tool: "fetch".to_string(),
+                exit_code: 1,
+            },
+        ));
+        assert!(!super::tool_exit_expectation_satisfied(
+            &tool_results,
+            &ToolExitExpectation::Scoped {
+                tool: "search".to_string(),
+                exit_code: 1,
+            },
+        ));
     }
 
     #[test]

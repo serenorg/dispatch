@@ -222,11 +222,14 @@ cases:
   - name: exact
     input: "What time is it?"
     expects_tool_count: 1
-    expects_tool_stdout_contains: "2026-04-03"
+    expects_tool_stdout_contains:
+      tool: system_time
+      contains: "2026-04-03"
     expects_text_exact: "plugin reply"
 ```
 
 `dispatch eval` runs those packaged cases against a live courier and reports pass/fail per case.
+Tool result assertions can be either a plain value or a tool-scoped object, so multi-tool evals can target one tool explicitly.
 
 Parcel format compatibility:
 

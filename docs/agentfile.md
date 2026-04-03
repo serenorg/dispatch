@@ -529,7 +529,9 @@ cases:
   - name: exact
     input: "What time is it?"
     expects_tool_count: 1
-    expects_tool_stdout_contains: "2026-04-03"
+    expects_tool_stdout_contains:
+      tool: system_time
+      contains: "2026-04-03"
     expects_text_exact: "plugin reply"
   - name: invalid-entrypoint
     input: ""
@@ -552,6 +554,17 @@ Supported fields in the reference runner:
 - `expects_text_exact`
 - `expects_text_not_contains`
 - `expects_error_contains`
+
+Tool result assertions accept either:
+
+- a plain value, for example `expects_tool_exit_code: 0`
+- a tool-scoped object, for example:
+
+```yaml
+expects_tool_stdout_contains:
+  tool: system_time
+  contains: "2026-04-03"
+```
 
 Run packaged evals with:
 

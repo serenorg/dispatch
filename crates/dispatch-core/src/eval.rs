@@ -34,13 +34,27 @@ pub struct EvalSpec {
     #[serde(default)]
     pub expects_tools: Vec<String>,
     #[serde(default)]
-    pub expects_tool_stdout_contains: Option<String>,
+    pub expects_tool_stdout_contains: Option<ToolTextExpectation>,
     #[serde(default)]
-    pub expects_tool_stderr_contains: Option<String>,
+    pub expects_tool_stderr_contains: Option<ToolTextExpectation>,
     #[serde(default)]
-    pub expects_tool_exit_code: Option<i32>,
+    pub expects_tool_exit_code: Option<ToolExitExpectation>,
     #[serde(default)]
     pub expects_error_contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ToolTextExpectation {
+    Contains(String),
+    Scoped { tool: String, contains: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ToolExitExpectation {
+    ExitCode(i32),
+    Scoped { tool: String, exit_code: i32 },
 }
 
 #[derive(Debug, Error)]
@@ -133,5 +147,48 @@ mod tests {
         assert_eq!(evals[1].0, "evals/multi.eval");
         assert_eq!(evals[1].1.name, "first");
         assert_eq!(evals[2].1.name, "second");
+    }
+
+    #[test]
+    fn load_parcel_evals_supports_tool_scoped_assertions() {
+        let dir = tempdir().unwrap();
+        let context_dir = dir.path().join("image");
+        fs::create_dir_all(context_dir.join("evals")).unwrap();
+        fs::write(
+            context_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nEVAL evals/scoped.eval\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+        fs::write(
+            context_dir.join("evals/scoped.eval"),
+            "name: scoped\ninput: hi\nexpects_tool_stdout_contains:\n  tool: search\n  contains: result\nexpects_tool_exit_code:\n  tool: search\n  exit_code: 0\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &context_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: context_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let parcel = load_parcel(&built.parcel_dir).unwrap();
+        let evals = load_parcel_evals(&parcel).unwrap();
+
+        assert_eq!(evals.len(), 1);
+        assert_eq!(
+            evals[0].1.expects_tool_stdout_contains,
+            Some(ToolTextExpectation::Scoped {
+                tool: "search".to_string(),
+                contains: "result".to_string(),
+            })
+        );
+        assert_eq!(
+            evals[0].1.expects_tool_exit_code,
+            Some(ToolExitExpectation::Scoped {
+                tool: "search".to_string(),
+                exit_code: 0,
+            })
+        );
     }
 }
