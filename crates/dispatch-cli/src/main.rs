@@ -1,4 +1,5 @@
 mod conformance;
+mod courier_cmds;
 mod eval;
 mod inspect;
 mod parcel_ops;
@@ -7,15 +8,8 @@ mod state;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use dispatch_core::{
-    BuildOptions, CourierCatalogEntry, CourierPluginManifest, Level, ResolvedCourier,
-    build_agentfile, default_courier_registry_path, install_courier_plugin, list_courier_catalog,
-    parse_agentfile, resolve_courier, validate_agentfile,
-};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use dispatch_core::{BuildOptions, Level, build_agentfile, parse_agentfile, validate_agentfile};
+use std::{fs, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "dispatch")]
@@ -309,7 +303,7 @@ fn main() -> Result<()> {
             json,
         } => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
         Command::Run(args) => run::run(args),
-        Command::Courier { command } => courier_command(command),
+        Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
     }
 }
@@ -384,25 +378,6 @@ fn build(path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn courier_command(command: CourierCommand) -> Result<()> {
-    match command {
-        CourierCommand::Ls { json, registry } => courier_ls(registry.as_deref(), json),
-        CourierCommand::Inspect {
-            name,
-            json,
-            registry,
-        } => courier_inspect(&name, registry.as_deref(), json),
-        CourierCommand::Install { manifest, registry } => {
-            courier_install(&manifest, registry.as_deref())
-        }
-        CourierCommand::Conformance {
-            name,
-            registry,
-            json,
-        } => conformance::courier_conformance(&name, registry.as_deref(), json),
-    }
-}
-
 fn state_command(command: StateCommand) -> Result<()> {
     match command {
         StateCommand::Ls {
@@ -421,116 +396,6 @@ fn state_command(command: StateCommand) -> Result<()> {
             root,
             force,
         } => state::state_migrate(&source_digest, &target_digest, root, force),
-    }
-}
-
-fn courier_ls(registry: Option<&Path>, emit_json: bool) -> Result<()> {
-    let catalog = list_courier_catalog(registry)?;
-    if emit_json {
-        println!("{}", serde_json::to_string_pretty(&catalog)?);
-        return Ok(());
-    }
-
-    for entry in catalog {
-        match entry {
-            CourierCatalogEntry::Builtin {
-                name,
-                kind,
-                description,
-            } => println!("{name}\tbuiltin\t{kind:?}\t{description}"),
-            CourierCatalogEntry::Plugin {
-                name,
-                protocol_version,
-                transport,
-                command,
-                ..
-            } => println!("{name}\tplugin\tprotocol-v{protocol_version}/{transport:?}\t{command}"),
-        }
-    }
-
-    Ok(())
-}
-
-fn courier_inspect(name: &str, registry: Option<&Path>, emit_json: bool) -> Result<()> {
-    match resolve_courier(name, registry)? {
-        ResolvedCourier::Builtin(courier) => {
-            let entry = inspect::builtin_catalog_entry(courier);
-            if emit_json {
-                println!("{}", serde_json::to_string_pretty(&entry)?);
-            } else {
-                print_courier_catalog_entry(&entry);
-            }
-        }
-        ResolvedCourier::Plugin(plugin) => {
-            if emit_json {
-                println!("{}", serde_json::to_string_pretty(&plugin)?);
-            } else {
-                print_courier_plugin_manifest(&plugin);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn courier_install(manifest: &Path, registry: Option<&Path>) -> Result<()> {
-    let installed = install_courier_plugin(manifest, registry)?;
-    let registry_path = registry
-        .map(PathBuf::from)
-        .or_else(|| default_courier_registry_path().ok())
-        .unwrap_or_else(|| PathBuf::from("<unknown>"));
-
-    println!("Installed courier plugin `{}`", installed.name);
-    println!("Registry: {}", registry_path.display());
-    Ok(())
-}
-
-fn print_courier_catalog_entry(entry: &CourierCatalogEntry) {
-    match entry {
-        CourierCatalogEntry::Builtin {
-            name,
-            kind,
-            description,
-        } => {
-            println!("Name: {name}");
-            println!("Source: builtin");
-            println!("Kind: {kind:?}");
-            println!("Description: {description}");
-        }
-        CourierCatalogEntry::Plugin {
-            name,
-            description,
-            protocol_version,
-            transport,
-            command,
-            args,
-        } => {
-            println!("Name: {name}");
-            println!("Source: plugin");
-            println!("Protocol: v{protocol_version}");
-            println!("Transport: {transport:?}");
-            println!("Command: {command}");
-            if !args.is_empty() {
-                println!("Args: {}", args.join(" "));
-            }
-            if let Some(description) = description {
-                println!("Description: {description}");
-            }
-        }
-    }
-}
-
-fn print_courier_plugin_manifest(plugin: &CourierPluginManifest) {
-    println!("Name: {}", plugin.name);
-    println!("Version: {}", plugin.version);
-    println!("Protocol: v{}", plugin.protocol_version);
-    println!("Transport: {:?}", plugin.transport);
-    println!("Command: {}", plugin.exec.command);
-    if !plugin.exec.args.is_empty() {
-        println!("Args: {}", plugin.exec.args.join(" "));
-    }
-    if let Some(description) = &plugin.description {
-        println!("Description: {description}");
     }
 }
 
