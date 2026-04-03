@@ -5,7 +5,7 @@ use dispatch_core::{
     CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierPluginManifest,
     CourierRequest, CourierSession, DockerCourier, JsonlCourierPlugin, Level, LoadedParcel,
     NativeCourier, ParcelManifest, ResolvedCourier, SignatureVerification, ToolInvocation,
-    VerificationReport, WasmCourier, build_agentfile, default_courier_registry_path,
+    ToolRunResult, VerificationReport, WasmCourier, build_agentfile, default_courier_registry_path,
     generate_keypair_files, install_courier_plugin, list_courier_catalog, load_parcel,
     parse_agentfile, parse_depot_reference, pull_parcel, push_parcel, resolve_courier, sign_parcel,
     validate_agentfile, verify_parcel, verify_parcel_signature,
@@ -312,6 +312,12 @@ struct EvalSpec {
     #[serde(default)]
     expects_tools: Vec<String>,
     #[serde(default)]
+    expects_tool_stdout_contains: Option<String>,
+    #[serde(default)]
+    expects_tool_stderr_contains: Option<String>,
+    #[serde(default)]
+    expects_tool_exit_code: Option<i32>,
+    #[serde(default)]
     expects_error_contains: Option<String>,
 }
 
@@ -322,6 +328,7 @@ struct EvalCaseResult {
     entrypoint: String,
     passed: bool,
     tool_calls: Vec<String>,
+    tool_results: Vec<ToolRunResult>,
     assistant_messages: Vec<String>,
     failures: Vec<String>,
     error: Option<String>,
@@ -616,6 +623,7 @@ fn run_eval_case<R: CourierBackend>(
         entrypoint: entrypoint.clone(),
         passed: false,
         tool_calls: Vec::new(),
+        tool_results: Vec::new(),
         assistant_messages: Vec::new(),
         failures: Vec::new(),
         error: None,
@@ -665,6 +673,11 @@ fn run_eval_case<R: CourierBackend>(
         match event {
             CourierEvent::ToolCallStarted { invocation, .. } => {
                 result.tool_calls.push(invocation.name.clone());
+            }
+            CourierEvent::ToolCallFinished {
+                result: tool_result,
+            } => {
+                result.tool_results.push(tool_result.clone());
             }
             CourierEvent::Message { role, content } if role == "assistant" => {
                 result.assistant_messages.push(content.clone());
@@ -737,6 +750,39 @@ fn apply_eval_expectations(
         ));
     }
 
+    if let Some(expected_stdout) = &spec.expects_tool_stdout_contains
+        && !result
+            .tool_results
+            .iter()
+            .any(|tool_result| tool_result.stdout.contains(expected_stdout))
+    {
+        result.failures.push(format!(
+            "expected tool stdout containing `{expected_stdout}`"
+        ));
+    }
+
+    if let Some(expected_stderr) = &spec.expects_tool_stderr_contains
+        && !result
+            .tool_results
+            .iter()
+            .any(|tool_result| tool_result.stderr.contains(expected_stderr))
+    {
+        result.failures.push(format!(
+            "expected tool stderr containing `{expected_stderr}`"
+        ));
+    }
+
+    if let Some(expected_exit_code) = spec.expects_tool_exit_code
+        && !result
+            .tool_results
+            .iter()
+            .any(|tool_result| tool_result.exit_code == expected_exit_code)
+    {
+        result
+            .failures
+            .push(format!("expected tool exit code `{expected_exit_code}`"));
+    }
+
     let error_expectation_satisfied = if let Some(expected_error) = &spec.expects_error_contains {
         match &result.error {
             Some(error) if error.contains(expected_error) => true,
@@ -770,6 +816,12 @@ fn print_eval_report(report: &EvalReport) {
         println!("{status} {} ({})", result.name, result.packaged_path);
         if !result.tool_calls.is_empty() {
             println!("tools: {}", result.tool_calls.join(", "));
+        }
+        for tool_result in &result.tool_results {
+            println!(
+                "tool-result: {} exit={} stdout={} stderr={}",
+                tool_result.tool, tool_result.exit_code, tool_result.stdout, tool_result.stderr
+            );
         }
         if !result.assistant_messages.is_empty() {
             println!("assistant: {}", result.assistant_messages.join(" | "));
@@ -2910,6 +2962,8 @@ ENTRYPOINT chat\n",
                 "    input: \"What time is it?\"\n",
                 "    expects_tools: [\"system_time\"]\n",
                 "    expects_tool_count: 1\n",
+                "    expects_tool_stdout_contains: \"2026-04-03\"\n",
+                "    expects_tool_exit_code: 0\n",
                 "    expects_text_exact: \"plugin reply\"\n",
                 "    expects_text_not_contains: \"wrong\"\n",
                 "  - name: invalid-entrypoint\n",

@@ -219,6 +219,7 @@ cases:
   - name: exact
     input: "What time is it?"
     expects_tool_count: 1
+    expects_tool_stdout_contains: "2026-04-03"
     expects_text_exact: "plugin reply"
 ```
 

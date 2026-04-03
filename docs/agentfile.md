@@ -529,6 +529,7 @@ cases:
   - name: exact
     input: "What time is it?"
     expects_tool_count: 1
+    expects_tool_stdout_contains: "2026-04-03"
     expects_text_exact: "plugin reply"
   - name: invalid-entrypoint
     input: ""
@@ -544,6 +545,9 @@ Supported fields in the reference runner:
 - `expects_tool`
 - `expects_tools`
 - `expects_tool_count`
+- `expects_tool_stdout_contains`
+- `expects_tool_stderr_contains`
+- `expects_tool_exit_code`
 - `expects_text_contains`
 - `expects_text_exact`
 - `expects_text_not_contains`
