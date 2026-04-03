@@ -18,12 +18,7 @@ pub struct EvalSpec {
     pub entrypoint: Option<String>,
     #[serde(default)]
     pub expects_tool: Option<String>,
-    #[serde(
-        default,
-        alias = "expects_output_contains",
-        alias = "expects_message_contains",
-        alias = "expects_text_contains"
-    )]
+    #[serde(default, rename = "expects_text_contains")]
     pub expects_text: Option<String>,
     #[serde(default)]
     pub expects_text_exact: Option<String>,

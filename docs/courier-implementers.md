@@ -145,6 +145,12 @@ That command builds temporary fixture parcels, runs the shared contract checks a
 
 Dispatch does not require Docker, WASM, or any other execution engine. Those are implementation choices behind the courier boundary.
 
+For the built-in Docker courier specifically, the current boundary is:
+
+- Dispatch keeps session history, mounts, and hosted-model orchestration on the host
+- declared local tools run inside Docker as the isolated execution surface
+- the parcel is not currently executed as a full in-container agent runtime
+
 ## WASM Host Model Calls
 
 For `dispatch/wasm`, hosted-model access remains a host responsibility even when the guest initiates the request through the WIT ABI.
