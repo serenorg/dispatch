@@ -121,7 +121,10 @@ The current suite checks:
 - built-in mount resolution on `open_session()`
 - prompt resolution behavior
 - local tool listing behavior
-- basic chat execution for the native courier
+- conditional chat execution
+- conditional job execution
+- conditional heartbeat execution
+- conditional direct local tool invocation
 - explicit rejection of unsupported execution in stub couriers
 
 If you are building a new courier, these tests are the minimum target. Add courier-specific tests in your own crate, but keep the shared public contract passing.

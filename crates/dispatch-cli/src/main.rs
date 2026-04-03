@@ -332,7 +332,8 @@ struct ConformanceFixtures {
     _dir: TempDir,
     compatible: LoadedParcel,
     incompatible: LoadedParcel,
-    mounts: LoadedParcel,
+    job: LoadedParcel,
+    heartbeat: LoadedParcel,
 }
 
 fn main() -> Result<()> {
@@ -1604,6 +1605,105 @@ fn run_courier_conformance_with<R: CourierBackend>(
                 detail: "courier does not advertise chat support".to_string(),
             });
         }
+
+        if capabilities.supports_job {
+            let job_response = match block_on(courier.open_session(&fixtures.job)) {
+                Ok(job_session) => block_on(courier.run(
+                    &fixtures.job,
+                    CourierRequest {
+                        session: job_session,
+                        operation: CourierOperation::Job {
+                            payload: "work item".to_string(),
+                        },
+                    },
+                )),
+                Err(error) => Err(error),
+            };
+            checks.push(run_conformance_operation_check(
+                "job",
+                job_response,
+                |response| {
+                    response.events.iter().any(|event| {
+                        matches!(event, CourierEvent::Message { role, .. } if role == "assistant")
+                    }) && matches!(response.events.last(), Some(CourierEvent::Done))
+                },
+                "expected assistant message and Done event",
+            ));
+        } else {
+            checks.push(ConformanceCheck {
+                name: "job".to_string(),
+                passed: true,
+                skipped: true,
+                detail: "courier does not advertise job support".to_string(),
+            });
+        }
+
+        if capabilities.supports_heartbeat {
+            let heartbeat_response = match block_on(courier.open_session(&fixtures.heartbeat)) {
+                Ok(heartbeat_session) => block_on(courier.run(
+                    &fixtures.heartbeat,
+                    CourierRequest {
+                        session: heartbeat_session,
+                        operation: CourierOperation::Heartbeat {
+                            payload: Some("tick".to_string()),
+                        },
+                    },
+                )),
+                Err(error) => Err(error),
+            };
+            checks.push(run_conformance_operation_check(
+                "heartbeat",
+                heartbeat_response,
+                |response| {
+                    response.events.iter().any(|event| {
+                        matches!(event, CourierEvent::Message { role, .. } if role == "assistant")
+                    }) && matches!(response.events.last(), Some(CourierEvent::Done))
+                },
+                "expected assistant message and Done event",
+            ));
+        } else {
+            checks.push(ConformanceCheck {
+                name: "heartbeat".to_string(),
+                passed: true,
+                skipped: true,
+                detail: "courier does not advertise heartbeat support".to_string(),
+            });
+        }
+
+        if capabilities.supports_local_tools {
+            checks.push(run_conformance_operation_check(
+                "invoke-tool",
+                block_on(courier.run(
+                    &fixtures.compatible,
+                    CourierRequest {
+                        session: session.clone(),
+                        operation: CourierOperation::InvokeTool {
+                            invocation: ToolInvocation {
+                                name: "demo".to_string(),
+                                input: Some("hello".to_string()),
+                            },
+                        },
+                    },
+                )),
+                |response| {
+                    response.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            CourierEvent::ToolCallFinished { result }
+                                if result.tool == "demo" && result.exit_code == 0
+                        )
+                    }) && matches!(response.events.last(), Some(CourierEvent::Done))
+                },
+                "expected successful tool execution and Done event",
+            ));
+        } else {
+            checks.push(ConformanceCheck {
+                name: "invoke-tool".to_string(),
+                passed: true,
+                skipped: true,
+                detail: "courier does not advertise local tool support".to_string(),
+            });
+        }
     }
 
     if capabilities
@@ -1616,7 +1716,7 @@ fn run_courier_conformance_with<R: CourierBackend>(
             .supports_mounts
             .contains(&dispatch_core::MountKind::Artifacts)
     {
-        checks.push(match block_on(courier.open_session(&fixtures.mounts)) {
+        checks.push(match block_on(courier.open_session(&fixtures.compatible)) {
             Ok(session) if !session.resolved_mounts.is_empty() => ConformanceCheck {
                 name: "resolve-mounts".to_string(),
                 passed: true,
@@ -1721,24 +1821,35 @@ fn build_conformance_fixtures(kind: CourierKind) -> Result<ConformanceFixtures> 
         "compatible",
         compatible_reference_for_kind(kind),
         "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
+        "chat",
     )?;
     let incompatible = build_conformance_fixture(
         dir.path(),
         "incompatible",
         incompatible_reference_for_kind(kind),
         "",
+        "chat",
     )?;
-    let mounts = build_conformance_fixture(
+    let job = build_conformance_fixture(
         dir.path(),
-        "mounts",
+        "job",
         compatible_reference_for_kind(kind),
         "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
+        "job",
+    )?;
+    let heartbeat = build_conformance_fixture(
+        dir.path(),
+        "heartbeat",
+        compatible_reference_for_kind(kind),
+        "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
+        "heartbeat",
     )?;
     Ok(ConformanceFixtures {
         _dir: dir,
         compatible,
         incompatible,
-        mounts,
+        job,
+        heartbeat,
     })
 }
 
@@ -1747,6 +1858,7 @@ fn build_conformance_fixture(
     name: &str,
     courier_reference: &str,
     extra_lines: &str,
+    entrypoint: &str,
 ) -> Result<LoadedParcel> {
     let context_dir = root.join(name);
     fs::create_dir_all(context_dir.join("tools"))
@@ -1760,7 +1872,7 @@ VERSION 0.1.0\n\
 SOUL SOUL.md\n\
 TOOL LOCAL tools/demo.sh AS demo\n\
 {extra_lines}\
-ENTRYPOINT chat\n"
+ENTRYPOINT {entrypoint}\n"
         ),
     )
     .with_context(|| {
