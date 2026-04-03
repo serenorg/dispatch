@@ -2550,6 +2550,28 @@ mod tests {
     }
 
     #[test]
+    fn merge_public_keys_preserves_explicit_keys_and_deduplicates_policy_keys() {
+        let merged = super::merge_public_keys(
+            vec![
+                PathBuf::from("/tmp/explicit-a.pub"),
+                PathBuf::from("/tmp/shared.pub"),
+            ],
+            vec![
+                PathBuf::from("/tmp/shared.pub"),
+                PathBuf::from("/tmp/policy-b.pub"),
+            ],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                PathBuf::from("/tmp/explicit-a.pub"),
+                PathBuf::from("/tmp/shared.pub"),
+                PathBuf::from("/tmp/policy-b.pub"),
+            ]
+        );
+    }
+
+    #[test]
     fn cli_parses_verify_with_public_keys() {
         let cli = Cli::try_parse_from([
             "dispatch",

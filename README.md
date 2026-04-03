@@ -337,7 +337,7 @@ State management:
 - `dispatch pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
 - `dispatch push ... --json` / `dispatch pull ... --json` - emit machine-readable depot results
 - `dispatch pull <reference> --public-key <path>` - require detached signature verification during fetch
-- `dispatch pull <reference> --trust-policy <path>` - apply pull-time signature requirements by reference prefix
+- `dispatch pull <reference> --trust-policy <path>` - apply pull-time trust rules during fetch
 - v1 depot references include:
 - `file:///absolute/path/to/depot::org/parcel:v1`
 - `https://depot.example.com::org/parcel:v1`
@@ -347,6 +347,13 @@ State management:
 - set `DISPATCH_DEPOT_TOKEN` to send `Authorization: Bearer <token>` on HTTP depot requests
 - set `DISPATCH_TRUST_POLICY` to apply a default pull-time trust policy without passing `--trust-policy`
 - trust policy files are YAML documents with `rules`, optional `reference_prefix`, optional `repository_prefix`, `public_keys`, and optional `require_signatures`
+- each trust-policy rule must set at least one matcher: `reference_prefix`, `repository_prefix`, or both
+- if a rule sets both prefixes, both must match for the rule to apply
+- matching rules compose:
+  - `require_signatures` is enabled if any matching rule requires it
+  - `public_keys` from matching rules are merged and deduplicated
+- `--public-key` composes with `--trust-policy`; explicit keys are added to any matching policy keys
+- trust-policy verification happens before a pulled parcel is committed into the local parcel store
 
 ## Design Principles
 
