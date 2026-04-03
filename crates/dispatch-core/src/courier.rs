@@ -418,6 +418,7 @@ pub struct CourierResponse {
 struct ChatTurnResult {
     reply: String,
     events: Vec<CourierEvent>,
+    streamed_reply: bool,
 }
 
 struct WasmHostState {
@@ -478,6 +479,13 @@ pub trait ChatModelBackend: Send + Sync {
         false
     }
     fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError>;
+    fn generate_with_events(
+        &self,
+        request: &ModelRequest,
+        _on_event: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelGeneration, CourierError> {
+        self.generate(request)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -506,6 +514,11 @@ pub struct ModelReply {
 pub enum ModelGeneration {
     Reply(ModelReply),
     NotConfigured { backend: String, reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelStreamEvent {
+    TextDelta { content: String },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2091,10 +2104,12 @@ impl CourierBackend for NativeCourier {
                         role: "assistant".to_string(),
                         content: chat_turn.reply.clone(),
                     });
-                    chat_turn.events.push(CourierEvent::Message {
-                        role: "assistant".to_string(),
-                        content: chat_turn.reply,
-                    });
+                    if !chat_turn.streamed_reply {
+                        chat_turn.events.push(CourierEvent::Message {
+                            role: "assistant".to_string(),
+                            content: chat_turn.reply.clone(),
+                        });
+                    }
                     chat_turn.events.push(CourierEvent::Done);
 
                     persist_session_mounts(&session)?;
@@ -3000,10 +3015,12 @@ fn run_native_task_operation(
         role: "assistant".to_string(),
         content: turn.reply.clone(),
     });
-    turn.events.push(CourierEvent::Message {
-        role: "assistant".to_string(),
-        content: turn.reply,
-    });
+    if !turn.streamed_reply {
+        turn.events.push(CourierEvent::Message {
+            role: "assistant".to_string(),
+            content: turn.reply.clone(),
+        });
+    }
     turn.events.push(CourierEvent::Done);
 
     persist_session_mounts(&session)?;
@@ -3441,6 +3458,7 @@ fn execute_native_turn(
         return Ok(ChatTurnResult {
             reply: resolve_prompt_text(image)?,
             events: Vec::new(),
+            streamed_reply: false,
         });
     }
 
@@ -3449,6 +3467,7 @@ fn execute_native_turn(
             return Ok(ChatTurnResult {
                 reply: "No local tools are declared for this image.".to_string(),
                 events: Vec::new(),
+                streamed_reply: false,
             });
         }
 
@@ -3460,6 +3479,7 @@ fn execute_native_turn(
         return Ok(ChatTurnResult {
             reply: format!("Declared local tools: {names}"),
             events: Vec::new(),
+            streamed_reply: false,
         });
     }
 
@@ -3469,6 +3489,7 @@ fn execute_native_turn(
                 "Native chat is a reference backend. Available commands: /prompt, /tools, /memory, /help."
                     .to_string(),
             events: Vec::new(),
+            streamed_reply: false,
         });
     }
 
@@ -3476,6 +3497,7 @@ fn execute_native_turn(
         return Ok(ChatTurnResult {
             reply: handle_native_memory_command(session, trimmed)?,
             events: Vec::new(),
+            streamed_reply: false,
         });
     }
 
@@ -3494,6 +3516,7 @@ fn execute_native_turn(
         let mut rounds = 0u32;
         let mut backend = select_chat_backend(chat_backend_override, &request);
         let mut candidate_locked = false;
+        let mut streamed_reply = false;
         loop {
             if rounds >= MAX_TOOL_ROUNDS {
                 events.push(CourierEvent::BackendFallback {
@@ -3507,7 +3530,10 @@ fn execute_native_turn(
             }
             rounds += 1;
 
-            let reply = match backend.generate(&request) {
+            let mut streamed_deltas = Vec::new();
+            let reply = match backend.generate_with_events(&request, &mut |event| match event {
+                ModelStreamEvent::TextDelta { content } => streamed_deltas.push(content),
+            }) {
                 Ok(ModelGeneration::Reply(reply)) => reply,
                 Ok(ModelGeneration::NotConfigured {
                     backend: not_configured_backend,
@@ -3557,6 +3583,15 @@ fn execute_native_turn(
                     break;
                 }
             };
+
+            if reply.tool_calls.is_empty() && !streamed_deltas.is_empty() {
+                streamed_reply = true;
+                events.extend(
+                    streamed_deltas
+                        .into_iter()
+                        .map(|content| CourierEvent::TextDelta { content }),
+                );
+            }
 
             if !reply.tool_calls.is_empty() {
                 candidate_locked = true;
@@ -3639,6 +3674,7 @@ fn execute_native_turn(
                 return Ok(ChatTurnResult {
                     reply: text,
                     events,
+                    streamed_reply,
                 });
             }
             break;
@@ -3678,6 +3714,7 @@ fn execute_native_turn(
             input
         ),
         events,
+        streamed_reply: false,
     })
 }
 
@@ -4087,6 +4124,7 @@ mod tests {
     #[derive(Default)]
     struct FakeChatBackend {
         replies: Mutex<Vec<Result<ModelGeneration, String>>>,
+        streams: Mutex<Vec<Vec<String>>>,
         calls: Mutex<Vec<ModelRequest>>,
         supports_previous_response_id: bool,
     }
@@ -4100,12 +4138,28 @@ mod tests {
                     response_id: None,
                     tool_calls: Vec::new(),
                 }))]),
+                streams: Mutex::new(vec![Vec::new()]),
+                calls: Mutex::new(Vec::new()),
+                supports_previous_response_id: true,
+            }
+        }
+
+        fn with_streaming_reply(reply: impl Into<String>, deltas: Vec<&str>) -> Self {
+            Self {
+                replies: Mutex::new(vec![Ok(ModelGeneration::Reply(ModelReply {
+                    text: Some(reply.into()),
+                    backend: "fake".to_string(),
+                    response_id: None,
+                    tool_calls: Vec::new(),
+                }))]),
+                streams: Mutex::new(vec![deltas.into_iter().map(ToString::to_string).collect()]),
                 calls: Mutex::new(Vec::new()),
                 supports_previous_response_id: true,
             }
         }
 
         fn with_replies(replies: Vec<Option<ModelReply>>) -> Self {
+            let reply_count = replies.len();
             Self {
                 replies: Mutex::new(
                     replies
@@ -4119,12 +4173,14 @@ mod tests {
                         })
                         .collect(),
                 ),
+                streams: Mutex::new(vec![Vec::new(); reply_count]),
                 calls: Mutex::new(Vec::new()),
                 supports_previous_response_id: true,
             }
         }
 
         fn with_replies_without_previous_response_id(replies: Vec<Option<ModelReply>>) -> Self {
+            let reply_count = replies.len();
             Self {
                 replies: Mutex::new(
                     replies
@@ -4138,6 +4194,7 @@ mod tests {
                         })
                         .collect(),
                 ),
+                streams: Mutex::new(vec![Vec::new(); reply_count]),
                 calls: Mutex::new(Vec::new()),
                 supports_previous_response_id: false,
             }
@@ -4146,6 +4203,7 @@ mod tests {
         fn with_error(error: impl Into<String>) -> Self {
             Self {
                 replies: Mutex::new(vec![Err(error.into())]),
+                streams: Mutex::new(vec![Vec::new()]),
                 calls: Mutex::new(Vec::new()),
                 supports_previous_response_id: true,
             }
@@ -4169,6 +4227,27 @@ mod tests {
                     backend: "fake".to_string(),
                     reason: "not configured".to_string(),
                 });
+            }
+            replies.remove(0).map_err(CourierError::ModelBackendRequest)
+        }
+
+        fn generate_with_events(
+            &self,
+            request: &ModelRequest,
+            on_event: &mut dyn FnMut(ModelStreamEvent),
+        ) -> Result<ModelGeneration, CourierError> {
+            self.calls.lock().unwrap().push(request.clone());
+            let mut replies = self.replies.lock().unwrap();
+            let mut streams = self.streams.lock().unwrap();
+            if replies.is_empty() {
+                return Ok(ModelGeneration::NotConfigured {
+                    backend: "fake".to_string(),
+                    reason: "not configured".to_string(),
+                });
+            }
+            let stream = streams.remove(0);
+            for content in stream {
+                on_event(ModelStreamEvent::TextDelta { content });
             }
             replies.remove(0).map_err(CourierError::ModelBackendRequest)
         }
@@ -5884,6 +5963,60 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn native_courier_chat_streams_text_delta_without_duplicate_message() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let backend = Arc::new(FakeChatBackend::with_streaming_reply(
+            "streamed reply",
+            vec!["streamed ", "reply"],
+        ));
+        let courier = NativeCourier::with_chat_backend(backend);
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "stream please".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    CourierEvent::TextDelta { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["streamed ", "reply"]
+        );
+        assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+        assert!(!response.events.iter().any(|event| matches!(
+            event,
+            CourierEvent::Message { role, content }
+                if role == "assistant" && content == "streamed reply"
+        )));
+        assert_eq!(
+            response.session.history.last(),
+            Some(&ConversationMessage {
+                role: "assistant".to_string(),
+                content: "streamed reply".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn native_courier_chat_executes_tool_calls_then_continues_model_turn() {
         let test_image = build_test_image(
             "\
@@ -6118,6 +6251,7 @@ ENTRYPOINT chat
                     tool_calls: Vec::new(),
                 })),
             ]),
+            streams: Mutex::new(vec![Vec::new(), Vec::new()]),
             calls: Mutex::new(Vec::new()),
             supports_previous_response_id: false,
         });

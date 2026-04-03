@@ -1208,7 +1208,13 @@ fn print_signature_verifications(verifications: &[SignatureVerification]) {
 }
 
 fn print_courier_events(events: &[CourierEvent]) {
+    let mut streamed_assistant_reply = false;
+    let mut stream_line_open = false;
     for event in events {
+        if stream_line_open && !matches!(event, CourierEvent::TextDelta { .. }) {
+            println!();
+            stream_line_open = false;
+        }
         match event {
             CourierEvent::PromptResolved { text } => println!("{text}"),
             CourierEvent::LocalToolsListed { tools } => {
@@ -1240,12 +1246,23 @@ fn print_courier_events(events: &[CourierEvent]) {
                 }
             }
             CourierEvent::Message { role, content } => {
+                if streamed_assistant_reply && role == "assistant" {
+                    continue;
+                }
                 println!("{role}: {content}");
             }
             CourierEvent::TextDelta { content } => {
+                streamed_assistant_reply = true;
+                stream_line_open = true;
                 print!("{content}");
+                let _ = io::stdout().flush();
             }
-            CourierEvent::Done => {}
+            CourierEvent::Done => {
+                if stream_line_open {
+                    println!();
+                    stream_line_open = false;
+                }
+            }
         }
     }
 }

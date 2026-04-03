@@ -1,4 +1,5 @@
 use super::*;
+use std::io::{BufRead, BufReader};
 
 struct OpenAiResponsesBackend;
 struct OpenAiChatCompletionsBackend;
@@ -57,30 +58,7 @@ impl ChatModelBackend for OpenAiResponsesBackend {
 
         let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
         let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "model": request.model,
-            "instructions": request.instructions,
-            "input": if request.previous_response_id.is_some() {
-                request
-                    .tool_outputs
-                    .iter()
-                    .map(openai_tool_output_item)
-                    .collect::<Vec<_>>()
-            } else {
-                request
-                    .messages
-                    .iter()
-                    .map(openai_input_message)
-                    .collect::<Vec<_>>()
-            },
-            "previous_response_id": request.previous_response_id,
-            "parallel_tool_calls": false,
-            "tools": request
-                .tools
-                .iter()
-                .map(openai_tool_definition)
-                .collect::<Vec<_>>(),
-        });
+        let payload = openai_responses_payload(request, false);
 
         let response = ureq::post(&url)
             .config()
@@ -103,6 +81,37 @@ impl ChatModelBackend for OpenAiResponsesBackend {
                 .map(ToString::to_string),
             tool_calls,
         }))
+    }
+
+    fn generate_with_events(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent),
+    ) -> Result<ModelGeneration, CourierError> {
+        let api_key = match model_api_key("LLM_API_KEY", "OPENAI_API_KEY") {
+            Some(value) => value,
+            None => {
+                return Ok(ModelGeneration::NotConfigured {
+                    backend: self.id().to_string(),
+                    reason: "missing LLM_API_KEY or OPENAI_API_KEY".to_string(),
+                });
+            }
+        };
+
+        let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
+        let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
+        let payload = openai_responses_payload(request, true);
+
+        let response = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("authorization", &format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        read_openai_streaming_response(response, self.id(), on_event)
     }
 }
 
@@ -276,6 +285,34 @@ fn openai_input_message(message: &ConversationMessage) -> serde_json::Value {
     })
 }
 
+fn openai_responses_payload(request: &ModelRequest, stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": request.model,
+        "instructions": request.instructions,
+        "input": if request.previous_response_id.is_some() {
+            request
+                .tool_outputs
+                .iter()
+                .map(openai_tool_output_item)
+                .collect::<Vec<_>>()
+        } else {
+            request
+                .messages
+                .iter()
+                .map(openai_input_message)
+                .collect::<Vec<_>>()
+        },
+        "previous_response_id": request.previous_response_id,
+        "parallel_tool_calls": false,
+        "stream": stream,
+        "tools": request
+            .tools
+            .iter()
+            .map(openai_tool_definition)
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn openai_chat_completions_message(message: &ConversationMessage) -> serde_json::Value {
     serde_json::json!({
         "role": message.role,
@@ -384,6 +421,117 @@ fn model_base_url(primary: &str, fallback: &str, default: &str) -> String {
         .ok()
         .or_else(|| std::env::var(fallback).ok())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn read_openai_streaming_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    backend: &str,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<ModelGeneration, CourierError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = format_provider_error_body(&body);
+        let message = if detail.is_empty() {
+            format!("{backend} HTTP {}", status.as_u16())
+        } else {
+            format!("{backend} HTTP {}: {detail}", status.as_u16())
+        };
+        return Err(CourierError::ModelBackendRequest(message));
+    }
+
+    let reader = BufReader::new(response.body_mut().as_reader());
+    let body = parse_openai_streaming_events(reader, on_event)?;
+    let (text, tool_calls) = extract_openai_output(&body)?;
+
+    Ok(ModelGeneration::Reply(ModelReply {
+        text,
+        backend: backend.to_string(),
+        response_id: body
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        tool_calls,
+    }))
+}
+
+fn parse_openai_streaming_events<R: BufRead>(
+    mut reader: R,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+) -> Result<serde_json::Value, CourierError> {
+    let mut event_data = String::new();
+    let mut line = String::new();
+    let mut completed_response = None;
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            process_openai_stream_event(&event_data, on_event, &mut completed_response)?;
+            event_data.clear();
+            continue;
+        }
+
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            if !event_data.is_empty() {
+                event_data.push('\n');
+            }
+            event_data.push_str(data.trim_start());
+        }
+    }
+
+    process_openai_stream_event(&event_data, on_event, &mut completed_response)?;
+    let body = completed_response.ok_or_else(|| {
+        CourierError::ModelBackendResponse(
+            "streaming response ended without a `response.completed` event".to_string(),
+        )
+    })?;
+    Ok(body)
+}
+
+fn process_openai_stream_event(
+    event_data: &str,
+    on_event: &mut dyn FnMut(ModelStreamEvent),
+    completed_response: &mut Option<serde_json::Value>,
+) -> Result<(), CourierError> {
+    let data = event_data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(data)
+        .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.output_text.delta") => {
+            if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
+                on_event(ModelStreamEvent::TextDelta {
+                    content: delta.to_string(),
+                });
+            }
+        }
+        Some("response.failed") => {
+            let message = value
+                .pointer("/response/error/message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("streaming response failed");
+            return Err(CourierError::ModelBackendRequest(message.to_string()));
+        }
+        Some("response.completed") => {
+            if let Some(response) = value.get("response") {
+                *completed_response = Some(response.clone());
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn read_model_json_response(
@@ -907,5 +1055,32 @@ fn parse_openai_chat_completions_tool_call(
         None => Err(CourierError::ModelBackendResponse(
             "tool call missing `type`".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn parse_openai_streaming_events_collects_text_deltas_and_completed_response() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello world\"}]}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut deltas = Vec::new();
+        let body = parse_openai_streaming_events(Cursor::new(stream), &mut |event| match event {
+            ModelStreamEvent::TextDelta { content } => deltas.push(content),
+        })
+        .unwrap();
+
+        assert_eq!(deltas, vec!["hello ".to_string(), "world".to_string()]);
+        assert_eq!(body["id"], "resp_123");
+        let (text, tool_calls) = extract_openai_output(&body).unwrap();
+        assert_eq!(text.as_deref(), Some("hello world"));
+        assert!(tool_calls.is_empty());
     }
 }
