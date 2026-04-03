@@ -25,6 +25,7 @@ jsonschema.workspace = true
 rusqlite.workspace = true
 tar.workspace = true
 urlencoding.workspace = true
+serde_yaml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

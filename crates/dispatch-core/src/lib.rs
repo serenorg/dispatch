@@ -7,6 +7,7 @@ pub mod parse;
 pub mod plugin_protocol;
 pub mod plugins;
 pub mod signing;
+pub mod trust;
 pub mod validate;
 
 pub use ast::{Instruction, ParsedAgentfile, Value};
@@ -24,7 +25,7 @@ pub use courier::{
 };
 pub use depot::{
     DepotError, DepotLocator, DepotReference, DepotTagRecord, PulledParcel, PushedParcel,
-    parse_depot_reference, pull_parcel, push_parcel,
+    parse_depot_reference, pull_parcel, pull_parcel_verified, push_parcel,
 };
 pub use manifest::{
     BuiltinToolConfig, CommandSpec, CourierTarget, DISPATCH_WASM_ABI, EnvVar, InstructionConfig,
@@ -49,4 +50,5 @@ pub use signing::{
     PublicKeyFile, SecretKeyFile, SignatureVerification, SigningError, generate_keypair_files,
     sign_parcel, verify_parcel_signature,
 };
+pub use trust::{PullTrustPolicy, PullTrustRequirement, PullTrustRule, TrustPolicyError};
 pub use validate::{Diagnostic, Level, ValidationReport, validate_agentfile};

@@ -1,4 +1,7 @@
-use crate::{LoadedParcel, load_parcel};
+use crate::{
+    LoadedParcel, PullTrustPolicy, SignatureVerification, TrustPolicyError, load_parcel,
+    verify_parcel, verify_parcel_signature,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -6,6 +9,8 @@ use std::{
     fs,
     io::{Cursor, Read},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tar::{Archive, Builder};
 use thiserror::Error;
@@ -121,7 +126,13 @@ pub enum DepotError {
     LoadParcel(#[from] crate::CourierError),
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
+    #[error(transparent)]
+    TrustPolicy(#[from] TrustPolicyError),
+    #[error("pulled parcel `{path}` failed verification: {reason}")]
+    VerificationFailed { path: String, reason: String },
 }
+
+static PULL_STAGING_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn parse_depot_reference(reference: &str) -> Result<DepotReference, DepotError> {
     let (locator, parcel_ref) =
@@ -155,9 +166,40 @@ pub fn pull_parcel(
     reference: &DepotReference,
     output_root: &Path,
 ) -> Result<PulledParcel, DepotError> {
+    let raw_reference = reference_string(reference);
+    pull_parcel_verified(reference, &raw_reference, output_root, &[], None)
+}
+
+pub fn pull_parcel_verified(
+    reference: &DepotReference,
+    raw_reference: &str,
+    output_root: &Path,
+    public_keys: &[PathBuf],
+    trust_policy: Option<&PullTrustPolicy>,
+) -> Result<PulledParcel, DepotError> {
+    let mut effective_public_keys = public_keys.to_vec();
+    let mut require_signatures = false;
+    if let Some(policy) = trust_policy {
+        let requirement = policy.resolve_for_reference(raw_reference, reference);
+        require_signatures |= requirement.require_signatures;
+        effective_public_keys.extend(requirement.public_keys);
+    }
+    effective_public_keys.sort();
+    effective_public_keys.dedup();
+
     match &reference.locator {
-        DepotLocator::File { .. } => pull_file_parcel(reference, output_root),
-        DepotLocator::Http { .. } => pull_http_parcel(reference, output_root),
+        DepotLocator::File { .. } => pull_file_parcel(
+            reference,
+            output_root,
+            &effective_public_keys,
+            require_signatures,
+        ),
+        DepotLocator::Http { .. } => pull_http_parcel(
+            reference,
+            output_root,
+            &effective_public_keys,
+            require_signatures,
+        ),
     }
 }
 
@@ -230,6 +272,8 @@ fn push_file_parcel(
 fn pull_file_parcel(
     reference: &DepotReference,
     output_root: &Path,
+    public_keys: &[PathBuf],
+    require_signatures: bool,
 ) -> Result<PulledParcel, DepotError> {
     let tag_path = reference.tag_path();
     if !tag_path.exists() {
@@ -256,8 +300,31 @@ fn pull_file_parcel(
     }
 
     let parcel_dir = output_root.join(&tag_record.digest);
-    if !parcel_dir.exists() {
-        copy_tree(&source_blob, &parcel_dir)?;
+    if parcel_dir.exists() {
+        verify_pulled_parcel(&parcel_dir, public_keys, require_signatures)?;
+    } else {
+        let staging_dir = staging_parcel_dir(output_root, &tag_record.digest);
+        if staging_dir.exists() {
+            fs::remove_dir_all(&staging_dir).map_err(|source| DepotError::WriteFile {
+                path: staging_dir.display().to_string(),
+                source,
+            })?;
+        }
+        copy_tree(&source_blob, &staging_dir)?;
+        if let Err(error) = verify_pulled_parcel(&staging_dir, public_keys, require_signatures) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(error);
+        }
+        if let Some(parent) = parcel_dir.parent() {
+            fs::create_dir_all(parent).map_err(|source| DepotError::CreateDir {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        fs::rename(&staging_dir, &parcel_dir).map_err(|source| DepotError::WriteFile {
+            path: parcel_dir.display().to_string(),
+            source,
+        })?;
     }
 
     let loaded = load_parcel(&parcel_dir)?;
@@ -315,6 +382,74 @@ impl DepotReference {
             ),
         }
     }
+}
+
+fn reference_string(reference: &DepotReference) -> String {
+    let locator = match &reference.locator {
+        DepotLocator::File { root } => format!("file://{}", root.display()),
+        DepotLocator::Http { base_url } => base_url.clone(),
+    };
+    format!("{locator}::{}:{}", reference.repository, reference.tag)
+}
+
+fn staging_parcel_dir(output_root: &Path, digest: &str) -> PathBuf {
+    let counter = PULL_STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    output_root.join(format!(".partial-{digest}-{timestamp}-{counter}"))
+}
+
+fn verify_pulled_parcel(
+    parcel_dir: &Path,
+    public_keys: &[PathBuf],
+    require_signatures: bool,
+) -> Result<(), DepotError> {
+    if public_keys.is_empty() && !require_signatures {
+        return Ok(());
+    }
+    if require_signatures && public_keys.is_empty() {
+        return Err(DepotError::VerificationFailed {
+            path: parcel_dir.display().to_string(),
+            reason: "trust policy requires signatures but no public keys matched".to_string(),
+        });
+    }
+
+    let integrity = verify_parcel(parcel_dir).map_err(|error| DepotError::VerificationFailed {
+        path: parcel_dir.display().to_string(),
+        reason: format!("failed to verify parcel integrity: {error}"),
+    })?;
+    if !integrity.is_ok() {
+        return Err(DepotError::VerificationFailed {
+            path: parcel_dir.display().to_string(),
+            reason: "integrity verification failed".to_string(),
+        });
+    }
+
+    let signature_checks = public_keys
+        .iter()
+        .map(|public_key| {
+            verify_parcel_signature(parcel_dir, public_key).map_err(|error| {
+                DepotError::VerificationFailed {
+                    path: parcel_dir.display().to_string(),
+                    reason: format!(
+                        "failed to verify detached signature with {}: {error}",
+                        public_key.display()
+                    ),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let signatures_ok = signature_checks.iter().all(SignatureVerification::is_ok);
+    if !signatures_ok {
+        return Err(DepotError::VerificationFailed {
+            path: parcel_dir.display().to_string(),
+            reason: "signature verification failed".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn parse_depot_locator(locator: &str) -> Result<DepotLocator, DepotError> {
@@ -444,6 +579,8 @@ fn push_http_parcel(
 fn pull_http_parcel(
     reference: &DepotReference,
     output_root: &Path,
+    public_keys: &[PathBuf],
+    require_signatures: bool,
 ) -> Result<PulledParcel, DepotError> {
     let tag_location = reference.tag_location();
     let mut tag_request = ureq::get(&tag_location);
@@ -479,8 +616,31 @@ fn pull_http_parcel(
     let blob_bytes = read_http_body(blob_response, &blob_location)?;
 
     let parcel_dir = output_root.join(&tag_record.digest);
-    if !parcel_dir.exists() {
-        unpack_parcel_archive(&blob_bytes, &parcel_dir)?;
+    if parcel_dir.exists() {
+        verify_pulled_parcel(&parcel_dir, public_keys, require_signatures)?;
+    } else {
+        let staging_dir = staging_parcel_dir(output_root, &tag_record.digest);
+        if staging_dir.exists() {
+            fs::remove_dir_all(&staging_dir).map_err(|source| DepotError::WriteFile {
+                path: staging_dir.display().to_string(),
+                source,
+            })?;
+        }
+        unpack_parcel_archive(&blob_bytes, &staging_dir)?;
+        if let Err(error) = verify_pulled_parcel(&staging_dir, public_keys, require_signatures) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(error);
+        }
+        if let Some(parent) = parcel_dir.parent() {
+            fs::create_dir_all(parent).map_err(|source| DepotError::CreateDir {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        fs::rename(&staging_dir, &parcel_dir).map_err(|source| DepotError::WriteFile {
+            path: parcel_dir.display().to_string(),
+            source,
+        })?;
     }
 
     let loaded = load_parcel(&parcel_dir)?;

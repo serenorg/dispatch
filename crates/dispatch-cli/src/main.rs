@@ -3,13 +3,13 @@ use clap::{Args, Parser, Subcommand};
 use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
     CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierPluginManifest,
-    CourierRequest, CourierSession, DepotReference, DockerCourier, JsonlCourierPlugin, Level,
-    LoadedParcel, NativeCourier, ParcelManifest, ResolvedCourier, SignatureVerification,
+    CourierRequest, CourierSession, DockerCourier, JsonlCourierPlugin, Level, LoadedParcel,
+    NativeCourier, ParcelManifest, PullTrustPolicy, ResolvedCourier, SignatureVerification,
     ToolInvocation, ToolRunResult, VerificationReport, WasmCourier, build_agentfile,
     default_courier_registry_path, generate_keypair_files, install_courier_plugin,
-    list_courier_catalog, load_parcel, parse_agentfile, parse_depot_reference, pull_parcel,
-    push_parcel, resolve_courier, sign_parcel, validate_agentfile, verify_parcel,
-    verify_parcel_signature,
+    list_courier_catalog, load_parcel, parse_agentfile, parse_depot_reference,
+    pull_parcel_verified, push_parcel, resolve_courier, sign_parcel, validate_agentfile,
+    verify_parcel, verify_parcel_signature,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -350,24 +350,6 @@ struct EvalReport {
     parcel_digest: String,
     courier: String,
     results: Vec<EvalCaseResult>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct TrustPolicyDocument {
-    #[serde(default)]
-    rules: Vec<TrustPolicyRule>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct TrustPolicyRule {
-    #[serde(default)]
-    reference_prefix: Option<String>,
-    #[serde(default)]
-    repository_prefix: Option<String>,
-    #[serde(default)]
-    public_keys: Vec<PathBuf>,
-    #[serde(default)]
-    require_signatures: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1010,22 +992,32 @@ fn pull(
     let reference = parse_depot_reference(reference)
         .with_context(|| format!("invalid depot reference `{reference}`"))?;
     let trust_policy = resolve_trust_policy_path(trust_policy, |name| std::env::var_os(name));
-    let (policy_keys, require_signatures) = match trust_policy.as_deref() {
-        Some(policy_path) => {
-            resolve_trust_policy_for_reference(&raw_reference, &reference, policy_path)?
-        }
-        None => (Vec::new(), false),
-    };
-    let public_keys = merge_public_keys(public_keys, policy_keys);
+    let trust_policy = trust_policy
+        .as_deref()
+        .map(PullTrustPolicy::from_path)
+        .transpose()?;
+    let requirement = trust_policy
+        .as_ref()
+        .map(|policy| policy.resolve_for_reference(&raw_reference, &reference));
+    let public_keys = merge_public_keys(
+        public_keys,
+        requirement
+            .as_ref()
+            .map(|requirement| requirement.public_keys.clone())
+            .unwrap_or_default(),
+    );
+    let require_signatures = requirement
+        .as_ref()
+        .is_some_and(|requirement| requirement.require_signatures);
     let output_root = output_dir.unwrap_or_else(default_pull_output_root);
-    let pulled = pull_parcel(&reference, &output_root)?;
+    let pulled = pull_parcel_verified(
+        &reference,
+        &raw_reference,
+        &output_root,
+        &public_keys,
+        trust_policy.as_ref(),
+    )?;
     let verification = if !public_keys.is_empty() || require_signatures {
-        if require_signatures && public_keys.is_empty() {
-            bail!(
-                "trust policy requires signatures for `{}` but no public keys matched",
-                raw_reference
-            );
-        }
         let integrity = verify_parcel(&pulled.parcel_dir).with_context(|| {
             format!(
                 "failed to verify pulled parcel {}",
@@ -1079,58 +1071,6 @@ fn default_pull_output_root() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".dispatch/parcels")
-}
-
-fn resolve_trust_policy_for_reference(
-    reference: &str,
-    parsed_reference: &DepotReference,
-    policy_path: &Path,
-) -> Result<(Vec<PathBuf>, bool)> {
-    let source = fs::read_to_string(policy_path)
-        .with_context(|| format!("failed to read {}", policy_path.display()))?;
-    let policy: TrustPolicyDocument = serde_yaml::from_str(&source)
-        .with_context(|| format!("failed to parse {}", policy_path.display()))?;
-    let policy_root = policy_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut public_keys = Vec::new();
-    let mut require_signatures = false;
-
-    for rule in policy.rules {
-        if !trust_policy_rule_matches(&rule, reference, parsed_reference) {
-            continue;
-        }
-        require_signatures |= rule.require_signatures;
-        for public_key in rule.public_keys {
-            public_keys.push(if public_key.is_absolute() {
-                public_key
-            } else {
-                policy_root.join(public_key)
-            });
-        }
-    }
-
-    Ok((public_keys, require_signatures))
-}
-
-fn trust_policy_rule_matches(
-    rule: &TrustPolicyRule,
-    reference: &str,
-    parsed_reference: &DepotReference,
-) -> bool {
-    let has_matcher = rule.reference_prefix.is_some() || rule.repository_prefix.is_some();
-    if !has_matcher {
-        return false;
-    }
-    if let Some(prefix) = &rule.reference_prefix
-        && !reference.starts_with(prefix)
-    {
-        return false;
-    }
-    if let Some(prefix) = &rule.repository_prefix
-        && !parsed_reference.repository.starts_with(prefix)
-    {
-        return false;
-    }
-    true
 }
 
 fn resolve_trust_policy_path(
@@ -3097,11 +3037,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("pulled parcel failed verification")
-        );
+        assert!(error.to_string().contains("signature verification failed"));
     }
 
     #[cfg(unix)]
@@ -3140,13 +3076,13 @@ ENTRYPOINT chat\n",
                     "set -eu\n",
                     "while IFS= read -r line; do\n",
                     "if printf '%s' \"$line\" | grep -q '\"kind\":\"capabilities\"'; then\n",
-                    "  printf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n",
+                    "  printf '%s\\n' '{{\"kind\":\"capabilities\",\"capabilities\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n",
                     "elif printf '%s' \"$line\" | grep -q '\"kind\":\"validate_parcel\"'; then\n",
-                    "  printf '%s\\n' '{{\"kind\":\"result\"}}'\n",
+                    "  printf '%s\\n' '{{\"kind\":\"ok\"}}'\n",
                     "elif printf '%s' \"$line\" | grep -q '\"kind\":\"inspect\"'; then\n",
-                    "  printf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n",
+                    "  printf '%s\\n' '{{\"kind\":\"inspection\",\"inspection\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n",
                     "elif printf '%s' \"$line\" | grep -q '\"kind\":\"open_session\"'; then\n",
-                    "  printf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[]}}}}'\n",
+                    "  printf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[],\"backend_state\":\"open\"}}}}'\n",
                     "elif printf '%s' \"$line\" | grep -q '\"kind\":\"run\"'; then\n",
                     "  printf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"plugin reply\"}}}}'\n",
                     "  printf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"hello\"}},{{\"role\":\"assistant\",\"content\":\"plugin reply\"}}]}}}}'\n",
@@ -3240,13 +3176,13 @@ ENTRYPOINT chat\n",
             "set -eu\n",
             "while IFS= read -r line; do\n",
             "if printf '%s' \"$line\" | grep -q '\"kind\":\"capabilities\"'; then\n",
-            "  printf '%s\\n' '{\"kind\":\"result\",\"capabilities\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"capabilities\",\"capabilities\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}'\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"validate_parcel\"'; then\n",
-            "  printf '%s\\n' '{\"kind\":\"result\"}'\n",
+            "  printf '%s\\n' '{\"kind\":\"ok\"}'\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"inspect\"'; then\n",
-            "  printf '%s\\n' '{\"kind\":\"result\",\"inspection\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"inspection\",\"inspection\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}'\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"open_session\"'; then\n",
-            "  printf '%s\\n' '{\"kind\":\"result\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"session\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}'\n",
             "elif printf '%s' \"$line\" | grep -q '\"kind\":\"run\"'; then\n",
             "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"tool_call_started\",\"invocation\":{\"name\":\"system_time\",\"input\":null},\"command\":\"builtin\",\"args\":[]}}'\n",
             "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"tool_call_finished\",\"result\":{\"tool\":\"system_time\",\"command\":\"builtin\",\"args\":[],\"exit_code\":0,\"stdout\":\"2026-04-03T00:00:00Z\",\"stderr\":\"\"}}}'\n",
