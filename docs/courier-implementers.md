@@ -58,6 +58,7 @@ Current operations:
 
 Minimum expectations:
 
+- `ResolvePrompt` and `ListLocalTools` are parcel-inspection helpers, not turn-execution operations
 - `ResolvePrompt` returns the resolved prompt stack from packaged instruction files
 - `ListLocalTools` returns the declared local tool list from the parcel manifest
 - `InvokeTool` executes one declared local tool or rejects the request if unsupported
@@ -97,6 +98,7 @@ Inspection should not require opening a courier session.
 
 For couriers that execute packaged local tools:
 
+- only declared parcel tools may be exposed to the model or to operator-facing inspection commands
 - only declared local tools may be invoked
 - required secrets must be enforced before execution
 - couriers should avoid forwarding their full ambient environment to tools

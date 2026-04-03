@@ -101,6 +101,12 @@ In the Rust reference implementation, this boundary is represented by:
 
 This is the core execution contract for a Dispatch courier.
 
+Resolved prompt/tool invariant:
+
+- instruction files contribute prompt content only after they are packaged into the parcel
+- tool exposure is driven by declared tool entries in the parcel manifest
+- prompt text must not be treated as authority to expose undeclared tools
+
 The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. Otherwise it falls back to a local reference reply path.
 
 ### Pluggable Courier Model
@@ -460,8 +466,9 @@ MOUNT MEMORY pgvector
 Semantics:
 
 - `none` means no durable long-term memory backend
-- `sqlite` reserves a local durable memory database path for couriers that implement memory persistence
+- `sqlite` resolves a local durable memory database path for couriers that implement memory persistence
 - `pgvector` is a declared remote memory backend target for couriers that support it
+- unsupported memory drivers must fail when the courier opens a session instead of being silently ignored
 
 #### `MOUNT ARTIFACTS`
 
@@ -507,17 +514,24 @@ ENTRYPOINT http
 
 ## Resolution Order
 
-The final prompt stack should resolve in this order:
+The resolved prompt stack is deterministic:
 
-1. base parcel defaults
-2. `SOUL`
-3. `SKILL`
-4. `MEMORY POLICY`
-5. `HEARTBEAT`
-6. inline `PROMPT`
-7. courier system supplements injected by the selected courier
+1. prompt-bearing instruction files are appended in the order they appear in the authored `Agentfile`
+2. inline `PROMPT` bodies are appended after the packaged instruction files
+3. courier-specific system supplements, if any, are injected after the parcel-owned prompt stack
 
-This order matters and should be deterministic.
+In the reference implementation, the prompt-bearing instruction kinds are:
+
+- `IDENTITY`
+- `SOUL`
+- `SKILL`
+- `AGENTS`
+- `USER`
+- `TOOLS`
+- `MEMORY`
+- `HEARTBEAT`
+
+`EVAL` files are packaged but omitted from the runtime prompt stack.
 
 ## Build-Time Validation
 

@@ -182,6 +182,7 @@ Tool declaration behavior:
 - native model-backed chat uses that description when exposing local tools to the model
 - schema-backed local tools are exposed as structured function tools to the OpenAI Responses backend
 - if no description is declared, Dispatch falls back to a generic packaged-path description
+- couriers should only expose declared parcel tools; packaged prompt text must never imply tool capabilities that are not present in the parcel manifest
 
 Framework provenance behavior:
 
@@ -232,6 +233,7 @@ Mount behavior:
 
 - built-in couriers resolve declared mounts during `open_session`
 - `MOUNT SESSION sqlite` creates a parcel-scoped sqlite database and persists `CourierSession` state on open plus after each turn
+- `MOUNT MEMORY sqlite` resolves a durable parcel-scoped memory database path for couriers that implement memory persistence; the mount contract exists now even though the generic memory API surface is still narrow
 - unsupported mount drivers fail fast when a courier session opens
 
 Optional environment variables for the native OpenAI-backed chat path:
@@ -277,6 +279,12 @@ Core pieces:
 - `ToolInvocation` / `ToolRunResult` - stable local tool execution envelope
 - `MountProvider`, `MountRequest`, `ResolvedMount` - mount abstraction for session, memory, and artifacts
 - `NativeCourier` - reference implementation
+
+Resolved prompt/tool invariant:
+
+- prompt resolution is driven by packaged parcel content only
+- couriers should only expose tools declared in the parcel manifest
+- a courier must not advertise or execute undeclared local tools based on prompt text, ambient filesystem state, or backend defaults
 
 This is the intended extension model for:
 
