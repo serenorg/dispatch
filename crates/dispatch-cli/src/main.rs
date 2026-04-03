@@ -11,7 +11,7 @@ use dispatch_core::{
     validate_agentfile, verify_parcel, verify_parcel_signature,
 };
 use futures::executor::block_on;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{self, Write as _},
@@ -43,6 +43,24 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Output directory for built parcels
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
+    /// Execute packaged evals against a live courier
+    Eval {
+        /// Path to a built parcel, Agentfile, or directory containing one
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Courier backend to use for eval execution
+        #[arg(long = "courier", default_value = "native")]
+        courier: String,
+        /// Override the courier plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+        /// Print full eval report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Output directory for built parcels when evaluating an Agentfile source
         #[arg(long)]
         output_dir: Option<PathBuf>,
     },
@@ -248,12 +266,62 @@ struct StateGcReport {
     dry_run: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum EvalDocument {
+    Single(EvalSpec),
+    Cases { cases: Vec<EvalSpec> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvalSpec {
+    name: String,
+    input: String,
+    #[serde(default)]
+    entrypoint: Option<String>,
+    #[serde(default)]
+    expects_tool: Option<String>,
+    #[serde(
+        default,
+        alias = "expects_output_contains",
+        alias = "expects_message_contains",
+        alias = "expects_text_contains"
+    )]
+    expects_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct EvalCaseResult {
+    name: String,
+    packaged_path: String,
+    entrypoint: String,
+    passed: bool,
+    tool_calls: Vec<String>,
+    assistant_messages: Vec<String>,
+    failures: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct EvalReport {
+    parcel_digest: String,
+    courier: String,
+    results: Vec<EvalCaseResult>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Lint { path, json } => lint(path, json),
         Command::Build { path, output_dir } => build(path, output_dir),
+        Command::Eval {
+            path,
+            courier,
+            registry,
+            json,
+            output_dir,
+        } => eval(path, &courier, registry, json, output_dir),
         Command::Inspect {
             path,
             courier,
@@ -346,6 +414,258 @@ fn build(path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
     println!("Manifest: {}", built.manifest_path.display());
     println!("Lockfile: {}", built.lockfile_path.display());
     Ok(())
+}
+
+fn eval(
+    path: PathBuf,
+    courier_name: &str,
+    registry: Option<PathBuf>,
+    emit_json: bool,
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
+    let parcel = load_or_build_parcel_for_eval(path, output_dir)?;
+    match resolve_courier(courier_name, registry.as_deref())? {
+        ResolvedCourier::Builtin(courier) => {
+            eval_with_builtin_courier(courier, &parcel, courier_name, emit_json)
+        }
+        ResolvedCourier::Plugin(plugin) => eval_with_courier(
+            JsonlCourierPlugin::new(plugin),
+            &parcel,
+            courier_name,
+            emit_json,
+        ),
+    }
+}
+
+fn load_or_build_parcel_for_eval(
+    path: PathBuf,
+    output_dir: Option<PathBuf>,
+) -> Result<LoadedParcel> {
+    if is_agentfile_target(&path) {
+        let agentfile_path = resolve_agentfile_path(path);
+        let context_dir = agentfile_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let output_root = output_dir.unwrap_or_else(|| context_dir.join(".dispatch/parcels"));
+        let built = build_agentfile(
+            &agentfile_path,
+            &BuildOptions {
+                output_root: output_root.clone(),
+            },
+        )
+        .with_context(|| format!("failed to build {}", agentfile_path.display()))?;
+        return load_parcel(&built.parcel_dir)
+            .with_context(|| format!("failed to load parcel {}", built.parcel_dir.display()));
+    }
+
+    load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))
+}
+
+fn is_agentfile_target(path: &Path) -> bool {
+    if path.is_dir() {
+        return path.join("Agentfile").exists();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "Agentfile")
+}
+
+fn eval_with_builtin_courier(
+    courier: BuiltinCourier,
+    parcel: &LoadedParcel,
+    courier_name: &str,
+    emit_json: bool,
+) -> Result<()> {
+    match courier {
+        BuiltinCourier::Native => {
+            eval_with_courier(NativeCourier::default(), parcel, courier_name, emit_json)
+        }
+        BuiltinCourier::Docker => {
+            eval_with_courier(DockerCourier::default(), parcel, courier_name, emit_json)
+        }
+        BuiltinCourier::Wasm => {
+            eval_with_courier(WasmCourier::default(), parcel, courier_name, emit_json)
+        }
+    }
+}
+
+fn eval_with_courier<R: CourierBackend>(
+    courier: R,
+    parcel: &LoadedParcel,
+    courier_name: &str,
+    emit_json: bool,
+) -> Result<()> {
+    let evals = load_eval_specs(parcel)?;
+    if evals.is_empty() {
+        bail!("parcel does not declare any EVAL files");
+    }
+
+    let results = evals
+        .iter()
+        .map(|(packaged_path, spec)| run_eval_case(&courier, parcel, packaged_path, spec))
+        .collect::<Vec<_>>();
+    let report = EvalReport {
+        parcel_digest: parcel.config.digest.clone(),
+        courier: courier_name.to_string(),
+        results,
+    };
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_eval_report(&report);
+    }
+
+    if report.results.iter().all(|result| result.passed) {
+        Ok(())
+    } else {
+        bail!("eval failed")
+    }
+}
+
+fn load_eval_specs(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)>> {
+    let mut evals = Vec::new();
+    for instruction in &parcel.config.instructions {
+        if !matches!(instruction.kind, dispatch_core::InstructionKind::Eval) {
+            continue;
+        }
+        let path = parcel
+            .parcel_dir
+            .join("context")
+            .join(&instruction.packaged_path);
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let parsed: EvalDocument = serde_yaml::from_str(&source)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        match parsed {
+            EvalDocument::Single(spec) => evals.push((instruction.packaged_path.clone(), spec)),
+            EvalDocument::Cases { cases } => {
+                for spec in cases {
+                    evals.push((instruction.packaged_path.clone(), spec));
+                }
+            }
+        }
+    }
+    Ok(evals)
+}
+
+fn run_eval_case<R: CourierBackend>(
+    courier: &R,
+    parcel: &LoadedParcel,
+    packaged_path: &str,
+    spec: &EvalSpec,
+) -> EvalCaseResult {
+    let entrypoint = spec
+        .entrypoint
+        .clone()
+        .or_else(|| parcel.config.entrypoint.clone())
+        .unwrap_or_else(|| "chat".to_string());
+    let mut result = EvalCaseResult {
+        name: spec.name.clone(),
+        packaged_path: packaged_path.to_string(),
+        entrypoint: entrypoint.clone(),
+        passed: false,
+        tool_calls: Vec::new(),
+        assistant_messages: Vec::new(),
+        failures: Vec::new(),
+        error: None,
+    };
+
+    let operation = match entrypoint.as_str() {
+        "chat" => CourierOperation::Chat {
+            input: spec.input.clone(),
+        },
+        "job" => CourierOperation::Job {
+            payload: spec.input.clone(),
+        },
+        "heartbeat" => CourierOperation::Heartbeat {
+            payload: if spec.input.is_empty() {
+                None
+            } else {
+                Some(spec.input.clone())
+            },
+        },
+        other => {
+            result.error = Some(format!("unsupported eval entrypoint `{other}`"));
+            return result;
+        }
+    };
+
+    let session = match block_on(courier.open_session(parcel)) {
+        Ok(session) => session,
+        Err(error) => {
+            result.error = Some(error.to_string());
+            return result;
+        }
+    };
+
+    let response = match block_on(courier.run(parcel, CourierRequest { session, operation })) {
+        Ok(response) => response,
+        Err(error) => {
+            result.error = Some(error.to_string());
+            return result;
+        }
+    };
+
+    let mut text_observations = Vec::new();
+    for event in &response.events {
+        match event {
+            CourierEvent::ToolCallStarted { invocation, .. } => {
+                result.tool_calls.push(invocation.name.clone());
+            }
+            CourierEvent::Message { role, content } if role == "assistant" => {
+                result.assistant_messages.push(content.clone());
+                text_observations.push(content.clone());
+            }
+            CourierEvent::TextDelta { content } => text_observations.push(content.clone()),
+            _ => {}
+        }
+    }
+
+    if let Some(expected_tool) = &spec.expects_tool
+        && !result.tool_calls.iter().any(|tool| tool == expected_tool)
+    {
+        result.failures.push(format!(
+            "expected tool `{expected_tool}` but saw [{}]",
+            result.tool_calls.join(", ")
+        ));
+    }
+    if let Some(expected_text) = &spec.expects_text
+        && !text_observations
+            .iter()
+            .any(|observed| observed.contains(expected_text))
+    {
+        result.failures.push(format!(
+            "expected assistant text containing `{expected_text}`"
+        ));
+    }
+
+    result.passed = result.error.is_none() && result.failures.is_empty();
+    result
+}
+
+fn print_eval_report(report: &EvalReport) {
+    println!(
+        "Parcel {} on courier `{}`",
+        report.parcel_digest, report.courier
+    );
+    for result in &report.results {
+        let status = if result.passed { "PASS" } else { "FAIL" };
+        println!("{status} {} ({})", result.name, result.packaged_path);
+        if !result.tool_calls.is_empty() {
+            println!("tools: {}", result.tool_calls.join(", "));
+        }
+        if !result.assistant_messages.is_empty() {
+            println!("assistant: {}", result.assistant_messages.join(" | "));
+        }
+        if let Some(error) = &result.error {
+            println!("error: {error}");
+        }
+        for failure in &result.failures {
+            println!("failure: {failure}");
+        }
+    }
 }
 
 fn inspect(
@@ -1656,6 +1976,36 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn eval_runs_packaged_evals_against_live_courier() {
+        let dir = tempdir().unwrap();
+        let source_dir = build_test_eval_source(dir.path());
+        let built = build_agentfile(
+            &source_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: source_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let registry_path = dir.path().join("plugins.json");
+        install_eval_test_plugin(
+            dir.path(),
+            &registry_path,
+            "demo-eval-plugin",
+            &built.digest,
+        );
+
+        super::eval(
+            source_dir,
+            "demo-eval-plugin",
+            Some(registry_path),
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn push_and_pull_round_trip_through_file_depot() {
         let dir = tempdir().unwrap();
@@ -1847,6 +2197,88 @@ ENTRYPOINT chat\n",
                 protocol_version: 1,
                 transport: PluginTransport::Jsonl,
                 description: Some("Demo JSONL plugin for CLI tests".to_string()),
+                exec: CourierPluginExec {
+                    command: script_path.display().to_string(),
+                    args: Vec::new(),
+                },
+                installed_sha256: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        dispatch_core::install_courier_plugin(&manifest_path, Some(registry_path)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn build_test_eval_source(root: &Path) -> PathBuf {
+        let context_dir = root.join("eval-source");
+        fs::create_dir_all(context_dir.join("evals")).unwrap();
+        fs::write(
+            context_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\n\
+NAME eval-fixture\n\
+VERSION 0.1.0\n\
+SKILL SKILL.md\n\
+EVAL evals/smoke.eval\n\
+ENTRYPOINT chat\n",
+        )
+        .unwrap();
+        fs::write(context_dir.join("SKILL.md"), "You are an eval fixture.\n").unwrap();
+        fs::write(
+            context_dir.join("evals/smoke.eval"),
+            "name: smoke\ninput: \"What time is it?\"\nexpects_tool: \"system_time\"\nexpects_text_contains: \"plugin reply\"\n",
+        )
+        .unwrap();
+        context_dir
+    }
+
+    #[cfg(unix)]
+    fn install_eval_test_plugin(
+        root: &Path,
+        registry_path: &Path,
+        name: &str,
+        parcel_digest: &str,
+    ) {
+        let script_path = root.join("eval-plugin.sh");
+        let script = concat!(
+            "#!/bin/sh\n",
+            "set -eu\n",
+            "while IFS= read -r line; do\n",
+            "if printf '%s' \"$line\" | grep -q '\"kind\":\"capabilities\"'; then\n",
+            "  printf '%s\\n' '{\"kind\":\"result\",\"capabilities\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}'\n",
+            "elif printf '%s' \"$line\" | grep -q '\"kind\":\"validate_parcel\"'; then\n",
+            "  printf '%s\\n' '{\"kind\":\"result\"}'\n",
+            "elif printf '%s' \"$line\" | grep -q '\"kind\":\"inspect\"'; then\n",
+            "  printf '%s\\n' '{\"kind\":\"result\",\"inspection\":{\"courier_id\":\"demo-eval-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}'\n",
+            "elif printf '%s' \"$line\" | grep -q '\"kind\":\"open_session\"'; then\n",
+            "  printf '%s\\n' '{\"kind\":\"result\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}'\n",
+            "elif printf '%s' \"$line\" | grep -q '\"kind\":\"run\"'; then\n",
+            "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"tool_call_started\",\"invocation\":{\"name\":\"system_time\",\"input\":null},\"command\":\"builtin\",\"args\":[]}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"tool_call_finished\",\"result\":{\"tool\":\"system_time\",\"command\":\"builtin\",\"args\":[],\"exit_code\":0,\"stdout\":\"2026-04-03T00:00:00Z\",\"stderr\":\"\"}}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"event\",\"event\":{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"plugin reply\"}}'\n",
+            "  printf '%s\\n' '{\"kind\":\"done\",\"session\":{\"id\":\"demo-eval-session\",\"parcel_digest\":\"__DIGEST__\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{\"role\":\"user\",\"content\":\"What time is it?\"},{\"role\":\"assistant\",\"content\":\"plugin reply\"}]}}'\n",
+            "else\n",
+            "  printf '%s\\n' '{\"kind\":\"error\",\"error\":{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}'\n",
+            "  exit 1\n",
+            "fi\n",
+            "done\n"
+        )
+        .replace("__DIGEST__", parcel_digest);
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest_path = root.join("eval-plugin.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&CourierPluginManifest {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                protocol_version: 1,
+                transport: PluginTransport::Jsonl,
+                description: Some("Demo eval plugin for CLI tests".to_string()),
                 exec: CourierPluginExec {
                     command: script_path.display().to_string(),
                     args: Vec::new(),

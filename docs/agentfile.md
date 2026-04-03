@@ -510,6 +510,30 @@ EVAL evals/smoke.eval
 EVAL evals/safety.eval REQUIRED
 ```
 
+Minimal eval file:
+
+```yaml
+name: smoke
+input: "What time is it?"
+expects_tool: system_time
+expects_text_contains: "plugin reply"
+```
+
+Supported fields in the reference runner:
+
+- `name`
+- `input`
+- `entrypoint` (`chat`, `job`, or `heartbeat`; defaults to the parcel entrypoint or `chat`)
+- `expects_tool`
+- `expects_text_contains`
+
+Run packaged evals with:
+
+```bash
+dispatch eval <parcel-or-source>
+dispatch eval <parcel-or-source> --courier wasm
+```
+
 #### `TEST`
 
 Reserved for local build verification commands.

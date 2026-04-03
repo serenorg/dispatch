@@ -143,6 +143,10 @@ cargo run -p dispatch -- lint examples/wasm-reference
 cargo run -p dispatch -- build examples/basic
 cargo run -p dispatch -- build examples/wasm-reference
 
+# Run packaged evals
+cargo run -p dispatch -- eval examples/basic
+cargo run -p dispatch -- eval examples/basic --courier native
+
 # Inspect a built parcel
 cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest>
 cargo run -p dispatch -- inspect examples/wasm-reference/.dispatch/parcels/<digest> --courier wasm
@@ -192,6 +196,17 @@ A built parcel contains:
 - `signatures/<key_id>.json` - detached Ed25519 signatures (optional)
 
 The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
+
+Packaged eval files live under `context/` with the other authored inputs. A minimal eval file looks like:
+
+```yaml
+name: smoke
+input: "What time is it?"
+expects_tool: system_time
+expects_text_contains: "plugin reply"
+```
+
+`dispatch eval` runs those packaged cases against a live courier and reports pass/fail per case.
 
 Parcel format compatibility:
 
