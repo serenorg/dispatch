@@ -468,6 +468,7 @@ Semantics:
 - `none` means no durable long-term memory backend
 - `sqlite` resolves a parcel-scoped local durable memory database for built-in courier memory APIs
 - `pgvector` is a declared remote memory backend target for couriers that support it
+- guests and built-in memory helpers must fail explicitly when no usable memory mount is declared
 - unsupported memory drivers must fail when the courier opens a session instead of being silently ignored
 
 #### `MOUNT ARTIFACTS`
@@ -481,6 +482,12 @@ Semantics:
 
 - `local` resolves to a parcel-scoped local artifacts directory for built-in couriers
 - other artifact drivers are courier-specific and must fail fast when unsupported
+
+Built-in courier state root:
+
+- when a parcel is opened from the standard `.dispatch/parcels/<digest>/` layout, built-in courier state is stored under `.dispatch/state/<digest>/`
+- when a parcel is opened from a custom location, built-in courier state is stored under `<parcel-parent>/.dispatch-state/<digest>/`
+- `DISPATCH_STATE_ROOT` overrides the built-in courier state root completely
 
 ### Evaluation
 

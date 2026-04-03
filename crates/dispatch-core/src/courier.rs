@@ -214,6 +214,24 @@ pub enum CourierError {
     ModelBackendRequest(String),
     #[error("model backend returned an unexpected response: {0}")]
     ModelBackendResponse(String),
+    #[error(
+        "parcel `{parcel_digest}` does not declare a usable memory mount for courier memory operations"
+    )]
+    MissingMemoryMount { parcel_digest: String },
+    #[error("failed to create directory `{path}`: {source}")]
+    CreateDir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write `{path}`: {source}")]
+    WriteFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to serialize courier session for sqlite persistence: {0}")]
+    SerializeSession(String),
     #[error("failed to access sqlite mount `{path}` during `{operation}`: {source}")]
     SqliteMount {
         path: String,
@@ -711,15 +729,11 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
         key: String,
         value: String,
     ) -> Result<bool, String> {
-        memory_put(&self.session, &namespace, &key, &value)
-            .map(|replaced| replaced.unwrap_or(false))
-            .map_err(|error| error.to_string())
+        memory_put(&self.session, &namespace, &key, &value).map_err(|error| error.to_string())
     }
 
     fn memory_delete(&mut self, namespace: String, key: String) -> Result<bool, String> {
-        memory_delete(&self.session, &namespace, &key)
-            .map(|deleted| deleted.unwrap_or(false))
-            .map_err(|error| error.to_string())
+        memory_delete(&self.session, &namespace, &key).map_err(|error| error.to_string())
     }
 
     fn memory_list(
@@ -730,7 +744,6 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
         memory_list(&self.session, &namespace, prefix.as_deref())
             .map(|entries| {
                 entries
-                    .unwrap_or_default()
                     .into_iter()
                     .map(
                         |entry| wasm_bindings::dispatch::courier::host::MemoryEntry {
@@ -1005,13 +1018,7 @@ fn resolve_builtin_mounts(
     session_id: &str,
 ) -> Result<Vec<ResolvedMount>, CourierError> {
     let mut mounts = Vec::with_capacity(parcel.config.mounts.len());
-    let parcel_state_root = parcel
-        .parcel_dir
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(parcel.parcel_dir.as_path())
-        .join("state")
-        .join(&parcel.config.digest);
+    let parcel_state_root = resolve_parcel_state_root(parcel);
     let session_state_root = parcel_state_root.join("sessions").join(session_id);
 
     for mount in &parcel.config.mounts {
@@ -1052,7 +1059,7 @@ fn resolve_builtin_mounts(
             }
             (MountKind::Artifacts, "local") => {
                 let path = parcel_state_root.join("artifacts");
-                fs::create_dir_all(&path).map_err(|source| CourierError::ReadFile {
+                fs::create_dir_all(&path).map_err(|source| CourierError::CreateDir {
                     path: path.display().to_string(),
                     source,
                 })?;
@@ -1075,6 +1082,26 @@ fn resolve_builtin_mounts(
     }
 
     Ok(mounts)
+}
+
+fn resolve_parcel_state_root(parcel: &LoadedParcel) -> PathBuf {
+    if let Some(root) = std::env::var_os("DISPATCH_STATE_ROOT") {
+        return PathBuf::from(root).join(&parcel.config.digest);
+    }
+
+    let parcel_dir = parcel.parcel_dir.as_path();
+    if let Some(parent) = parcel_dir.parent()
+        && parent.file_name().is_some_and(|name| name == "parcels")
+        && let Some(dispatch_root) = parent.parent()
+    {
+        return dispatch_root.join("state").join(&parcel.config.digest);
+    }
+
+    parcel_dir
+        .parent()
+        .unwrap_or(parcel_dir)
+        .join(".dispatch-state")
+        .join(&parcel.config.digest)
 }
 
 fn validate_parcel_schema(
@@ -1117,7 +1144,7 @@ fn format_schema_error(error: &jsonschema::ValidationError<'_>) -> String {
 
 fn ensure_parent_dir(path: &Path) -> Result<(), CourierError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CourierError::ReadFile {
+        fs::create_dir_all(parent).map_err(|source| CourierError::CreateDir {
             path: parent.display().to_string(),
             source,
         })?;
@@ -1129,7 +1156,7 @@ fn touch_file(path: &Path) -> Result<(), CourierError> {
     if path.exists() {
         return Ok(());
     }
-    fs::write(path, []).map_err(|source| CourierError::ReadFile {
+    fs::write(path, []).map_err(|source| CourierError::WriteFile {
         path: path.display().to_string(),
         source,
     })
@@ -1165,11 +1192,8 @@ fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), C
             operation: "create_session_table",
             source,
         })?;
-    let payload = serde_json::to_string(session).map_err(|error| {
-        CourierError::ModelBackendResponse(format!(
-            "failed to serialize courier session for sqlite persistence: {error}"
-        ))
-    })?;
+    let payload = serde_json::to_string(session)
+        .map_err(|error| CourierError::SerializeSession(error.to_string()))?;
     connection
         .execute(
             concat!(
@@ -1214,6 +1238,12 @@ fn memory_mount_path(session: &CourierSession) -> Option<&Path> {
         .map(|mount| Path::new(&mount.target_path))
 }
 
+fn require_memory_mount_path(session: &CourierSession) -> Result<&Path, CourierError> {
+    memory_mount_path(session).ok_or_else(|| CourierError::MissingMemoryMount {
+        parcel_digest: session.parcel_digest.clone(),
+    })
+}
+
 fn ensure_memory_sqlite(connection: &Connection, path: &Path) -> Result<(), CourierError> {
     connection
         .execute_batch(
@@ -1245,9 +1275,7 @@ fn memory_get(
     namespace: &str,
     key: &str,
 ) -> Result<Option<MemoryEntry>, CourierError> {
-    let Some(path) = memory_mount_path(session) else {
-        return Ok(None);
-    };
+    let path = require_memory_mount_path(session)?;
     let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
         path: path.display().to_string(),
         operation: "open_memory_get",
@@ -1287,10 +1315,8 @@ fn memory_put(
     namespace: &str,
     key: &str,
     value: &str,
-) -> Result<Option<bool>, CourierError> {
-    let Some(path) = memory_mount_path(session) else {
-        return Ok(None);
-    };
+) -> Result<bool, CourierError> {
+    let path = require_memory_mount_path(session)?;
     let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
         path: path.display().to_string(),
         operation: "open_memory_put",
@@ -1321,17 +1347,15 @@ fn memory_put(
             operation: "upsert_memory_put",
             source,
         })?;
-    Ok(Some(existed))
+    Ok(existed)
 }
 
 fn memory_delete(
     session: &CourierSession,
     namespace: &str,
     key: &str,
-) -> Result<Option<bool>, CourierError> {
-    let Some(path) = memory_mount_path(session) else {
-        return Ok(None);
-    };
+) -> Result<bool, CourierError> {
+    let path = require_memory_mount_path(session)?;
     let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
         path: path.display().to_string(),
         operation: "open_memory_delete",
@@ -1351,29 +1375,27 @@ fn memory_delete(
             operation: "delete_memory_entry",
             source,
         })?;
-    Ok(Some(deleted > 0))
+    Ok(deleted > 0)
 }
 
 fn memory_list(
     session: &CourierSession,
     namespace: &str,
     prefix: Option<&str>,
-) -> Result<Option<Vec<MemoryEntry>>, CourierError> {
-    let Some(path) = memory_mount_path(session) else {
-        return Ok(None);
-    };
+) -> Result<Vec<MemoryEntry>, CourierError> {
+    let path = require_memory_mount_path(session)?;
     let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
         path: path.display().to_string(),
         operation: "open_memory_list",
         source,
     })?;
     ensure_memory_sqlite(&connection, path)?;
-    let prefix_like = format!("{}%", prefix.unwrap_or_default());
+    let prefix_like = escape_sql_like_prefix(prefix.unwrap_or_default());
     let mut statement = connection
         .prepare(concat!(
             "SELECT namespace, key, value, updated_at ",
             "FROM dispatch_memory ",
-            "WHERE parcel_digest = ?1 AND namespace = ?2 AND key LIKE ?3 ",
+            "WHERE parcel_digest = ?1 AND namespace = ?2 AND key LIKE ?3 ESCAPE '\\' ",
             "ORDER BY key ASC"
         ))
         .map_err(|source| CourierError::SqliteMount {
@@ -1406,7 +1428,19 @@ fn memory_list(
             source,
         })?);
     }
-    Ok(Some(entries))
+    Ok(entries)
+}
+
+fn escape_sql_like_prefix(prefix: &str) -> String {
+    let mut escaped = String::with_capacity(prefix.len() + 1);
+    for ch in prefix.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('%');
+    escaped
 }
 
 fn parse_memory_ref(token: &str) -> (&str, &str) {
@@ -1441,7 +1475,7 @@ fn handle_native_memory_command(
                 return Ok("Usage: /memory put <key|namespace:key> <value>".to_string());
             }
             let (namespace, key) = parse_memory_ref(key_ref);
-            let replaced = memory_put(session, namespace, key, value)?.unwrap_or(false);
+            let replaced = memory_put(session, namespace, key, value)?;
             Ok(if replaced {
                 format!("Updated memory {}:{}", namespace, key)
             } else {
@@ -1468,7 +1502,7 @@ fn handle_native_memory_command(
                 return Ok("Usage: /memory delete <key|namespace:key>".to_string());
             }
             let (namespace, key) = parse_memory_ref(key_ref);
-            let deleted = memory_delete(session, namespace, key)?.unwrap_or(false);
+            let deleted = memory_delete(session, namespace, key)?;
             Ok(if deleted {
                 format!("Deleted memory {}:{}", namespace, key)
             } else {
@@ -1483,7 +1517,7 @@ fn handle_native_memory_command(
                 let (namespace, key) = parse_memory_ref(key_ref);
                 (namespace, Some(key))
             };
-            let entries = memory_list(session, namespace, prefix)?.unwrap_or_default();
+            let entries = memory_list(session, namespace, prefix)?;
             if entries.is_empty() {
                 return Ok(format!("No memory entries in namespace `{namespace}`."));
             }
@@ -3698,7 +3732,18 @@ mod tests {
     }
 
     fn build_test_image(agentfile: &str, files: &[(&str, &str)]) -> TestImage {
-        build_test_image_with_binary_files(agentfile, files, &[])
+        let dir = tempdir().unwrap();
+        let output_root = dir.path().join(".dispatch/parcels");
+        build_test_image_in_dir(dir, agentfile, files, &[], output_root)
+    }
+
+    fn build_test_image_with_output_root(
+        agentfile: &str,
+        files: &[(&str, &str)],
+        output_root: &Path,
+    ) -> TestImage {
+        let dir = tempdir().unwrap();
+        build_test_image_in_dir(dir, agentfile, files, &[], output_root.to_path_buf())
     }
 
     fn build_test_image_with_binary_files(
@@ -3707,6 +3752,17 @@ mod tests {
         binary_files: &[(&str, &[u8])],
     ) -> TestImage {
         let dir = tempdir().unwrap();
+        let output_root = dir.path().join(".dispatch/parcels");
+        build_test_image_in_dir(dir, agentfile, files, binary_files, output_root)
+    }
+
+    fn build_test_image_in_dir(
+        dir: tempfile::TempDir,
+        agentfile: &str,
+        files: &[(&str, &str)],
+        binary_files: &[(&str, &[u8])],
+        output_root: PathBuf,
+    ) -> TestImage {
         fs::write(dir.path().join("Agentfile"), agentfile).unwrap();
         for (relative, body) in files {
             let path = dir.path().join(relative);
@@ -3723,13 +3779,8 @@ mod tests {
             fs::write(path, body).unwrap();
         }
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
-            &BuildOptions {
-                output_root: dir.path().join(".dispatch/parcels"),
-            },
-        )
-        .unwrap();
+        let built =
+            build_agentfile(&dir.path().join("Agentfile"), &BuildOptions { output_root }).unwrap();
 
         TestImage {
             image: load_parcel(&built.parcel_dir).unwrap(),
@@ -4704,6 +4755,44 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn builtin_mounts_use_explicit_state_root_for_custom_output_layouts() {
+        let root = tempdir().unwrap();
+        let output_root = root.path().join("pulled");
+        let test_image = build_test_image_with_output_root(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+MOUNT ARTIFACTS local
+ENTRYPOINT chat
+",
+            &[],
+            &output_root,
+        );
+        let courier = NativeCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let session_db = mount_path(&session, MountKind::Session, "sqlite");
+        let memory_db = mount_path(&session, MountKind::Memory, "sqlite");
+        let artifacts_dir = mount_path(&session, MountKind::Artifacts, "local");
+
+        let expected_root = output_root
+            .canonicalize()
+            .unwrap()
+            .join(".dispatch-state")
+            .join(&test_image.image.config.digest);
+        assert!(session_db.starts_with(expected_root.join("sessions").to_string_lossy().as_ref()));
+        assert_eq!(
+            memory_db,
+            expected_root.join("memory.sqlite").to_string_lossy()
+        );
+        assert_eq!(
+            artifacts_dir,
+            expected_root.join("artifacts").to_string_lossy()
+        );
+    }
+
+    #[test]
     fn native_courier_memory_sqlite_persists_across_sessions() {
         let test_image = build_test_image(
             "\
@@ -4749,6 +4838,99 @@ ENTRYPOINT chat
         assert!(matches!(
             second_response.events.first(),
             Some(CourierEvent::Message { content, .. }) if content == "profile:name = Christian"
+        ));
+    }
+
+    #[test]
+    fn native_memory_list_treats_underscore_as_literal_prefix_character() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let session = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "/memory put default:user_1 first".to_string(),
+                },
+            },
+        ))
+        .unwrap()
+        .session;
+        let session = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "/memory put default:userA second".to_string(),
+                },
+            },
+        ))
+        .unwrap()
+        .session;
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "/memory list default:user_".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let CourierEvent::Message { content, .. } = response.events.first().unwrap() else {
+            panic!("expected message event");
+        };
+        assert!(content.contains("default:user_1 = first"));
+        assert!(!content.contains("default:userA = second"));
+    }
+
+    #[test]
+    fn wasm_courier_reference_guest_rejects_memory_ops_without_memory_mount() {
+        static REFERENCE_GUEST: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/dispatch-wasm-guest-reference.wasm"
+        ));
+
+        let test_image = build_test_image_with_binary_files(
+            "\
+FROM dispatch/wasm:latest
+COMPONENT components/reference.wasm
+MOUNT MEMORY none
+ENTRYPOINT chat
+",
+            &[],
+            &[("components/reference.wasm", REFERENCE_GUEST)],
+        );
+        let courier = WasmCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let error = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "remember profile:name Christian".to_string(),
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CourierError::WasmGuest { message, .. }
+                if message.contains("memory put failed")
+                    && message.contains("does not declare a usable memory mount")
         ));
     }
 

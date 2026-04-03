@@ -234,6 +234,9 @@ Mount behavior:
 - built-in couriers resolve declared mounts during `open_session`
 - `MOUNT SESSION sqlite` creates a session-scoped sqlite database and persists `CourierSession` state on open plus after each turn
 - `MOUNT MEMORY sqlite` resolves a durable parcel-scoped sqlite database for built-in courier memory APIs
+- memory operations fail explicitly when the parcel does not declare a usable memory mount
+- built-in courier state lives under the standard `.dispatch/state/<digest>/` layout when parcels are opened from a normal build output tree, or under `<parcel-parent>/.dispatch-state/<digest>/` for custom parcel locations
+- `DISPATCH_STATE_ROOT` overrides the built-in courier state root completely when you need an explicit shared state location
 - unsupported mount drivers fail fast when a courier session opens
 
 Optional environment variables for the native OpenAI-backed chat path:
