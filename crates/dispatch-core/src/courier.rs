@@ -1561,36 +1561,63 @@ fn memory_put(
     value: &str,
 ) -> Result<bool, CourierError> {
     let path = require_memory_mount_path(session)?;
-    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+    let mut connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
         path: path.display().to_string(),
         operation: "open_memory_put",
         source,
     })?;
     ensure_memory_sqlite(&connection, path)?;
-    let existed = memory_get(session, namespace, key)?.is_some();
-    connection
-        .execute(
-            concat!(
-                "INSERT INTO dispatch_memory ",
-                "(parcel_digest, namespace, key, value, updated_at) ",
-                "VALUES (?1, ?2, ?3, ?4, ?5) ",
-                "ON CONFLICT(parcel_digest, namespace, key) DO UPDATE SET ",
-                "value = excluded.value, ",
-                "updated_at = excluded.updated_at"
-            ),
-            params![
-                session.parcel_digest,
-                namespace,
-                key,
-                value,
-                current_unix_timestamp() as i64,
-            ],
-        )
+    let tx = connection
+        .transaction()
         .map_err(|source| CourierError::SqliteMount {
             path: path.display().to_string(),
-            operation: "upsert_memory_put",
+            operation: "begin_memory_put",
             source,
         })?;
+    let existed = tx
+        .query_row(
+            concat!(
+                "SELECT EXISTS(",
+                "SELECT 1 FROM dispatch_memory ",
+                "WHERE parcel_digest = ?1 AND namespace = ?2 AND key = ?3",
+                ")"
+            ),
+            params![session.parcel_digest, namespace, key],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "query_memory_put_exists",
+            source,
+        })?;
+    tx.execute(
+        concat!(
+            "INSERT INTO dispatch_memory ",
+            "(parcel_digest, namespace, key, value, updated_at) ",
+            "VALUES (?1, ?2, ?3, ?4, ?5) ",
+            "ON CONFLICT(parcel_digest, namespace, key) DO UPDATE SET ",
+            "value = excluded.value, ",
+            "updated_at = excluded.updated_at"
+        ),
+        params![
+            session.parcel_digest,
+            namespace,
+            key,
+            value,
+            current_unix_timestamp() as i64,
+        ],
+    )
+    .map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "upsert_memory_put",
+        source,
+    })?;
+    tx.commit().map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "commit_memory_put",
+        source,
+    })?;
     Ok(existed)
 }
 
@@ -5597,6 +5624,66 @@ ENTRYPOINT chat
         assert!(matches!(
             second_response.events.first(),
             Some(CourierEvent::Message { content, .. }) if content == "profile:name = Christian"
+        ));
+    }
+
+    #[test]
+    fn native_courier_memory_put_reports_updates_after_first_write() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let first = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "/memory put profile:name Christian".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            first.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "Stored memory profile:name"
+        ));
+
+        let second = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: first.session,
+                operation: CourierOperation::Chat {
+                    input: "/memory put profile:name Chris".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            second.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "Updated memory profile:name"
+        ));
+
+        let third = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: second.session,
+                operation: CourierOperation::Chat {
+                    input: "/memory get profile:name".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            third.events.first(),
+            Some(CourierEvent::Message { content, .. }) if content == "profile:name = Chris"
         ));
     }
 
