@@ -180,6 +180,7 @@ dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-dep
 dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0
 dispatch push examples/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0
+dispatch pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
 ```
 
 Print the parsed AST:
@@ -316,12 +317,14 @@ State management:
 
 - `dispatch push <parcel> <reference>` - publish a parcel into a depot
 - `dispatch pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
+- `dispatch pull <reference> --public-key <path>` - require detached signature verification during fetch
 - v1 depot references include:
 - `file:///absolute/path/to/depot::org/parcel:v1`
 - `https://depot.example.com::org/parcel:v1`
 - file depots store parcels by digest under `blobs/parcels/<digest>/`
 - file depots store tags under `refs/<org>/<parcel>/tags/<tag>.json`
 - HTTP depots expose parcel blobs at `/v1/parcels/<digest>.tar` and tag lookup at `/v1/tags?repository=<repo>&tag=<tag>`
+- set `DISPATCH_DEPOT_TOKEN` to send `Authorization: Bearer <token>` on HTTP depot requests
 
 ## Design Principles
 

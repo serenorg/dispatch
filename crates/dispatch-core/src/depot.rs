@@ -1,5 +1,7 @@
 use crate::{LoadedParcel, load_parcel};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::{
     fs,
     io::{Cursor, Read},
@@ -157,6 +159,36 @@ pub fn pull_parcel(
         DepotLocator::File { .. } => pull_file_parcel(reference, output_root),
         DepotLocator::Http { .. } => pull_http_parcel(reference, output_root),
     }
+}
+
+fn depot_auth_token() -> Option<String> {
+    #[cfg(test)]
+    if let Some(override_token) = test_depot_auth_token_override() {
+        return Some(override_token);
+    }
+    std::env::var("DISPATCH_DEPOT_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+static TEST_DEPOT_AUTH_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_depot_auth_token_override() -> Option<String> {
+    TEST_DEPOT_AUTH_TOKEN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|token| token.clone())
+}
+
+#[cfg(test)]
+fn set_test_depot_auth_token(token: Option<&str>) {
+    let store = TEST_DEPOT_AUTH_TOKEN.get_or_init(|| Mutex::new(None));
+    *store
+        .lock()
+        .expect("depot auth token override lock poisoned") = token.map(ToString::to_string);
 }
 
 fn push_file_parcel(
@@ -373,8 +405,11 @@ fn push_http_parcel(
     let blob_location = reference.blob_location(&parcel.config.digest);
     let tag_location = reference.tag_location();
     let archive = archive_parcel_tree(&parcel.parcel_dir)?;
-    let response = ureq::put(&blob_location)
-        .header("content-type", "application/x-tar")
+    let mut blob_request = ureq::put(&blob_location).header("content-type", "application/x-tar");
+    if let Some(token) = depot_auth_token() {
+        blob_request = blob_request.header("authorization", &format!("Bearer {token}"));
+    }
+    let response = blob_request
         .send(&archive[..])
         .map_err(|source| DepotError::HttpRequest {
             url: blob_location.clone(),
@@ -387,8 +422,11 @@ fn push_http_parcel(
         tag: reference.tag.clone(),
         digest: parcel.config.digest.clone(),
     };
-    let response = ureq::put(&tag_location)
-        .header("content-type", "application/json")
+    let mut tag_request = ureq::put(&tag_location).header("content-type", "application/json");
+    if let Some(token) = depot_auth_token() {
+        tag_request = tag_request.header("authorization", &format!("Bearer {token}"));
+    }
+    let response = tag_request
         .send_json(tag_record)
         .map_err(|source| DepotError::HttpRequest {
             url: tag_location.clone(),
@@ -408,13 +446,16 @@ fn pull_http_parcel(
     output_root: &Path,
 ) -> Result<PulledParcel, DepotError> {
     let tag_location = reference.tag_location();
-    let tag_response =
-        ureq::get(&tag_location)
-            .call()
-            .map_err(|source| DepotError::HttpRequest {
-                url: tag_location.clone(),
-                source,
-            })?;
+    let mut tag_request = ureq::get(&tag_location);
+    if let Some(token) = depot_auth_token() {
+        tag_request = tag_request.header("authorization", &format!("Bearer {token}"));
+    }
+    let tag_response = tag_request
+        .call()
+        .map_err(|source| DepotError::HttpRequest {
+            url: tag_location.clone(),
+            source,
+        })?;
     let tag_response = ensure_http_success(tag_response, &tag_location)?;
     let tag_bytes = read_http_body(tag_response, &tag_location)?;
     let tag_record: DepotTagRecord =
@@ -424,13 +465,16 @@ fn pull_http_parcel(
         })?;
 
     let blob_location = reference.blob_location(&tag_record.digest);
-    let blob_response =
-        ureq::get(&blob_location)
-            .call()
-            .map_err(|source| DepotError::HttpRequest {
-                url: blob_location.clone(),
-                source,
-            })?;
+    let mut blob_request = ureq::get(&blob_location);
+    if let Some(token) = depot_auth_token() {
+        blob_request = blob_request.header("authorization", &format!("Bearer {token}"));
+    }
+    let blob_response = blob_request
+        .call()
+        .map_err(|source| DepotError::HttpRequest {
+            url: blob_location.clone(),
+            source,
+        })?;
     let blob_response = ensure_http_success(blob_response, &blob_location)?;
     let blob_bytes = read_http_body(blob_response, &blob_location)?;
 
@@ -591,9 +635,14 @@ mod tests {
     }
 
     fn start_http_depot(root: PathBuf) -> HttpDepotServer {
+        start_http_depot_with_auth(root, None)
+    }
+
+    fn start_http_depot_with_auth(root: PathBuf, expected_auth: Option<&str>) -> HttpDepotServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let expected_auth = expected_auth.map(ToString::to_string);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let handle = thread::spawn(move || {
             loop {
@@ -601,7 +650,9 @@ mod tests {
                     break;
                 }
                 match listener.accept() {
-                    Ok((stream, _)) => handle_http_depot_connection(stream, &root),
+                    Ok((stream, _)) => {
+                        handle_http_depot_connection(stream, &root, expected_auth.as_deref())
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -616,7 +667,7 @@ mod tests {
         }
     }
 
-    fn handle_http_depot_connection(stream: TcpStream, root: &Path) {
+    fn handle_http_depot_connection(stream: TcpStream, root: &Path, expected_auth: Option<&str>) {
         stream.set_nonblocking(false).unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
@@ -630,6 +681,7 @@ mod tests {
         let target = parts.next().unwrap_or_default();
 
         let mut content_length = 0usize;
+        let mut authorization = None;
         loop {
             let mut header_line = String::new();
             reader.read_line(&mut header_line).unwrap();
@@ -640,8 +692,21 @@ mod tests {
             if let Some((name, value)) = header_line.split_once(':') {
                 if name.eq_ignore_ascii_case("content-length") {
                     content_length = value.trim().parse().unwrap();
+                } else if name.eq_ignore_ascii_case("authorization") {
+                    authorization = Some(value.trim().to_string());
                 }
             }
+        }
+
+        if expected_auth.is_some_and(|expected| authorization.as_deref() != Some(expected)) {
+            write_http_response(
+                &mut writer,
+                401,
+                "unauthorized",
+                "text/plain",
+                b"missing or invalid authorization",
+            );
+            return;
         }
 
         let mut body = vec![0u8; content_length];
@@ -861,6 +926,25 @@ mod tests {
                 .join(format!("{}.tar", parcel.config.digest))
                 .exists()
         );
+    }
+
+    #[test]
+    fn http_depot_uses_bearer_token_when_configured() {
+        let dir = tempdir().unwrap();
+        let built = build_fixture(dir.path());
+        let parcel = load_parcel(&built.parcel_dir).unwrap();
+        let server_root = dir.path().join("http-auth-depot");
+        let server = start_http_depot_with_auth(server_root, Some("Bearer depot-token"));
+        let output_root = dir.path().join("pulled/http-auth");
+        let reference =
+            parse_depot_reference(&format!("{}::acme/secure:v1", server.base_url)).unwrap();
+
+        set_test_depot_auth_token(Some("depot-token"));
+        let pushed = push_parcel(&parcel, &reference).unwrap();
+        assert_eq!(pushed.digest, parcel.config.digest);
+        let pulled = pull_parcel(&reference, &output_root).unwrap();
+        assert_eq!(pulled.digest, parcel.config.digest);
+        set_test_depot_auth_token(None);
     }
 
     #[test]

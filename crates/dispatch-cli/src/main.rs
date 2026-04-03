@@ -120,6 +120,9 @@ enum Command {
         /// Output directory for pulled parcels
         #[arg(long)]
         output_dir: Option<PathBuf>,
+        /// Verify detached parcel signatures immediately after pull
+        #[arg(long = "public-key")]
+        public_keys: Vec<PathBuf>,
     },
     /// Execute part of a built parcel locally
     Run(RunArgs),
@@ -339,7 +342,8 @@ fn main() -> Result<()> {
         Command::Pull {
             reference,
             output_dir,
-        } => pull(&reference, output_dir),
+            public_keys,
+        } => pull(&reference, output_dir, public_keys),
         Command::Run(args) => run(args),
         Command::Courier { command } => courier_command(command),
         Command::State { command } => state_command(command),
@@ -793,11 +797,37 @@ fn push(path: PathBuf, reference: &str) -> Result<()> {
     Ok(())
 }
 
-fn pull(reference: &str, output_dir: Option<PathBuf>) -> Result<()> {
+fn pull(reference: &str, output_dir: Option<PathBuf>, public_keys: Vec<PathBuf>) -> Result<()> {
     let reference = parse_depot_reference(reference)
         .with_context(|| format!("invalid depot reference `{reference}`"))?;
     let output_root = output_dir.unwrap_or_else(default_pull_output_root);
     let pulled = pull_parcel(&reference, &output_root)?;
+    if !public_keys.is_empty() {
+        let integrity = verify_parcel(&pulled.parcel_dir).with_context(|| {
+            format!(
+                "failed to verify pulled parcel {}",
+                pulled.parcel_dir.display()
+            )
+        })?;
+        let signature_checks = public_keys
+            .iter()
+            .map(|public_key| {
+                verify_parcel_signature(&pulled.parcel_dir, public_key).with_context(|| {
+                    format!(
+                        "failed to verify detached signature for {} with {}",
+                        pulled.parcel_dir.display(),
+                        public_key.display()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let signatures_ok = signature_checks.iter().all(SignatureVerification::is_ok);
+        if !integrity.is_ok() || !signatures_ok {
+            print_verification_report(&integrity);
+            print_signature_verifications(&signature_checks);
+            bail!("pulled parcel failed verification");
+        }
+    }
 
     println!("Pulled parcel {}", pulled.digest);
     println!("Parcel dir: {}", pulled.parcel_dir.display());
@@ -1713,12 +1743,14 @@ mod tests {
         let Command::Pull {
             reference,
             output_dir,
+            public_keys,
         } = cli.command
         else {
             panic!("expected pull command");
         };
         assert_eq!(reference, "file:///tmp/depot::acme/monitor:v1");
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/parcels")));
+        assert!(public_keys.is_empty());
     }
 
     #[test]
@@ -2017,7 +2049,7 @@ mod tests {
         let pull_root = dir.path().join("pulled");
 
         super::push(parcel_dir.clone(), &depot_ref).unwrap();
-        super::pull(&depot_ref, Some(pull_root.clone())).unwrap();
+        super::pull(&depot_ref, Some(pull_root.clone()), Vec::new()).unwrap();
 
         let pulled_manifest = pull_root.join(&parcel_digest).join("manifest.json");
         assert!(pulled_manifest.exists());
@@ -2126,6 +2158,26 @@ mod tests {
 
         super::sign(parcel_dir.clone(), &secret_key).unwrap();
         super::verify(parcel_dir, vec![public_key], false).unwrap();
+    }
+
+    #[test]
+    fn pull_can_verify_signatures_during_fetch() {
+        let dir = tempdir().unwrap();
+        let (parcel_dir, _) = build_test_image(dir.path());
+        let keys_dir = dir.path().join("keys");
+        let depot_ref = format!(
+            "file://{}::acme/signed-fixture:v1",
+            dir.path().join("depot").display()
+        );
+        let pull_root = dir.path().join("pulled");
+
+        super::keygen("release", Some(keys_dir.clone())).unwrap();
+        let secret_key = keys_dir.join("release.dispatch-secret.json");
+        let public_key = keys_dir.join("release.dispatch-public.json");
+        super::sign(parcel_dir.clone(), &secret_key).unwrap();
+        super::push(parcel_dir, &depot_ref).unwrap();
+
+        super::pull(&depot_ref, Some(pull_root.clone()), vec![public_key]).unwrap();
     }
 
     #[cfg(unix)]
