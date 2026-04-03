@@ -53,8 +53,8 @@ USER USER.md
 TOOLS TOOLS.md
 MEMORY POLICY MEMORY.md
 
-MODEL gpt-5-mini
-FALLBACK gpt-5-nano
+MODEL gpt-5.4-mini PROVIDER openai
+FALLBACK claude-sonnet-4-6 PROVIDER anthropic
 
 TOOL BUILTIN system_time
 TOOL BUILTIN web_search
@@ -194,12 +194,13 @@ Framework provenance behavior:
 
 Native courier behavior:
 
-- if the parcel declares `MODEL <id>` and provider credentials are present, Dispatch can call a hosted model backend from the native courier
+- if the parcel declares `MODEL <id> [PROVIDER <backend>]` and provider credentials are present, Dispatch can call a hosted model backend from the native courier
 - `LLM_BACKEND=openai` uses the OpenAI Responses API
 - `LLM_BACKEND=anthropic` uses the Anthropic Messages API
 - `LLM_BACKEND=gemini` uses the Gemini `generateContent` API
 - `LLM_BACKEND=openai_compatible` uses a Chat Completions-compatible endpoint such as OpenRouter, Together, Fireworks, LiteLLM, or a self-hosted OpenAI-compatible server
 - if the parcel does not declare `MODEL <id>`, Dispatch falls back to `LLM_MODEL` for the native and WASM hosted-model paths
+- if the parcel model does not declare `PROVIDER <backend>`, Dispatch falls back to `LLM_BACKEND` for backend selection
 - declared local tools are exposed to that model-backed path as tool definitions for the selected backend
 - custom tool calls are executed locally and their outputs are sent back to the model before the assistant reply is finalized
 - tool execution is surfaced as ordered courier events during the chat turn

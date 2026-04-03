@@ -107,7 +107,7 @@ Resolved prompt/tool invariant:
 - tool exposure is driven by declared tool entries in the parcel manifest
 - prompt text must not be treated as authority to expose undeclared tools
 
-The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools plus the supported built-in memory tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. Otherwise it falls back to a local reference reply path.
+The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools plus the supported built-in memory tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. `MODEL <id> PROVIDER <backend>` selects a parcel-level backend explicitly; otherwise the courier falls back to `LLM_BACKEND`. If no parcel model is declared, Dispatch falls back to `LLM_MODEL`. Without a usable hosted-model configuration it falls back to a local reference reply path.
 
 ### Pluggable Courier Model
 
@@ -313,13 +313,14 @@ EOF
 
 ```dockerfile
 MODEL gpt-5.4-mini
+MODEL claude-sonnet-4-6 PROVIDER anthropic
 ```
 
 #### `FALLBACK`
 
 ```dockerfile
 FALLBACK gpt-5.4-nano
-FALLBACK claude-sonnet-4-6
+FALLBACK claude-sonnet-4-6 PROVIDER anthropic
 ```
 
 #### `ROUTING`
@@ -588,7 +589,7 @@ Supported pattern:
 ```dockerfile
 FROM acme/research-base:1
 SKILL market/SKILL.md
-MODEL gpt-5.4-mini
+MODEL gpt-5.4-mini PROVIDER openai
 ```
 
 The derived parcel can override:

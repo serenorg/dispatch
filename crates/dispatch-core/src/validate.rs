@@ -47,9 +47,10 @@ pub fn validate_agentfile(agentfile: &ParsedAgentfile) -> ValidationReport {
 
         match instruction.keyword.as_str() {
             "FROM" => require_min_args(instruction, 1, &mut diagnostics),
-            "NAME" | "VERSION" | "MODEL" | "ENTRYPOINT" | "VISIBILITY" => {
+            "NAME" | "VERSION" | "ENTRYPOINT" | "VISIBILITY" => {
                 require_exact_args(instruction, 1, &mut diagnostics)
             }
+            "MODEL" | "FALLBACK" => require_min_args(instruction, 1, &mut diagnostics),
             "FRAMEWORK" => require_min_args(instruction, 1, &mut diagnostics),
             "COMPONENT" => require_min_args(instruction, 1, &mut diagnostics),
             "IDENTITY" | "SOUL" | "SKILL" | "AGENTS" | "USER" | "TOOLS" | "EVAL" => {
@@ -57,7 +58,7 @@ pub fn validate_agentfile(agentfile: &ParsedAgentfile) -> ValidationReport {
             }
             "MEMORY" => require_min_args(instruction, 2, &mut diagnostics),
             "HEARTBEAT" | "TOOL" | "MOUNT" | "TIMEOUT" | "LIMIT" | "ENV" | "SECRET" | "NETWORK"
-            | "LABEL" | "COPY" | "ADD" | "FALLBACK" | "ROUTING" | "PROMPT" => {
+            | "LABEL" | "COPY" | "ADD" | "ROUTING" | "PROMPT" => {
                 require_min_args(instruction, 1, &mut diagnostics)
             }
             _ => {}

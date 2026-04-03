@@ -530,8 +530,9 @@ pub enum ModelToolKind {
     Function,
 }
 
+#[derive(Default)]
 pub struct NativeCourier {
-    chat_backend: Arc<dyn ChatModelBackend>,
+    chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
 }
 
 #[derive(Debug, Clone)]
@@ -548,7 +549,7 @@ pub struct DockerCourier {
 #[derive(Clone)]
 pub struct WasmCourier {
     engine: Engine,
-    chat_backend: Arc<dyn ChatModelBackend>,
+    chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
     component_cache: Arc<Mutex<BTreeMap<String, Component>>>,
 }
 
@@ -556,14 +557,6 @@ pub struct WasmCourier {
 pub struct StubCourier {
     courier_id: &'static str,
     kind: CourierKind,
-}
-
-impl Default for NativeCourier {
-    fn default() -> Self {
-        Self {
-            chat_backend: default_chat_backend(),
-        }
-    }
 }
 
 impl Default for DockerCourier {
@@ -585,7 +578,7 @@ impl Default for WasmCourier {
         let engine = Engine::new(&config).expect("failed to initialize wasmtime engine");
         Self {
             engine,
-            chat_backend: default_chat_backend(),
+            chat_backend_override: None,
             component_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -780,7 +773,9 @@ impl WasiView for WasmHostState {
 
 impl NativeCourier {
     pub fn with_chat_backend(chat_backend: Arc<dyn ChatModelBackend>) -> Self {
-        Self { chat_backend }
+        Self {
+            chat_backend_override: Some(chat_backend),
+        }
     }
 }
 
@@ -791,7 +786,7 @@ impl WasmCourier {
         let engine = Engine::new(&config).expect("failed to initialize wasmtime engine");
         Self {
             engine,
-            chat_backend,
+            chat_backend_override: Some(chat_backend),
             component_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -820,15 +815,20 @@ struct OpenAiChatCompletionsBackend;
 struct AnthropicMessagesBackend;
 struct GeminiGenerateContentBackend;
 
-fn default_chat_backend() -> Arc<dyn ChatModelBackend> {
-    default_chat_backend_with(process_env_lookup)
+fn default_chat_backend_for_model(primary: Option<&ModelReference>) -> Arc<dyn ChatModelBackend> {
+    default_chat_backend_for_model_with(primary, process_env_lookup)
 }
 
-fn default_chat_backend_with<F>(mut env_lookup: F) -> Arc<dyn ChatModelBackend>
+fn default_chat_backend_for_model_with<F>(
+    primary: Option<&ModelReference>,
+    mut env_lookup: F,
+) -> Arc<dyn ChatModelBackend>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    match env_lookup("LLM_BACKEND")
+    match primary
+        .and_then(|model| model.provider.clone())
+        .or_else(|| env_lookup("LLM_BACKEND"))
         .unwrap_or_else(|| "openai".to_string())
         .to_ascii_lowercase()
         .as_str()
@@ -2023,6 +2023,9 @@ impl CourierBackend for NativeCourier {
         let courier_id = self.id().to_string();
         let operation = request.operation;
         let mut session = request.session;
+        let chat_backend = self.chat_backend_override.clone().unwrap_or_else(|| {
+            default_chat_backend_for_model(image.config.models.primary.as_ref())
+        });
 
         async move {
             validate_native_parcel(image)?;
@@ -2087,7 +2090,7 @@ impl CourierBackend for NativeCourier {
                         image,
                         &session,
                         &input,
-                        self.chat_backend.as_ref(),
+                        chat_backend.as_ref(),
                         NativeTurnMode::Chat,
                     )?;
                     session.history.push(ConversationMessage {
@@ -2111,7 +2114,7 @@ impl CourierBackend for NativeCourier {
                     image,
                     session,
                     courier_id,
-                    self.chat_backend.as_ref(),
+                    chat_backend.as_ref(),
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
                 ),
@@ -2119,7 +2122,7 @@ impl CourierBackend for NativeCourier {
                     image,
                     session,
                     courier_id,
-                    self.chat_backend.as_ref(),
+                    chat_backend.as_ref(),
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
                 ),
@@ -2749,7 +2752,9 @@ impl CourierBackend for WasmCourier {
         let parcel = parcel.clone();
         let operation = request.operation;
         let mut session = request.session;
-        let chat_backend = self.chat_backend.clone();
+        let chat_backend = self.chat_backend_override.clone().unwrap_or_else(|| {
+            default_chat_backend_for_model(parcel.config.models.primary.as_ref())
+        });
         async move {
             validate_courier_reference(
                 "wasm",
@@ -6004,7 +6009,7 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_selects_openai_compatible_from_env() {
-        let backend = default_chat_backend_with(|name| match name {
+        let backend = default_chat_backend_for_model_with(None, |name| match name {
             "LLM_BACKEND" => Some("openai_compatible".to_string()),
             _ => None,
         });
@@ -6015,7 +6020,7 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_selects_anthropic_from_env() {
-        let backend = default_chat_backend_with(|name| match name {
+        let backend = default_chat_backend_for_model_with(None, |name| match name {
             "LLM_BACKEND" => Some("anthropic".to_string()),
             _ => None,
         });
@@ -6026,13 +6031,27 @@ ENTRYPOINT chat
 
     #[test]
     fn default_chat_backend_selects_gemini_from_env() {
-        let backend = default_chat_backend_with(|name| match name {
+        let backend = default_chat_backend_for_model_with(None, |name| match name {
             "LLM_BACKEND" => Some("gemini".to_string()),
             _ => None,
         });
 
         assert_eq!(backend.id(), "google_gemini_generate_content");
         assert!(!backend.supports_previous_response_id());
+    }
+
+    #[test]
+    fn default_chat_backend_prefers_model_provider_over_env() {
+        let model = ModelReference {
+            id: "claude-sonnet-4".to_string(),
+            provider: Some("anthropic".to_string()),
+        };
+        let backend = default_chat_backend_for_model_with(Some(&model), |name| match name {
+            "LLM_BACKEND" => Some("openai".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(backend.id(), "anthropic_messages");
     }
 
     #[test]

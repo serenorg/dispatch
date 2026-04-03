@@ -285,13 +285,13 @@ pub fn build_agentfile(
                 }
             }
             "MODEL" => {
-                if let Some(id) = first_scalar(instruction.args.first()) {
-                    resolved.models.primary = Some(ModelReference { id });
+                if let Some(model) = parse_model_reference(&instruction.args) {
+                    resolved.models.primary = Some(model);
                 }
             }
             "FALLBACK" => {
-                if let Some(id) = first_scalar(instruction.args.first()) {
-                    resolved.models.fallbacks.push(ModelReference { id });
+                if let Some(model) = parse_model_reference(&instruction.args) {
+                    resolved.models.fallbacks.push(model);
                 }
             }
             "ROUTING" => resolved.models.routing = first_scalar(instruction.args.first()),
@@ -750,6 +750,25 @@ fn parse_framework(args: &[Value]) -> Option<FrameworkProvenance> {
     })
 }
 
+fn parse_model_reference(args: &[Value]) -> Option<ModelReference> {
+    let tokens = scalars(args);
+    let id = tokens.first()?.clone();
+    let mut provider = None;
+
+    let mut index = 1;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "PROVIDER" if index + 1 < tokens.len() => {
+                provider = Some(tokens[index + 1].clone());
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+
+    Some(ModelReference { id, provider })
+}
+
 fn parse_env_var(args: &[Value]) -> Option<EnvVar> {
     let joined = join_scalars(args);
     let (name, value) = joined.split_once('=')?;
@@ -1051,8 +1070,8 @@ SKILL SKILL.md
 AGENTS AGENTS.md
 USER USER.md
 TOOLS TOOLS.md
-MODEL gpt-5-mini
-FALLBACK gpt-5-nano
+MODEL claude-sonnet-4 PROVIDER anthropic
+FALLBACK gpt-5-nano PROVIDER openai
 TOOL LOCAL tools/demo.py AS demo USING python3 -u DESCRIPTION \"Look up a record by id and print JSON.\"
 TOOL BUILTIN web_search APPROVAL required DESCRIPTION \"Search the web for live information.\"
 MOUNT SESSION sqlite
@@ -1107,8 +1126,19 @@ ENTRYPOINT chat
                 .and_then(|framework| framework.target.as_deref()),
             Some("wasm")
         );
-        assert_eq!(parcel.models.primary.unwrap().id, "gpt-5-mini");
+        assert_eq!(
+            parcel.models.primary.as_ref().unwrap().id,
+            "claude-sonnet-4"
+        );
+        assert_eq!(
+            parcel.models.primary.as_ref().unwrap().provider.as_deref(),
+            Some("anthropic")
+        );
         assert_eq!(parcel.models.fallbacks[0].id, "gpt-5-nano");
+        assert_eq!(
+            parcel.models.fallbacks[0].provider.as_deref(),
+            Some("openai")
+        );
         assert_eq!(parcel.env[0].name, "TZ");
         assert_eq!(parcel.secrets[0].name, "OPENAI_API_KEY");
         assert_eq!(parcel.labels["org.example.team"], "platform");

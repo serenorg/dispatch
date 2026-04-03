@@ -10,7 +10,7 @@ USER USER.md
 TOOLS TOOLS.md
 MEMORY POLICY MEMORY.md
 
-MODEL gpt-5-mini
+MODEL gpt-5.4-mini PROVIDER openai
 
 TOOL BUILTIN web_search
 TOOL LOCAL tools/echo.sh AS echo DESCRIPTION "Echo the provided input back for debugging."

@@ -531,6 +531,12 @@
       "properties": {
         "id": {
           "type": "string"
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

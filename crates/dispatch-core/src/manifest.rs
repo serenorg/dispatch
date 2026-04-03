@@ -236,6 +236,7 @@ pub struct ModelPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelReference {
     pub id: String,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

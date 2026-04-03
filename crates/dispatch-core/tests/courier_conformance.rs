@@ -180,7 +180,7 @@ fn conformance_builds_schema_backed_local_tools_into_public_manifest_shape() {
     let fixture = build_fixture(
         "\
 FROM dispatch/native:latest
-MODEL gpt-5-mini
+MODEL gpt-5-mini PROVIDER openai
 TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json DESCRIPTION \"Look up a record by id.\"
 ENTRYPOINT chat
 ",
