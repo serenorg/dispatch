@@ -182,7 +182,7 @@ Tool declaration behavior:
 - `TOOL ... DESCRIPTION "..."` preserves authored tool guidance in the built manifest
 - `TOOL LOCAL ... SCHEMA <file>` packages a JSON input schema with the tool and records its digest in the manifest
 - native model-backed chat uses that description when exposing local tools to the model
-- schema-backed local tools are exposed as structured function tools to the OpenAI Responses backend
+- schema-backed local tools are exposed as structured function tools to model backends that support typed function calling
 - if no description is declared, Dispatch falls back to a generic packaged-path description
 - couriers should only expose declared parcel tools; packaged prompt text must never imply tool capabilities that are not present in the parcel manifest
 
@@ -196,7 +196,10 @@ Native courier behavior:
 
 - if the parcel declares `MODEL <id>` and provider credentials are present, Dispatch can call a hosted model backend from the native courier
 - `LLM_BACKEND=openai` uses the OpenAI Responses API
+- `LLM_BACKEND=anthropic` uses the Anthropic Messages API
+- `LLM_BACKEND=gemini` uses the Gemini `generateContent` API
 - `LLM_BACKEND=openai_compatible` uses a Chat Completions-compatible endpoint such as OpenRouter, Together, Fireworks, LiteLLM, or a self-hosted OpenAI-compatible server
+- if the parcel does not declare `MODEL <id>`, Dispatch falls back to `LLM_MODEL` for the native and WASM hosted-model paths
 - declared local tools are exposed to that model-backed path as tool definitions for the selected backend
 - custom tool calls are executed locally and their outputs are sent back to the model before the assistant reply is finalized
 - tool execution is surfaced as ordered courier events during the chat turn
@@ -249,11 +252,16 @@ Mount behavior:
 
 Optional environment variables for the native model-backed chat path:
 
-- `LLM_BACKEND` - selects the native hosted-model backend; currently `openai` and `openai_compatible`
-- `LLM_API_KEY` - provider-neutral API key used by `openai_compatible` and accepted as a fallback by `openai`
-- `LLM_BASE_URL` - provider-neutral base URL used by `openai_compatible` and accepted as a fallback by `openai`
+- `LLM_BACKEND` - selects the native hosted-model backend; currently `openai`, `anthropic`, `gemini`, and `openai_compatible`
+- `LLM_MODEL` - provider-neutral model identifier used when the parcel does not declare `MODEL <id>`
+- `LLM_API_KEY` - provider-neutral API key used by `openai_compatible` and accepted as a fallback by `openai`, `anthropic`, and `gemini`
+- `LLM_BASE_URL` - provider-neutral base URL used by `openai_compatible` and accepted as a fallback by `openai`, `anthropic`, and `gemini`
 - `OPENAI_API_KEY` - enables the `openai` backend and is accepted as a fallback by `openai_compatible`
 - `OPENAI_BASE_URL` - overrides the default `https://api.openai.com` for the `openai` backend and is accepted as a fallback by `openai_compatible`
+- `ANTHROPIC_API_KEY` - enables the `anthropic` backend
+- `ANTHROPIC_BASE_URL` - overrides the default `https://api.anthropic.com` for the `anthropic` backend
+- `GEMINI_API_KEY` or `GOOGLE_API_KEY` - enables the `gemini` backend
+- `GEMINI_BASE_URL` - overrides the default `https://generativelanguage.googleapis.com/v1beta` for the `gemini` backend
 
 Optional environment variables for the Docker courier:
 

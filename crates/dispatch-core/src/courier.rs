@@ -1,6 +1,7 @@
 use crate::{
     manifest::{
-        BuiltinToolConfig, InstructionKind, MountConfig, MountKind, ParcelManifest, ToolConfig,
+        BuiltinToolConfig, InstructionKind, ModelReference, MountConfig, MountKind, ParcelManifest,
+        ToolConfig,
     },
     plugin_protocol::{
         COURIER_PLUGIN_PROTOCOL_VERSION, PluginRequest, PluginRequestEnvelope, PluginResponse,
@@ -14,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fs,
     future::Future,
@@ -602,14 +604,7 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
     ) -> Result<wasm_bindings::dispatch::courier::host::ModelResponse, String> {
         let model = request
             .model
-            .or_else(|| {
-                self.parcel
-                    .config
-                    .models
-                    .primary
-                    .as_ref()
-                    .map(|m| m.id.clone())
-            })
+            .or_else(|| configured_model_id(self.parcel.config.models.primary.as_ref()))
             .ok_or_else(|| "no model configured for wasm guest request".to_string())?;
         let messages = request
             .messages
@@ -822,6 +817,8 @@ impl StubCourier {
 
 struct OpenAiResponsesBackend;
 struct OpenAiChatCompletionsBackend;
+struct AnthropicMessagesBackend;
+struct GeminiGenerateContentBackend;
 
 fn default_chat_backend() -> Arc<dyn ChatModelBackend> {
     default_chat_backend_with(process_env_lookup)
@@ -836,6 +833,8 @@ where
         .to_ascii_lowercase()
         .as_str()
     {
+        "anthropic" => Arc::new(AnthropicMessagesBackend),
+        "gemini" | "google" | "google_gemini" => Arc::new(GeminiGenerateContentBackend),
         "openai_compatible" | "openrouter" | "together" | "fireworks" | "litellm" | "vllm"
         | "lm_studio" => Arc::new(OpenAiChatCompletionsBackend),
         _ => Arc::new(OpenAiResponsesBackend),
@@ -3531,12 +3530,14 @@ fn execute_native_turn(
                         .iter()
                         .find(|t| t.alias == tool_call.name || t.packaged_path == tool_call.name)
                     {
+                        let normalized_input =
+                            normalize_local_tool_input(tool, tool_call.input.as_str())?;
                         events.push(CourierEvent::ToolCallStarted {
                             invocation,
                             command: tool.command.clone(),
                             args: tool.args.clone(),
                         });
-                        execute_local_tool(image, tool, Some(&tool_call.input))?
+                        execute_local_tool(image, tool, Some(normalized_input.as_ref()))?
                     } else if let Some(tool) = builtin_tools
                         .iter()
                         .find(|tool| tool.capability == tool_call.name)
@@ -3665,7 +3666,7 @@ fn build_model_request(
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
 ) -> Result<Option<ModelRequest>, CourierError> {
-    let Some(primary) = &image.config.models.primary else {
+    let Some(model) = configured_model_id(image.config.models.primary.as_ref()) else {
         return Ok(None);
     };
     let builtin_tools = list_native_builtin_tools(image);
@@ -3680,7 +3681,7 @@ fn build_model_request(
     );
 
     Ok(Some(ModelRequest {
-        model: primary.id.clone(),
+        model,
         instructions: resolve_prompt_text(image)?,
         messages: messages.to_vec(),
         tools,
@@ -3723,6 +3724,29 @@ fn build_builtin_model_tool_definition(tool: &BuiltinToolSpec) -> ModelToolDefin
         format: ModelToolFormat::JsonSchema {
             schema: tool.input_schema.clone(),
         },
+    }
+}
+
+fn normalize_local_tool_input<'a>(
+    tool: &LocalToolSpec,
+    input: &'a str,
+) -> Result<Cow<'a, str>, CourierError> {
+    if tool.input_schema_packaged_path.is_some() {
+        return Ok(Cow::Borrowed(input));
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
+        return Ok(Cow::Borrowed(input));
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(Cow::Borrowed(input));
+    };
+    if object.len() != 1 {
+        return Ok(Cow::Borrowed(input));
+    }
+    match object.get("input").and_then(serde_json::Value::as_str) {
+        Some(value) => Ok(Cow::Owned(value.to_string())),
+        None => Ok(Cow::Borrowed(input)),
     }
 }
 
@@ -3845,11 +3869,7 @@ impl ChatModelBackend for OpenAiChatCompletionsBackend {
         let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
         let payload = serde_json::json!({
             "model": request.model,
-            "messages": request
-                .messages
-                .iter()
-                .map(openai_chat_completions_message)
-                .collect::<Vec<_>>(),
+            "messages": openai_chat_completions_messages(request),
             "tools": request
                 .tools
                 .iter()
@@ -3872,6 +3892,103 @@ impl ChatModelBackend for OpenAiChatCompletionsBackend {
     }
 }
 
+impl ChatModelBackend for AnthropicMessagesBackend {
+    fn id(&self) -> &str {
+        "anthropic_messages"
+    }
+
+    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
+        let api_key = match model_api_key("ANTHROPIC_API_KEY", "LLM_API_KEY") {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        let base_url = model_base_url(
+            "ANTHROPIC_BASE_URL",
+            "LLM_BASE_URL",
+            "https://api.anthropic.com",
+        );
+        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "model": request.model,
+            "max_tokens": 2048,
+            "system": request.instructions,
+            "messages": anthropic_messages(request),
+            "tools": request
+                .tools
+                .iter()
+                .map(anthropic_tool_definition)
+                .collect::<Vec<_>>(),
+        });
+
+        let mut response = ureq::post(&url)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        let body: serde_json::Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        extract_anthropic_output(&body)
+    }
+}
+
+impl ChatModelBackend for GeminiGenerateContentBackend {
+    fn id(&self) -> &str {
+        "google_gemini_generate_content"
+    }
+
+    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+            .or_else(|| std::env::var("LLM_API_KEY").ok());
+        let api_key = match api_key {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        let base_url = std::env::var("GEMINI_BASE_URL")
+            .ok()
+            .or_else(|| std::env::var("LLM_BASE_URL").ok())
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
+        let model = if request.model.starts_with("models/") {
+            request.model.clone()
+        } else {
+            format!("models/{}", request.model)
+        };
+        let url = format!("{}/{model}:generateContent", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "systemInstruction": {
+                "parts": [{ "text": request.instructions }]
+            },
+            "contents": gemini_messages(request),
+            "tools": [{
+                "functionDeclarations": request
+                    .tools
+                    .iter()
+                    .map(gemini_tool_definition)
+                    .collect::<Vec<_>>()
+            }],
+        });
+
+        let mut response = ureq::post(&url)
+            .header("x-goog-api-key", &api_key)
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        let body: serde_json::Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        extract_gemini_output(&body)
+    }
+}
+
 fn openai_input_message(message: &ConversationMessage) -> serde_json::Value {
     serde_json::json!({
         "role": message.role,
@@ -3889,6 +4006,18 @@ fn openai_chat_completions_message(message: &ConversationMessage) -> serde_json:
         "role": message.role,
         "content": message.content,
     })
+}
+
+fn openai_chat_completions_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
+    let mut messages = Vec::with_capacity(request.messages.len() + 1);
+    if !request.instructions.trim().is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": request.instructions,
+        }));
+    }
+    messages.extend(request.messages.iter().map(openai_chat_completions_message));
+    messages
 }
 
 fn openai_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
@@ -3909,24 +4038,14 @@ fn openai_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
 }
 
 fn openai_chat_completions_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
-    match &tool.format {
-        ModelToolFormat::Text => serde_json::json!({
-            "type": "custom",
-            "custom": {
-                "name": tool.name,
-                "description": tool.description,
-                "format": { "type": "text" },
-            },
-        }),
-        ModelToolFormat::JsonSchema { schema } => serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": schema,
-            },
-        }),
-    }
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": function_parameters_for_tool(tool),
+        },
+    })
 }
 
 fn openai_tool_output_item(output: &ModelToolOutput) -> serde_json::Value {
@@ -3992,11 +4111,95 @@ fn model_api_key(primary: &str, fallback: &str) -> Option<String> {
         .or_else(|| std::env::var(fallback).ok())
 }
 
+fn configured_model_id(primary: Option<&ModelReference>) -> Option<String> {
+    configured_model_id_with(primary, process_env_lookup)
+}
+
+fn configured_model_id_with<F>(
+    primary: Option<&ModelReference>,
+    mut env_lookup: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    primary
+        .map(|model| model.id.clone())
+        .or_else(|| env_lookup("LLM_MODEL"))
+}
+
 fn model_base_url(primary: &str, fallback: &str, default: &str) -> String {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn function_parameters_for_tool(tool: &ModelToolDefinition) -> serde_json::Value {
+    match &tool.format {
+        ModelToolFormat::Text => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Free-form text input for the tool."
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        }),
+        ModelToolFormat::JsonSchema { schema } => schema.clone(),
+    }
+}
+
+fn anthropic_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": message.role,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": message.content,
+                    }
+                ],
+            })
+        })
+        .collect()
+}
+
+fn anthropic_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
+    serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": function_parameters_for_tool(tool),
+    })
+}
+
+fn gemini_messages(request: &ModelRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": if message.role == "assistant" { "model" } else { "user" },
+                "parts": [
+                    {
+                        "text": message.content,
+                    }
+                ],
+            })
+        })
+        .collect()
+}
+
+fn gemini_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
+    serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": function_parameters_for_tool(tool),
+    })
 }
 
 fn extract_openai_output(
@@ -4045,6 +4248,130 @@ fn extract_openai_output(
     }
 
     Ok((Some(text), tool_calls))
+}
+
+fn extract_anthropic_output(body: &serde_json::Value) -> Result<Option<ModelReply>, CourierError> {
+    let content = body
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CourierError::ModelBackendResponse("missing `content` array".to_string()))?;
+
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for item in content {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(value) = item.get("text").and_then(serde_json::Value::as_str) {
+                    text.push_str(value);
+                }
+            }
+            Some("tool_use") => {
+                let call_id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        CourierError::ModelBackendResponse(
+                            "anthropic tool_use missing `id`".to_string(),
+                        )
+                    })?;
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        CourierError::ModelBackendResponse(
+                            "anthropic tool_use missing `name`".to_string(),
+                        )
+                    })?;
+                let input = item
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                tool_calls.push(ModelToolCall {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    input: serde_json::to_string(&input).map_err(|error| {
+                        CourierError::ModelBackendResponse(format!(
+                            "failed to serialize anthropic tool input: {error}"
+                        ))
+                    })?,
+                    kind: ModelToolKind::Function,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Some(ModelReply {
+        text: if text.is_empty() { None } else { Some(text) },
+        backend: "anthropic_messages".to_string(),
+        response_id: body
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        tool_calls,
+    }))
+}
+
+fn extract_gemini_output(body: &serde_json::Value) -> Result<Option<ModelReply>, CourierError> {
+    let candidate = body
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .ok_or_else(|| CourierError::ModelBackendResponse("missing `candidates[0]`".to_string()))?;
+    let parts = candidate
+        .get("content")
+        .and_then(|content| content.get("parts"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CourierError::ModelBackendResponse("missing `candidates[0].content.parts`".to_string())
+        })?;
+
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for part in parts {
+        if let Some(value) = part.get("text").and_then(serde_json::Value::as_str) {
+            text.push_str(value);
+        }
+        if let Some(function_call) = part
+            .get("functionCall")
+            .or_else(|| part.get("function_call"))
+        {
+            let name = function_call
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CourierError::ModelBackendResponse(
+                        "gemini functionCall missing `name`".to_string(),
+                    )
+                })?;
+            let args = function_call
+                .get("args")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let call_id = function_call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(next_generated_tool_call_id);
+            tool_calls.push(ModelToolCall {
+                call_id,
+                name: name.to_string(),
+                input: serde_json::to_string(&args).map_err(|error| {
+                    CourierError::ModelBackendResponse(format!(
+                        "failed to serialize gemini tool args: {error}"
+                    ))
+                })?,
+                kind: ModelToolKind::Function,
+            });
+        }
+    }
+
+    Ok(Some(ModelReply {
+        text: if text.is_empty() { None } else { Some(text) },
+        backend: "google_gemini_generate_content".to_string(),
+        response_id: None,
+        tool_calls,
+    }))
 }
 
 fn parse_openai_tool_call(
@@ -4201,6 +4528,10 @@ fn parse_openai_chat_completions_tool_call(
             "tool call missing `type`".to_string(),
         )),
     }
+}
+
+fn next_generated_tool_call_id() -> String {
+    format!("call_{}", SESSION_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
@@ -5683,6 +6014,28 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn default_chat_backend_selects_anthropic_from_env() {
+        let backend = default_chat_backend_with(|name| match name {
+            "LLM_BACKEND" => Some("anthropic".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(backend.id(), "anthropic_messages");
+        assert!(!backend.supports_previous_response_id());
+    }
+
+    #[test]
+    fn default_chat_backend_selects_gemini_from_env() {
+        let backend = default_chat_backend_with(|name| match name {
+            "LLM_BACKEND" => Some("gemini".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(backend.id(), "google_gemini_generate_content");
+        assert!(!backend.supports_previous_response_id());
+    }
+
+    #[test]
     fn extract_openai_chat_completions_output_parses_tool_calls() {
         let body = serde_json::json!({
             "choices": [
@@ -5725,6 +6078,64 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn extract_anthropic_output_parses_tool_use_blocks() {
+        let body = serde_json::json!({
+            "id": "msg_123",
+            "content": [
+                { "type": "text", "text": "Let me check." },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "lookup",
+                    "input": { "id": "123" }
+                }
+            ]
+        });
+
+        let reply = extract_anthropic_output(&body)
+            .unwrap()
+            .expect("expected anthropic reply");
+        assert_eq!(reply.backend, "anthropic_messages");
+        assert_eq!(reply.response_id.as_deref(), Some("msg_123"));
+        assert_eq!(reply.text.as_deref(), Some("Let me check."));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "lookup");
+        assert_eq!(reply.tool_calls[0].kind, ModelToolKind::Function);
+        assert_eq!(reply.tool_calls[0].input, "{\"id\":\"123\"}");
+    }
+
+    #[test]
+    fn extract_gemini_output_parses_function_calls() {
+        let body = serde_json::json!({
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            { "text": "Checking..." },
+                            {
+                                "functionCall": {
+                                    "name": "lookup",
+                                    "args": { "id": "123" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let reply = extract_gemini_output(&body)
+            .unwrap()
+            .expect("expected gemini reply");
+        assert_eq!(reply.backend, "google_gemini_generate_content");
+        assert_eq!(reply.text.as_deref(), Some("Checking..."));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "lookup");
+        assert_eq!(reply.tool_calls[0].kind, ModelToolKind::Function);
+        assert_eq!(reply.tool_calls[0].input, "{\"id\":\"123\"}");
+    }
+
+    #[test]
     fn extract_openai_output_parses_function_calls() {
         let body = serde_json::json!({
             "output": [
@@ -5744,6 +6155,32 @@ ENTRYPOINT chat
         assert_eq!(tool_calls[0].name, "demo");
         assert_eq!(tool_calls[0].kind, ModelToolKind::Function);
         assert_eq!(tool_calls[0].input, "{\"id\":\"123\"}");
+    }
+
+    #[test]
+    fn configured_model_id_uses_env_when_primary_missing() {
+        let model = configured_model_id_with(None, |name| match name {
+            "LLM_MODEL" => Some("claude-sonnet-4".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn normalize_local_tool_input_extracts_function_style_text_payload() {
+        let tool = LocalToolSpec {
+            alias: "demo".to_string(),
+            packaged_path: "tools/demo.sh".to_string(),
+            command: "bash".to_string(),
+            args: Vec::new(),
+            description: None,
+            input_schema_packaged_path: None,
+            input_schema_sha256: None,
+        };
+
+        let normalized = normalize_local_tool_input(&tool, "{\"input\":\"echo hi\"}").unwrap();
+        assert_eq!(normalized.as_ref(), "echo hi");
     }
 
     #[test]
