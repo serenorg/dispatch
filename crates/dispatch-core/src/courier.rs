@@ -2659,12 +2659,12 @@ impl CourierBackend for JsonlCourierPlugin {
         async move {
             ensure_session_matches_parcel(image, &request.session)?;
             let parcel_dir = parcel_dir?;
-            let session_id = request.session.id.clone();
+            let session = courier.ensure_persistent_process(&parcel_dir, request.session)?;
             let response = courier.run_persistent_plugin(
-                session_id,
+                session.id.clone(),
                 PluginRequest::Run {
                     parcel_dir,
-                    session: request.session,
+                    session,
                     operation: request.operation,
                 },
             )?;
@@ -2807,6 +2807,73 @@ impl JsonlCourierPlugin {
             Ok(session) => Ok((session, events)),
             Err(error) => {
                 let mut process = sessions.remove(&session_id).expect("session just existed");
+                let _ = shutdown_persistent_plugin_process(
+                    &mut process,
+                    &self.manifest.name,
+                    self.manifest.protocol_version,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_persistent_process(
+        &self,
+        parcel_dir: &str,
+        session: CourierSession,
+    ) -> Result<CourierSession, CourierError> {
+        {
+            let sessions =
+                self.state
+                    .sessions
+                    .lock()
+                    .map_err(|_| CourierError::PluginProtocol {
+                        courier: self.manifest.name.clone(),
+                        message: "plugin session state is poisoned".to_string(),
+                    })?;
+            if sessions.contains_key(&session.id) {
+                return Ok(session);
+            }
+        }
+
+        let mut process = self.spawn_persistent_plugin()?;
+        process.write_request(
+            self.manifest.protocol_version,
+            &self.manifest.name,
+            PluginRequest::ResumeSession {
+                parcel_dir: parcel_dir.to_string(),
+                session,
+            },
+        )?;
+        match process.read_response(&self.manifest.name) {
+            Ok(PluginResponse::Result {
+                session: Some(session),
+                ..
+            }) => {
+                self.store_persistent_process(session.id.clone(), process)?;
+                Ok(session)
+            }
+            Ok(PluginResponse::Error { error }) => {
+                let _ = shutdown_persistent_plugin_process(
+                    &mut process,
+                    &self.manifest.name,
+                    self.manifest.protocol_version,
+                );
+                Err(CourierError::PluginProtocol {
+                    courier: self.manifest.name.clone(),
+                    message: format!("{}: {}", error.code, error.message),
+                })
+            }
+            Ok(other) => {
+                let _ = shutdown_persistent_plugin_process(
+                    &mut process,
+                    &self.manifest.name,
+                    self.manifest.protocol_version,
+                );
+                Err(self
+                    .unexpected_plugin_response("resume_session", describe_plugin_response(&other)))
+            }
+            Err(error) => {
                 let _ = shutdown_persistent_plugin_process(
                     &mut process,
                     &self.manifest.name,
@@ -4475,7 +4542,7 @@ mod tests {
                 .to_string()
         } else {
             format!(
-                "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n"
+                "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"validate_parcel\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\n;;\n*'\"kind\":\"inspect\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"inspection\":{{\"courier_id\":\"demo-plugin\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello plugin\"}},{{\"role\":\"assistant\",\"content\":\"from plugin\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n"
             )
         };
         fs::write(&plugin_path, &script).unwrap();
@@ -4505,7 +4572,7 @@ mod tests {
         let plugin_path = dir.path().join("counting-plugin.sh");
         let starts_path = dir.path().join("plugin-starts.log");
         let script = format!(
-            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-counting-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
+            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"capabilities\":{{\"courier_id\":\"demo-counting-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[]}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"result\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\ncase \"$request\" in\n*'\"turn_count\":1'*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":2,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}},{{\"role\":\"user\",\"content\":\"second\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 2\"}}]}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}}}'\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-counting\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"first\"}},{{\"role\":\"assistant\",\"content\":\"from plugin turn 1\"}}]}}}}'\n;;\nesac\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n",
             starts_path.display()
         );
         fs::write(&plugin_path, &script).unwrap();
@@ -4875,6 +4942,60 @@ ENTRYPOINT chat
         .unwrap();
         let starts_after_second = fs::read_to_string(&starts_path).unwrap();
         assert_eq!(starts_after_second.lines().count(), 2);
+        assert_eq!(second.session.turn_count, 2);
+        assert!(matches!(
+            second.events.first(),
+            Some(CourierEvent::Message { role, content })
+                if role == "assistant" && content == "from plugin turn 2"
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jsonl_plugin_resumes_persistent_session_after_new_host_process() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/custom:latest
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let (courier, _plugin_path, starts_path) =
+            build_test_counting_plugin_courier(&test_image._dir, &test_image.image.config.digest);
+
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let first = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "first".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(first.session.turn_count, 1);
+
+        let manifest = courier.manifest.clone();
+        drop(courier);
+
+        let starts_after_restart = fs::read_to_string(&starts_path).unwrap();
+        assert_eq!(starts_after_restart.lines().count(), 2);
+
+        let resumed_courier = JsonlCourierPlugin::new(manifest);
+        let second = futures::executor::block_on(resumed_courier.run(
+            &test_image.image,
+            CourierRequest {
+                session: first.session,
+                operation: CourierOperation::Chat {
+                    input: "second".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let starts_after_resume = fs::read_to_string(&starts_path).unwrap();
+        assert_eq!(starts_after_resume.lines().count(), 3);
         assert_eq!(second.session.turn_count, 2);
         assert!(matches!(
             second.events.first(),

@@ -123,6 +123,24 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                 }),
             }])
         }
+        PluginRequest::ResumeSession {
+            parcel_dir,
+            session,
+        } => {
+            let parcel = load_parcel(Path::new(&parcel_dir))
+                .map_err(|error| format!("failed to load parcel: {error}"))?;
+            if session.parcel_digest != parcel.config.digest {
+                return Err(format!(
+                    "session digest {} does not match parcel {}",
+                    session.parcel_digest, parcel.config.digest
+                ));
+            }
+            Ok(vec![PluginResponse::Result {
+                capabilities: None,
+                inspection: None,
+                session: Some(session),
+            }])
+        }
         PluginRequest::Shutdown => Ok(vec![PluginResponse::Result {
             capabilities: None,
             inspection: None,

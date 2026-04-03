@@ -24,6 +24,10 @@ pub enum PluginRequest {
     OpenSession {
         parcel_dir: String,
     },
+    ResumeSession {
+        parcel_dir: String,
+        session: CourierSession,
+    },
     Shutdown,
     Run {
         parcel_dir: String,
@@ -85,6 +89,32 @@ mod tests {
                 },
                 operation: CourierOperation::Chat {
                     input: "hello".to_string(),
+                },
+            },
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: PluginRequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn resume_session_request_round_trips_json() {
+        let request = PluginRequestEnvelope {
+            protocol_version: COURIER_PLUGIN_PROTOCOL_VERSION,
+            request: PluginRequest::ResumeSession {
+                parcel_dir: "/tmp/demo".to_string(),
+                session: CourierSession {
+                    id: "session-1".to_string(),
+                    parcel_digest: "digest".to_string(),
+                    entrypoint: Some("chat".to_string()),
+                    turn_count: 1,
+                    history: vec![ConversationMessage {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                    }],
+                    resolved_mounts: Vec::new(),
+                    backend_state: None,
                 },
             },
         };
