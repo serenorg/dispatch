@@ -2,21 +2,18 @@ mod conformance;
 mod eval;
 mod inspect;
 mod parcel_ops;
+mod run;
 mod state;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dispatch_core::{
-    BuildOptions, BuiltinCourier, CourierBackend, CourierCatalogEntry, CourierEvent,
-    CourierOperation, CourierPluginManifest, CourierRequest, CourierSession, DockerCourier,
-    JsonlCourierPlugin, Level, LoadedParcel, NativeCourier, ResolvedCourier, ToolInvocation,
-    WasmCourier, build_agentfile, default_courier_registry_path, install_courier_plugin,
-    list_courier_catalog, load_parcel, parse_agentfile, resolve_courier, validate_agentfile,
+    BuildOptions, CourierCatalogEntry, CourierPluginManifest, Level, ResolvedCourier,
+    build_agentfile, default_courier_registry_path, install_courier_plugin, list_courier_catalog,
+    parse_agentfile, resolve_courier, validate_agentfile,
 };
-use futures::executor::block_on;
 use std::{
     fs,
-    io::{self, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -311,7 +308,7 @@ fn main() -> Result<()> {
             trust_policy,
             json,
         } => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
-        Command::Run(args) => run(args),
+        Command::Run(args) => run::run(args),
         Command::Courier { command } => courier_command(command),
         Command::State { command } => state_command(command),
     }
@@ -488,239 +485,6 @@ fn courier_install(manifest: &Path, registry: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn run(args: RunArgs) -> Result<()> {
-    let courier_name = args.courier.clone();
-    match resolve_courier(&courier_name, args.registry.as_deref())? {
-        ResolvedCourier::Builtin(courier) => run_with_builtin_courier(courier, args),
-        ResolvedCourier::Plugin(plugin) => run_with_courier(JsonlCourierPlugin::new(plugin), args),
-    }
-}
-
-fn run_with_builtin_courier(courier: BuiltinCourier, args: RunArgs) -> Result<()> {
-    match courier {
-        BuiltinCourier::Native => run_with_courier(NativeCourier::default(), args),
-        BuiltinCourier::Docker => run_with_courier(DockerCourier::default(), args),
-        BuiltinCourier::Wasm => run_with_courier(WasmCourier::default(), args),
-    }
-}
-
-fn run_with_courier<R: CourierBackend>(courier: R, args: RunArgs) -> Result<()> {
-    let RunArgs {
-        path,
-        courier: _,
-        registry: _,
-        session_file,
-        chat,
-        job,
-        heartbeat,
-        interactive,
-        print_prompt,
-        list_tools,
-        tool,
-        input,
-    } = args;
-    let parcel =
-        load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))?;
-    let mut session = load_or_open_session(&courier, &parcel, session_file.as_deref())?;
-
-    if interactive {
-        return run_interactive_chat(&courier, &parcel, &mut session, session_file.as_deref());
-    }
-
-    if let Some(chat_input) = chat {
-        let response = block_on(courier.run(
-            &parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::Chat { input: chat_input },
-            },
-        ))
-        .with_context(|| "failed to execute chat turn")?;
-        persist_session(session_file.as_deref(), &response.session)?;
-        print_courier_events(&response.events);
-        return Ok(());
-    }
-
-    if let Some(job_payload) = job {
-        let response = block_on(courier.run(
-            &parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::Job {
-                    payload: job_payload,
-                },
-            },
-        ))
-        .with_context(|| "failed to execute job turn")?;
-        persist_session(session_file.as_deref(), &response.session)?;
-        print_courier_events(&response.events);
-        return Ok(());
-    }
-
-    if let Some(heartbeat_payload) = heartbeat {
-        // `default_missing_value = ""` means a bare `--heartbeat` with no
-        // argument produces an empty string; map that to None (empty tick).
-        let payload = if heartbeat_payload.is_empty() {
-            None
-        } else {
-            Some(heartbeat_payload)
-        };
-        let response = block_on(courier.run(
-            &parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::Heartbeat { payload },
-            },
-        ))
-        .with_context(|| "failed to execute heartbeat turn")?;
-        persist_session(session_file.as_deref(), &response.session)?;
-        print_courier_events(&response.events);
-        return Ok(());
-    }
-
-    if print_prompt {
-        let response = block_on(courier.run(
-            &parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::ResolvePrompt,
-            },
-        ))
-        .with_context(|| "failed to resolve prompt stack")?;
-        persist_session(session_file.as_deref(), &response.session)?;
-        print_courier_events(&response.events);
-        return Ok(());
-    }
-
-    if list_tools {
-        let response = block_on(courier.run(
-            &parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::ListLocalTools,
-            },
-        ))
-        .with_context(|| "failed to list local tools")?;
-        persist_session(session_file.as_deref(), &response.session)?;
-        print_courier_events(&response.events);
-        return Ok(());
-    }
-
-    if let Some(tool) = tool {
-        let response = block_on(courier.run(
-            &parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::InvokeTool {
-                    invocation: ToolInvocation {
-                        name: tool.clone(),
-                        input,
-                    },
-                },
-            },
-        ))
-        .with_context(|| format!("failed to run local tool `{tool}`"))?;
-        persist_session(session_file.as_deref(), &response.session)?;
-        print_courier_events(&response.events);
-        return Ok(());
-    }
-
-    bail!(
-        "`dispatch run` currently requires one of `--interactive`, `--chat <text>`, `--job <payload>`, `--heartbeat [payload]`, `--print-prompt`, `--list-tools`, or `--tool <name>`"
-    )
-}
-
-fn run_interactive_chat<R: CourierBackend>(
-    courier: &R,
-    parcel: &LoadedParcel,
-    session: &mut CourierSession,
-    session_file: Option<&std::path::Path>,
-) -> Result<()> {
-    println!("Interactive chat started. Type /exit or /quit to stop.");
-
-    let stdin = io::stdin();
-    let mut line = String::new();
-
-    loop {
-        print!("you> ");
-        io::stdout()
-            .flush()
-            .with_context(|| "failed to flush prompt")?;
-
-        line.clear();
-        let bytes = stdin
-            .read_line(&mut line)
-            .with_context(|| "failed to read chat input")?;
-        if bytes == 0 {
-            break;
-        }
-
-        let input = line.trim_end().to_string();
-        if input.is_empty() {
-            continue;
-        }
-        if matches!(input.as_str(), "/exit" | "/quit") {
-            break;
-        }
-
-        let response = block_on(courier.run(
-            parcel,
-            CourierRequest {
-                session: session.clone(),
-                operation: CourierOperation::Chat { input },
-            },
-        ))
-        .with_context(|| "failed to execute chat turn")?;
-
-        *session = response.session;
-        persist_session(session_file, session)?;
-        print_courier_events(&response.events);
-    }
-
-    Ok(())
-}
-
-fn load_or_open_session(
-    courier: &impl CourierBackend,
-    parcel: &LoadedParcel,
-    session_file: Option<&std::path::Path>,
-) -> Result<CourierSession> {
-    if let Some(path) = session_file
-        && path.exists()
-    {
-        return load_session(path);
-    }
-
-    let session = block_on(courier.open_session(parcel))
-        .with_context(|| "failed to open dispatch session")?;
-    persist_session(session_file, &session)?;
-    Ok(session)
-}
-
-fn load_session(path: &std::path::Path) -> Result<CourierSession> {
-    let source =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&source)
-        .with_context(|| format!("failed to parse session {}", path.display()))
-}
-
-fn persist_session(path: Option<&std::path::Path>, session: &CourierSession) -> Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let payload = serde_json::to_string_pretty(session)?;
-    fs::write(path, payload).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
 fn print_courier_catalog_entry(entry: &CourierCatalogEntry) {
     match entry {
         CourierCatalogEntry::Builtin {
@@ -770,69 +534,9 @@ fn print_courier_plugin_manifest(plugin: &CourierPluginManifest) {
     }
 }
 
-fn print_courier_events(events: &[CourierEvent]) {
-    let mut streamed_assistant_reply = false;
-    let mut stream_line_open = false;
-    for event in events {
-        if stream_line_open && !matches!(event, CourierEvent::TextDelta { .. }) {
-            println!();
-            stream_line_open = false;
-        }
-        match event {
-            CourierEvent::PromptResolved { text } => println!("{text}"),
-            CourierEvent::LocalToolsListed { tools } => {
-                for tool in tools {
-                    println!("{} -> {}", tool.alias, tool.packaged_path);
-                }
-            }
-            CourierEvent::BackendFallback { backend, error } => {
-                println!("backend fallback ({backend}): {error}");
-            }
-            CourierEvent::ToolCallStarted {
-                invocation,
-                command,
-                args,
-            } => {
-                println!("Tool: {}", invocation.name);
-                println!("Command: {command}");
-                if !args.is_empty() {
-                    println!("Args: {}", args.join(" "));
-                }
-            }
-            CourierEvent::ToolCallFinished { result } => {
-                println!("Exit: {}", result.exit_code);
-                if !result.stdout.is_empty() {
-                    println!("Stdout:\n{}", result.stdout.trim_end());
-                }
-                if !result.stderr.is_empty() {
-                    println!("Stderr:\n{}", result.stderr.trim_end());
-                }
-            }
-            CourierEvent::Message { role, content } => {
-                if streamed_assistant_reply && role == "assistant" {
-                    continue;
-                }
-                println!("{role}: {content}");
-            }
-            CourierEvent::TextDelta { content } => {
-                streamed_assistant_reply = true;
-                stream_line_open = true;
-                print!("{content}");
-                let _ = io::stdout().flush();
-            }
-            CourierEvent::Done => {
-                if stream_line_open {
-                    println!();
-                    stream_line_open = false;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, CourierCommand, StateCommand, load_session, persist_session};
+    use super::{Cli, Command, CourierCommand, StateCommand};
     use clap::Parser;
     use dispatch_core::{
         BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
@@ -875,8 +579,8 @@ mod tests {
         let path = dir.path().join("session.json");
         let session = sample_session();
 
-        persist_session(Some(&path), &session).unwrap();
-        let loaded = load_session(&path).unwrap();
+        crate::run::persist_session(Some(&path), &session).unwrap();
+        let loaded = crate::run::load_session(&path).unwrap();
 
         assert_eq!(loaded, session);
     }
@@ -887,15 +591,15 @@ mod tests {
         let path = dir.path().join("nested/session.json");
         let session = sample_session();
 
-        persist_session(Some(&path), &session).unwrap();
+        crate::run::persist_session(Some(&path), &session).unwrap();
 
         assert!(path.exists());
-        assert_eq!(load_session(&path).unwrap(), session);
+        assert_eq!(crate::run::load_session(&path).unwrap(), session);
     }
 
     #[test]
     fn persist_session_is_noop_without_path() {
-        persist_session(None, &sample_session()).unwrap();
+        crate::run::persist_session(None, &sample_session()).unwrap();
     }
 
     #[test]
@@ -1308,7 +1012,7 @@ mod tests {
         let plugin_name = "demo-jsonl";
         install_test_plugin(dir.path(), &registry_path, plugin_name, &parcel_digest);
 
-        super::run(super::RunArgs {
+        crate::run::run(super::RunArgs {
             path: parcel_dir,
             courier: plugin_name.to_string(),
             registry: Some(registry_path),
@@ -1324,7 +1028,7 @@ mod tests {
         })
         .unwrap();
 
-        let session = load_session(&session_path).unwrap();
+        let session = crate::run::load_session(&session_path).unwrap();
         assert_eq!(session.id, "demo-jsonl-session");
         assert_eq!(session.turn_count, 2);
         assert_eq!(session.history.len(), 2);
