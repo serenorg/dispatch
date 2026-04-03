@@ -559,7 +559,7 @@ pub struct StubCourier {
 impl Default for NativeCourier {
     fn default() -> Self {
         Self {
-            chat_backend: Arc::new(OpenAiResponsesBackend),
+            chat_backend: default_chat_backend(),
         }
     }
 }
@@ -583,7 +583,7 @@ impl Default for WasmCourier {
         let engine = Engine::new(&config).expect("failed to initialize wasmtime engine");
         Self {
             engine,
-            chat_backend: Arc::new(OpenAiResponsesBackend),
+            chat_backend: default_chat_backend(),
             component_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -821,6 +821,26 @@ impl StubCourier {
 }
 
 struct OpenAiResponsesBackend;
+struct OpenAiChatCompletionsBackend;
+
+fn default_chat_backend() -> Arc<dyn ChatModelBackend> {
+    default_chat_backend_with(process_env_lookup)
+}
+
+fn default_chat_backend_with<F>(mut env_lookup: F) -> Arc<dyn ChatModelBackend>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    match env_lookup("LLM_BACKEND")
+        .unwrap_or_else(|| "openai".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "openai_compatible" | "openrouter" | "together" | "fireworks" | "litellm" | "vllm"
+        | "lm_studio" => Arc::new(OpenAiChatCompletionsBackend),
+        _ => Arc::new(OpenAiResponsesBackend),
+    }
+}
 
 pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
     let manifest_path = resolve_manifest_path(path)?
@@ -3754,13 +3774,12 @@ impl ChatModelBackend for OpenAiResponsesBackend {
     }
 
     fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
-        let api_key = match std::env::var("OPENAI_API_KEY") {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
+        let api_key = match model_api_key("OPENAI_API_KEY", "LLM_API_KEY") {
+            Some(value) => value,
+            None => return Ok(None),
         };
 
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com".to_string());
+        let base_url = model_base_url("OPENAI_BASE_URL", "LLM_BASE_URL", "https://api.openai.com");
         let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
         let payload = serde_json::json!({
             "model": request.model,
@@ -3811,6 +3830,48 @@ impl ChatModelBackend for OpenAiResponsesBackend {
     }
 }
 
+impl ChatModelBackend for OpenAiChatCompletionsBackend {
+    fn id(&self) -> &str {
+        "openai_compatible_chat_completions"
+    }
+
+    fn generate(&self, request: &ModelRequest) -> Result<Option<ModelReply>, CourierError> {
+        let api_key = match model_api_key("LLM_API_KEY", "OPENAI_API_KEY") {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "model": request.model,
+            "messages": request
+                .messages
+                .iter()
+                .map(openai_chat_completions_message)
+                .collect::<Vec<_>>(),
+            "tools": request
+                .tools
+                .iter()
+                .map(openai_chat_completions_tool_definition)
+                .collect::<Vec<_>>(),
+            "tool_choice": "auto",
+        });
+
+        let mut response = ureq::post(&url)
+            .header("authorization", &format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .send_json(payload)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+
+        let body: serde_json::Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
+        extract_openai_chat_completions_output(&body)
+    }
+}
+
 fn openai_input_message(message: &ConversationMessage) -> serde_json::Value {
     serde_json::json!({
         "role": message.role,
@@ -3820,6 +3881,13 @@ fn openai_input_message(message: &ConversationMessage) -> serde_json::Value {
                 "text": message.content,
             }
         ],
+    })
+}
+
+fn openai_chat_completions_message(message: &ConversationMessage) -> serde_json::Value {
+    serde_json::json!({
+        "role": message.role,
+        "content": message.content,
     })
 }
 
@@ -3836,6 +3904,27 @@ fn openai_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
             "name": tool.name,
             "description": tool.description,
             "parameters": schema,
+        }),
+    }
+}
+
+fn openai_chat_completions_tool_definition(tool: &ModelToolDefinition) -> serde_json::Value {
+    match &tool.format {
+        ModelToolFormat::Text => serde_json::json!({
+            "type": "custom",
+            "custom": {
+                "name": tool.name,
+                "description": tool.description,
+                "format": { "type": "text" },
+            },
+        }),
+        ModelToolFormat::JsonSchema { schema } => serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": schema,
+            },
         }),
     }
 }
@@ -3895,6 +3984,19 @@ fn build_followup_messages_for_tool_outputs(
     }
 
     messages
+}
+
+fn model_api_key(primary: &str, fallback: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
+}
+
+fn model_base_url(primary: &str, fallback: &str, default: &str) -> String {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn extract_openai_output(
@@ -3982,6 +4084,123 @@ fn parse_openai_tool_call(
         input: input.to_string(),
         kind,
     })
+}
+
+fn extract_openai_chat_completions_output(
+    body: &serde_json::Value,
+) -> Result<Option<ModelReply>, CourierError> {
+    let choice = body
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| CourierError::ModelBackendResponse("missing `choices[0]`".to_string()))?;
+    let message = choice.get("message").ok_or_else(|| {
+        CourierError::ModelBackendResponse("missing `choices[0].message`".to_string())
+    })?;
+
+    let text = match message.get("content") {
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Array(parts)) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<String>();
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
+    };
+
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|tool_calls| {
+            tool_calls
+                .iter()
+                .map(parse_openai_chat_completions_tool_call)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(Some(ModelReply {
+        text,
+        backend: "openai_compatible_chat_completions".to_string(),
+        response_id: None,
+        tool_calls,
+    }))
+}
+
+fn parse_openai_chat_completions_tool_call(
+    value: &serde_json::Value,
+) -> Result<ModelToolCall, CourierError> {
+    let call_id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CourierError::ModelBackendResponse("tool call missing `id`".to_string()))?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("function") => {
+            let function = value.get("function").ok_or_else(|| {
+                CourierError::ModelBackendResponse(
+                    "function tool call missing `function`".to_string(),
+                )
+            })?;
+            let name = function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CourierError::ModelBackendResponse(
+                        "function tool call missing `function.name`".to_string(),
+                    )
+                })?;
+            let arguments = function
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CourierError::ModelBackendResponse(
+                        "function tool call missing `function.arguments`".to_string(),
+                    )
+                })?;
+            Ok(ModelToolCall {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                input: arguments.to_string(),
+                kind: ModelToolKind::Function,
+            })
+        }
+        Some("custom") => {
+            let custom = value.get("custom").ok_or_else(|| {
+                CourierError::ModelBackendResponse("custom tool call missing `custom`".to_string())
+            })?;
+            let name = custom
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CourierError::ModelBackendResponse(
+                        "custom tool call missing `custom.name`".to_string(),
+                    )
+                })?;
+            let input = custom
+                .get("input")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CourierError::ModelBackendResponse(
+                        "custom tool call missing `custom.input`".to_string(),
+                    )
+                })?;
+            Ok(ModelToolCall {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                input: input.to_string(),
+                kind: ModelToolKind::Custom,
+            })
+        }
+        Some(other) => Err(CourierError::ModelBackendResponse(format!(
+            "unsupported chat completion tool call type `{other}`"
+        ))),
+        None => Err(CourierError::ModelBackendResponse(
+            "tool call missing `type`".to_string(),
+        )),
+    }
 }
 
 fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
@@ -5450,6 +5669,59 @@ ENTRYPOINT chat
         assert_eq!(value["type"], "function");
         assert_eq!(value["name"], "demo");
         assert_eq!(value["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn default_chat_backend_selects_openai_compatible_from_env() {
+        let backend = default_chat_backend_with(|name| match name {
+            "LLM_BACKEND" => Some("openai_compatible".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(backend.id(), "openai_compatible_chat_completions");
+        assert!(!backend.supports_previous_response_id());
+    }
+
+    #[test]
+    fn extract_openai_chat_completions_output_parses_tool_calls() {
+        let body = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_fn",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{\"id\":\"123\"}"
+                                }
+                            },
+                            {
+                                "id": "call_custom",
+                                "type": "custom",
+                                "custom": {
+                                    "name": "shell",
+                                    "input": "echo hi"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let reply = extract_openai_chat_completions_output(&body)
+            .unwrap()
+            .expect("expected model reply");
+        assert_eq!(reply.backend, "openai_compatible_chat_completions");
+        assert!(reply.text.is_none());
+        assert_eq!(reply.tool_calls.len(), 2);
+        assert_eq!(reply.tool_calls[0].kind, ModelToolKind::Function);
+        assert_eq!(reply.tool_calls[0].name, "lookup");
+        assert_eq!(reply.tool_calls[1].kind, ModelToolKind::Custom);
+        assert_eq!(reply.tool_calls[1].input, "echo hi");
     }
 
     #[test]

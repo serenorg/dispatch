@@ -194,8 +194,10 @@ Framework provenance behavior:
 
 Native courier behavior:
 
-- if the parcel declares `MODEL <id>` and `OPENAI_API_KEY` is present, Dispatch calls the OpenAI Responses API
-- declared local tools are exposed to that model-backed path as OpenAI custom tools
+- if the parcel declares `MODEL <id>` and provider credentials are present, Dispatch can call a hosted model backend from the native courier
+- `LLM_BACKEND=openai` uses the OpenAI Responses API
+- `LLM_BACKEND=openai_compatible` uses a Chat Completions-compatible endpoint such as OpenRouter, Together, Fireworks, LiteLLM, or a self-hosted OpenAI-compatible server
+- declared local tools are exposed to that model-backed path as tool definitions for the selected backend
 - custom tool calls are executed locally and their outputs are sent back to the model before the assistant reply is finalized
 - tool execution is surfaced as ordered courier events during the chat turn
 - backend request failures are surfaced as courier events and then fall back to the local reference reply
@@ -245,10 +247,13 @@ Mount behavior:
 - `dispatch state migrate <old-digest> <new-digest>` copies built-in courier state when a rebuilt parcel gets a new digest
 - unsupported mount drivers fail fast when a courier session opens
 
-Optional environment variables for the native OpenAI-backed chat path:
+Optional environment variables for the native model-backed chat path:
 
-- `OPENAI_API_KEY` - enables live model calls
-- `OPENAI_BASE_URL` - overrides the default `https://api.openai.com`
+- `LLM_BACKEND` - selects the native hosted-model backend; currently `openai` and `openai_compatible`
+- `LLM_API_KEY` - provider-neutral API key used by `openai_compatible` and accepted as a fallback by `openai`
+- `LLM_BASE_URL` - provider-neutral base URL used by `openai_compatible` and accepted as a fallback by `openai`
+- `OPENAI_API_KEY` - enables the `openai` backend and is accepted as a fallback by `openai_compatible`
+- `OPENAI_BASE_URL` - overrides the default `https://api.openai.com` for the `openai` backend and is accepted as a fallback by `openai_compatible`
 
 Optional environment variables for the Docker courier:
 
