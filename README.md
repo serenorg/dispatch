@@ -342,7 +342,8 @@ State management:
 - file depots store tags under `refs/<org>/<parcel>/tags/<tag>.json`
 - HTTP depots expose parcel blobs at `/v1/parcels/<digest>.tar` and tag lookup at `/v1/tags?repository=<repo>&tag=<tag>`
 - set `DISPATCH_DEPOT_TOKEN` to send `Authorization: Bearer <token>` on HTTP depot requests
-- trust policy files are YAML documents with `rules`, `reference_prefix`, `public_keys`, and optional `require_signatures`
+- set `DISPATCH_TRUST_POLICY` to apply a default pull-time trust policy without passing `--trust-policy`
+- trust policy files are YAML documents with `rules`, optional `reference_prefix`, optional `repository_prefix`, `public_keys`, and optional `require_signatures`
 
 ## Design Principles
 

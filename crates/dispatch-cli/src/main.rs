@@ -3,12 +3,13 @@ use clap::{Args, Parser, Subcommand};
 use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
     CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierPluginManifest,
-    CourierRequest, CourierSession, DockerCourier, JsonlCourierPlugin, Level, LoadedParcel,
-    NativeCourier, ParcelManifest, ResolvedCourier, SignatureVerification, ToolInvocation,
-    ToolRunResult, VerificationReport, WasmCourier, build_agentfile, default_courier_registry_path,
-    generate_keypair_files, install_courier_plugin, list_courier_catalog, load_parcel,
-    parse_agentfile, parse_depot_reference, pull_parcel, push_parcel, resolve_courier, sign_parcel,
-    validate_agentfile, verify_parcel, verify_parcel_signature,
+    CourierRequest, CourierSession, DepotReference, DockerCourier, JsonlCourierPlugin, Level,
+    LoadedParcel, NativeCourier, ParcelManifest, ResolvedCourier, SignatureVerification,
+    ToolInvocation, ToolRunResult, VerificationReport, WasmCourier, build_agentfile,
+    default_courier_registry_path, generate_keypair_files, install_courier_plugin,
+    list_courier_catalog, load_parcel, parse_agentfile, parse_depot_reference, pull_parcel,
+    push_parcel, resolve_courier, sign_parcel, validate_agentfile, verify_parcel,
+    verify_parcel_signature,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -353,7 +354,10 @@ struct TrustPolicyDocument {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct TrustPolicyRule {
-    reference_prefix: String,
+    #[serde(default)]
+    reference_prefix: Option<String>,
+    #[serde(default)]
+    repository_prefix: Option<String>,
     #[serde(default)]
     public_keys: Vec<PathBuf>,
     #[serde(default)]
@@ -989,8 +993,11 @@ fn pull(
     let raw_reference = reference.to_string();
     let reference = parse_depot_reference(reference)
         .with_context(|| format!("invalid depot reference `{reference}`"))?;
+    let trust_policy = resolve_trust_policy_path(trust_policy, |name| std::env::var_os(name));
     let (policy_keys, require_signatures) = match trust_policy.as_deref() {
-        Some(policy_path) => resolve_trust_policy_for_reference(&raw_reference, policy_path)?,
+        Some(policy_path) => {
+            resolve_trust_policy_for_reference(&raw_reference, &reference, policy_path)?
+        }
         None => (Vec::new(), false),
     };
     let public_keys = merge_public_keys(public_keys, policy_keys);
@@ -1043,6 +1050,7 @@ fn default_pull_output_root() -> PathBuf {
 
 fn resolve_trust_policy_for_reference(
     reference: &str,
+    parsed_reference: &DepotReference,
     policy_path: &Path,
 ) -> Result<(Vec<PathBuf>, bool)> {
     let source = fs::read_to_string(policy_path)
@@ -1054,7 +1062,7 @@ fn resolve_trust_policy_for_reference(
     let mut require_signatures = false;
 
     for rule in policy.rules {
-        if !reference.starts_with(&rule.reference_prefix) {
+        if !trust_policy_rule_matches(&rule, reference, parsed_reference) {
             continue;
         }
         require_signatures |= rule.require_signatures;
@@ -1068,6 +1076,35 @@ fn resolve_trust_policy_for_reference(
     }
 
     Ok((public_keys, require_signatures))
+}
+
+fn trust_policy_rule_matches(
+    rule: &TrustPolicyRule,
+    reference: &str,
+    parsed_reference: &DepotReference,
+) -> bool {
+    let has_matcher = rule.reference_prefix.is_some() || rule.repository_prefix.is_some();
+    if !has_matcher {
+        return false;
+    }
+    if let Some(prefix) = &rule.reference_prefix
+        && !reference.starts_with(prefix)
+    {
+        return false;
+    }
+    if let Some(prefix) = &rule.repository_prefix
+        && !parsed_reference.repository.starts_with(prefix)
+    {
+        return false;
+    }
+    true
+}
+
+fn resolve_trust_policy_path(
+    explicit: Option<PathBuf>,
+    env_lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    explicit.or_else(|| env_lookup("DISPATCH_TRUST_POLICY").map(PathBuf::from))
 }
 
 fn merge_public_keys(explicit_keys: Vec<PathBuf>, policy_keys: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -2470,6 +2507,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_trust_policy_path_prefers_explicit_then_env() {
+        let explicit = Some(PathBuf::from("/tmp/explicit.yaml"));
+        let env_path = super::resolve_trust_policy_path(explicit.clone(), |_| {
+            Some(std::ffi::OsString::from("/tmp/env.yaml"))
+        });
+        assert_eq!(env_path, explicit);
+
+        let env_only = super::resolve_trust_policy_path(None, |_| {
+            Some(std::ffi::OsString::from("/tmp/env.yaml"))
+        });
+        assert_eq!(env_only, Some(PathBuf::from("/tmp/env.yaml")));
+    }
+
+    #[test]
     fn cli_parses_verify_with_public_keys() {
         let cli = Cli::try_parse_from([
             "dispatch",
@@ -2948,7 +2999,7 @@ mod tests {
         super::push(parcel_dir, &depot_ref).unwrap();
         fs::write(
             &policy_path,
-            "rules:\n  - reference_prefix: \"file://\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
+            "rules:\n  - repository_prefix: \"acme/trusted-fixture\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
         )
         .unwrap();
 
@@ -2983,7 +3034,7 @@ mod tests {
         super::push(parcel_dir, &depot_ref).unwrap();
         fs::write(
             &policy_path,
-            "rules:\n  - reference_prefix: \"file://\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
+            "rules:\n  - repository_prefix: \"acme/unsigned-fixture\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
         )
         .unwrap();
 
