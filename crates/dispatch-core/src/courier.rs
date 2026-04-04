@@ -6831,6 +6831,32 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn a2a_operator_policy_overrides_supply_allowed_origins_to_process_lookup() {
+        let result = with_a2a_operator_policy_overrides(
+            A2aOperatorPolicyOverrides {
+                allowed_origins: Some("https://planner.example.com".to_string()),
+                trust_policy: None,
+            },
+            || process_env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS"),
+        );
+        assert_eq!(result.as_deref(), Some("https://planner.example.com"));
+        assert!(a2a_operator_policy_override_value("DISPATCH_A2A_ALLOWED_ORIGINS").is_none());
+    }
+
+    #[test]
+    fn a2a_operator_policy_overrides_supply_trust_policy_to_process_lookup() {
+        let result = with_a2a_operator_policy_overrides(
+            A2aOperatorPolicyOverrides {
+                allowed_origins: None,
+                trust_policy: Some("/tmp/dispatch-a2a-policy.yaml".to_string()),
+            },
+            || process_env_lookup("DISPATCH_A2A_TRUST_POLICY"),
+        );
+        assert_eq!(result.as_deref(), Some("/tmp/dispatch-a2a-policy.yaml"));
+        assert!(a2a_operator_policy_override_value("DISPATCH_A2A_TRUST_POLICY").is_none());
+    }
+
+    #[test]
     fn native_courier_open_session_sets_identity_and_zero_turns() {
         let test_image = build_test_image(
             "\

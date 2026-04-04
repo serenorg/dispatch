@@ -81,6 +81,8 @@ CLI-scoped controls:
 
 The CLI flags apply only to that command invocation. They do not mutate process-global environment state.
 
+When both are present, CLI-scoped overrides win over inherited environment variables for that invocation.
+
 ### `DISPATCH_A2A_ALLOWED_ORIGINS`
 
 Comma-separated hostnames or exact origins:
