@@ -329,7 +329,7 @@ pub fn build_agentfile(
                 }
             }
             "TIMEOUT" => {
-                if let Some(timeout) = parse_timeout(&instruction.args) {
+                if let Some(timeout) = parse_timeout(&instruction.args)? {
                     resolved.timeouts.push(timeout);
                 }
             }
@@ -1110,16 +1110,38 @@ fn parse_compaction(args: &[Value]) -> Option<CompactionConfig> {
     Some(CompactionConfig { interval, overlap })
 }
 
-fn parse_timeout(args: &[Value]) -> Option<TimeoutSpec> {
+fn parse_timeout(args: &[Value]) -> Result<Option<TimeoutSpec>, BuildError> {
     let tokens = scalars(args);
     if tokens.len() < 2 {
-        return None;
+        return Ok(None);
     }
-    Some(TimeoutSpec {
+    if !timeout_duration_is_valid(&tokens[1]) {
+        return Err(BuildError::Validation(format!(
+            "invalid timeout duration `{}`; expected a positive integer ending in ms, s, m, or h",
+            tokens[1]
+        )));
+    }
+    Ok(Some(TimeoutSpec {
         scope: tokens[0].clone(),
         duration: tokens[1].clone(),
         qualifiers: tokens[2..].to_vec(),
-    })
+    }))
+}
+
+fn timeout_duration_is_valid(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let value = if let Some(value) = trimmed.strip_suffix("ms") {
+        value
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        value
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        value
+    } else if let Some(value) = trimmed.strip_suffix('h') {
+        value
+    } else {
+        return false;
+    };
+    value.trim().parse::<u64>().is_ok()
 }
 
 fn parse_network_rule(args: &[Value]) -> Option<NetworkRule> {
@@ -1528,6 +1550,30 @@ ENTRYPOINT chat
         .unwrap_err();
 
         assert!(error.to_string().contains("invalid limit scope"));
+    }
+
+    #[test]
+    fn build_rejects_invalid_timeout_duration() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TIMEOUT TOOL sixty
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid timeout duration"));
     }
 
     #[test]

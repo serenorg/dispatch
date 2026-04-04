@@ -103,6 +103,7 @@ ENTRYPOINT chat
 
 `TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
 Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
+Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.
 
 
 ## WASM Courier
