@@ -22,7 +22,7 @@ use std::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -756,8 +756,8 @@ struct JsonlCourierPluginState {
 struct PersistentPluginProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
     stderr: ChildStderr,
+    responses: mpsc::Receiver<Result<PluginResponse, CourierError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2292,6 +2292,18 @@ fn remaining_run_budget_duration(
     Ok(Some(Duration::from_millis(remaining_ms)))
 }
 
+fn remaining_run_budget_with_literal(
+    session: &CourierSession,
+    timeouts: &[crate::manifest::TimeoutSpec],
+) -> Result<Option<(String, Duration)>, CourierError> {
+    let Some((_, timeout_literal)) = configured_timeout_duration_with_literal(timeouts, "RUN")?
+    else {
+        return Ok(None);
+    };
+    Ok(remaining_run_budget_duration(session, timeouts)?
+        .map(|remaining| (timeout_literal, remaining)))
+}
+
 fn run_timeout_deadline(
     session: &CourierSession,
     timeouts: &[crate::manifest::TimeoutSpec],
@@ -3130,6 +3142,11 @@ impl CourierBackend for JsonlCourierPlugin {
             let started_at = Instant::now();
             let parcel_dir = parcel_dir?;
             let session = courier.ensure_persistent_process(&parcel_dir, session)?;
+            let run_timeout = if consumes_run_budget {
+                remaining_run_budget_with_literal(&session, &image.config.timeouts)?
+            } else {
+                None
+            };
             let (session, events) = courier.run_persistent_plugin(
                 session.id.clone(),
                 PluginRequest::Run {
@@ -3137,6 +3154,7 @@ impl CourierBackend for JsonlCourierPlugin {
                     session,
                     operation,
                 },
+                run_timeout,
             )?;
             let mut response = CourierResponse {
                 courier_id: courier.manifest.name.clone(),
@@ -3224,8 +3242,8 @@ impl JsonlCourierPlugin {
         Ok(PersistentPluginProcess {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
             stderr,
+            responses: spawn_plugin_response_reader(stdout, self.manifest.name.clone()),
         })
     }
 
@@ -3257,6 +3275,7 @@ impl JsonlCourierPlugin {
         &self,
         session_id: String,
         request: PluginRequest,
+        run_timeout: Option<(String, Duration)>,
     ) -> Result<(CourierSession, Vec<CourierEvent>), CourierError> {
         let mut sessions =
             self.state
@@ -3277,7 +3296,13 @@ impl JsonlCourierPlugin {
                 })?;
         process.write_request(self.manifest.protocol_version, &self.manifest.name, request)?;
         let mut events = Vec::new();
-        match read_plugin_run_completion(&mut process.stdout, &self.manifest.name, &mut events) {
+        match read_plugin_run_completion(
+            process,
+            &self.manifest.name,
+            &session_id,
+            run_timeout,
+            &mut events,
+        ) {
             Ok(session) => Ok((session, events)),
             Err(error) => {
                 let mut process = sessions.remove(&session_id).expect("session just existed");
@@ -3427,8 +3452,57 @@ impl PersistentPluginProcess {
     }
 
     fn read_response(&mut self, courier_name: &str) -> Result<PluginResponse, CourierError> {
-        read_plugin_response(&mut self.stdout, courier_name)
+        match self.read_response_timeout(courier_name, None)? {
+            Some(response) => Ok(response),
+            None => Err(CourierError::PluginProtocol {
+                courier: courier_name.to_string(),
+                message: "plugin response timed out".to_string(),
+            }),
+        }
     }
+
+    fn read_response_timeout(
+        &mut self,
+        courier_name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Option<PluginResponse>, CourierError> {
+        let received = match timeout {
+            Some(timeout) => match self.responses.recv_timeout(timeout) {
+                Ok(result) => return result.map(Some),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            },
+            None => self.responses.recv().ok(),
+        };
+        match received {
+            Some(result) => result.map(Some),
+            None => Err(CourierError::PluginProtocol {
+                courier: courier_name.to_string(),
+                message: "plugin produced no response".to_string(),
+            }),
+        }
+    }
+}
+
+fn spawn_plugin_response_reader(
+    stdout: ChildStdout,
+    courier_name: String,
+) -> mpsc::Receiver<Result<PluginResponse, CourierError>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let result = read_plugin_response(&mut reader, &courier_name);
+            let should_break = result.is_err();
+            if tx.send(result).is_err() {
+                break;
+            }
+            if should_break {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 fn read_plugin_response<R: std::io::BufRead>(
@@ -3454,13 +3528,29 @@ fn read_plugin_response<R: std::io::BufRead>(
     })
 }
 
-fn read_plugin_run_completion<R: std::io::BufRead>(
-    reader: &mut R,
+fn read_plugin_run_completion(
+    process: &mut PersistentPluginProcess,
     courier_name: &str,
+    session_id: &str,
+    run_timeout: Option<(String, Duration)>,
     events: &mut Vec<CourierEvent>,
 ) -> Result<CourierSession, CourierError> {
     loop {
-        match read_plugin_response(reader, courier_name)? {
+        let response = process.read_response_timeout(
+            courier_name,
+            run_timeout.as_ref().map(|(_, duration)| *duration),
+        )?;
+        let Some(response) = response else {
+            let timeout = run_timeout
+                .as_ref()
+                .map(|(literal, _)| literal.clone())
+                .unwrap_or_else(|| "RUN".to_string());
+            return Err(CourierError::RunTimedOut {
+                session_id: session_id.to_string(),
+                timeout,
+            });
+        };
+        match response {
             PluginResponse::Event { event } => events.push(event),
             PluginResponse::Done { session } => return Ok(session),
             PluginResponse::Error { error } => {
@@ -3488,7 +3578,7 @@ fn shutdown_persistent_plugin_process(
     protocol_version: u32,
 ) -> Result<(), CourierError> {
     let _ = process.write_request(protocol_version, courier_name, PluginRequest::Shutdown);
-    let _ = process.read_response(courier_name);
+    let _ = process.read_response_timeout(courier_name, Some(Duration::from_millis(200)));
     let _ = process.stdin.flush();
     if process.child.try_wait().ok().flatten().is_none() {
         let _ = process.child.kill();
@@ -5435,6 +5525,28 @@ mod tests {
         )
     }
 
+    fn build_test_slow_plugin_courier(dir: &tempfile::TempDir, digest: &str) -> JsonlCourierPlugin {
+        let plugin_path = dir.path().join("slow-plugin.sh");
+        let script = format!(
+            "#!/bin/sh\nwhile IFS= read -r request; do\ncase \"$request\" in\n*'\"kind\":\"capabilities\"'*)\nprintf '%s\\n' '{{\"kind\":\"capabilities\",\"capabilities\":{{\"courier_id\":\"demo-slow-plugin\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n;;\n*'\"kind\":\"open_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session-slow\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open\"}}}}'\n;;\n*'\"kind\":\"resume_session\"'*)\nprintf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"plugin-session-slow\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"history\":[],\"backend_state\":\"open|resumed\"}}}}'\n;;\n*'\"kind\":\"shutdown\"'*)\nprintf '%s\\n' '{{\"kind\":\"ok\"}}'\nexit 0\n;;\n*'\"kind\":\"run\"'*)\nsleep 0.2\nprintf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"plugin-session-slow\",\"parcel_digest\":\"{digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"history\":[{{\"role\":\"user\",\"content\":\"hello\"}},{{\"role\":\"assistant\",\"content\":\"slow reply\"}}],\"backend_state\":\"turns:1\"}}}}'\n;;\n*)\nprintf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"bad_request\",\"message\":\"unexpected request\"}}}}'\n;;\nesac\ndone\n"
+        );
+        fs::write(&plugin_path, &script).unwrap();
+        fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        JsonlCourierPlugin::new(CourierPluginManifest {
+            name: "demo-slow-plugin".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: crate::plugins::PluginTransport::Jsonl,
+            description: Some("Slow plugin".to_string()),
+            exec: crate::plugins::CourierPluginExec {
+                command: plugin_path.display().to_string(),
+                args: Vec::new(),
+            },
+            installed_sha256: Some(encode_hex(Sha256::digest(script.as_bytes()))),
+        })
+    }
+
     fn build_test_shutdown_plugin_courier(
         dir: &tempfile::TempDir,
         digest: &str,
@@ -5873,6 +5985,38 @@ ENTRYPOINT chat
 
         let shutdowns = fs::read_to_string(shutdowns_path).unwrap();
         assert!(shutdowns.contains("shutdown"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jsonl_plugin_run_timeout_uses_remaining_run_budget() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/custom:latest
+TIMEOUT RUN 50ms
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let dir = tempdir().unwrap();
+        let courier = build_test_slow_plugin_courier(&dir, &test_image.image.config.digest);
+
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        let error = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "hello".to_string(),
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CourierError::RunTimedOut { ref timeout, .. } if timeout == "50ms"
+        ));
     }
 
     #[test]
