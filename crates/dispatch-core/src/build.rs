@@ -861,7 +861,7 @@ fn resolve_skill_dispatch_manifest_path(
         return Ok(Some(resolve_skill_member_path(skill_dir, path)?));
     }
     let default = skill_dir.join("dispatch.toml");
-    if default.exists() {
+    if default.is_file() {
         return Ok(Some(resolve_skill_member_path(skill_dir, "dispatch.toml")?));
     }
     Ok(None)
@@ -913,9 +913,13 @@ fn synthesize_skill_tool(
     let input_schema = if let Some(schema_path) = &skill_tool.schema {
         let resolved_schema = resolve_skill_member_path(skill_dir, schema_path)?;
         validate_tool_schema(&resolved_schema, &skill_tool.name)?;
+        let schema_bytes = fs::read(&resolved_schema).map_err(|source| BuildError::ReadFile {
+            path: resolved_schema.display().to_string(),
+            source,
+        })?;
         Some(ToolInputSchemaRef {
             packaged_path: relative_display(context_dir, &resolved_schema),
-            sha256: String::new(),
+            sha256: hex_digest(&schema_bytes),
         })
     } else {
         None
@@ -1009,10 +1013,12 @@ fn insert_resolved_tool(
                 ));
                 return Ok(());
             }
-            _ => {}
+            (None, None) => {
+                return Err(BuildError::Validation(format!(
+                    "tool `{alias}` is declared more than once in the Agentfile"
+                )));
+            }
         }
-        *existing = tool;
-        return Ok(());
     }
     tools.push(tool);
     Ok(())
@@ -2154,6 +2160,71 @@ ENTRYPOINT chat
                 "tool `read_file` from skill `file-analyst` was shadowed by an explicit Agentfile tool declaration"
                     .to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_explicit_tool_aliases() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("tools")).unwrap();
+        fs::write(dir.path().join("tools/read_file.py"), "print('one')\n").unwrap();
+        fs::write(dir.path().join("tools/read_file.sh"), "echo two\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nTOOL LOCAL tools/read_file.py AS read_file\nTOOL LOCAL tools/read_file.sh AS read_file\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("tool `read_file` is declared more than once in the Agentfile")
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_tool_aliases_within_single_skill_sidecar() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/other.sh\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(skill_dir.join("scripts/other.sh"), "echo other\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("tool `read_file` is declared more than once by skill `file-analyst`")
         );
     }
 

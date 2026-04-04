@@ -1327,6 +1327,21 @@ pub fn resolve_prompt_text(parcel: &LoadedParcel) -> Result<String, CourierError
     Ok(sections.join("\n\n"))
 }
 
+pub fn collect_skill_allowed_tools(parcel: &LoadedParcel) -> BTreeMap<String, Vec<String>> {
+    parcel
+        .config
+        .instructions
+        .iter()
+        .filter_map(|instruction| {
+            instruction
+                .skill_name
+                .as_ref()
+                .zip(instruction.allowed_tools.as_ref())
+                .map(|(skill_name, allowed_tools)| (skill_name.clone(), allowed_tools.clone()))
+        })
+        .collect()
+}
+
 pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
     parcel
         .config
@@ -5876,6 +5891,37 @@ ENTRYPOINT chat
         assert!(prompt.contains("name: file-analyst"));
         assert!(prompt.contains("description: Analyze files"));
         assert!(prompt.contains("Use the file tools before answering."));
+    }
+
+    #[test]
+    fn collect_skill_allowed_tools_returns_skill_annotations() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+SKILL file-analyst
+ENTRYPOINT chat
+",
+            &[
+                (
+                    "file-analyst/SKILL.md",
+                    "---\nname: file-analyst\ndescription: Analyze files\nallowed-tools:\n  - Bash\n  - Read\n---\nUse the file tools before answering.\n",
+                ),
+                (
+                    "file-analyst/dispatch.toml",
+                    "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+                ),
+                (
+                    "file-analyst/scripts/read_file.sh",
+                    "#!/bin/sh\ncat \"$1\"\n",
+                ),
+            ],
+        );
+
+        let allowed = collect_skill_allowed_tools(&test_image.image);
+        assert_eq!(
+            allowed.get("file-analyst"),
+            Some(&vec!["Bash".to_string(), "Read".to_string()])
+        );
     }
 
     #[test]

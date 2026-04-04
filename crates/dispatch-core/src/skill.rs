@@ -16,6 +16,9 @@ pub(crate) struct AgentSkillFrontmatter {
     pub allowed_tools: Option<Vec<String>>,
 }
 
+// Agent Skills frontmatter is owned by an external spec, so we intentionally
+// tolerate unknown fields for forward compatibility. Dispatch-owned sidecars are
+// strict and use `deny_unknown_fields` below.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DispatchSkillManifest {

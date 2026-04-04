@@ -327,16 +327,10 @@
           "pattern": "^[a-f0-9]{64}$"
         },
         "skill_name": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "allowed_tools": {
-          "type": [
-            "array",
-            "null"
-          ],
+          "type": "array",
           "items": {
             "type": "string"
           }
@@ -496,10 +490,7 @@
           }
         },
         "skill_source": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       }
     },
