@@ -1,0 +1,20 @@
+entrypoint = "chat"
+
+[[tools]]
+name = "read_file"
+script = "scripts/read_file.sh"
+risk = "low"
+description = "Read the full contents of a file. Input: JSON with 'path' field."
+
+[[tools]]
+name = "list_dir"
+script = "scripts/list_dir.sh"
+risk = "low"
+description = "List files and directories at a path. Input: JSON with 'path' field (defaults to current directory)."
+
+[[tools]]
+name = "find_files"
+script = "scripts/find_files.sh"
+schema = "schemas/find_files.json"
+risk = "low"
+description = "Find files matching a pattern under a directory. Input: JSON with 'dir' and 'pattern' fields."

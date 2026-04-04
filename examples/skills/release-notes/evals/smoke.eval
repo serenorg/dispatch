@@ -1,0 +1,3 @@
+name = "reads-git-log"
+input = "HEAD~5..HEAD"
+expects_tool = "git_log"

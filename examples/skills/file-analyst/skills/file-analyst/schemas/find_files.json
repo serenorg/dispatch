@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "dir": {
+      "type": "string",
+      "description": "Directory to search under"
+    },
+    "pattern": {
+      "type": "string",
+      "description": "Glob pattern for filenames, e.g. '*.rs', '*.toml', 'README*'"
+    },
+    "max_depth": {
+      "type": "integer",
+      "description": "Maximum directory depth to search (default: 6)",
+      "minimum": 1,
+      "maximum": 20
+    }
+  },
+  "required": ["dir", "pattern"]
+}

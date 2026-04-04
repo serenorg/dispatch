@@ -1,0 +1,19 @@
+entrypoint = "job"
+
+[[tools]]
+name = "git_log"
+script = "scripts/git_log.sh"
+risk = "low"
+description = "Get git commit log between two refs. Input: JSON with optional 'from' and 'to' fields (for example 'HEAD~10' and 'HEAD'). Omit 'from' for the last 20 commits."
+
+[[tools]]
+name = "git_diff_stat"
+script = "scripts/git_diff_stat.sh"
+risk = "low"
+description = "Get a summary of files changed between two refs. Input: JSON with 'from' and 'to' fields."
+
+[[tools]]
+name = "git_show"
+script = "scripts/git_show.sh"
+risk = "low"
+description = "Show details of a specific commit. Input: JSON with 'ref' field."

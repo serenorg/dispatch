@@ -52,7 +52,7 @@ An agent project has:
 - an explicit `COMPONENT` for `dispatch/wasm` parcels
 - local tools, reference assets, evals, and code
 
-Example (`examples/basic/Agentfile`):
+Example (`examples/parcels/basic/Agentfile`):
 
 ```dockerfile
 FROM dispatch/native:latest
@@ -227,49 +227,52 @@ Build and run the reference examples:
 
 ```bash
 # Lint an Agentfile
-cargo run -p dispatch -- lint examples/basic
-cargo run -p dispatch -- lint examples/wasm-reference
+cargo run -p dispatch -- lint examples/parcels/basic
+cargo run -p dispatch -- lint examples/parcels/wasm-reference
+cargo run -p dispatch -- lint examples/skills/file-analyst
 
 # Build a parcel
-cargo run -p dispatch -- build examples/basic
-cargo run -p dispatch -- build examples/wasm-reference
+cargo run -p dispatch -- build examples/parcels/basic
+cargo run -p dispatch -- build examples/parcels/wasm-reference
+cargo run -p dispatch -- build examples/skills/file-analyst
 
 # Run packaged evals
-cargo run -p dispatch -- eval examples/basic
-cargo run -p dispatch -- eval examples/basic --courier native
+cargo run -p dispatch -- eval examples/parcels/basic
+cargo run -p dispatch -- eval examples/parcels/basic --courier native
+cargo run -p dispatch -- eval examples/skills/file-analyst --courier native
 
 # Inspect a built parcel
-cargo run -p dispatch -- inspect examples/basic/.dispatch/parcels/<digest>
-cargo run -p dispatch -- inspect examples/wasm-reference/.dispatch/parcels/<digest> --courier wasm
+cargo run -p dispatch -- inspect examples/parcels/basic/.dispatch/parcels/<digest>
+cargo run -p dispatch -- inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
 
 # Verify parcel integrity
-cargo run -p dispatch -- verify examples/basic/.dispatch/parcels/<digest>
+cargo run -p dispatch -- verify examples/parcels/basic/.dispatch/parcels/<digest>
 
 # Sign a parcel
 cargo run -p dispatch -- keygen --key-id release --output-dir .dispatch/keys
-cargo run -p dispatch -- sign examples/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
-cargo run -p dispatch -- verify examples/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
+cargo run -p dispatch -- sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
+cargo run -p dispatch -- verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
 
 # Run a parcel (native courier, requires LLM_API_KEY or provider env vars)
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --chat "hello"
-cargo run -p dispatch -- run examples/basic/.dispatch/parcels/<digest> --interactive
+cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
+cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
 
 # Run a WASM parcel
-cargo run -p dispatch -- run examples/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
+cargo run -p dispatch -- run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
 
 # Run a heartbeat
-cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
+cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
 
 # List and invoke tools
-cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
-cargo run -p dispatch -- run examples/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
+cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
+cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
 
 # Push/pull to a depot
-dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
 dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0
-dispatch push examples/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
+dispatch push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
 dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
-dispatch push examples/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
+dispatch push examples/parcels/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
 dispatch pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.toml
@@ -278,7 +281,7 @@ dispatch pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-p
 Print the parsed AST:
 
 ```bash
-cargo run -p dispatch -- lint examples/basic --json
+cargo run -p dispatch -- lint examples/parcels/basic --json
 ```
 
 ## Parcel Format

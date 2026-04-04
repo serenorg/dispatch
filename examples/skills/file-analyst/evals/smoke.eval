@@ -1,0 +1,3 @@
+name = "lists-directory"
+input = "What files are in the current directory?"
+expects_tool = "list_dir"

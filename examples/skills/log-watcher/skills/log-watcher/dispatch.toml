@@ -1,0 +1,20 @@
+entrypoint = "heartbeat"
+
+[[tools]]
+name = "read_log"
+script = "scripts/read_log.sh"
+risk = "low"
+description = "Read log lines from a file. Input: JSON with 'path' field and optional 'since_line' (line number to read from, 0-indexed) to get only new entries."
+
+[[tools]]
+name = "line_count"
+script = "scripts/line_count.sh"
+risk = "low"
+description = "Get the total number of lines in a file. Input: JSON with 'path' field."
+
+[[tools]]
+name = "write_alert"
+script = "scripts/write_alert.sh"
+risk = "low"
+approval = "audit"
+description = "Append an alert entry to the alerts log. Input: JSON with 'message' and optional 'level' (info, warn, error)."

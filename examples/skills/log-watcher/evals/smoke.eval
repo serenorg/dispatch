@@ -1,0 +1,4 @@
+name = "counts-log-lines"
+input = "Check the log for new entries"
+entrypoint = "heartbeat"
+expects_tool = "line_count"

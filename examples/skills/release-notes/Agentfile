@@ -1,0 +1,21 @@
+FROM dispatch/native:latest
+
+NAME release-notes
+VERSION 0.1.0
+
+SOUL SOUL.md
+SKILL skills/release-notes
+
+MODEL claude-sonnet-4-6 PROVIDER anthropic
+FALLBACK gpt-4o PROVIDER openai
+
+LIMIT ITERATIONS 20
+LIMIT TOOL_CALLS 40
+LIMIT TOOL_OUTPUT 65536
+TIMEOUT RUN 180s
+TIMEOUT TOOL 30s
+TIMEOUT LLM 120s
+
+EVAL evals/smoke.eval
+
+ENTRYPOINT job

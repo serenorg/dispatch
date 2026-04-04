@@ -1,0 +1,29 @@
+FROM dispatch/native:latest
+
+NAME file-analyst
+VERSION 0.1.0
+
+SOUL SOUL.md
+SKILL skills/file-analyst
+
+MODEL claude-sonnet-4-6 PROVIDER anthropic
+FALLBACK gpt-4o PROVIDER openai
+
+TOOL BUILTIN memory_put RISK low APPROVAL audit DESCRIPTION "Remember something for later. Use to store file summaries and key findings."
+TOOL BUILTIN memory_get RISK low
+TOOL BUILTIN memory_list RISK low
+
+MOUNT SESSION sqlite
+MOUNT MEMORY sqlite
+MOUNT ARTIFACTS local
+
+LIMIT ITERATIONS 30
+LIMIT TOOL_CALLS 60
+LIMIT TOOL_OUTPUT 32768
+TIMEOUT RUN 300s
+TIMEOUT TOOL 30s
+TIMEOUT LLM 120s
+
+EVAL evals/smoke.eval
+
+ENTRYPOINT chat
