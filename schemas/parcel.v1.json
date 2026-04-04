@@ -594,6 +594,46 @@
         "url": {
           "type": "string"
         },
+        "endpoint_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "auto",
+            "card",
+            "direct",
+            null
+          ]
+        },
+        "auth": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "scheme",
+            "secret_name"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            },
+            "secret_name": {
+              "type": "string"
+            }
+          }
+        },
+        "expected_agent_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "approval": {
           "type": [
             "string",

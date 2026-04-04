@@ -236,10 +236,36 @@ pub struct McpToolConfig {
 pub struct A2aToolConfig {
     pub alias: String,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_mode: Option<A2aEndpointMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<A2aAuthConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_agent_name: Option<String>,
     pub approval: Option<ToolApprovalPolicy>,
     pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema: Option<ToolInputSchemaRef>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum A2aEndpointMode {
+    Auto,
+    Card,
+    Direct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aAuthConfig {
+    pub scheme: A2aAuthScheme,
+    pub secret_name: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum A2aAuthScheme {
+    Bearer,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

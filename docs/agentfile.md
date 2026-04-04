@@ -385,13 +385,18 @@ Declares a remote agent-to-agent tool backed by a fixed A2A endpoint.
 
 ```dockerfile
 TOOL A2A planner URL https://planner.example.com DESCRIPTION "Delegate planning to a remote agent."
-TOOL A2A broker URL https://broker.example.com SCHEMA schemas/broker-input.json APPROVAL confirm RISK high
+TOOL A2A broker URL https://broker.example.com DISCOVERY card AUTH bearer BROKER_TOKEN EXPECT_AGENT_NAME broker-agent SCHEMA schemas/broker-input.json APPROVAL confirm RISK high
 ```
 
 Reference implementation notes:
 
 - the endpoint is declared statically in the parcel via `URL`, not supplied by the model at call time
-- the reference couriers perform agent-card discovery when available and fall back to `<url>/a2a` for JSON-RPC `message/send`
+- `DISCOVERY auto|card|direct` controls endpoint resolution:
+  - `auto` tries `/.well-known/agent.json` and falls back to `<url>/a2a`
+  - `card` requires successful agent-card discovery
+  - `direct` skips discovery and normalizes the endpoint as a direct JSON-RPC target
+- `AUTH bearer <secret_name>` sends `Authorization: Bearer ...` using a declared `SECRET`
+- `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match
 - `TOOL A2A` currently exposes a synchronous request/response tool surface; task polling and cancellation are not part of the v1 Dispatch tool contract
 
 ### Files and Assets

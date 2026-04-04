@@ -1,7 +1,7 @@
 use crate::{
     manifest::{
-        BuiltinToolConfig, InstructionKind, ModelReference, MountConfig, MountKind, ParcelManifest,
-        ToolConfig,
+        A2aAuthScheme, A2aEndpointMode, BuiltinToolConfig, InstructionKind, ModelReference,
+        MountConfig, MountKind, ParcelManifest, ToolConfig,
     },
     plugin_protocol::{PluginRequest, PluginRequestEnvelope, PluginResponse},
     plugins::CourierPluginManifest,
@@ -294,6 +294,10 @@ pub struct LocalToolSpec {
     pub args: Vec<String>,
     pub transport: LocalToolTransport,
     pub endpoint_url: Option<String>,
+    pub endpoint_mode: Option<A2aEndpointMode>,
+    pub auth_secret_name: Option<String>,
+    pub auth_scheme: Option<A2aAuthScheme>,
+    pub expected_agent_name: Option<String>,
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
@@ -1126,6 +1130,10 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 args: local.runner.args.clone(),
                 transport: LocalToolTransport::Local,
                 endpoint_url: None,
+                endpoint_mode: None,
+                auth_secret_name: None,
+                auth_scheme: None,
+                expected_agent_name: None,
                 description: local.description.clone(),
                 input_schema_packaged_path: local
                     .input_schema
@@ -1143,6 +1151,10 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 args: vec![a2a.url.clone()],
                 transport: LocalToolTransport::A2a,
                 endpoint_url: Some(a2a.url.clone()),
+                endpoint_mode: a2a.endpoint_mode,
+                auth_secret_name: a2a.auth.as_ref().map(|auth| auth.secret_name.clone()),
+                auth_scheme: a2a.auth.as_ref().map(|auth| auth.scheme),
+                expected_agent_name: a2a.expected_agent_name.clone(),
                 description: a2a.description.clone(),
                 input_schema_packaged_path: a2a
                     .input_schema
@@ -2081,9 +2093,13 @@ fn read_a2a_json_response(
         })
 }
 
-fn resolve_a2a_rpc_endpoint(
+fn resolve_a2a_rpc_endpoint_with_env<F>(
     tool: &LocalToolSpec,
-) -> Result<(String, Option<String>), CourierError> {
+    mut env_lookup: F,
+) -> Result<(String, Option<String>), CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let url = tool
         .endpoint_url
         .as_deref()
@@ -2091,14 +2107,24 @@ fn resolve_a2a_rpc_endpoint(
         .ok_or_else(|| CourierError::MissingA2aToolUrl {
             tool: tool.alias.clone(),
         })?;
+    if matches!(tool.endpoint_mode, Some(A2aEndpointMode::Direct)) {
+        return Ok((normalize_a2a_rpc_endpoint(url), None));
+    }
     let discovery_url = format!(
         "{}/.well-known/agent.json",
         normalize_a2a_discovery_base(url)
     );
-    let response = ureq::get(&discovery_url)
+    let mut request = ureq::get(&discovery_url)
         .config()
         .http_status_as_error(false)
-        .build()
+        .build();
+    if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
+        (tool.auth_secret_name.as_deref(), tool.auth_scheme)
+        && let Some(secret_value) = env_lookup(secret_name)
+    {
+        request = request.header("authorization", &format!("Bearer {secret_value}"));
+    }
+    let response = request
         .call()
         .map_err(|error| CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
@@ -2123,7 +2149,22 @@ fn resolve_a2a_rpc_endpoint(
             .get("name")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
+        if let (Some(expected), Some(actual)) =
+            (tool.expected_agent_name.as_deref(), agent_name.as_deref())
+            && expected != actual
+        {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("agent card name mismatch: expected `{expected}`, got `{actual}`"),
+            });
+        }
         return Ok((endpoint, agent_name));
+    }
+    if matches!(tool.endpoint_mode, Some(A2aEndpointMode::Card)) {
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: "agent card discovery failed for required `DISCOVERY card` mode".to_string(),
+        });
     }
     Ok((normalize_a2a_rpc_endpoint(url), None))
 }
@@ -2192,11 +2233,16 @@ fn extract_a2a_task_output(value: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Null
 }
 
-fn execute_a2a_tool(
+fn execute_a2a_tool_with_env<F>(
     tool: &LocalToolSpec,
     input: Option<&str>,
-) -> Result<ToolRunResult, CourierError> {
-    let (endpoint, agent_name) = resolve_a2a_rpc_endpoint(tool)?;
+    env_lookup: F,
+) -> Result<ToolRunResult, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut env_lookup = env_lookup;
+    let (endpoint, agent_name) = resolve_a2a_rpc_endpoint_with_env(tool, &mut env_lookup)?;
     let request_id = a2a_request_id();
     let input_value = input.unwrap_or_default();
     let part = if tool.input_schema_packaged_path.is_some() {
@@ -2222,11 +2268,18 @@ fn execute_a2a_tool(
             }
         }
     });
-    let response = ureq::post(&endpoint)
+    let mut request = ureq::post(&endpoint)
         .config()
         .http_status_as_error(false)
         .build()
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
+        (tool.auth_secret_name.as_deref(), tool.auth_scheme)
+        && let Some(secret_value) = env_lookup(secret_name)
+    {
+        request = request.header("authorization", &format!("Bearer {secret_value}"));
+    }
+    let response = request
         .send_json(payload)
         .map_err(|error| CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
@@ -2287,7 +2340,7 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     if matches!(tool.transport, LocalToolTransport::A2a) {
-        return execute_a2a_tool(tool, input);
+        return execute_a2a_tool_with_env(tool, input, env_lookup);
     }
 
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
@@ -2360,7 +2413,7 @@ fn execute_local_tool_in_docker(
     courier: &DockerCourier,
 ) -> Result<ToolRunResult, CourierError> {
     if matches!(tool.transport, LocalToolTransport::A2a) {
-        return execute_a2a_tool(tool, input);
+        return execute_a2a_tool_with_env(tool, input, process_env_lookup);
     }
 
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
@@ -4854,6 +4907,23 @@ mod tests {
         handle: Option<thread::JoinHandle<()>>,
     }
 
+    #[derive(Clone)]
+    struct TestA2aServerOptions {
+        agent_name: String,
+        expected_auth: Option<String>,
+        publish_card: bool,
+    }
+
+    impl Default for TestA2aServerOptions {
+        fn default() -> Self {
+            Self {
+                agent_name: "demo-a2a".to_string(),
+                expected_auth: None,
+                publish_card: true,
+            }
+        }
+    }
+
     impl Drop for TestA2aServer {
         fn drop(&mut self) {
             let _ = self.shutdown.send(());
@@ -4864,18 +4934,25 @@ mod tests {
     }
 
     fn start_test_a2a_server() -> TestA2aServer {
+        start_test_a2a_server_with_options(TestA2aServerOptions::default())
+    }
+
+    fn start_test_a2a_server_with_options(options: TestA2aServerOptions) -> TestA2aServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let server_base_url = base_url.clone();
+        let options = options.clone();
         let handle = thread::spawn(move || {
             loop {
                 if shutdown_rx.try_recv().is_ok() {
                     break;
                 }
                 match listener.accept() {
-                    Ok((stream, _)) => handle_test_a2a_connection(stream, &server_base_url),
+                    Ok((stream, _)) => {
+                        handle_test_a2a_connection(stream, &server_base_url, &options)
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -4890,7 +4967,11 @@ mod tests {
         }
     }
 
-    fn handle_test_a2a_connection(stream: TcpStream, base_url: &str) {
+    fn handle_test_a2a_connection(
+        stream: TcpStream,
+        base_url: &str,
+        options: &TestA2aServerOptions,
+    ) {
         stream.set_nonblocking(false).unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
@@ -4903,6 +4984,7 @@ mod tests {
         let method = parts.next().unwrap_or_default();
         let target = parts.next().unwrap_or_default();
         let mut content_length = 0usize;
+        let mut authorization = None;
         loop {
             let mut header_line = String::new();
             reader.read_line(&mut header_line).unwrap();
@@ -4914,18 +4996,31 @@ mod tests {
                 && name.eq_ignore_ascii_case("content-length")
             {
                 content_length = value.trim().parse().unwrap();
+            } else if let Some((name, value)) = header_line.split_once(':')
+                && name.eq_ignore_ascii_case("authorization")
+            {
+                authorization = Some(value.trim().to_string());
             }
         }
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body).unwrap();
 
+        if options
+            .expected_auth
+            .as_deref()
+            .is_some_and(|expected| authorization.as_deref() != Some(expected))
+        {
+            write_test_http_response(&mut writer, 401, "text/plain", b"unauthorized");
+            return;
+        }
+
         match (method, target) {
-            ("GET", "/.well-known/agent.json") => write_test_http_response(
+            ("GET", "/.well-known/agent.json") if options.publish_card => write_test_http_response(
                 &mut writer,
                 200,
                 "application/json",
                 serde_json::to_vec(&serde_json::json!({
-                    "name":"demo-a2a",
+                    "name": options.agent_name,
                     "url": format!("{base_url}/a2a")
                 }))
                 .unwrap()
@@ -5599,7 +5694,8 @@ ENTRYPOINT job
         let test_image = build_test_image(
             "\
 FROM dispatch/native:latest
-TOOL A2A broker URL https://broker.example.com SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
+SECRET A2A_TOKEN
+TOOL A2A broker URL https://broker.example.com DISCOVERY direct AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
 ENTRYPOINT job
 ",
             &[(
@@ -5615,6 +5711,13 @@ ENTRYPOINT job
         assert_eq!(
             tools[0].endpoint_url.as_deref(),
             Some("https://broker.example.com")
+        );
+        assert_eq!(tools[0].endpoint_mode, Some(A2aEndpointMode::Direct));
+        assert_eq!(tools[0].auth_secret_name.as_deref(), Some("A2A_TOKEN"));
+        assert_eq!(tools[0].auth_scheme, Some(A2aAuthScheme::Bearer));
+        assert_eq!(
+            tools[0].expected_agent_name.as_deref(),
+            Some("remote-broker")
         );
         assert_eq!(tools[0].command, "dispatch-a2a");
     }
@@ -5664,6 +5767,84 @@ ENTRYPOINT job
         assert_eq!(
             output.pointer("/query").and_then(serde_json::Value::as_str),
             Some("weather")
+        );
+    }
+
+    #[test]
+    fn native_courier_executes_a2a_tools_with_bearer_auth() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            expected_auth: Some("Bearer topsecret".to_string()),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+SECRET A2A_TOKEN
+TOOL A2A broker URL {} AUTH bearer A2A_TOKEN
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "A2A_TOKEN").then(|| "topsecret".to_string())
+        })
+        .unwrap();
+        assert!(result.stdout.contains("echo:hello"));
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_agent_name_mismatch() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            agent_name: "actual-agent".to_string(),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} EXPECT_AGENT_NAME expected-agent
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "agent card name mismatch: expected `expected-agent`, got `actual-agent`"
+            )
+        );
+    }
+
+    #[test]
+    fn native_courier_requires_card_discovery_when_configured() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            publish_card: false,
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} DISCOVERY card
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("agent card discovery failed for required `DISCOVERY card` mode")
         );
     }
 
@@ -7258,6 +7439,10 @@ ENTRYPOINT chat
             args: Vec::new(),
             transport: LocalToolTransport::Local,
             endpoint_url: None,
+            endpoint_mode: None,
+            auth_secret_name: None,
+            auth_scheme: None,
+            expected_agent_name: None,
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
