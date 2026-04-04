@@ -435,12 +435,16 @@ TOOL BUILTIN memory_get DESCRIPTION "Load a durable profile fact."
 TOOL BUILTIN memory_list_range DESCRIPTION "List durable facts over a key range."
 TOOL BUILTIN memory_delete_range APPROVAL confirm RISK medium DESCRIPTION "Delete durable facts over a key range."
 TOOL BUILTIN memory_put_many DESCRIPTION "Store multiple durable facts in one call."
+TOOL BUILTIN checkpoint_put DESCRIPTION "Store a durable named session checkpoint."
+TOOL BUILTIN checkpoint_get DESCRIPTION "Read a durable named session checkpoint."
+TOOL BUILTIN checkpoint_list DESCRIPTION "List durable named session checkpoints."
 ```
 
 Native courier note:
 
 - the native reference courier currently host-implements `memory_get`, `memory_put`, `memory_delete`, and `memory_list` for model-backed turns when a parcel declares `MOUNT MEMORY sqlite`
 - it also host-implements `memory_list_range`, `memory_delete_range`, and `memory_put_many` when a parcel declares `MOUNT MEMORY sqlite`
+- it host-implements `checkpoint_get`, `checkpoint_put`, `checkpoint_delete`, and `checkpoint_list` when a parcel declares `MOUNT SESSION sqlite`
 - other builtin capabilities remain declarative until a courier provides a concrete implementation
 
 #### `TOOL MCP`

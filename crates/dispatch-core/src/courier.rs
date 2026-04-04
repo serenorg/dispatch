@@ -269,6 +269,10 @@ pub enum CourierError {
         "parcel `{parcel_digest}` does not declare a usable memory mount for courier memory operations"
     )]
     MissingMemoryMount { parcel_digest: String },
+    #[error(
+        "parcel `{parcel_digest}` does not declare a usable session sqlite mount for checkpoint operations"
+    )]
+    MissingSessionMount { parcel_digest: String },
     #[error("failed to create directory `{path}`: {source}")]
     CreateDir {
         path: String,
@@ -1560,6 +1564,38 @@ fn builtin_memory_tool_schema(capability: &str) -> Option<serde_json::Value> {
             "required": ["entries"],
             "additionalProperties": false
         })),
+        "checkpoint_get" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        })),
+        "checkpoint_put" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["name", "value"],
+            "additionalProperties": false
+        })),
+        "checkpoint_delete" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        })),
+        "checkpoint_list" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prefix": { "type": "string" }
+            },
+            "additionalProperties": false
+        })),
         _ => None,
     }
 }
@@ -1591,6 +1627,22 @@ fn builtin_memory_tool_description(tool: &BuiltinToolSpec) -> String {
             }
             "memory_put_many" => {
                 "Store or update multiple values in the configured Dispatch memory mount."
+                    .to_string()
+            }
+            "checkpoint_get" => {
+                "Read a durable named checkpoint from the configured Dispatch session mount."
+                    .to_string()
+            }
+            "checkpoint_put" => {
+                "Store or update a durable named checkpoint in the configured Dispatch session mount."
+                    .to_string()
+            }
+            "checkpoint_delete" => {
+                "Delete a durable named checkpoint from the configured Dispatch session mount."
+                    .to_string()
+            }
+            "checkpoint_list" => {
+                "List durable named checkpoints from the configured Dispatch session mount."
                     .to_string()
             }
             _ => format!("Dispatch builtin capability `{}`.", tool.capability),
@@ -1875,21 +1927,7 @@ fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), C
         operation: "open",
         source,
     })?;
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS dispatch_sessions (
-                session_id TEXT PRIMARY KEY,
-                parcel_digest TEXT NOT NULL,
-                entrypoint TEXT,
-                turn_count INTEGER NOT NULL,
-                payload_json TEXT NOT NULL
-            );",
-        )
-        .map_err(|source| CourierError::SqliteMount {
-            path: path.display().to_string(),
-            operation: "create_session_table",
-            source,
-        })?;
+    ensure_session_sqlite(&connection, path)?;
     let payload = serde_json::to_string(session)
         .map_err(|error| CourierError::SerializeSession(error.to_string()))?;
     connection
@@ -1920,6 +1958,32 @@ fn persist_session_sqlite(path: &Path, session: &CourierSession) -> Result<(), C
     Ok(())
 }
 
+fn ensure_session_sqlite(connection: &Connection, path: &Path) -> Result<(), CourierError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS dispatch_sessions (
+                session_id TEXT PRIMARY KEY,
+                parcel_digest TEXT NOT NULL,
+                entrypoint TEXT,
+                turn_count INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dispatch_checkpoints (
+                session_id TEXT NOT NULL,
+                parcel_digest TEXT NOT NULL,
+                checkpoint_name TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, checkpoint_name)
+            );",
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "create_session_tables",
+            source,
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MemoryEntry {
     namespace: String,
@@ -1937,6 +2001,21 @@ fn map_memory_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CheckpointEntry {
+    name: String,
+    value: String,
+    updated_at: u64,
+}
+
+fn map_checkpoint_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointEntry> {
+    Ok(CheckpointEntry {
+        name: row.get(0)?,
+        value: row.get(1)?,
+        updated_at: row.get::<_, i64>(2)? as u64,
+    })
+}
+
 fn memory_mount_path(session: &CourierSession) -> Option<&Path> {
     session
         .resolved_mounts
@@ -1947,6 +2026,20 @@ fn memory_mount_path(session: &CourierSession) -> Option<&Path> {
 
 fn require_memory_mount_path(session: &CourierSession) -> Result<&Path, CourierError> {
     memory_mount_path(session).ok_or_else(|| CourierError::MissingMemoryMount {
+        parcel_digest: session.parcel_digest.clone(),
+    })
+}
+
+fn session_mount_path(session: &CourierSession) -> Option<&Path> {
+    session
+        .resolved_mounts
+        .iter()
+        .find(|mount| mount.kind == MountKind::Session && mount.driver == "sqlite")
+        .map(|mount| Path::new(&mount.target_path))
+}
+
+fn require_session_mount_path(session: &CourierSession) -> Result<&Path, CourierError> {
+    session_mount_path(session).ok_or_else(|| CourierError::MissingSessionMount {
         parcel_digest: session.parcel_digest.clone(),
     })
 }
@@ -2345,6 +2438,170 @@ fn memory_put_many(
     Ok(replaced)
 }
 
+fn checkpoint_get(
+    session: &CourierSession,
+    name: &str,
+) -> Result<Option<CheckpointEntry>, CourierError> {
+    let path = require_session_mount_path(session)?;
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_checkpoint_get",
+        source,
+    })?;
+    ensure_session_sqlite(&connection, path)?;
+    connection
+        .query_row(
+            concat!(
+                "SELECT checkpoint_name, value, updated_at ",
+                "FROM dispatch_checkpoints ",
+                "WHERE session_id = ?1 AND parcel_digest = ?2 AND checkpoint_name = ?3"
+            ),
+            params![session.id, session.parcel_digest, name],
+            map_checkpoint_entry,
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            source => Err(CourierError::SqliteMount {
+                path: path.display().to_string(),
+                operation: "query_checkpoint_get",
+                source,
+            }),
+        })
+}
+
+fn checkpoint_put(session: &CourierSession, name: &str, value: &str) -> Result<bool, CourierError> {
+    let path = require_session_mount_path(session)?;
+    let mut connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_checkpoint_put",
+        source,
+    })?;
+    ensure_session_sqlite(&connection, path)?;
+    let tx = connection
+        .transaction()
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "begin_checkpoint_put",
+            source,
+        })?;
+    let existed = tx
+        .query_row(
+            concat!(
+                "SELECT EXISTS(",
+                "SELECT 1 FROM dispatch_checkpoints ",
+                "WHERE session_id = ?1 AND checkpoint_name = ?2",
+                ")"
+            ),
+            params![session.id, name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "query_checkpoint_put_exists",
+            source,
+        })?;
+    tx.execute(
+        concat!(
+            "INSERT INTO dispatch_checkpoints ",
+            "(session_id, parcel_digest, checkpoint_name, value, updated_at) ",
+            "VALUES (?1, ?2, ?3, ?4, ?5) ",
+            "ON CONFLICT(session_id, checkpoint_name) DO UPDATE SET ",
+            "parcel_digest = excluded.parcel_digest, ",
+            "value = excluded.value, ",
+            "updated_at = excluded.updated_at"
+        ),
+        params![
+            session.id,
+            session.parcel_digest,
+            name,
+            value,
+            current_unix_timestamp() as i64,
+        ],
+    )
+    .map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "upsert_checkpoint_put",
+        source,
+    })?;
+    tx.commit().map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "commit_checkpoint_put",
+        source,
+    })?;
+    Ok(existed)
+}
+
+fn checkpoint_delete(session: &CourierSession, name: &str) -> Result<bool, CourierError> {
+    let path = require_session_mount_path(session)?;
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_checkpoint_delete",
+        source,
+    })?;
+    ensure_session_sqlite(&connection, path)?;
+    let deleted = connection
+        .execute(
+            concat!(
+                "DELETE FROM dispatch_checkpoints ",
+                "WHERE session_id = ?1 AND parcel_digest = ?2 AND checkpoint_name = ?3"
+            ),
+            params![session.id, session.parcel_digest, name],
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "delete_checkpoint",
+            source,
+        })?;
+    Ok(deleted > 0)
+}
+
+fn checkpoint_list(
+    session: &CourierSession,
+    prefix: Option<&str>,
+) -> Result<Vec<CheckpointEntry>, CourierError> {
+    let path = require_session_mount_path(session)?;
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_checkpoint_list",
+        source,
+    })?;
+    ensure_session_sqlite(&connection, path)?;
+    let prefix_like = escape_sql_like_prefix(prefix.unwrap_or_default());
+    let mut statement = connection
+        .prepare(concat!(
+            "SELECT checkpoint_name, value, updated_at ",
+            "FROM dispatch_checkpoints ",
+            "WHERE session_id = ?1 AND parcel_digest = ?2 AND checkpoint_name LIKE ?3 ESCAPE '\\' ",
+            "ORDER BY checkpoint_name ASC"
+        ))
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "prepare_checkpoint_list",
+            source,
+        })?;
+    let rows = statement
+        .query_map(
+            params![session.id, session.parcel_digest, prefix_like],
+            map_checkpoint_entry,
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "query_checkpoint_list",
+            source,
+        })?;
+    let mut entries = Vec::new();
+    for entry in rows {
+        entries.push(entry.map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "read_checkpoint_list",
+            source,
+        })?);
+    }
+    Ok(entries)
+}
+
 fn escape_sql_like_prefix(prefix: &str) -> String {
     let mut escaped = String::with_capacity(prefix.len() + 1);
     for ch in prefix.chars() {
@@ -2410,6 +2667,22 @@ struct BuiltinMemoryPutManyInput {
     #[serde(default = "default_memory_namespace")]
     namespace: String,
     entries: Vec<BuiltinMemoryPutEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinCheckpointGetInput {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinCheckpointPutInput {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinCheckpointListInput {
+    prefix: Option<String>,
 }
 
 fn parse_builtin_tool_input<T>(tool: &str, input: &str) -> Result<T, CourierError>
@@ -2518,6 +2791,44 @@ fn execute_builtin_tool(
                 if input.entries.len() == 1 { "y" } else { "ies" },
                 input.namespace
             )
+        }
+        "checkpoint_get" => {
+            let input: BuiltinCheckpointGetInput = parse_builtin_tool_input(capability, input)?;
+            match checkpoint_get(session, &input.name)? {
+                Some(entry) => format!("{} = {}", entry.name, entry.value),
+                None => format!("No checkpoint named `{}`", input.name),
+            }
+        }
+        "checkpoint_put" => {
+            let input: BuiltinCheckpointPutInput = parse_builtin_tool_input(capability, input)?;
+            let replaced = checkpoint_put(session, &input.name, &input.value)?;
+            if replaced {
+                format!("Updated checkpoint `{}`", input.name)
+            } else {
+                format!("Stored checkpoint `{}`", input.name)
+            }
+        }
+        "checkpoint_delete" => {
+            let input: BuiltinCheckpointGetInput = parse_builtin_tool_input(capability, input)?;
+            let deleted = checkpoint_delete(session, &input.name)?;
+            if deleted {
+                format!("Deleted checkpoint `{}`", input.name)
+            } else {
+                format!("No checkpoint named `{}`", input.name)
+            }
+        }
+        "checkpoint_list" => {
+            let input: BuiltinCheckpointListInput = parse_builtin_tool_input(capability, input)?;
+            let entries = checkpoint_list(session, input.prefix.as_deref())?;
+            if entries.is_empty() {
+                "No checkpoints stored.".to_string()
+            } else {
+                entries
+                    .into_iter()
+                    .map(|entry| format!("{} = {}", entry.name, entry.value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
         }
         _ => {
             return Err(CourierError::InvalidBuiltinToolInput {
@@ -8837,6 +9148,8 @@ TOOL BUILTIN memory_get DESCRIPTION \"Read remembered state.\"
 TOOL BUILTIN memory_list_range
 TOOL BUILTIN memory_delete_range
 TOOL BUILTIN memory_put_many
+TOOL BUILTIN checkpoint_put
+TOOL BUILTIN checkpoint_list
 TOOL BUILTIN web_search
 ENTRYPOINT chat
 ",
@@ -8844,12 +9157,14 @@ ENTRYPOINT chat
         );
 
         let tools = list_native_builtin_tools(&test_image.image);
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 7);
         assert_eq!(tools[0].capability, "memory_put");
         assert_eq!(tools[1].capability, "memory_get");
         assert_eq!(tools[2].capability, "memory_list_range");
         assert_eq!(tools[3].capability, "memory_delete_range");
         assert_eq!(tools[4].capability, "memory_put_many");
+        assert_eq!(tools[5].capability, "checkpoint_put");
+        assert_eq!(tools[6].capability, "checkpoint_list");
         assert_eq!(
             tools[1].description.as_deref(),
             Some("Read remembered state.")
@@ -8867,6 +9182,8 @@ TOOL BUILTIN memory_get
 TOOL BUILTIN memory_list_range
 TOOL BUILTIN memory_delete_range
 TOOL BUILTIN memory_put_many
+TOOL BUILTIN checkpoint_put
+TOOL BUILTIN checkpoint_list
 ENTRYPOINT chat
 ",
             &[],
@@ -8883,7 +9200,7 @@ ENTRYPOINT chat
         .unwrap()
         .expect("expected model request");
 
-        assert_eq!(request.tools.len(), 5);
+        assert_eq!(request.tools.len(), 7);
         assert_eq!(request.tools[0].name, "memory_put");
         assert!(matches!(
             request.tools[0].format,
@@ -8893,6 +9210,8 @@ ENTRYPOINT chat
         assert_eq!(request.tools[2].name, "memory_list_range");
         assert_eq!(request.tools[3].name, "memory_delete_range");
         assert_eq!(request.tools[4].name, "memory_put_many");
+        assert_eq!(request.tools[5].name, "checkpoint_put");
+        assert_eq!(request.tools[6].name, "checkpoint_list");
     }
 
     #[test]
@@ -10188,6 +10507,41 @@ ENTRYPOINT chat
             execute_builtin_tool(&session, "memory_list_range", r#"{"namespace":"profile"}"#)
                 .unwrap();
         assert_eq!(remaining.stdout, "profile:a = one\nprofile:c = three");
+    }
+
+    #[test]
+    fn execute_builtin_checkpoint_tools() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT SESSION sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let put = execute_builtin_tool(
+            &session,
+            "checkpoint_put",
+            r#"{"name":"fetch-users","value":"{\"page\":2}"}"#,
+        )
+        .unwrap();
+        assert_eq!(put.stdout, "Stored checkpoint `fetch-users`");
+
+        let get =
+            execute_builtin_tool(&session, "checkpoint_get", r#"{"name":"fetch-users"}"#).unwrap();
+        assert_eq!(get.stdout, r#"fetch-users = {"page":2}"#);
+
+        let list =
+            execute_builtin_tool(&session, "checkpoint_list", r#"{"prefix":"fetch"}"#).unwrap();
+        assert_eq!(list.stdout, r#"fetch-users = {"page":2}"#);
+
+        let delete =
+            execute_builtin_tool(&session, "checkpoint_delete", r#"{"name":"fetch-users"}"#)
+                .unwrap();
+        assert_eq!(delete.stdout, "Deleted checkpoint `fetch-users`");
     }
 
     #[test]
