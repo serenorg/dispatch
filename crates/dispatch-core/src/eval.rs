@@ -29,6 +29,8 @@ pub struct EvalSpec {
     #[serde(default)]
     pub expects_tools: Vec<String>,
     #[serde(default)]
+    pub expects_no_tool: bool,
+    #[serde(default)]
     pub expects_tool_stdout_contains: Option<ToolTextExpectation>,
     #[serde(default)]
     pub expects_tool_stderr_contains: Option<ToolTextExpectation>,
@@ -185,5 +187,35 @@ mod tests {
                 exit_code: 0,
             })
         );
+    }
+
+    #[test]
+    fn load_parcel_evals_supports_expects_no_tool() {
+        let dir = tempdir().unwrap();
+        let context_dir = dir.path().join("image");
+        fs::create_dir_all(context_dir.join("evals")).unwrap();
+        fs::write(
+            context_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nEVAL evals/no-tool.eval\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+        fs::write(
+            context_dir.join("evals/no-tool.eval"),
+            "name = \"no-tool\"\ninput = \"hi\"\nexpects_no_tool = true\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &context_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: context_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let parcel = load_parcel(&built.parcel_dir).unwrap();
+        let evals = load_parcel_evals(&parcel).unwrap();
+
+        assert_eq!(evals.len(), 1);
+        assert!(evals[0].1.expects_no_tool);
     }
 }

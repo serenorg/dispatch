@@ -322,6 +322,7 @@ expects_text_exact = "plugin reply"
 
 `dispatch eval` runs those packaged cases against a live courier and reports pass/fail per case.
 Tool result assertions can be either a plain value or a tool-scoped object, so multi-tool evals can target one tool explicitly.
+`expects_no_tool = true` can be used for cases that should complete without invoking any tool.
 
 Parcel format compatibility:
 
@@ -366,8 +367,10 @@ Supported backends:
 - `--job <payload>` - execute the parcel `job` entrypoint
 - `--heartbeat [payload]` - execute the parcel `heartbeat` entrypoint
 - `--print-prompt` - resolve and print the courier prompt stack
-- `--list-tools` - list declared local tools
+- `--list-tools` - list declared tools
+- `--json` - when combined with `--list-tools`, print full tool metadata as JSON
 - `--tool <name>` - execute one declared local tool
+- `--tool-approval <ask|always|never>` - control how `APPROVAL confirm` tools are handled at the CLI
 - `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
 
 ## Courier Architecture

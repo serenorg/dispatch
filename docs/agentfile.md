@@ -420,6 +420,11 @@ Supported clauses:
 - `DESCRIPTION "..."` for model/tooling guidance
 - `SCHEMA <file>` to package a JSON input schema for structured tool invocation
 
+Reference implementation note:
+
+- the CLI honors `APPROVAL confirm` for direct `dispatch run --tool ...` execution and for model-driven tool calls during `dispatch run`
+- use `--tool-approval ask|always|never` to control how interactive approval is handled at the CLI boundary
+
 #### `TOOL BUILTIN`
 
 ```dockerfile
@@ -654,6 +659,7 @@ Supported fields in the reference runner:
 - `name`
 - `input`
 - `entrypoint` (`chat`, `job`, or `heartbeat`; defaults to the parcel entrypoint or `chat`)
+- `expects_no_tool`
 - `expects_tool`
 - `expects_tools`
 - `expects_tool_count`
@@ -679,6 +685,7 @@ Run packaged evals with:
 ```bash
 dispatch eval <parcel-or-source>
 dispatch eval <parcel-or-source> --courier wasm
+dispatch eval <parcel-or-source> --tool-approval never
 ```
 
 #### `TEST`

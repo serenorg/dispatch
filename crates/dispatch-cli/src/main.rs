@@ -8,12 +8,12 @@ mod state;
 mod tool_display;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use dispatch_core::{
     A2aOperatorPolicyOverrides, BuildOptions, Level, build_agentfile, parse_agentfile,
     validate_agentfile_at_path, with_a2a_operator_policy_overrides,
 };
-use std::{fs, path::PathBuf};
+use std::{fs, io::IsTerminal, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "dispatch")]
@@ -60,6 +60,9 @@ enum Command {
         /// Output directory for built parcels when evaluating an Agentfile source
         #[arg(long)]
         output_dir: Option<PathBuf>,
+        /// How to handle tools declared with `APPROVAL confirm`
+        #[arg(long, value_enum)]
+        tool_approval: Option<CliToolApprovalMode>,
         /// Override allowed outbound A2A origins or hostnames for this command
         #[arg(long)]
         a2a_allowed_origins: Option<String>,
@@ -182,12 +185,18 @@ struct RunArgs {
     /// List declared local tools
     #[arg(long)]
     list_tools: bool,
+    /// Print machine-readable JSON when used with `--list-tools`
+    #[arg(long)]
+    json: bool,
     /// Execute a declared local tool by alias
     #[arg(long)]
     tool: Option<String>,
     /// Pass raw input to the tool via stdin and `TOOL_INPUT`
     #[arg(long)]
     input: Option<String>,
+    /// How to handle tools declared with `APPROVAL confirm`
+    #[arg(long, value_enum)]
+    tool_approval: Option<CliToolApprovalMode>,
     /// Override allowed outbound A2A origins or hostnames for this command
     #[arg(long)]
     a2a_allowed_origins: Option<String>,
@@ -251,6 +260,95 @@ pub(crate) struct CliA2aPolicy {
     pub trust_policy: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliToolApprovalMode {
+    Ask,
+    Always,
+    Never,
+}
+
+pub(crate) fn resolve_run_tool_approval_mode(
+    requested: Option<CliToolApprovalMode>,
+) -> CliToolApprovalMode {
+    requested.unwrap_or_else(|| {
+        if std::io::stdin().is_terminal() {
+            CliToolApprovalMode::Ask
+        } else {
+            CliToolApprovalMode::Never
+        }
+    })
+}
+
+pub(crate) fn resolve_noninteractive_tool_approval_mode(
+    requested: Option<CliToolApprovalMode>,
+) -> CliToolApprovalMode {
+    requested.unwrap_or(CliToolApprovalMode::Never)
+}
+
+pub(crate) fn with_cli_tool_approval<T>(
+    mode: CliToolApprovalMode,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match mode {
+        CliToolApprovalMode::Always => dispatch_core::with_tool_approval_handler(
+            |_| Ok(dispatch_core::ToolApprovalDecision::Approve),
+            f,
+        ),
+        CliToolApprovalMode::Never => dispatch_core::with_tool_approval_handler(
+            |_| Ok(dispatch_core::ToolApprovalDecision::Deny),
+            f,
+        ),
+        CliToolApprovalMode::Ask => dispatch_core::with_tool_approval_handler(
+            |request| prompt_for_tool_approval(request).map_err(|error| error.to_string()),
+            f,
+        ),
+    }
+}
+
+fn prompt_for_tool_approval(
+    request: &dispatch_core::ToolApprovalRequest,
+) -> Result<dispatch_core::ToolApprovalDecision> {
+    use std::io::{self, Write as _};
+
+    let risk = request
+        .risk
+        .map(|risk| format!("{risk:?}").to_ascii_lowercase())
+        .unwrap_or_else(|| "unspecified".to_string());
+    eprintln!("Tool `{}` requires approval.", request.tool);
+    eprintln!("kind={:?} risk={risk}", request.kind);
+    eprintln!("command={} {}", request.command, request.args.join(" "));
+    if let Some(description) = &request.description {
+        eprintln!("description={description}");
+    }
+    if let Some(skill_source) = &request.skill_source {
+        eprintln!("skill_source={skill_source}");
+    }
+    if let Some(input) = &request.input
+        && !input.is_empty()
+    {
+        eprintln!("input={}", truncate_tool_approval_input(input));
+    }
+    eprint!("Approve? [y/N] ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let decision = match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => dispatch_core::ToolApprovalDecision::Approve,
+        _ => dispatch_core::ToolApprovalDecision::Deny,
+    };
+    Ok(decision)
+}
+
+fn truncate_tool_approval_input(input: &str) -> String {
+    const LIMIT: usize = 200;
+    let truncated = input.chars().take(LIMIT).collect::<String>();
+    if truncated.len() == input.len() {
+        truncated
+    } else {
+        format!("{truncated}...")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum StateCommand {
     /// List local state directories keyed by parcel digest
@@ -304,6 +402,7 @@ fn main() -> Result<()> {
             registry,
             json,
             output_dir,
+            tool_approval,
             a2a_allowed_origins,
             a2a_trust_policy,
         } => eval::eval(
@@ -312,6 +411,7 @@ fn main() -> Result<()> {
             registry,
             json,
             output_dir,
+            resolve_noninteractive_tool_approval_mode(tool_approval),
             CliA2aPolicy {
                 allowed_origins: a2a_allowed_origins,
                 trust_policy: a2a_trust_policy,
@@ -454,7 +554,7 @@ fn state_command(command: StateCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, CliA2aPolicy, Command, CourierCommand, StateCommand};
+    use super::{Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, StateCommand};
     use clap::Parser;
     use dispatch_core::{
         BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
@@ -1002,8 +1102,10 @@ mod tests {
             interactive: false,
             print_prompt: false,
             list_tools: false,
+            json: false,
             tool: None,
             input: None,
+            tool_approval: None,
             a2a_allowed_origins: None,
             a2a_trust_policy: None,
         })
@@ -1060,6 +1162,7 @@ mod tests {
             Some(registry_path),
             false,
             None,
+            CliToolApprovalMode::Never,
             CliA2aPolicy::default(),
         )
         .unwrap();
@@ -1092,6 +1195,7 @@ mod tests {
             Some(registry_path),
             false,
             None,
+            CliToolApprovalMode::Never,
             CliA2aPolicy::default(),
         )
         .unwrap_err();

@@ -1,7 +1,7 @@
 use crate::{
     manifest::{
         A2aAuthScheme, A2aEndpointMode, BuiltinToolConfig, InstructionKind, ModelReference,
-        MountConfig, MountKind, ParcelManifest, ToolConfig,
+        MountConfig, MountKind, ParcelManifest, ToolApprovalPolicy, ToolConfig, ToolRiskLevel,
     },
     plugin_protocol::{PluginRequest, PluginRequestEnvelope, PluginResponse},
     plugins::CourierPluginManifest,
@@ -22,6 +22,7 @@ use std::{
     io::{BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    rc::Rc,
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, mpsc},
@@ -46,7 +47,13 @@ thread_local! {
     static A2A_OPERATOR_POLICY_OVERRIDES: RefCell<Option<A2aOperatorPolicyOverrides>> = const {
         RefCell::new(None)
     };
+    static TOOL_APPROVAL_HANDLER: RefCell<Option<Rc<ToolApprovalHandler>>> = const {
+        RefCell::new(None)
+    };
 }
+
+type ToolApprovalHandler =
+    dyn Fn(&ToolApprovalRequest) -> Result<ToolApprovalDecision, String> + 'static;
 
 pub(crate) fn a2a_origin_for_trust(url: &url::Url) -> Option<String> {
     a2a::a2a_origin(url)
@@ -121,6 +128,12 @@ pub enum CourierError {
     },
     #[error("required secret `{name}` is not present in the environment")]
     MissingSecret { name: String },
+    #[error("tool `{tool}` requires APPROVAL confirm")]
+    ApprovalRequired { tool: String },
+    #[error("tool `{tool}` was denied by the approval handler")]
+    ApprovalDenied { tool: String },
+    #[error("tool `{tool}` approval failed: {message}")]
+    ApprovalFailed { tool: String, message: String },
     #[error("parcel manifest `{path}` does not conform to the Dispatch parcel schema: {message}")]
     InvalidParcelSchema { path: String, message: String },
     #[error("courier `{courier}` does not support mount `{kind:?}` with driver `{driver}`")]
@@ -325,6 +338,18 @@ pub fn with_a2a_operator_policy_overrides<T>(
     })
 }
 
+pub fn with_tool_approval_handler<T>(
+    handler: impl Fn(&ToolApprovalRequest) -> Result<ToolApprovalDecision, String> + 'static,
+    f: impl FnOnce() -> T,
+) -> T {
+    TOOL_APPROVAL_HANDLER.with(|slot| {
+        let previous = slot.replace(Some(Rc::new(handler)));
+        let result = f();
+        slot.replace(previous);
+        result
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalToolTransport {
@@ -352,6 +377,8 @@ pub enum LocalToolTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalToolSpec {
     pub alias: String,
+    pub approval: Option<ToolApprovalPolicy>,
+    pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
@@ -466,13 +493,50 @@ impl LocalToolSpec {
     pub fn matches_name(&self, tool_name: &str) -> bool {
         self.alias == tool_name || self.packaged_path().is_some_and(|path| path == tool_name)
     }
+
+    pub fn approval_kind(&self) -> ToolApprovalTargetKind {
+        match self.target {
+            LocalToolTarget::Local { .. } => ToolApprovalTargetKind::Local,
+            LocalToolTarget::A2a { .. } => ToolApprovalTargetKind::A2a,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuiltinToolSpec {
     pub capability: String,
+    pub approval: Option<ToolApprovalPolicy>,
+    pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalTargetKind {
+    Local,
+    Builtin,
+    A2a,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalDecision {
+    Approve,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolApprovalRequest {
+    pub tool: String,
+    pub kind: ToolApprovalTargetKind,
+    pub command: String,
+    pub args: Vec<String>,
+    pub approval: ToolApprovalPolicy,
+    pub risk: Option<ToolRiskLevel>,
+    pub description: Option<String>,
+    pub skill_source: Option<String>,
+    pub input: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1350,6 +1414,8 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
         .filter_map(|tool| match tool {
             ToolConfig::Local(local) => Some(LocalToolSpec {
                 alias: local.alias.clone(),
+                approval: local.approval,
+                risk: local.risk,
                 description: local.description.clone(),
                 input_schema_packaged_path: local
                     .input_schema
@@ -1368,6 +1434,8 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
             }),
             ToolConfig::A2a(a2a) => Some(LocalToolSpec {
                 alias: a2a.alias.clone(),
+                approval: a2a.approval,
+                risk: a2a.risk,
                 description: a2a.description.clone(),
                 input_schema_packaged_path: a2a
                     .input_schema
@@ -1407,6 +1475,8 @@ fn builtin_memory_tool_spec(tool: &BuiltinToolConfig) -> Option<BuiltinToolSpec>
     let input_schema = builtin_memory_tool_schema(&tool.capability)?;
     Some(BuiltinToolSpec {
         capability: tool.capability.clone(),
+        approval: tool.approval,
+        risk: tool.risk,
         description: tool.description.clone(),
         input_schema,
     })
@@ -1493,6 +1563,11 @@ where
     F: FnMut(&str) -> Option<String> + Copy,
 {
     let tool = resolve_local_tool_with_env(parcel, tool_name, env_lookup)?;
+    if let Some(request) = build_local_tool_approval_request(&tool, input)
+        && !check_tool_approval(&request)?
+    {
+        return Err(CourierError::ApprovalDenied { tool: request.tool });
+    }
 
     execute_local_tool_with_env(parcel, &tool, input, None, env_lookup)
 }
@@ -2649,6 +2724,76 @@ fn execute_host_local_tool(
     }
 }
 
+fn check_tool_approval(request: &ToolApprovalRequest) -> Result<bool, CourierError> {
+    match request.approval {
+        ToolApprovalPolicy::Never | ToolApprovalPolicy::Always | ToolApprovalPolicy::Audit => {
+            Ok(true)
+        }
+        ToolApprovalPolicy::Confirm => TOOL_APPROVAL_HANDLER.with(|slot| {
+            let Some(handler) = slot.borrow().as_ref().cloned() else {
+                return Err(CourierError::ApprovalRequired {
+                    tool: request.tool.clone(),
+                });
+            };
+            match handler(request) {
+                Ok(ToolApprovalDecision::Approve) => Ok(true),
+                Ok(ToolApprovalDecision::Deny) => Ok(false),
+                Err(message) => Err(CourierError::ApprovalFailed {
+                    tool: request.tool.clone(),
+                    message,
+                }),
+            }
+        }),
+    }
+}
+
+fn build_local_tool_approval_request(
+    tool: &LocalToolSpec,
+    input: Option<&str>,
+) -> Option<ToolApprovalRequest> {
+    let approval = tool.approval?;
+    Some(ToolApprovalRequest {
+        tool: tool.alias.clone(),
+        kind: tool.approval_kind(),
+        command: tool.command().to_string(),
+        args: tool.args().to_vec(),
+        approval,
+        risk: tool.risk,
+        description: tool.description.clone(),
+        skill_source: tool.skill_source.clone(),
+        input: input.map(|value| value.to_string()),
+    })
+}
+
+fn build_builtin_tool_approval_request(
+    tool: &BuiltinToolSpec,
+    input: Option<&str>,
+) -> Option<ToolApprovalRequest> {
+    let approval = tool.approval?;
+    Some(ToolApprovalRequest {
+        tool: tool.capability.clone(),
+        kind: ToolApprovalTargetKind::Builtin,
+        command: "dispatch-builtin".to_string(),
+        args: vec![tool.capability.clone()],
+        approval,
+        risk: tool.risk,
+        description: tool.description.clone(),
+        skill_source: None,
+        input: input.map(|value| value.to_string()),
+    })
+}
+
+fn denied_tool_run_result(request: &ToolApprovalRequest) -> ToolRunResult {
+    ToolRunResult {
+        tool: request.tool.clone(),
+        command: request.command.clone(),
+        args: request.args.clone(),
+        exit_code: 126,
+        stdout: String::new(),
+        stderr: format!("tool `{}` was denied by APPROVAL confirm", request.tool),
+    }
+}
+
 impl CourierBackend for NativeCourier {
     fn id(&self) -> &str {
         "native"
@@ -2781,6 +2926,12 @@ impl CourierBackend for NativeCourier {
                 }),
                 CourierOperation::InvokeTool { invocation } => {
                     let tool = resolve_local_tool(image, &invocation.name)?;
+                    if let Some(request) =
+                        build_local_tool_approval_request(&tool, invocation.input.as_deref())
+                        && !check_tool_approval(&request)?
+                    {
+                        return Err(CourierError::ApprovalDenied { tool: request.tool });
+                    }
                     let result = execute_host_local_tool(
                         image,
                         &tool,
@@ -3017,6 +3168,12 @@ impl CourierBackend for DockerCourier {
                 }),
                 CourierOperation::InvokeTool { invocation } => {
                     let tool = resolve_local_tool(image, &invocation.name)?;
+                    if let Some(request) =
+                        build_local_tool_approval_request(&tool, invocation.input.as_deref())
+                        && !check_tool_approval(&request)?
+                    {
+                        return Err(CourierError::ApprovalDenied { tool: request.tool });
+                    }
                     let result = execute_local_tool_in_docker(
                         image,
                         &tool,
@@ -3910,6 +4067,12 @@ impl CourierBackend for WasmCourier {
                 CourierOperation::InvokeTool { invocation } => {
                     session.turn_count += 1;
                     let tool = resolve_local_tool(&parcel, &invocation.name)?;
+                    if let Some(request) =
+                        build_local_tool_approval_request(&tool, invocation.input.as_deref())
+                        && !check_tool_approval(&request)?
+                    {
+                        return Err(CourierError::ApprovalDenied { tool: request.tool });
+                    }
                     let result = execute_host_local_tool(
                         &parcel,
                         &tool,
@@ -4774,13 +4937,29 @@ fn execute_host_turn(
                             command: tool.command().to_string(),
                             args: tool.args().to_vec(),
                         });
-                        execute_host_local_tool(
-                            image,
-                            tool,
-                            Some(normalized_input.as_ref()),
-                            context.tool_runner,
-                            context.run_deadline,
-                        )?
+                        if let Some(request) =
+                            build_local_tool_approval_request(tool, Some(normalized_input.as_ref()))
+                        {
+                            if check_tool_approval(&request)? {
+                                execute_host_local_tool(
+                                    image,
+                                    tool,
+                                    Some(normalized_input.as_ref()),
+                                    context.tool_runner,
+                                    context.run_deadline,
+                                )?
+                            } else {
+                                denied_tool_run_result(&request)
+                            }
+                        } else {
+                            execute_host_local_tool(
+                                image,
+                                tool,
+                                Some(normalized_input.as_ref()),
+                                context.tool_runner,
+                                context.run_deadline,
+                            )?
+                        }
                     } else if let Some(tool) = builtin_tools
                         .iter()
                         .find(|tool| tool.capability == tool_call.name)
@@ -4790,7 +4969,18 @@ fn execute_host_turn(
                             command: "dispatch-builtin".to_string(),
                             args: vec![tool.capability.clone()],
                         });
-                        execute_builtin_tool(session, &tool.capability, &tool_call.input)?
+                        if let Some(request) = build_builtin_tool_approval_request(
+                            tool,
+                            Some(tool_call.input.as_str()),
+                        ) {
+                            if check_tool_approval(&request)? {
+                                execute_builtin_tool(session, &tool.capability, &tool_call.input)?
+                            } else {
+                                denied_tool_run_result(&request)
+                            }
+                        } else {
+                            execute_builtin_tool(session, &tool.capability, &tool_call.input)?
+                        }
                     } else {
                         return Err(CourierError::UnknownLocalTool {
                             tool: tool_call.name.clone(),
@@ -6490,6 +6680,8 @@ ENTRYPOINT job
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
+            approval: None,
+            risk: None,
             skill_source: None,
             target: LocalToolTarget::A2a {
                 endpoint_url: server.base_url.clone(),
@@ -8756,6 +8948,8 @@ ENTRYPOINT chat
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
+            approval: None,
+            risk: None,
             skill_source: None,
             target: LocalToolTarget::Local {
                 packaged_path: "tools/demo.sh".to_string(),
@@ -9337,6 +9531,102 @@ ENTRYPOINT chat
                 if content.contains("Native chat reference reply")
         ));
         assert_eq!(backend.calls.lock().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn run_local_tool_requires_approval_handler_for_confirm_policy() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
+ENTRYPOINT chat
+",
+            &[("tools/demo.sh", "printf ok")],
+        );
+
+        let error = run_local_tool(&test_image.image, "demo", Some("hello")).unwrap_err();
+        assert!(matches!(error, CourierError::ApprovalRequired { ref tool } if tool == "demo"));
+    }
+
+    #[test]
+    fn run_local_tool_can_be_denied_by_approval_handler() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
+ENTRYPOINT chat
+",
+            &[("tools/demo.sh", "printf ok")],
+        );
+
+        let error = with_tool_approval_handler(
+            |_| Ok(ToolApprovalDecision::Deny),
+            || run_local_tool(&test_image.image, "demo", Some("hello")),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CourierError::ApprovalDenied { ref tool } if tool == "demo"));
+    }
+
+    #[test]
+    fn native_courier_chat_reports_denied_tool_calls() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
+ENTRYPOINT chat
+",
+            &[("tools/demo.sh", "printf 'tool-output'")],
+        );
+        let backend = Arc::new(FakeChatBackend::with_replies(vec![
+            Some(ModelReply {
+                text: None,
+                backend: "fake".to_string(),
+                response_id: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "demo".to_string(),
+                    input: "{\"query\":\"ping\"}".to_string(),
+                    kind: ModelToolKind::Custom,
+                }],
+            }),
+            Some(ModelReply {
+                text: Some("final reply".to_string()),
+                backend: "fake".to_string(),
+                response_id: None,
+                tool_calls: Vec::new(),
+            }),
+        ]));
+        let courier = NativeCourier::with_chat_backend(backend);
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = with_tool_approval_handler(
+            |_| Ok(ToolApprovalDecision::Deny),
+            || {
+                futures::executor::block_on(courier.run(
+                    &test_image.image,
+                    CourierRequest {
+                        session,
+                        operation: CourierOperation::Chat {
+                            input: "try the tool".to_string(),
+                        },
+                    },
+                ))
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            response.events.get(1),
+            Some(CourierEvent::ToolCallFinished { result })
+                if result.tool == "demo"
+                    && result.exit_code == 126
+                    && result.stderr.contains("denied by APPROVAL confirm")
+        ));
+        assert!(matches!(
+            response.events.iter().rev().nth(1),
+            Some(CourierEvent::Message { content, .. }) if content == "final reply"
+        ));
     }
 
     #[test]
