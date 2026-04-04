@@ -11,8 +11,8 @@ use crate::{
     },
     parse_agentfile,
     skill::{
-        DispatchSkillManifest, DispatchSkillTool, dispatch_skill_manifest_path,
-        parse_skill_markdown, validate_agent_skill_frontmatter,
+        DispatchSkillManifest, DispatchSkillTool, allowed_tool_warnings,
+        dispatch_skill_manifest_path, parse_skill_markdown, validate_agent_skill_frontmatter,
     },
     validate::{Level, validate_agentfile},
 };
@@ -168,6 +168,7 @@ struct ResolvedAgentSpec {
     network: Vec<NetworkRule>,
     labels: BTreeMap<String, String>,
     entrypoint_declared: bool,
+    skill_tool_aliases: BTreeMap<String, Vec<String>>,
     warnings: Vec<String>,
 }
 
@@ -395,6 +396,12 @@ pub fn build_agentfile(
             _ => {}
         }
     }
+
+    resolved.warnings.extend(skill_allowed_tool_build_warnings(
+        &resolved.instructions,
+        &resolved.skill_tool_aliases,
+        &resolved.tools,
+    ));
 
     files.sort_by(|left, right| left.packaged_as.cmp(&right.packaged_as));
     for pair in files.windows(2) {
@@ -845,6 +852,12 @@ fn process_skill_instruction(
             }
         }
 
+        resolved
+            .skill_tool_aliases
+            .entry(parsed_skill.frontmatter.name.clone())
+            .or_default()
+            .extend(skill_manifest.tools.iter().map(|tool| tool.name.clone()));
+
         for skill_tool in skill_manifest.tools {
             let mut tool = synthesize_skill_tool(
                 context_dir,
@@ -1064,6 +1077,44 @@ fn tool_skill_source(tool: &ToolConfig) -> Option<&str> {
     match tool {
         ToolConfig::Local(local) => local.skill_source.as_deref(),
         ToolConfig::Builtin(_) | ToolConfig::Mcp(_) | ToolConfig::A2a(_) => None,
+    }
+}
+
+fn skill_allowed_tool_build_warnings(
+    instructions: &[InstructionConfig],
+    skill_tool_aliases: &BTreeMap<String, Vec<String>>,
+    tools: &[ToolConfig],
+) -> Vec<String> {
+    let parcel_tool_names = tools
+        .iter()
+        .filter_map(model_visible_tool_name)
+        .map(ToOwned::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    instructions
+        .iter()
+        .filter_map(|instruction| {
+            instruction
+                .skill_name
+                .as_ref()
+                .map(|skill_name| (skill_name, instruction.allowed_tools.as_deref()))
+        })
+        .flat_map(|(skill_name, allowed_tools)| {
+            let own_aliases = skill_tool_aliases
+                .get(skill_name)
+                .map(|aliases| aliases.as_slice())
+                .unwrap_or(&[]);
+            allowed_tool_warnings(skill_name, allowed_tools, own_aliases, &parcel_tool_names)
+        })
+        .collect()
+}
+
+fn model_visible_tool_name(tool: &ToolConfig) -> Option<&str> {
+    match tool {
+        ToolConfig::Local(local) => Some(local.alias.as_str()),
+        ToolConfig::Builtin(builtin) => Some(builtin.capability.as_str()),
+        ToolConfig::A2a(tool) => Some(tool.alias.as_str()),
+        ToolConfig::Mcp(_) => None,
     }
 }
 
@@ -1936,6 +1987,47 @@ ENTRYPOINT chat
         assert_eq!(
             parcel.instructions[0].allowed_tools.as_deref(),
             Some(&["Bash".to_string(), "Grep".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn build_warns_on_skill_allowed_tools_mismatches() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\nallowed-tools:\n  - Bash\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            built.warnings,
+            vec![
+                "skill `file-analyst` declares allowed-tools entry `Bash` but no tool with that name exists in the built parcel"
+                    .to_string(),
+                "skill `file-analyst` synthesizes tool `read_file` but its allowed-tools list does not include that alias"
+                    .to_string(),
+            ]
         );
     }
 

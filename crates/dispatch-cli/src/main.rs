@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dispatch_core::{
     A2aOperatorPolicyOverrides, BuildOptions, Level, build_agentfile, parse_agentfile,
-    validate_agentfile, with_a2a_operator_policy_overrides,
+    validate_agentfile_at_path, with_a2a_operator_policy_overrides,
 };
 use std::{fs, path::PathBuf};
 
@@ -365,7 +365,7 @@ fn lint(path: PathBuf, emit_json: bool) -> Result<()> {
 
     let parsed =
         parse_agentfile(&source).with_context(|| format!("failed to parse {}", path.display()))?;
-    let report = validate_agentfile(&parsed);
+    let report = validate_agentfile_at_path(&path, &parsed);
 
     if emit_json {
         println!("{}", serde_json::to_string_pretty(&parsed)?);

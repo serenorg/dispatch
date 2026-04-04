@@ -1,6 +1,9 @@
 use crate::manifest::{ToolApprovalPolicy, ToolRiskLevel};
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentSkillFrontmatter {
@@ -86,6 +89,38 @@ pub(crate) fn validate_agent_skill_frontmatter(
     validate_skill_compatibility(frontmatter.compatibility.as_deref())?;
     validate_allowed_tools(frontmatter.allowed_tools.as_deref())?;
     Ok(())
+}
+
+pub(crate) fn allowed_tool_warnings(
+    skill_name: &str,
+    allowed_tools: Option<&[String]>,
+    own_tool_aliases: &[String],
+    parcel_tool_names: &BTreeSet<String>,
+) -> Vec<String> {
+    let Some(allowed_tools) = allowed_tools else {
+        return Vec::new();
+    };
+
+    let allowed_set = allowed_tools.iter().cloned().collect::<BTreeSet<_>>();
+    let mut warnings = Vec::new();
+
+    for allowed_tool in allowed_tools {
+        if !parcel_tool_names.contains(allowed_tool) {
+            warnings.push(format!(
+                "skill `{skill_name}` declares allowed-tools entry `{allowed_tool}` but no tool with that name exists in the built parcel"
+            ));
+        }
+    }
+
+    for own_tool in own_tool_aliases {
+        if !allowed_set.contains(own_tool) {
+            warnings.push(format!(
+                "skill `{skill_name}` synthesizes tool `{own_tool}` but its allowed-tools list does not include that alias"
+            ));
+        }
+    }
+
+    warnings
 }
 
 fn validate_skill_name_matches_dir(skill_dir: &Path, name: &str) -> Result<(), String> {

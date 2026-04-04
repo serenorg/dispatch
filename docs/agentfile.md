@@ -250,7 +250,7 @@ Semantics:
 - `dispatch.toml` is a reserved filename inside skill directories; if it exists, Dispatch treats it as the sidecar unless frontmatter points at a different file
 - the sidecar may also declare a default `entrypoint = "chat" | "job" | "heartbeat"` when the `Agentfile` does not set `ENTRYPOINT`
 - built parcels preserve skill annotations such as `allowed-tools` as structured lists, and skill-generated tools keep `skill_source` provenance using the skill's canonical `name`
-- `allowed-tools` is currently stored as informational parcel metadata for interoperability and downstream policy engines; the reference courier does not enforce it yet
+- `allowed-tools` is currently stored as informational parcel metadata for interoperability and downstream policy engines; the reference courier does not enforce it yet, but `dispatch lint` and `dispatch build` warn about obvious mismatches
 - if the `Agentfile` later declares `TOOL ...` with the same alias as a skill-generated tool, the explicit `TOOL` declaration wins
 - duplicate explicit tool aliases fail the build
 - if multiple skills declare the same tool alias, Dispatch fails the build instead of picking one silently

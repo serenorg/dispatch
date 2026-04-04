@@ -62,4 +62,6 @@ pub use trust::{
     A2aTrustPolicy, A2aTrustRequirement, A2aTrustRule, PullTrustPolicy, PullTrustRequirement,
     PullTrustRule, TrustPolicyError,
 };
-pub use validate::{Diagnostic, Level, ValidationReport, validate_agentfile};
+pub use validate::{
+    Diagnostic, Level, ValidationReport, validate_agentfile, validate_agentfile_at_path,
+};
