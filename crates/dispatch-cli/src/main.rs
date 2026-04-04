@@ -26,120 +26,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Validate an Agentfile
-    Lint {
-        /// Path to an Agentfile or a directory containing one
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Print the parsed AST as JSON
-        #[arg(long)]
-        json: bool,
+    /// Manage parcel sources, signatures, and built artifacts
+    Parcel {
+        #[command(subcommand)]
+        command: ParcelCommand,
     },
-    /// Build an immutable agent parcel
-    Build {
-        /// Path to an Agentfile or a directory containing one
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Output directory for built parcels
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-    },
+    #[command(hide = true)]
+    Lint(LintArgs),
+    #[command(hide = true)]
+    Build(BuildArgs),
     /// Execute packaged evals against a live courier
-    Eval {
-        /// Path to a built parcel, Agentfile, or directory containing one
-        #[arg(default_value = ".")]
-        path: PathBuf,
-        /// Courier backend to use for eval execution
-        #[arg(long = "courier", default_value = "native")]
-        courier: String,
-        /// Override the courier plugin registry path
-        #[arg(long)]
-        registry: Option<PathBuf>,
-        /// Print full eval report as JSON
-        #[arg(long)]
-        json: bool,
-        /// Output directory for built parcels when evaluating an Agentfile source
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-        /// How to handle tools declared with `APPROVAL confirm`
-        #[arg(long, value_enum)]
-        tool_approval: Option<CliToolApprovalMode>,
-        /// Override allowed outbound A2A origins or hostnames for this command
-        #[arg(long)]
-        a2a_allowed_origins: Option<String>,
-        /// Apply a structured A2A trust policy file for this command
-        #[arg(long)]
-        a2a_trust_policy: Option<PathBuf>,
+    Eval(EvalArgs),
+    #[command(hide = true)]
+    Inspect(InspectArgs),
+    #[command(hide = true)]
+    Verify(VerifyArgs),
+    #[command(hide = true)]
+    Keygen(KeygenArgs),
+    #[command(hide = true)]
+    Sign(SignArgs),
+    /// Manage parcel distribution to and from depots
+    Depot {
+        #[command(subcommand)]
+        command: DepotCommand,
     },
-    /// Inspect a built parcel
-    Inspect {
-        /// Path to a parcel directory or a `manifest.json` file
-        path: PathBuf,
-        /// Validate and inspect the parcel against a specific courier backend
-        #[arg(long = "courier")]
-        courier: Option<String>,
-        /// Override the courier plugin registry path
-        #[arg(long)]
-        registry: Option<PathBuf>,
-        /// Print full JSON instead of a summary
-        #[arg(long)]
-        json: bool,
-    },
-    /// Verify parcel digest, lockfile, and packaged file integrity
-    Verify {
-        /// Path to a parcel directory or a `manifest.json` file
-        path: PathBuf,
-        /// Verify a detached parcel signature with the given public key file.
-        #[arg(long = "public-key")]
-        public_keys: Vec<PathBuf>,
-        /// Print full verification report as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Generate an Ed25519 signing keypair for parcel signatures
-    Keygen {
-        /// Stable key identifier used in detached signature filenames
-        #[arg(long)]
-        key_id: String,
-        /// Output directory for generated key files
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-    },
-    /// Sign a parcel with a detached signature file
-    Sign {
-        /// Path to a parcel directory or a `manifest.json` file
-        path: PathBuf,
-        /// Path to a generated secret key JSON file
-        #[arg(long = "secret-key")]
-        secret_key: PathBuf,
-    },
-    /// Push a built parcel to a depot reference
-    Push {
-        /// Path to a parcel directory or a `manifest.json` file
-        path: PathBuf,
-        /// Depot reference, e.g. `file:///tmp/depot::org/parcel:v1`
-        reference: String,
-        /// Print full JSON instead of a summary
-        #[arg(long)]
-        json: bool,
-    },
-    /// Pull a parcel from a depot reference
-    Pull {
-        /// Depot reference, e.g. `file:///tmp/depot::org/parcel:v1`
-        reference: String,
-        /// Output directory for pulled parcels
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-        /// Verify detached parcel signatures immediately after pull
-        #[arg(long = "public-key")]
-        public_keys: Vec<PathBuf>,
-        /// Apply a trust policy file that matches reference prefixes to public keys
-        #[arg(long)]
-        trust_policy: Option<PathBuf>,
-        /// Print full JSON instead of a summary
-        #[arg(long)]
-        json: bool,
-    },
+    #[command(hide = true)]
+    Push(PushArgs),
+    #[command(hide = true)]
+    Pull(PullArgs),
     /// Execute part of a built parcel locally
     Run(RunArgs),
     /// Manage Agent Skills bundles and skill execution
@@ -157,6 +71,129 @@ enum Command {
         #[command(subcommand)]
         command: StateCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct LintArgs {
+    /// Path to an Agentfile or a directory containing one
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Print the parsed AST as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct BuildArgs {
+    /// Path to an Agentfile or a directory containing one
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Output directory for built parcels
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct EvalArgs {
+    /// Path to a built parcel, Agentfile, or directory containing one
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Courier backend to use for eval execution
+    #[arg(long = "courier", default_value = "native")]
+    courier: String,
+    /// Override the courier plugin registry path
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// Print full eval report as JSON
+    #[arg(long)]
+    json: bool,
+    /// Output directory for built parcels when evaluating an Agentfile source
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    /// How to handle tools declared with `APPROVAL confirm`
+    #[arg(long, value_enum)]
+    tool_approval: Option<CliToolApprovalMode>,
+    /// Override allowed outbound A2A origins or hostnames for this command
+    #[arg(long)]
+    a2a_allowed_origins: Option<String>,
+    /// Apply a structured A2A trust policy file for this command
+    #[arg(long)]
+    a2a_trust_policy: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// Path to a parcel directory or a `manifest.json` file
+    path: PathBuf,
+    /// Validate and inspect the parcel against a specific courier backend
+    #[arg(long = "courier")]
+    courier: Option<String>,
+    /// Override the courier plugin registry path
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// Print full JSON instead of a summary
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Path to a parcel directory or a `manifest.json` file
+    path: PathBuf,
+    /// Verify a detached parcel signature with the given public key file.
+    #[arg(long = "public-key")]
+    public_keys: Vec<PathBuf>,
+    /// Print full verification report as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct KeygenArgs {
+    /// Stable key identifier used in detached signature filenames
+    #[arg(long)]
+    key_id: String,
+    /// Output directory for generated key files
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SignArgs {
+    /// Path to a parcel directory or a `manifest.json` file
+    path: PathBuf,
+    /// Path to a generated secret key JSON file
+    #[arg(long = "secret-key")]
+    secret_key: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PushArgs {
+    /// Path to a parcel directory or a `manifest.json` file
+    path: PathBuf,
+    /// Depot reference, e.g. `file:///tmp/depot::org/parcel:v1`
+    reference: String,
+    /// Print full JSON instead of a summary
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PullArgs {
+    /// Depot reference, e.g. `file:///tmp/depot::org/parcel:v1`
+    reference: String,
+    /// Output directory for pulled parcels
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    /// Verify detached parcel signatures immediately after pull
+    #[arg(long = "public-key")]
+    public_keys: Vec<PathBuf>,
+    /// Apply a trust policy file that matches reference prefixes to public keys
+    #[arg(long)]
+    trust_policy: Option<PathBuf>,
+    /// Print full JSON instead of a summary
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -272,9 +309,33 @@ struct RunSkillArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ParcelCommand {
+    /// Validate an Agentfile
+    Lint(LintArgs),
+    /// Build an immutable agent parcel
+    Build(BuildArgs),
+    /// Inspect a built parcel
+    Inspect(InspectArgs),
+    /// Verify parcel digest, lockfile, and packaged file integrity
+    Verify(VerifyArgs),
+    /// Generate an Ed25519 signing keypair for parcel signatures
+    Keygen(KeygenArgs),
+    /// Sign a parcel with a detached signature file
+    Sign(SignArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum SkillCommand {
     /// Execute a skill file or Agent Skills bundle without an authored Agentfile
     Run(RunSkillArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DepotCommand {
+    /// Push a built parcel to a depot reference
+    Push(PushArgs),
+    /// Pull a parcel from a depot reference
+    Pull(PullArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -466,9 +527,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Lint { path, json } => lint(path, json),
-        Command::Build { path, output_dir } => build(path, output_dir),
-        Command::Eval {
+        Command::Parcel { command } => parcel_command(command),
+        Command::Lint(args) => parcel_command(ParcelCommand::Lint(args)),
+        Command::Build(args) => parcel_command(ParcelCommand::Build(args)),
+        Command::Eval(EvalArgs {
             path,
             courier,
             registry,
@@ -477,7 +539,7 @@ fn main() -> Result<()> {
             tool_approval,
             a2a_allowed_origins,
             a2a_trust_policy,
-        } => eval::eval(
+        }) => eval::eval(
             path,
             &courier,
             registry,
@@ -489,37 +551,58 @@ fn main() -> Result<()> {
                 trust_policy: a2a_trust_policy,
             },
         ),
-        Command::Inspect {
-            path,
-            courier,
-            registry,
-            json,
-        } => inspect::inspect(path, courier, registry, json),
-        Command::Verify {
-            path,
-            public_keys,
-            json,
-        } => parcel_ops::verify(path, public_keys, json),
-        Command::Keygen { key_id, output_dir } => parcel_ops::keygen(&key_id, output_dir),
-        Command::Sign { path, secret_key } => parcel_ops::sign(path, &secret_key),
-        Command::Push {
-            path,
-            reference,
-            json,
-        } => parcel_ops::push(path, &reference, json),
-        Command::Pull {
-            reference,
-            output_dir,
-            public_keys,
-            trust_policy,
-            json,
-        } => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
+        Command::Inspect(args) => parcel_command(ParcelCommand::Inspect(args)),
+        Command::Verify(args) => parcel_command(ParcelCommand::Verify(args)),
+        Command::Keygen(args) => parcel_command(ParcelCommand::Keygen(args)),
+        Command::Sign(args) => parcel_command(ParcelCommand::Sign(args)),
+        Command::Depot { command } => depot_command(command),
+        Command::Push(args) => depot_command(DepotCommand::Push(args)),
+        Command::Pull(args) => depot_command(DepotCommand::Pull(args)),
         Command::Run(args) => run::run(args),
         Command::Skill { command } => match command {
             SkillCommand::Run(args) => skill_run::run_skill(args),
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
+    }
+}
+
+fn parcel_command(command: ParcelCommand) -> Result<()> {
+    match command {
+        ParcelCommand::Lint(LintArgs { path, json }) => lint(path, json),
+        ParcelCommand::Build(BuildArgs { path, output_dir }) => build(path, output_dir),
+        ParcelCommand::Inspect(InspectArgs {
+            path,
+            courier,
+            registry,
+            json,
+        }) => inspect::inspect(path, courier, registry, json),
+        ParcelCommand::Verify(VerifyArgs {
+            path,
+            public_keys,
+            json,
+        }) => parcel_ops::verify(path, public_keys, json),
+        ParcelCommand::Keygen(KeygenArgs { key_id, output_dir }) => {
+            parcel_ops::keygen(&key_id, output_dir)
+        }
+        ParcelCommand::Sign(SignArgs { path, secret_key }) => parcel_ops::sign(path, &secret_key),
+    }
+}
+
+fn depot_command(command: DepotCommand) -> Result<()> {
+    match command {
+        DepotCommand::Push(PushArgs {
+            path,
+            reference,
+            json,
+        }) => parcel_ops::push(path, &reference, json),
+        DepotCommand::Pull(PullArgs {
+            reference,
+            output_dir,
+            public_keys,
+            trust_policy,
+            json,
+        }) => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
     }
 }
 
@@ -630,7 +713,9 @@ fn state_command(command: StateCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, SkillCommand, StateCommand,
+        Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, DepotCommand, EvalArgs,
+        InspectArgs, KeygenArgs, ParcelCommand, PullArgs, PushArgs, SignArgs, SkillCommand,
+        StateCommand, VerifyArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -751,11 +836,11 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Eval {
+        let Command::Eval(EvalArgs {
             a2a_allowed_origins,
             a2a_trust_policy,
             ..
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected eval command");
         };
@@ -773,6 +858,7 @@ mod tests {
     fn cli_parses_push_command() {
         let cli = Cli::try_parse_from([
             "dispatch",
+            "depot",
             "push",
             "manifest.json",
             "file:///tmp/depot::acme/monitor:v1",
@@ -780,13 +866,16 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Push {
+        let Command::Depot { command } = cli.command else {
+            panic!("expected depot command");
+        };
+        let DepotCommand::Push(PushArgs {
             path,
             reference,
             json,
-        } = cli.command
+        }) = command
         else {
-            panic!("expected push command");
+            panic!("expected depot push command");
         };
         assert_eq!(path, Path::new("manifest.json"));
         assert_eq!(reference, "file:///tmp/depot::acme/monitor:v1");
@@ -797,6 +886,7 @@ mod tests {
     fn cli_parses_pull_command_with_output_dir() {
         let cli = Cli::try_parse_from([
             "dispatch",
+            "depot",
             "pull",
             "file:///tmp/depot::acme/monitor:v1",
             "--output-dir",
@@ -805,15 +895,18 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Pull {
+        let Command::Depot { command } = cli.command else {
+            panic!("expected depot command");
+        };
+        let DepotCommand::Pull(PullArgs {
             reference,
             output_dir,
             public_keys,
             trust_policy,
             json,
-        } = cli.command
+        }) = command
         else {
-            panic!("expected pull command");
+            panic!("expected depot pull command");
         };
         assert_eq!(reference, "file:///tmp/depot::acme/monitor:v1");
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/parcels")));
@@ -915,6 +1008,7 @@ mod tests {
     fn cli_parses_verify_with_public_keys() {
         let cli = Cli::try_parse_from([
             "dispatch",
+            "parcel",
             "verify",
             "manifest.json",
             "--public-key",
@@ -924,13 +1018,16 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Verify {
+        let Command::Parcel { command } = cli.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::Verify(VerifyArgs {
             path,
             public_keys,
             json,
-        } = cli.command
+        }) = command
         else {
-            panic!("expected verify command");
+            panic!("expected parcel verify command");
         };
         assert_eq!(path, Path::new("manifest.json"));
         assert_eq!(
@@ -947,6 +1044,7 @@ mod tests {
     fn cli_parses_keygen_and_sign_commands() {
         let keygen = Cli::try_parse_from([
             "dispatch",
+            "parcel",
             "keygen",
             "--key-id",
             "release",
@@ -954,22 +1052,29 @@ mod tests {
             "/tmp/keys",
         ])
         .unwrap();
-        let Command::Keygen { key_id, output_dir } = keygen.command else {
-            panic!("expected keygen command");
+        let Command::Parcel { command } = keygen.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::Keygen(KeygenArgs { key_id, output_dir }) = command else {
+            panic!("expected parcel keygen command");
         };
         assert_eq!(key_id, "release");
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/keys")));
 
         let sign = Cli::try_parse_from([
             "dispatch",
+            "parcel",
             "sign",
             "manifest.json",
             "--secret-key",
             "release.dispatch-secret.json",
         ])
         .unwrap();
-        let Command::Sign { path, secret_key } = sign.command else {
-            panic!("expected sign command");
+        let Command::Parcel { command } = sign.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::Sign(SignArgs { path, secret_key }) = command else {
+            panic!("expected parcel sign command");
         };
         assert_eq!(path, Path::new("manifest.json"));
         assert_eq!(secret_key, PathBuf::from("release.dispatch-secret.json"));
@@ -1119,6 +1224,7 @@ mod tests {
     fn cli_parses_parcel_inspect_registry_override() {
         let cli = Cli::try_parse_from([
             "dispatch",
+            "parcel",
             "inspect",
             "manifest.json",
             "--courier",
@@ -1128,19 +1234,55 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Inspect {
+        let Command::Parcel { command } = cli.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::Inspect(InspectArgs {
             path,
             courier,
             registry,
             json,
-        } = cli.command
+        }) = command
         else {
-            panic!("expected inspect command");
+            panic!("expected parcel inspect command");
         };
         assert_eq!(path, Path::new("manifest.json"));
         assert_eq!(courier.as_deref(), Some("remote-demo"));
         assert_eq!(registry.as_deref(), Some(Path::new("/tmp/plugins.json")));
         assert!(!json);
+    }
+
+    #[test]
+    fn cli_accepts_legacy_flat_parcel_commands() {
+        let lint = Cli::try_parse_from(["dispatch", "lint", "."]).unwrap();
+        let Command::Lint(_) = lint.command else {
+            panic!("expected legacy lint alias");
+        };
+
+        let verify = Cli::try_parse_from(["dispatch", "verify", "manifest.json"]).unwrap();
+        let Command::Verify(_) = verify.command else {
+            panic!("expected legacy verify alias");
+        };
+    }
+
+    #[test]
+    fn cli_accepts_legacy_flat_depot_commands() {
+        let push = Cli::try_parse_from([
+            "dispatch",
+            "push",
+            "manifest.json",
+            "file:///tmp/depot::acme/monitor:v1",
+        ])
+        .unwrap();
+        let Command::Push(_) = push.command else {
+            panic!("expected legacy push alias");
+        };
+
+        let pull = Cli::try_parse_from(["dispatch", "pull", "file:///tmp/depot::acme/monitor:v1"])
+            .unwrap();
+        let Command::Pull(_) = pull.command else {
+            panic!("expected legacy pull alias");
+        };
     }
 
     #[test]

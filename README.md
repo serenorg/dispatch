@@ -5,7 +5,7 @@ Dispatch is an open packaging, courier, and signing standard for agents.
 The core idea: an agent should be a self-describing, verifiable artifact - separate from the infrastructure that runs it. Build it once. Run it anywhere a courier exists.
 
 ```
-Agentfile  ->  dispatch build  ->  parcel (artifact)  ->  dispatch run  ->  courier
+Agentfile  ->  dispatch parcel build  ->  parcel (artifact)  ->  dispatch run  ->  courier
 ```
 
 The **WASM courier** is the most differentiated part. A guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) runs in any WASM host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
@@ -24,8 +24,8 @@ Without a standard artifact format:
 With Dispatch:
 
 - `Agentfile` is the canonical authored spec - human-editable, diff-friendly, reviewable
-- `dispatch build` produces a content-addressed parcel with a verifiable manifest
-- `dispatch verify` re-hashes every file and checks detached signatures
+- `dispatch parcel build` produces a content-addressed parcel with a verifiable manifest
+- `dispatch parcel verify` re-hashes every file and checks detached signatures
 - `dispatch run` selects a courier backend and executes - the parcel carries its contract with it
 - couriers can be native, Docker, WASM, or custom; the parcel format is independent of which one runs it
 
@@ -195,7 +195,7 @@ description = "Find files matching a pattern."
 
 Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model for directory-based skill bundles, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. File-based `SKILL path/to/file.md` instructions are left unchanged even if they happen to contain YAML frontmatter. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but duplicate explicit aliases and conflicting aliases across skills fail the build.
 
-`allowed-tools` is currently preserved as informational metadata for interoperability and downstream policy engines. The reference courier does not enforce it yet, but `dispatch lint` and `dispatch build` warn when a skill's `allowed-tools` entries do not line up with synthesized or declared tool aliases.
+`allowed-tools` is currently preserved as informational metadata for interoperability and downstream policy engines. The reference courier does not enforce it yet, but `dispatch parcel lint` and `dispatch parcel build` warn when a skill's `allowed-tools` entries do not line up with synthesized or declared tool aliases.
 
 
 ## WASM Courier
@@ -240,14 +240,14 @@ Build and run the reference examples:
 
 ```bash
 # Lint an Agentfile
-cargo run -p dispatch -- lint examples/parcels/basic
-cargo run -p dispatch -- lint examples/parcels/wasm-reference
-cargo run -p dispatch -- lint examples/skills/file-analyst
+cargo run -p dispatch -- parcel lint examples/parcels/basic
+cargo run -p dispatch -- parcel lint examples/parcels/wasm-reference
+cargo run -p dispatch -- parcel lint examples/skills/file-analyst
 
 # Build a parcel
-cargo run -p dispatch -- build examples/parcels/basic
-cargo run -p dispatch -- build examples/parcels/wasm-reference
-cargo run -p dispatch -- build examples/skills/file-analyst
+cargo run -p dispatch -- parcel build examples/parcels/basic
+cargo run -p dispatch -- parcel build examples/parcels/wasm-reference
+cargo run -p dispatch -- parcel build examples/skills/file-analyst
 
 # Run packaged evals
 cargo run -p dispatch -- eval examples/parcels/basic
@@ -255,16 +255,16 @@ cargo run -p dispatch -- eval examples/parcels/basic --courier native
 cargo run -p dispatch -- eval examples/skills/file-analyst --courier native
 
 # Inspect a built parcel
-cargo run -p dispatch -- inspect examples/parcels/basic/.dispatch/parcels/<digest>
-cargo run -p dispatch -- inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
+cargo run -p dispatch -- parcel inspect examples/parcels/basic/.dispatch/parcels/<digest>
+cargo run -p dispatch -- parcel inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
 
 # Verify parcel integrity
-cargo run -p dispatch -- verify examples/parcels/basic/.dispatch/parcels/<digest>
+cargo run -p dispatch -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest>
 
 # Sign a parcel
-cargo run -p dispatch -- keygen --key-id release --output-dir .dispatch/keys
-cargo run -p dispatch -- sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
-cargo run -p dispatch -- verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
+cargo run -p dispatch -- parcel keygen --key-id release --output-dir .dispatch/keys
+cargo run -p dispatch -- parcel sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
+cargo run -p dispatch -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
 
 # Run a parcel (native courier, requires LLM_API_KEY or provider env vars)
 cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
@@ -285,20 +285,20 @@ cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcel
 cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
 
 # Push/pull to a depot
-dispatch push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
-dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0
-dispatch push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
-dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
-dispatch push examples/parcels/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
-dispatch pull https://depot.example.com::acme/basic:0.1.0
-dispatch pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
-dispatch pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.toml
+dispatch depot push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch depot pull file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch depot push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
+dispatch depot pull file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
+dispatch depot push examples/parcels/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
+dispatch depot pull https://depot.example.com::acme/basic:0.1.0
+dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
+dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.toml
 ```
 
 Print the parsed AST:
 
 ```bash
-cargo run -p dispatch -- lint examples/parcels/basic --json
+cargo run -p dispatch -- parcel lint examples/parcels/basic --json
 ```
 
 ## Parcel Format
@@ -421,6 +421,8 @@ For courier implementers:
 
 Courier registry:
 
+- `dispatch parcel lint|build|inspect|verify|keygen|sign` - manage parcel sources, signatures, and built artifacts
+- `dispatch depot push|pull` - move parcels to and from depots
 - `dispatch courier ls` - list built-in backends and installed plugins
 - `dispatch courier inspect <name>` - show courier metadata
 - `dispatch courier install <manifest>` - install a plugin manifest
@@ -451,11 +453,11 @@ State management:
 
 ## Depot
 
-- `dispatch push <parcel> <reference>` - publish a parcel into a depot
-- `dispatch pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
-- `dispatch push ... --json` / `dispatch pull ... --json` - emit machine-readable depot results
-- `dispatch pull <reference> --public-key <path>` - require detached signature verification during fetch
-- `dispatch pull <reference> --trust-policy <path>` - apply pull-time trust rules during fetch
+- `dispatch depot push <parcel> <reference>` - publish a parcel into a depot
+- `dispatch depot pull <reference>` - resolve a tagged reference into `.dispatch/parcels/`
+- `dispatch depot push ... --json` / `dispatch depot pull ... --json` - emit machine-readable depot results
+- `dispatch depot pull <reference> --public-key <path>` - require detached signature verification during fetch
+- `dispatch depot pull <reference> --trust-policy <path>` - apply pull-time trust rules during fetch
 - v1 depot references include:
 - `file:///absolute/path/to/depot::org/parcel:v1`
 - `https://depot.example.com::org/parcel:v1`

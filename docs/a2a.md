@@ -133,7 +133,7 @@ Discovery/auth note:
 
 Dispatch exposes A2A tool metadata through normal CLI inspection:
 
-- `dispatch inspect <parcel> --courier native`
+- `dispatch parcel inspect <parcel> --courier native`
 - `dispatch run <parcel> --list-tools`
 
 These surfaces include:
