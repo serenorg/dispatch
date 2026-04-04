@@ -242,6 +242,8 @@ pub struct A2aToolConfig {
     pub auth: Option<A2aAuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_card_sha256: Option<String>,
     pub approval: Option<ToolApprovalPolicy>,
     pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,

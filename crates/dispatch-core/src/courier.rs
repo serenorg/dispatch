@@ -298,6 +298,7 @@ pub struct LocalToolSpec {
     pub auth_secret_name: Option<String>,
     pub auth_scheme: Option<A2aAuthScheme>,
     pub expected_agent_name: Option<String>,
+    pub expected_card_sha256: Option<String>,
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
@@ -1134,6 +1135,7 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 auth_secret_name: None,
                 auth_scheme: None,
                 expected_agent_name: None,
+                expected_card_sha256: None,
                 description: local.description.clone(),
                 input_schema_packaged_path: local
                     .input_schema
@@ -1155,6 +1157,7 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 auth_secret_name: a2a.auth.as_ref().map(|auth| auth.secret_name.clone()),
                 auth_scheme: a2a.auth.as_ref().map(|auth| auth.scheme),
                 expected_agent_name: a2a.expected_agent_name.clone(),
+                expected_card_sha256: a2a.expected_card_sha256.clone(),
                 description: a2a.description.clone(),
                 input_schema_packaged_path: a2a
                     .input_schema
@@ -2133,13 +2136,31 @@ where
     let status = response.status();
     if status.is_success() {
         let mut response = response;
-        let card = response
-            .body_mut()
-            .read_json::<serde_json::Value>()
-            .map_err(|error| CourierError::A2aToolRequest {
+        let body =
+            response
+                .body_mut()
+                .read_to_string()
+                .map_err(|error| CourierError::A2aToolRequest {
+                    tool: tool.alias.clone(),
+                    message: format!("failed to read agent card: {error}"),
+                })?;
+        let actual_sha256 = encode_hex(Sha256::digest(body.as_bytes()));
+        if let Some(expected_sha256) = tool.expected_card_sha256.as_deref()
+            && expected_sha256 != actual_sha256
+        {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!(
+                    "agent card digest mismatch: expected `{expected_sha256}`, got `{actual_sha256}`"
+                ),
+            });
+        }
+        let card = serde_json::from_str::<serde_json::Value>(&body).map_err(|error| {
+            CourierError::A2aToolRequest {
                 tool: tool.alias.clone(),
                 message: format!("failed to parse agent card: {error}"),
-            })?;
+            }
+        })?;
         let endpoint = card
             .get("url")
             .and_then(serde_json::Value::as_str)
@@ -5695,7 +5716,7 @@ ENTRYPOINT job
             "\
 FROM dispatch/native:latest
 SECRET A2A_TOKEN
-TOOL A2A broker URL https://broker.example.com DISCOVERY direct AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
+TOOL A2A broker URL https://broker.example.com DISCOVERY direct AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker EXPECT_CARD_SHA256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
 ENTRYPOINT job
 ",
             &[(
@@ -5718,6 +5739,10 @@ ENTRYPOINT job
         assert_eq!(
             tools[0].expected_agent_name.as_deref(),
             Some("remote-broker")
+        );
+        assert_eq!(
+            tools[0].expected_card_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(tools[0].command, "dispatch-a2a");
     }
@@ -5820,6 +5845,56 @@ ENTRYPOINT job
                 "agent card name mismatch: expected `expected-agent`, got `actual-agent`"
             )
         );
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_card_digest_mismatch() {
+        let server = start_test_a2a_server();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} EXPECT_CARD_SHA256 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("agent card digest mismatch: expected `ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff`"));
+    }
+
+    #[test]
+    fn native_courier_accepts_matching_a2a_card_digest() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            agent_name: "demo-a2a".to_string(),
+            ..Default::default()
+        });
+        let expected_card_sha256 = encode_hex(Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "name": "demo-a2a",
+                "url": format!("{}/a2a", server.base_url)
+            }))
+            .unwrap(),
+        ));
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} EXPECT_CARD_SHA256 {}
+ENTRYPOINT job
+",
+                server.base_url, expected_card_sha256
+            ),
+            &[],
+        );
+
+        let result = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap();
+        assert!(result.stdout.contains("echo:hello"));
     }
 
     #[test]
@@ -7443,6 +7518,7 @@ ENTRYPOINT chat
             auth_secret_name: None,
             auth_scheme: None,
             expected_agent_name: None,
+            expected_card_sha256: None,
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,

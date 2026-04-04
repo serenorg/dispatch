@@ -77,7 +77,7 @@ TOOL BUILTIN human_approval
 TOOL BUILTIN memory_put
 TOOL BUILTIN memory_get
 SECRET PLANNER_TOKEN
-TOOL A2A planner URL https://planner.example.com DISCOVERY card AUTH bearer PLANNER_TOKEN EXPECT_AGENT_NAME planner-agent DESCRIPTION "Delegate planning to a remote agent."
+TOOL A2A planner URL https://planner.example.com DISCOVERY card AUTH bearer PLANNER_TOKEN EXPECT_AGENT_NAME planner-agent EXPECT_CARD_SHA256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef DESCRIPTION "Delegate planning to a remote agent."
 
 MOUNT SESSION sqlite
 MOUNT MEMORY sqlite

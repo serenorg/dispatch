@@ -937,11 +937,26 @@ fn parse_a2a_tool(tokens: &[String]) -> Result<Option<A2aToolConfig>, BuildError
         endpoint_mode: parse_a2a_endpoint_mode(tokens)?,
         auth: parse_a2a_auth(tokens)?,
         expected_agent_name: parse_named_value(tokens, "EXPECT_AGENT_NAME"),
+        expected_card_sha256: parse_a2a_card_sha256(tokens)?,
         approval: parse_tool_approval(tokens)?,
         risk: parse_tool_risk(tokens)?,
         description: parse_named_value(tokens, "DESCRIPTION"),
         input_schema,
     }))
+}
+
+fn parse_a2a_card_sha256(tokens: &[String]) -> Result<Option<String>, BuildError> {
+    let Some(value) = parse_named_value(tokens, "EXPECT_CARD_SHA256") else {
+        return Ok(None);
+    };
+    let valid = value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit());
+    if !valid {
+        return Err(BuildError::Validation(
+            "EXPECT_CARD_SHA256 must be a 64-character lowercase or uppercase hex SHA256 digest"
+                .to_string(),
+        ));
+    }
+    Ok(Some(value.to_ascii_lowercase()))
 }
 
 fn parse_a2a_endpoint_mode(tokens: &[String]) -> Result<Option<A2aEndpointMode>, BuildError> {
@@ -1529,7 +1544,7 @@ ENTRYPOINT chat
             "\
 FROM dispatch/native:latest
 SECRET A2A_TOKEN
-TOOL A2A broker_agent URL https://broker.example.com DISCOVERY card AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker APPROVAL confirm RISK medium SCHEMA schemas/a2a-input.json DESCRIPTION \"Delegate to a remote broker\"
+TOOL A2A broker_agent URL https://broker.example.com DISCOVERY card AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker EXPECT_CARD_SHA256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa APPROVAL confirm RISK medium SCHEMA schemas/a2a-input.json DESCRIPTION \"Delegate to a remote broker\"
 ENTRYPOINT chat
 ",
         )
@@ -1551,6 +1566,10 @@ ENTRYPOINT chat
                 assert_eq!(tool.url, "https://broker.example.com");
                 assert_eq!(tool.endpoint_mode, Some(A2aEndpointMode::Card));
                 assert_eq!(tool.expected_agent_name.as_deref(), Some("remote-broker"));
+                assert_eq!(
+                    tool.expected_card_sha256.as_deref(),
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
                 let auth = tool.auth.as_ref().expect("expected auth config");
                 assert_eq!(auth.scheme, A2aAuthScheme::Bearer);
                 assert_eq!(auth.secret_name, "A2A_TOKEN");
@@ -1597,6 +1616,30 @@ ENTRYPOINT chat
                 .to_string()
                 .contains("references auth secret `MISSING_TOKEN`")
         );
+    }
+
+    #[test]
+    fn build_rejects_invalid_a2a_card_sha256() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker URL https://broker.example.com EXPECT_CARD_SHA256 not-a-digest
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("EXPECT_CARD_SHA256"));
     }
 
     #[test]
