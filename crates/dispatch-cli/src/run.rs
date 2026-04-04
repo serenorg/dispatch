@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::{
-    BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest, CourierSession,
-    DockerCourier, LoadedParcel, LocalToolTarget, NativeCourier, ResolvedCourier, ToolInvocation,
-    WasmCourier, load_parcel, resolve_courier,
+    A2aAuthConfig, BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest,
+    CourierSession, DockerCourier, LoadedParcel, LocalToolSpec, LocalToolTarget, NativeCourier,
+    ResolvedCourier, ToolInvocation, WasmCourier, load_parcel, resolve_courier,
 };
 use futures::executor::block_on;
 use std::{
@@ -256,14 +256,7 @@ fn print_courier_events(events: &[CourierEvent]) {
             CourierEvent::PromptResolved { text } => println!("{text}"),
             CourierEvent::LocalToolsListed { tools } => {
                 for tool in tools {
-                    match &tool.target {
-                        LocalToolTarget::Local { packaged_path, .. } => {
-                            println!("{} -> {}", tool.alias, packaged_path);
-                        }
-                        LocalToolTarget::A2a { endpoint_url, .. } => {
-                            println!("{} -> {}", tool.alias, endpoint_url);
-                        }
-                    }
+                    println!("{}", format_listed_tool(tool));
                 }
             }
             CourierEvent::BackendFallback { backend, error } => {
@@ -308,5 +301,49 @@ fn print_courier_events(events: &[CourierEvent]) {
                 }
             }
         }
+    }
+}
+
+fn format_listed_tool(tool: &LocalToolSpec) -> String {
+    match &tool.target {
+        LocalToolTarget::Local { packaged_path, .. } => {
+            format!("{} -> {} [local]", tool.alias, packaged_path)
+        }
+        LocalToolTarget::A2a {
+            endpoint_url,
+            endpoint_mode,
+            auth,
+            expected_agent_name,
+            expected_card_sha256,
+        } => {
+            let mut parts = vec!["a2a".to_string()];
+            if let Some(mode) = endpoint_mode {
+                parts.push(format!("discovery={mode:?}").to_ascii_lowercase());
+            }
+            if let Some(auth) = auth {
+                parts.push(format_a2a_auth_summary(auth));
+            }
+            if let Some(name) = expected_agent_name {
+                parts.push(format!("expected_agent_name={name}"));
+            }
+            if let Some(digest) = expected_card_sha256 {
+                parts.push(format!("expected_card_sha256={digest}"));
+            }
+            format!("{} -> {} [{}]", tool.alias, endpoint_url, parts.join(" "))
+        }
+    }
+}
+
+fn format_a2a_auth_summary(auth: &A2aAuthConfig) -> String {
+    match auth {
+        A2aAuthConfig::Bearer { secret_name } => format!("auth=bearer:{secret_name}"),
+        A2aAuthConfig::Header {
+            header_name,
+            secret_name,
+        } => format!("auth=header:{header_name}({secret_name})"),
+        A2aAuthConfig::Basic {
+            username_secret_name,
+            password_secret_name,
+        } => format!("auth=basic:{username_secret_name}+{password_secret_name}"),
     }
 }

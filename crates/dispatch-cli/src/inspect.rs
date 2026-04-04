@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use dispatch_core::{
-    BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry, CourierInspection,
-    DockerCourier, JsonlCourierPlugin, NativeCourier, ParcelManifest, ResolvedCourier, WasmCourier,
-    load_parcel, resolve_courier,
+    A2aAuthConfig, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
+    CourierInspection, DockerCourier, JsonlCourierPlugin, LocalToolTarget, NativeCourier,
+    ParcelManifest, ResolvedCourier, WasmCourier, load_parcel, resolve_courier,
 };
 use futures::executor::block_on;
 use std::{
@@ -126,6 +126,67 @@ fn print_courier_inspection(inspection: &CourierInspection) {
     println!("Declared Secrets: {}", inspection.required_secrets.len());
     println!("Declared Mounts: {}", inspection.mounts.len());
     println!("Declared Local Tools: {}", inspection.local_tools.len());
+    for secret in &inspection.required_secrets {
+        println!("  secret: {secret}");
+    }
+    for mount in &inspection.mounts {
+        println!("  mount: {:?} {}", mount.kind, mount.driver);
+    }
+    for tool in &inspection.local_tools {
+        match &tool.target {
+            LocalToolTarget::Local {
+                packaged_path,
+                command,
+                args,
+            } => {
+                let arg_suffix = if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", args.join(" "))
+                };
+                println!(
+                    "  tool: {} local path={} runner={}{}",
+                    tool.alias, packaged_path, command, arg_suffix
+                );
+            }
+            LocalToolTarget::A2a {
+                endpoint_url,
+                endpoint_mode,
+                auth,
+                expected_agent_name,
+                expected_card_sha256,
+            } => {
+                let mut details = vec![format!("url={endpoint_url}")];
+                if let Some(mode) = endpoint_mode {
+                    details.push(format!("discovery={mode:?}").to_ascii_lowercase());
+                }
+                if let Some(auth) = auth {
+                    details.push(format_a2a_auth_summary(auth));
+                }
+                if let Some(name) = expected_agent_name {
+                    details.push(format!("expected_agent_name={name}"));
+                }
+                if let Some(digest) = expected_card_sha256 {
+                    details.push(format!("expected_card_sha256={digest}"));
+                }
+                println!("  tool: {} a2a {}", tool.alias, details.join(" "));
+            }
+        }
+    }
+}
+
+fn format_a2a_auth_summary(auth: &A2aAuthConfig) -> String {
+    match auth {
+        A2aAuthConfig::Bearer { secret_name } => format!("auth=bearer:{secret_name}"),
+        A2aAuthConfig::Header {
+            header_name,
+            secret_name,
+        } => format!("auth=header:{header_name}({secret_name})"),
+        A2aAuthConfig::Basic {
+            username_secret_name,
+            password_secret_name,
+        } => format!("auth=basic:{username_secret_name}+{password_secret_name}"),
+    }
 }
 
 pub(crate) fn builtin_catalog_entry(courier: BuiltinCourier) -> CourierCatalogEntry {
