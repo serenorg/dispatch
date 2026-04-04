@@ -571,6 +571,7 @@ struct WasmHost {
     parcel: LoadedParcel,
     session: CourierSession,
     chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
+    run_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,9 +582,27 @@ enum NativeTurnMode {
 }
 
 #[derive(Clone, Copy)]
+struct HostTurnContext<'a> {
+    chat_backend_override: Option<&'a Arc<dyn ChatModelBackend>>,
+    tool_runner: HostToolRunner<'a>,
+    host_label: &'static str,
+    run_deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
 enum HostToolRunner<'a> {
     Native,
     Docker(&'a DockerCourier),
+}
+
+struct WasmModelRequestInput {
+    requested_model: Option<String>,
+    instructions: String,
+    messages: Vec<ConversationMessage>,
+    tools: Vec<ModelToolDefinition>,
+    tool_outputs: Vec<ModelToolOutput>,
+    previous_response_id: Option<String>,
+    run_deadline: Option<Instant>,
 }
 
 pub trait MountProvider: Send + Sync {
@@ -901,12 +920,15 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
             .collect::<Vec<_>>();
         let requests = build_wasm_model_requests(
             &self.parcel,
-            request.model,
-            request.instructions,
-            messages,
-            tools,
-            tool_outputs,
-            request.previous_response_id,
+            WasmModelRequestInput {
+                requested_model: request.model,
+                instructions: request.instructions,
+                messages,
+                tools,
+                tool_outputs,
+                previous_response_id: request.previous_response_id,
+                run_deadline: self.run_deadline,
+            },
         )
         .map_err(|error| error.to_string())?;
         let mut last_error = None;
@@ -956,8 +978,16 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
         &mut self,
         invocation: wasm_bindings::dispatch::courier::host::ToolInvocation,
     ) -> Result<wasm_bindings::dispatch::courier::host::ToolResult, String> {
-        let result = run_local_tool(&self.parcel, &invocation.name, invocation.input.as_deref())
+        let tool = resolve_local_tool(&self.parcel, &invocation.name)
             .map_err(|error| error.to_string())?;
+        let result = execute_local_tool_with_env(
+            &self.parcel,
+            &tool,
+            invocation.input.as_deref(),
+            self.run_deadline,
+            process_env_lookup,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(wasm_bindings::dispatch::courier::host::ToolResult {
             tool: result.tool,
             command: result.command,
@@ -1376,7 +1406,7 @@ where
 {
     let tool = resolve_local_tool_with_env(parcel, tool_name, env_lookup)?;
 
-    execute_local_tool_with_env(parcel, &tool, input, env_lookup)
+    execute_local_tool_with_env(parcel, &tool, input, None, env_lookup)
 }
 
 fn resolve_local_tool(
@@ -2204,12 +2234,31 @@ fn ensure_run_timeout_budget(
     session: &CourierSession,
     timeouts: &[crate::manifest::TimeoutSpec],
 ) -> Result<(), CourierError> {
+    let Some((timeout_duration, timeout_literal)) =
+        configured_timeout_duration_with_literal(timeouts, "RUN")?
+    else {
+        return Ok(());
+    };
+    let limit_ms = u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+    if session.elapsed_ms >= limit_ms {
+        return Err(CourierError::RunTimedOut {
+            session_id: session.id.clone(),
+            timeout: timeout_literal,
+        });
+    }
+    Ok(())
+}
+
+fn configured_timeout_duration_with_literal(
+    timeouts: &[crate::manifest::TimeoutSpec],
+    scope: &str,
+) -> Result<Option<(Duration, String)>, CourierError> {
     let Some(timeout_spec) = timeouts
         .iter()
         .rev()
-        .find(|timeout| timeout.scope.eq_ignore_ascii_case("RUN"))
+        .find(|timeout| timeout.scope.eq_ignore_ascii_case(scope))
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(timeout) = parse_timeout_duration(&timeout_spec.duration) else {
         return Err(CourierError::InvalidTimeoutSpec {
@@ -2217,14 +2266,62 @@ fn ensure_run_timeout_budget(
             duration: timeout_spec.duration.clone(),
         });
     };
-    let limit_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-    if session.elapsed_ms >= limit_ms {
-        return Err(CourierError::RunTimedOut {
-            session_id: session.id.clone(),
-            timeout: timeout_spec.duration.clone(),
-        });
+    Ok(Some((timeout, timeout_spec.duration.clone())))
+}
+
+fn remaining_run_budget_duration(
+    session: &CourierSession,
+    timeouts: &[crate::manifest::TimeoutSpec],
+) -> Result<Option<Duration>, CourierError> {
+    let Some((run_timeout, _)) = configured_timeout_duration_with_literal(timeouts, "RUN")? else {
+        return Ok(None);
+    };
+    let limit_ms = u64::try_from(run_timeout.as_millis()).unwrap_or(u64::MAX);
+    let remaining_ms = limit_ms.saturating_sub(session.elapsed_ms);
+    Ok(Some(Duration::from_millis(remaining_ms)))
+}
+
+fn run_timeout_deadline(
+    session: &CourierSession,
+    timeouts: &[crate::manifest::TimeoutSpec],
+) -> Result<Option<Instant>, CourierError> {
+    Ok(remaining_run_budget_duration(session, timeouts)?.map(|duration| Instant::now() + duration))
+}
+
+fn remaining_deadline_duration(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+fn effective_timeout_spec(
+    timeouts: &[crate::manifest::TimeoutSpec],
+    scope: &str,
+    run_deadline: Option<Instant>,
+) -> Result<Option<(&'static str, Duration)>, CourierError> {
+    let configured = configured_timeout_duration_with_literal(timeouts, scope)?;
+    let remaining_run = remaining_deadline_duration(run_deadline);
+    Ok(match (configured, remaining_run) {
+        (Some((configured_duration, _)), Some(remaining_run_duration)) => {
+            if remaining_run_duration < configured_duration {
+                Some(("RUN", remaining_run_duration))
+            } else {
+                Some((scope_to_timeout_label(scope), configured_duration))
+            }
+        }
+        (Some((configured_duration, _)), None) => {
+            Some((scope_to_timeout_label(scope), configured_duration))
+        }
+        (None, Some(remaining_run_duration)) => Some(("RUN", remaining_run_duration)),
+        (None, None) => None,
+    })
+}
+
+fn scope_to_timeout_label(scope: &str) -> &'static str {
+    match scope {
+        "TOOL" => "TOOL",
+        "LLM" => "LLM",
+        "RUN" => "RUN",
+        _ => "TIMEOUT",
     }
-    Ok(())
 }
 
 fn operation_counts_toward_run_budget(operation: &CourierOperation) -> bool {
@@ -2249,21 +2346,21 @@ fn execute_local_tool(
     tool: &LocalToolSpec,
     input: Option<&str>,
 ) -> Result<ToolRunResult, CourierError> {
-    execute_local_tool_with_env(parcel, tool, input, process_env_lookup)
+    execute_local_tool_with_env(parcel, tool, input, None, process_env_lookup)
 }
 
 fn execute_local_tool_with_env<F>(
     parcel: &LoadedParcel,
     tool: &LocalToolSpec,
     input: Option<&str>,
+    run_deadline: Option<Instant>,
     env_lookup: F,
 ) -> Result<ToolRunResult, CourierError>
 where
     F: FnMut(&str) -> Option<String>,
 {
     if matches!(tool.target, LocalToolTarget::A2a { .. }) {
-        let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
-        let timeout_spec = timeout.map(|duration| ("TOOL", duration));
+        let timeout_spec = effective_timeout_spec(&parcel.config.timeouts, "TOOL", run_deadline)?;
         return execute_a2a_tool_with_env(tool, input, env_lookup, timeout_spec);
     }
 
@@ -2314,11 +2411,10 @@ where
             })?;
     }
 
-    let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
     let output = wait_for_tool_output(
         child,
         &tool.alias,
-        timeout.map(|duration| ("TOOL", duration)),
+        effective_timeout_spec(&parcel.config.timeouts, "TOOL", run_deadline)?,
     )?;
 
     Ok(ToolRunResult {
@@ -2336,10 +2432,10 @@ fn execute_local_tool_in_docker(
     tool: &LocalToolSpec,
     input: Option<&str>,
     courier: &DockerCourier,
+    run_deadline: Option<Instant>,
 ) -> Result<ToolRunResult, CourierError> {
     if matches!(tool.target, LocalToolTarget::A2a { .. }) {
-        let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
-        let timeout_spec = timeout.map(|duration| ("TOOL", duration));
+        let timeout_spec = effective_timeout_spec(&parcel.config.timeouts, "TOOL", run_deadline)?;
         return execute_a2a_tool_with_env(tool, input, process_env_lookup, timeout_spec);
     }
 
@@ -2400,11 +2496,10 @@ fn execute_local_tool_in_docker(
             })?;
     }
 
-    let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
     let output = wait_for_tool_output(
         child,
         &tool.alias,
-        timeout.map(|duration| ("TOOL", duration)),
+        effective_timeout_spec(&parcel.config.timeouts, "TOOL", run_deadline)?,
     )?;
 
     Ok(ToolRunResult {
@@ -2422,11 +2517,15 @@ fn execute_host_local_tool(
     tool: &LocalToolSpec,
     input: Option<&str>,
     runner: HostToolRunner<'_>,
+    run_deadline: Option<Instant>,
 ) -> Result<ToolRunResult, CourierError> {
     match runner {
-        HostToolRunner::Native => execute_local_tool(parcel, tool, input),
+        HostToolRunner::Native if run_deadline.is_none() => execute_local_tool(parcel, tool, input),
+        HostToolRunner::Native => {
+            execute_local_tool_with_env(parcel, tool, input, run_deadline, process_env_lookup)
+        }
         HostToolRunner::Docker(courier) => {
-            execute_local_tool_in_docker(parcel, tool, input, courier)
+            execute_local_tool_in_docker(parcel, tool, input, courier, run_deadline)
         }
     }
 }
@@ -2526,6 +2625,11 @@ impl CourierBackend for NativeCourier {
             if consumes_run_budget {
                 ensure_run_timeout_budget(&session, &image.config.timeouts)?;
             }
+            let run_deadline = if consumes_run_budget {
+                run_timeout_deadline(&session, &image.config.timeouts)?
+            } else {
+                None
+            };
             session.turn_count += 1;
             let started_at = Instant::now();
 
@@ -2557,8 +2661,14 @@ impl CourierBackend for NativeCourier {
                     ],
                 }),
                 CourierOperation::InvokeTool { invocation } => {
-                    let result =
-                        run_local_tool(image, &invocation.name, invocation.input.as_deref())?;
+                    let tool = resolve_local_tool(image, &invocation.name)?;
+                    let result = execute_host_local_tool(
+                        image,
+                        &tool,
+                        invocation.input.as_deref(),
+                        HostToolRunner::Native,
+                        run_deadline,
+                    )?;
 
                     Ok(CourierResponse {
                         courier_id,
@@ -2586,10 +2696,13 @@ impl CourierBackend for NativeCourier {
                         image,
                         &session,
                         &input,
-                        chat_backend_override.as_ref(),
                         NativeTurnMode::Chat,
-                        HostToolRunner::Native,
-                        "Native",
+                        HostTurnContext {
+                            chat_backend_override: chat_backend_override.as_ref(),
+                            tool_runner: HostToolRunner::Native,
+                            host_label: "Native",
+                            run_deadline,
+                        },
                     )?;
                     session.history.push(ConversationMessage {
                         role: "assistant".to_string(),
@@ -2613,20 +2726,26 @@ impl CourierBackend for NativeCourier {
                 CourierOperation::Job { payload } => run_host_task_operation(
                     image,
                     session,
-                    chat_backend_override.as_ref(),
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
-                    HostToolRunner::Native,
-                    "Native",
+                    HostTurnContext {
+                        chat_backend_override: chat_backend_override.as_ref(),
+                        tool_runner: HostToolRunner::Native,
+                        host_label: "Native",
+                        run_deadline,
+                    },
                 ),
                 CourierOperation::Heartbeat { payload } => run_host_task_operation(
                     image,
                     session,
-                    chat_backend_override.as_ref(),
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
-                    HostToolRunner::Native,
-                    "Native",
+                    HostTurnContext {
+                        chat_backend_override: chat_backend_override.as_ref(),
+                        tool_runner: HostToolRunner::Native,
+                        host_label: "Native",
+                        run_deadline,
+                    },
                 ),
             }?;
 
@@ -2742,6 +2861,11 @@ impl CourierBackend for DockerCourier {
             if consumes_run_budget {
                 ensure_run_timeout_budget(&session, &image.config.timeouts)?;
             }
+            let run_deadline = if consumes_run_budget {
+                run_timeout_deadline(&session, &image.config.timeouts)?
+            } else {
+                None
+            };
             session.turn_count += 1;
             let started_at = Instant::now();
 
@@ -2779,6 +2903,7 @@ impl CourierBackend for DockerCourier {
                         &tool,
                         invocation.input.as_deref(),
                         &docker_courier,
+                        run_deadline,
                     )?;
 
                     Ok(CourierResponse {
@@ -2807,10 +2932,13 @@ impl CourierBackend for DockerCourier {
                         image,
                         &session,
                         &input,
-                        chat_backend_override.as_ref(),
                         NativeTurnMode::Chat,
-                        HostToolRunner::Docker(&docker_courier),
-                        "Docker",
+                        HostTurnContext {
+                            chat_backend_override: chat_backend_override.as_ref(),
+                            tool_runner: HostToolRunner::Docker(&docker_courier),
+                            host_label: "Docker",
+                            run_deadline,
+                        },
                     )?;
                     session.history.push(ConversationMessage {
                         role: "assistant".to_string(),
@@ -2834,20 +2962,26 @@ impl CourierBackend for DockerCourier {
                 CourierOperation::Job { payload } => run_host_task_operation(
                     image,
                     session,
-                    chat_backend_override.as_ref(),
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
-                    HostToolRunner::Docker(&docker_courier),
-                    "Docker",
+                    HostTurnContext {
+                        chat_backend_override: chat_backend_override.as_ref(),
+                        tool_runner: HostToolRunner::Docker(&docker_courier),
+                        host_label: "Docker",
+                        run_deadline,
+                    },
                 ),
                 CourierOperation::Heartbeat { payload } => run_host_task_operation(
                     image,
                     session,
-                    chat_backend_override.as_ref(),
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
-                    HostToolRunner::Docker(&docker_courier),
-                    "Docker",
+                    HostTurnContext {
+                        chat_backend_override: chat_backend_override.as_ref(),
+                        tool_runner: HostToolRunner::Docker(&docker_courier),
+                        host_label: "Docker",
+                        run_deadline,
+                    },
                 ),
             }?;
 
@@ -3792,25 +3926,15 @@ impl CourierBackend for StubCourier {
 fn run_host_task_operation(
     image: &LoadedParcel,
     mut session: CourierSession,
-    chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
     mode: NativeTurnMode,
     input: String,
-    tool_runner: HostToolRunner<'_>,
-    host_label: &'static str,
+    context: HostTurnContext<'_>,
 ) -> Result<CourierResponse, CourierError> {
     session.history.push(ConversationMessage {
         role: "user".to_string(),
         content: input.clone(),
     });
-    let mut turn = execute_host_turn(
-        image,
-        &session,
-        &input,
-        chat_backend_override,
-        mode,
-        tool_runner,
-        host_label,
-    )?;
+    let mut turn = execute_host_turn(image, &session, &input, mode, context)?;
     session.history.push(ConversationMessage {
         role: "assistant".to_string(),
         content: turn.reply.clone(),
@@ -3825,7 +3949,7 @@ fn run_host_task_operation(
 
     persist_session_mounts(&session)?;
     Ok(CourierResponse {
-        courier_id: host_label.to_ascii_lowercase(),
+        courier_id: context.host_label.to_ascii_lowercase(),
         session,
         events: turn.events,
     })
@@ -3968,6 +4092,7 @@ fn instantiate_wasm_guest(
                 parcel: parcel.clone(),
                 session: session.clone(),
                 chat_backend_override,
+                run_deadline: run_timeout_deadline(session, &parcel.config.timeouts)?,
             },
             wasi_ctx: WasiCtx::builder().build(),
             resource_table: ResourceTable::new(),
@@ -4245,10 +4370,8 @@ fn execute_host_turn(
     image: &LoadedParcel,
     session: &CourierSession,
     input: &str,
-    chat_backend_override: Option<&Arc<dyn ChatModelBackend>>,
     mode: NativeTurnMode,
-    tool_runner: HostToolRunner<'_>,
-    host_label: &'static str,
+    context: HostTurnContext<'_>,
 ) -> Result<ChatTurnResult, CourierError> {
     let trimmed = input.trim();
     let local_tools = list_local_tools(image);
@@ -4287,7 +4410,8 @@ fn execute_host_turn(
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/help") {
         return Ok(ChatTurnResult {
             reply: format!(
-                "{host_label} chat is a reference backend. Available commands: /prompt, /tools, /memory, /help."
+                "{} chat is a reference backend. Available commands: /prompt, /tools, /memory, /help.",
+                context.host_label
             ),
             events: Vec::new(),
             streamed_reply: false,
@@ -4302,7 +4426,8 @@ fn execute_host_turn(
         });
     }
 
-    let requests = build_model_requests(image, &session.history, &local_tools)?;
+    let requests =
+        build_model_requests(image, &session.history, &local_tools, context.run_deadline)?;
     if let Some(mut request) = requests.first().cloned() {
         let mut remaining_requests = requests.into_iter().skip(1).collect::<Vec<_>>();
         // Validate required secrets once before any tool execution.
@@ -4316,7 +4441,7 @@ fn execute_host_turn(
         const MAX_TOOL_ROUNDS: u32 = 8;
         let mut rounds = 0u32;
         let mut executed_tool_calls = 0u32;
-        let mut backend = select_chat_backend(chat_backend_override, &request);
+        let mut backend = select_chat_backend(context.chat_backend_override, &request);
         let mut candidate_locked = false;
         let mut streamed_reply = false;
         loop {
@@ -4332,6 +4457,8 @@ fn execute_host_turn(
             }
             rounds += 1;
 
+            request.llm_timeout_ms =
+                effective_llm_timeout_ms(&image.config.timeouts, context.run_deadline)?;
             let mut streamed_deltas = Vec::new();
             let reply = match backend.generate_with_events(&request, &mut |event| match event {
                 ModelStreamEvent::TextDelta { content } => streamed_deltas.push(content),
@@ -4352,7 +4479,7 @@ fn execute_host_turn(
                             ),
                         });
                         request = next_request;
-                        backend = select_chat_backend(chat_backend_override, &request);
+                        backend = select_chat_backend(context.chat_backend_override, &request);
                         remaining_requests.remove(0);
                         continue;
                     }
@@ -4374,7 +4501,7 @@ fn execute_host_turn(
                             ),
                         });
                         request = next_request;
-                        backend = select_chat_backend(chat_backend_override, &request);
+                        backend = select_chat_backend(context.chat_backend_override, &request);
                         remaining_requests.remove(0);
                         continue;
                     }
@@ -4425,7 +4552,8 @@ fn execute_host_turn(
                             image,
                             tool,
                             Some(normalized_input.as_ref()),
-                            tool_runner,
+                            context.tool_runner,
+                            context.run_deadline,
                         )?
                     } else if let Some(tool) = builtin_tools
                         .iter()
@@ -4522,7 +4650,7 @@ fn execute_host_turn(
     Ok(ChatTurnResult {
         reply: format!(
             "{} {} reference reply for turn {}. Loaded {} prompt section(s) and {} tool(s). Prior messages in session: {}. Input: {}",
-            host_label,
+            context.host_label,
             native_turn_mode_name(mode),
             session.turn_count,
             prompt_sections,
@@ -4560,7 +4688,7 @@ fn build_model_request(
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
 ) -> Result<Option<ModelRequest>, CourierError> {
-    Ok(build_model_requests(image, messages, local_tools)?
+    Ok(build_model_requests(image, messages, local_tools, None)?
         .into_iter()
         .next())
 }
@@ -4569,6 +4697,7 @@ fn build_model_requests(
     image: &LoadedParcel,
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
+    run_deadline: Option<Instant>,
 ) -> Result<Vec<ModelRequest>, CourierError> {
     let model_refs = configured_model_references(&image.config.models);
     if model_refs.is_empty() {
@@ -4585,7 +4714,7 @@ fn build_model_requests(
             .map(build_builtin_model_tool_definition),
     );
     let instructions = resolve_prompt_text(image)?;
-    let llm_timeout_ms = configured_llm_timeout_ms(&image.config.timeouts)?;
+    let llm_timeout_ms = effective_llm_timeout_ms(&image.config.timeouts, run_deadline)?;
 
     Ok(model_refs
         .into_iter()
@@ -4625,15 +4754,10 @@ fn configured_model_references(policy: &crate::manifest::ModelPolicy) -> Vec<Mod
 
 fn build_wasm_model_requests(
     parcel: &LoadedParcel,
-    requested_model: Option<String>,
-    instructions: String,
-    messages: Vec<ConversationMessage>,
-    tools: Vec<ModelToolDefinition>,
-    tool_outputs: Vec<ModelToolOutput>,
-    previous_response_id: Option<String>,
+    input: WasmModelRequestInput,
 ) -> Result<Vec<ModelRequest>, CourierError> {
     let configured = configured_model_references(&parcel.config.models);
-    let model_refs = match requested_model {
+    let model_refs = match input.requested_model {
         Some(model) => {
             if let Some(index) = configured
                 .iter()
@@ -4656,7 +4780,7 @@ fn build_wasm_model_requests(
         ));
     }
 
-    let llm_timeout_ms = configured_llm_timeout_ms(&parcel.config.timeouts)?;
+    let llm_timeout_ms = effective_llm_timeout_ms(&parcel.config.timeouts, input.run_deadline)?;
 
     Ok(model_refs
         .into_iter()
@@ -4667,12 +4791,12 @@ fn build_wasm_model_requests(
             context_token_limit: configured_context_token_limit(&parcel.config.limits),
             tool_call_limit: configured_tool_call_limit(&parcel.config.limits),
             tool_output_limit: configured_tool_output_limit(&parcel.config.limits),
-            instructions: instructions.clone(),
-            messages: messages.clone(),
-            tools: tools.clone(),
+            instructions: input.instructions.clone(),
+            messages: input.messages.clone(),
+            tools: input.tools.clone(),
             pending_tool_calls: Vec::new(),
-            tool_outputs: tool_outputs.clone(),
-            previous_response_id: previous_response_id.clone(),
+            tool_outputs: input.tool_outputs.clone(),
+            previous_response_id: input.previous_response_id.clone(),
         })
         .collect())
 }
@@ -4686,6 +4810,21 @@ fn configured_llm_timeout_ms(
 ) -> Result<Option<u64>, CourierError> {
     configured_timeout_duration(timeouts, "LLM")
         .map(|timeout| timeout.map(|duration| duration.as_millis() as u64))
+}
+
+fn effective_llm_timeout_ms(
+    timeouts: &[crate::manifest::TimeoutSpec],
+    run_deadline: Option<Instant>,
+) -> Result<Option<u64>, CourierError> {
+    let configured_ms = configured_llm_timeout_ms(timeouts)?;
+    let run_remaining_ms = remaining_deadline_duration(run_deadline)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    Ok(match (configured_ms, run_remaining_ms) {
+        (Some(configured), Some(run_remaining)) => Some(configured.min(run_remaining)),
+        (Some(configured), None) => Some(configured),
+        (None, Some(run_remaining)) => Some(run_remaining),
+        (None, None) => None,
+    })
 }
 
 fn configured_tool_call_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
@@ -6070,6 +6209,48 @@ print('done')\n",
         assert!(matches!(
             error,
             CourierError::ToolTimedOut { ref tool, ref timeout } if tool == "slow" && timeout == "TOOL"
+        ));
+    }
+
+    #[test]
+    fn native_courier_caps_tool_timeout_by_remaining_run_budget() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TIMEOUT RUN 100ms
+TOOL LOCAL tools/slow.py AS slow USING python3 -u
+ENTRYPOINT job
+",
+            &[(
+                "tools/slow.py",
+                "import time\n\
+time.sleep(0.2)\n\
+print('done')\n",
+            )],
+        );
+        let courier = NativeCourier::default();
+        let mut session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        session.elapsed_ms = 60;
+
+        let error = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::InvokeTool {
+                    invocation: ToolInvocation {
+                        name: "slow".to_string(),
+                        input: None,
+                    },
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CourierError::ToolTimedOut { ref tool, ref timeout }
+                if tool == "slow" && timeout == "RUN"
         ));
     }
 
@@ -8065,6 +8246,41 @@ ENTRYPOINT chat
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].model, "gpt-5-mini");
         assert_eq!(calls[0].messages[0].content, "hello backend");
+    }
+
+    #[test]
+    fn native_courier_caps_llm_timeout_by_remaining_run_budget() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+TIMEOUT RUN 100ms
+TIMEOUT LLM 5s
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let backend = Arc::new(FakeChatBackend::with_reply("backend reply"));
+        let courier = NativeCourier::with_chat_backend(backend.clone());
+        let mut session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        session.elapsed_ms = 60;
+
+        let _response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "hello backend".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let timeout_ms = calls[0].llm_timeout_ms.expect("expected llm timeout");
+        assert!((1..=40).contains(&timeout_ms));
     }
 
     #[test]
