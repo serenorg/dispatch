@@ -4,6 +4,7 @@ mod eval;
 mod inspect;
 mod parcel_ops;
 mod run;
+mod skill_run;
 mod state;
 mod tool_display;
 
@@ -141,6 +142,8 @@ enum Command {
     },
     /// Execute part of a built parcel locally
     Run(RunArgs),
+    /// Execute a skill file or Agent Skills bundle without an authored Agentfile
+    RunSkill(RunSkillArgs),
     /// Manage installed courier backends
     Courier {
         #[command(subcommand)]
@@ -194,6 +197,66 @@ struct RunArgs {
     /// Pass raw input to the tool via stdin and `TOOL_INPUT`
     #[arg(long)]
     input: Option<String>,
+    /// How to handle tools declared with `APPROVAL confirm`
+    #[arg(long, value_enum)]
+    tool_approval: Option<CliToolApprovalMode>,
+    /// Override allowed outbound A2A origins or hostnames for this command
+    #[arg(long)]
+    a2a_allowed_origins: Option<String>,
+    /// Apply a structured A2A trust policy file for this command
+    #[arg(long)]
+    a2a_trust_policy: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RunSkillArgs {
+    /// Path to a SKILL.md file or an Agent Skills bundle directory
+    path: PathBuf,
+    /// Courier backend to synthesize and run against (`native` or `docker`)
+    #[arg(long = "courier", default_value = "native")]
+    courier: String,
+    /// Override the courier plugin registry path for execution
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// Persist and resume dispatch state from a JSON file
+    #[arg(long)]
+    session_file: Option<PathBuf>,
+    /// Send a chat message through the courier
+    #[arg(long)]
+    chat: Option<String>,
+    /// Execute the parcel job entrypoint with a payload
+    #[arg(long)]
+    job: Option<String>,
+    /// Execute the parcel heartbeat entrypoint with an optional payload
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    heartbeat: Option<String>,
+    /// Start an interactive multi-turn chat session
+    #[arg(long)]
+    interactive: bool,
+    /// Print the resolved prompt stack
+    #[arg(long)]
+    print_prompt: bool,
+    /// List declared tools
+    #[arg(long)]
+    list_tools: bool,
+    /// Print machine-readable JSON when used with `--list-tools`
+    #[arg(long)]
+    json: bool,
+    /// Execute a declared tool by alias
+    #[arg(long)]
+    tool: Option<String>,
+    /// Pass raw input to the tool via stdin and `TOOL_INPUT`
+    #[arg(long)]
+    input: Option<String>,
+    /// Primary model id override for synthesized skill execution
+    #[arg(long)]
+    model: Option<String>,
+    /// Provider override paired with `--model`
+    #[arg(long)]
+    provider: Option<String>,
+    /// Entrypoint override for synthesized skill execution
+    #[arg(long)]
+    entrypoint: Option<String>,
     /// How to handle tools declared with `APPROVAL confirm`
     #[arg(long, value_enum)]
     tool_approval: Option<CliToolApprovalMode>,
@@ -443,6 +506,7 @@ fn main() -> Result<()> {
             json,
         } => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
         Command::Run(args) => run::run(args),
+        Command::RunSkill(args) => skill_run::run_skill(args),
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
     }
@@ -907,6 +971,32 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(args.courier, "native");
+    }
+
+    #[test]
+    fn cli_parses_run_skill_command() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "run-skill",
+            "skills/file-analyst",
+            "--courier",
+            "docker",
+            "--model",
+            "gpt-5-mini",
+            "--provider",
+            "openai",
+            "--list-tools",
+        ])
+        .unwrap();
+
+        let Command::RunSkill(args) = cli.command else {
+            panic!("expected run-skill command");
+        };
+        assert_eq!(args.path, PathBuf::from("skills/file-analyst"));
+        assert_eq!(args.courier, "docker");
+        assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(args.provider.as_deref(), Some("openai"));
+        assert!(args.list_tools);
     }
 
     #[test]

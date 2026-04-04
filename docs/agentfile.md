@@ -255,6 +255,8 @@ Semantics:
 - duplicate explicit tool aliases fail the build
 - if multiple skills declare the same tool alias, Dispatch fails the build instead of picking one silently
 
+For local execution and testing, the CLI also supports `dispatch run-skill <path>` as a convenience wrapper. It synthesizes a temporary `Agentfile` around a `SKILL.md` file or skill bundle directory, builds a temporary parcel, and then executes it through the normal `dispatch run` flow. This is a shortcut for development, not a second parcel format.
+
 Recommended Agent Skills-compatible layout:
 
 ```text
