@@ -3873,6 +3873,11 @@ impl CourierBackend for WasmCourier {
             if consumes_run_budget {
                 ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
             }
+            let run_deadline = if consumes_run_budget {
+                run_timeout_deadline(&session, &parcel.config.timeouts)?
+            } else {
+                None
+            };
             let started_at = Instant::now();
 
             let mut response = match operation {
@@ -3902,10 +3907,34 @@ impl CourierBackend for WasmCourier {
                         CourierEvent::Done,
                     ],
                 }),
-                CourierOperation::InvokeTool { .. } => Err(CourierError::UnsupportedOperation {
-                    courier: "wasm".to_string(),
-                    operation: "tool".to_string(),
-                }),
+                CourierOperation::InvokeTool { invocation } => {
+                    session.turn_count += 1;
+                    let tool = resolve_local_tool(&parcel, &invocation.name)?;
+                    let result = execute_host_local_tool(
+                        &parcel,
+                        &tool,
+                        invocation.input.as_deref(),
+                        HostToolRunner::Native,
+                        run_deadline,
+                    )?;
+
+                    Ok(CourierResponse {
+                        courier_id: "wasm".to_string(),
+                        session: {
+                            persist_session_mounts(&session)?;
+                            session
+                        },
+                        events: vec![
+                            CourierEvent::ToolCallStarted {
+                                invocation,
+                                command: result.command.clone(),
+                                args: result.args.clone(),
+                            },
+                            CourierEvent::ToolCallFinished { result },
+                            CourierEvent::Done,
+                        ],
+                    })
+                }
                 CourierOperation::Chat { .. }
                 | CourierOperation::Job { .. }
                 | CourierOperation::Heartbeat { .. } => {
@@ -7240,6 +7269,51 @@ ENTRYPOINT chat
         ));
         assert_eq!(tool_response.session.history.len(), 4);
         assert_eq!(tool_response.session.history[2].content, "tool demo");
+    }
+
+    #[test]
+    fn wasm_courier_supports_direct_tool_invocation() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/wasm:latest
+COMPONENT components/assistant.wat
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT chat
+",
+            &[
+                ("components/assistant.wat", "(component)"),
+                ("tools/demo.sh", "printf 'direct-tool-ok'"),
+            ],
+        );
+        let courier = WasmCourier::new().unwrap();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::InvokeTool {
+                    invocation: ToolInvocation {
+                        name: "demo".to_string(),
+                        input: Some("hello".to_string()),
+                    },
+                },
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.session.turn_count, 1);
+        assert!(matches!(
+            response.events.as_slice(),
+            [
+                CourierEvent::ToolCallStarted { invocation, .. },
+                CourierEvent::ToolCallFinished { result },
+                CourierEvent::Done
+            ] if invocation.name == "demo"
+                && result.tool == "demo"
+                && result.exit_code == 0
+                && result.stdout.contains("direct-tool-ok")
+        ));
     }
 
     #[test]

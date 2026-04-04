@@ -1106,6 +1106,12 @@ mod tests {
     }
 
     #[test]
+    fn courier_conformance_runs_against_wasm() {
+        crate::conformance::courier_conformance("wasm", None, false, CliA2aPolicy::default())
+            .unwrap();
+    }
+
+    #[test]
     fn push_and_pull_round_trip_through_file_depot() {
         let dir = tempdir().unwrap();
         let (parcel_dir, parcel_digest) = build_test_image(dir.path());

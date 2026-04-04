@@ -18,6 +18,11 @@ use std::{
 };
 use tempfile::TempDir;
 
+static WASM_CONFORMANCE_GUEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../dispatch-core/tests/dispatch-wasm-guest-reference.wasm"
+));
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ConformanceCheck {
     name: String,
@@ -365,8 +370,8 @@ fn run_courier_conformance_with<R: CourierBackend>(
             checks.push(run_conformance_operation_check(
                 "heartbeat",
                 heartbeat_response,
-                assistant_message_and_done,
-                "expected assistant message and Done event",
+                text_output_and_done,
+                "expected text output and Done event",
             ));
         } else {
             checks.push(skipped_check(
@@ -515,6 +520,15 @@ fn assistant_message_and_done(response: &CourierResponse) -> bool {
         && matches!(response.events.last(), Some(CourierEvent::Done))
 }
 
+fn text_output_and_done(response: &CourierResponse) -> bool {
+    response.events.iter().any(|event| {
+        matches!(
+            event,
+            CourierEvent::Message { .. } | CourierEvent::TextDelta { .. }
+        )
+    }) && matches!(response.events.last(), Some(CourierEvent::Done))
+}
+
 fn skipped_check(name: &str, detail: &str) -> ConformanceCheck {
     ConformanceCheck {
         name: name.to_string(),
@@ -537,11 +551,14 @@ fn run_conformance_operation_check(
             skipped: false,
             detail: "ok".to_string(),
         },
-        Ok(_) => ConformanceCheck {
+        Ok(response) => ConformanceCheck {
             name: name.to_string(),
             passed: false,
             skipped: false,
-            detail: failure_detail.to_string(),
+            detail: format!(
+                "{failure_detail}; got {}",
+                summarize_conformance_response(&response)
+            ),
         },
         Err(error) => ConformanceCheck {
             name: name.to_string(),
@@ -549,6 +566,55 @@ fn run_conformance_operation_check(
             skipped: false,
             detail: error.to_string(),
         },
+    }
+}
+
+fn summarize_conformance_response(response: &CourierResponse) -> String {
+    response
+        .events
+        .iter()
+        .map(|event| match event {
+            CourierEvent::PromptResolved { .. } => "PromptResolved".to_string(),
+            CourierEvent::LocalToolsListed { tools } => {
+                format!("LocalToolsListed(count={})", tools.len())
+            }
+            CourierEvent::ToolCallStarted { invocation, .. } => {
+                format!("ToolCallStarted(name={})", invocation.name)
+            }
+            CourierEvent::ToolCallFinished { result } => format!(
+                "ToolCallFinished(tool={},exit={},stdout={:?},stderr={:?})",
+                result.tool,
+                result.exit_code,
+                truncate_detail(&result.stdout),
+                truncate_detail(&result.stderr)
+            ),
+            CourierEvent::Message { role, content } => {
+                format!(
+                    "Message(role={},content={:?})",
+                    role,
+                    truncate_detail(content)
+                )
+            }
+            CourierEvent::TextDelta { content } => {
+                format!("TextDelta({:?})", truncate_detail(content))
+            }
+            CourierEvent::BackendFallback { backend, error } => format!(
+                "BackendFallback(backend={},error={:?})",
+                backend,
+                truncate_detail(error)
+            ),
+            CourierEvent::Done => "Done".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn truncate_detail(value: &str) -> String {
+    const LIMIT: usize = 120;
+    if value.len() <= LIMIT {
+        value.to_string()
+    } else {
+        format!("{}...", &value[..LIMIT])
     }
 }
 
@@ -633,12 +699,34 @@ fn build_conformance_fixture(
     let context_dir = root.join(name);
     fs::create_dir_all(context_dir.join("tools"))
         .with_context(|| format!("failed to create {}", context_dir.display()))?;
+    let component_line = if courier_reference.starts_with("dispatch/wasm") {
+        fs::create_dir_all(context_dir.join("components")).with_context(|| {
+            format!(
+                "failed to create {}",
+                context_dir.join("components").display()
+            )
+        })?;
+        fs::write(
+            context_dir.join("components/reference.wasm"),
+            WASM_CONFORMANCE_GUEST,
+        )
+        .with_context(|| {
+            format!(
+                "failed to write {}",
+                context_dir.join("components/reference.wasm").display()
+            )
+        })?;
+        "COMPONENT components/reference.wasm\n"
+    } else {
+        ""
+    };
     fs::write(
         context_dir.join("Agentfile"),
         format!(
             "FROM {courier_reference}\n\
 NAME conformance-{name}\n\
 VERSION 0.1.0\n\
+{component_line}\
 SOUL SOUL.md\n\
 TOOL LOCAL tools/demo.sh AS demo\n\
 {extra_lines}\
