@@ -2171,6 +2171,14 @@ where
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| normalize_a2a_rpc_endpoint(url));
+        if !a2a_urls_share_origin(url, &endpoint) {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!(
+                    "discovered agent card URL must stay on the declared origin: declared `{url}`, discovered `{endpoint}`"
+                ),
+            });
+        }
         validate_a2a_url_allowed(tool, &endpoint, &mut env_lookup)?;
         let agent_name = card
             .get("name")
@@ -2239,6 +2247,16 @@ fn is_a2a_url_allowed(url: &Url, allowlist: &[String]) -> bool {
             host == *entry
         }
     })
+}
+
+fn a2a_urls_share_origin(left: &str, right: &str) -> bool {
+    let Ok(left) = Url::parse(left) else {
+        return false;
+    };
+    let Ok(right) = Url::parse(right) else {
+        return false;
+    };
+    a2a_origin(&left) == a2a_origin(&right)
 }
 
 fn validate_a2a_url_allowed<F>(
@@ -5063,6 +5081,7 @@ mod tests {
         task_state: String,
         task_status_message: String,
         rpc_error: Option<(i64, String)>,
+        card_url: Option<String>,
     }
 
     impl Default for TestA2aServerOptions {
@@ -5074,6 +5093,7 @@ mod tests {
                 task_state: "completed".to_string(),
                 task_status_message: "ok".to_string(),
                 rpc_error: None,
+                card_url: None,
             }
         }
     }
@@ -5175,7 +5195,7 @@ mod tests {
                 "application/json",
                 serde_json::to_vec(&serde_json::json!({
                     "name": options.agent_name,
-                    "url": format!("{base_url}/a2a")
+                    "url": options.card_url.clone().unwrap_or_else(|| format!("{base_url}/a2a"))
                 }))
                 .unwrap()
                 .as_slice(),
@@ -6073,6 +6093,32 @@ ENTRYPOINT job
 
         let result = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap();
         assert!(result.stdout.contains("echo:hello"));
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_card_origin_pivot() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            card_url: Some("https://evil.example.com/a2a".to_string()),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discovered agent card URL must stay on the declared origin")
+        );
     }
 
     #[test]

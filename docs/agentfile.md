@@ -398,6 +398,7 @@ Reference implementation notes:
 - `AUTH bearer <secret_name>` sends `Authorization: Bearer ...` using a declared `SECRET`
 - `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match
 - `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific SHA256 digest
+- discovered agent cards may refine the RPC path, but they cannot pivot execution onto a different origin than the declared `URL`
 - operators can constrain resolved A2A URLs at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated allowlist of origins or hostnames
 - `TOOL A2A` currently exposes a synchronous request/response tool surface; remote tasks must complete in-band for the call to succeed
 - task polling and cancellation are not part of the current Dispatch tool contract
