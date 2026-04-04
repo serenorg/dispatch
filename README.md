@@ -47,7 +47,19 @@ The practical applications: deploying untrusted third-party agents in a sandboxe
 An agent project has:
 
 - an `Agentfile`
-- optional instruction files: `IDENTITY.md`, `SOUL.md`, `SKILL.md`, `AGENTS.md`, `USER.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`
+- optional instruction files loaded into the agent's prompt stack:
+
+| File | Purpose |
+|---|---|
+| `IDENTITY.md` | Name, role, and display metadata |
+| `SOUL.md` | Persona, tone, writing style, and behavioral invariants |
+| `SKILL.md` | What the agent does and how to approach tasks |
+| `AGENTS.md` | Operating procedures: tool discipline, memory discipline, scope rules |
+| `USER.md` | Operator context: timezone, preferences, access boundaries |
+| `TOOLS.md` | When and how to use each declared tool |
+| `MEMORY.md` | Memory policy: what to store, when, and in what format |
+| `HEARTBEAT.md` | Procedures to execute on each scheduled run |
+
 - optional [Agent Skills](https://agentskills.io/specification) bundles referenced with `SKILL path/to/skill-dir`
 - an explicit `COMPONENT` for `dispatch/wasm` parcels
 - local tools, reference assets, evals, and code
