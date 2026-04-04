@@ -5,7 +5,8 @@ use crate::{
         FrameworkProvenance, InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig,
         McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind, NetworkRule,
         PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
-        TimeoutSpec, ToolConfig, ToolInputSchemaRef, Visibility, WasmComponentConfig,
+        TimeoutSpec, ToolApprovalPolicy, ToolConfig, ToolInputSchemaRef, ToolRiskLevel, Visibility,
+        WasmComponentConfig,
     },
     parse_agentfile,
     validate::{Level, validate_agentfile},
@@ -264,7 +265,7 @@ pub fn build_agentfile(
                 }
             }
             "TOOL" => {
-                if let Some(mut tool) = parse_tool(&instruction.args) {
+                if let Some(mut tool) = parse_tool(&instruction.args)? {
                     if let ToolConfig::Local(local) = &mut tool {
                         let resolved_path = resolve_path(&context_dir, &local.packaged_path)?;
                         let file_record =
@@ -299,7 +300,7 @@ pub fn build_agentfile(
             "ROUTING" => resolved.models.routing = first_scalar(instruction.args.first()),
             "COMPACTION" => resolved.compaction = parse_compaction(&instruction.args),
             "LIMIT" => {
-                if let Some(limit) = parse_limit(&instruction.args) {
+                if let Some(limit) = parse_limit(&instruction.args)? {
                     resolved.limits.push(limit);
                 }
             }
@@ -802,25 +803,39 @@ fn parse_mount(args: &[Value]) -> Option<MountConfig> {
     })
 }
 
-fn parse_tool(args: &[Value]) -> Option<ToolConfig> {
+fn parse_tool(args: &[Value]) -> Result<Option<ToolConfig>, BuildError> {
     let tokens = scalars(args);
-    match tokens.first()?.as_str() {
-        "LOCAL" => parse_local_tool(&tokens).map(ToolConfig::Local),
-        "BUILTIN" => tokens.get(1).map(|capability| {
-            ToolConfig::Builtin(BuiltinToolConfig {
-                capability: capability.clone(),
-                approval: parse_named_value(&tokens, "APPROVAL"),
-                description: parse_named_value(&tokens, "DESCRIPTION"),
+    let Some(first) = tokens.first() else {
+        return Ok(None);
+    };
+    match first.as_str() {
+        "LOCAL" => parse_local_tool(&tokens).map(|tool| tool.map(ToolConfig::Local)),
+        "BUILTIN" => tokens
+            .get(1)
+            .map(|capability| {
+                Ok(ToolConfig::Builtin(BuiltinToolConfig {
+                    capability: capability.clone(),
+                    approval: parse_tool_approval(&tokens)?,
+                    risk: parse_tool_risk(&tokens)?,
+                    description: parse_named_value(&tokens, "DESCRIPTION"),
+                }))
             })
-        }),
-        "MCP" => tokens.get(1).map(|server| {
-            ToolConfig::Mcp(McpToolConfig {
-                server: server.clone(),
-                approval: parse_named_value(&tokens, "APPROVAL"),
-                description: parse_named_value(&tokens, "DESCRIPTION"),
+            .transpose(),
+        "MCP" => tokens
+            .get(1)
+            .map(|server| {
+                Ok(ToolConfig::Mcp(McpToolConfig {
+                    server: server.clone(),
+                    approval: parse_tool_approval(&tokens)?,
+                    risk: parse_tool_risk(&tokens)?,
+                    description: parse_named_value(&tokens, "DESCRIPTION"),
+                }))
             })
-        }),
-        _ => None,
+            .transpose(),
+        "A2A" => Err(BuildError::Validation(
+            "TOOL A2A is reserved but not yet supported by the reference builder".to_string(),
+        )),
+        _ => Ok(None),
     }
 }
 
@@ -834,15 +849,18 @@ fn parse_component(args: &[Value]) -> ParsedComponent {
     ParsedComponent { packaged_path }
 }
 
-fn parse_local_tool(tokens: &[String]) -> Option<LocalToolConfig> {
-    let packaged_path = tokens.get(1)?.clone();
+fn parse_local_tool(tokens: &[String]) -> Result<Option<LocalToolConfig>, BuildError> {
+    let Some(packaged_path) = tokens.get(1).cloned() else {
+        return Ok(None);
+    };
     let alias = parse_named_value(tokens, "AS").unwrap_or_else(|| {
         Path::new(&packaged_path)
             .file_stem()
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_else(|| packaged_path.clone())
     });
-    let approval = parse_named_value(tokens, "APPROVAL");
+    let approval = parse_tool_approval(tokens)?;
+    let risk = parse_tool_risk(tokens)?;
     let description = parse_named_value(tokens, "DESCRIPTION");
     let input_schema =
         parse_named_value(tokens, "SCHEMA").map(|packaged_path| ToolInputSchemaRef {
@@ -851,14 +869,15 @@ fn parse_local_tool(tokens: &[String]) -> Option<LocalToolConfig> {
         });
     let runner = parse_tool_runner(tokens, &packaged_path);
 
-    Some(LocalToolConfig {
+    Ok(Some(LocalToolConfig {
         alias,
         packaged_path,
         runner,
         approval,
+        risk,
         description,
         input_schema,
-    })
+    }))
 }
 
 fn parse_tool_runner(tokens: &[String], packaged_path: &str) -> CommandSpec {
@@ -872,7 +891,12 @@ fn parse_tool_runner(tokens: &[String], packaged_path: &str) -> CommandSpec {
         index += 1;
 
         while let Some(token) = tokens.get(index) {
-            if token == "AS" || token == "APPROVAL" || token == "DESCRIPTION" || token == "SCHEMA" {
+            if token == "AS"
+                || token == "APPROVAL"
+                || token == "RISK"
+                || token == "DESCRIPTION"
+                || token == "SCHEMA"
+            {
                 break;
             }
             args.push(token.clone());
@@ -883,6 +907,35 @@ fn parse_tool_runner(tokens: &[String], packaged_path: &str) -> CommandSpec {
     }
 
     infer_runner(packaged_path)
+}
+
+fn parse_tool_approval(tokens: &[String]) -> Result<Option<ToolApprovalPolicy>, BuildError> {
+    let Some(value) = parse_named_value(tokens, "APPROVAL") else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "never" => Ok(Some(ToolApprovalPolicy::Never)),
+        "always" => Ok(Some(ToolApprovalPolicy::Always)),
+        "confirm" | "required" => Ok(Some(ToolApprovalPolicy::Confirm)),
+        "audit" => Ok(Some(ToolApprovalPolicy::Audit)),
+        other => Err(BuildError::Validation(format!(
+            "invalid tool approval policy `{other}`; expected one of never, always, confirm, audit"
+        ))),
+    }
+}
+
+fn parse_tool_risk(tokens: &[String]) -> Result<Option<ToolRiskLevel>, BuildError> {
+    let Some(value) = parse_named_value(tokens, "RISK") else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "low" => Ok(Some(ToolRiskLevel::Low)),
+        "medium" => Ok(Some(ToolRiskLevel::Medium)),
+        "high" => Ok(Some(ToolRiskLevel::High)),
+        other => Err(BuildError::Validation(format!(
+            "invalid tool risk level `{other}`; expected one of low, medium, high"
+        ))),
+    }
 }
 
 fn infer_runner(packaged_path: &str) -> CommandSpec {
@@ -905,16 +958,25 @@ fn infer_runner(packaged_path: &str) -> CommandSpec {
     }
 }
 
-fn parse_limit(args: &[Value]) -> Option<LimitSpec> {
+fn parse_limit(args: &[Value]) -> Result<Option<LimitSpec>, BuildError> {
     let tokens = scalars(args);
     if tokens.len() < 2 {
-        return None;
+        return Ok(None);
     }
-    Some(LimitSpec {
-        scope: tokens[0].clone(),
+    let scope = tokens[0].clone();
+    if !matches!(
+        scope.as_str(),
+        "ITERATIONS" | "TOOL_CALLS" | "TOOL_OUTPUT" | "CONTEXT_TOKENS"
+    ) {
+        return Err(BuildError::Validation(format!(
+            "invalid limit scope `{scope}`; expected one of ITERATIONS, TOOL_CALLS, TOOL_OUTPUT, CONTEXT_TOKENS"
+        )));
+    }
+    Ok(Some(LimitSpec {
+        scope,
         value: tokens[1].clone(),
         qualifiers: tokens[2..].to_vec(),
-    })
+    }))
 }
 
 fn parse_compaction(args: &[Value]) -> Option<CompactionConfig> {
@@ -1088,8 +1150,8 @@ USER USER.md
 TOOLS TOOLS.md
 MODEL claude-sonnet-4 PROVIDER anthropic
 FALLBACK gpt-5-nano PROVIDER openai
-TOOL LOCAL tools/demo.py AS demo USING python3 -u DESCRIPTION \"Look up a record by id and print JSON.\"
-TOOL BUILTIN web_search APPROVAL required DESCRIPTION \"Search the web for live information.\"
+TOOL LOCAL tools/demo.py AS demo USING python3 -u RISK low DESCRIPTION \"Look up a record by id and print JSON.\"
+TOOL BUILTIN web_search APPROVAL required RISK medium DESCRIPTION \"Search the web for live information.\"
 MOUNT SESSION sqlite
 NETWORK allow api.example.com
 ENV TZ=UTC
@@ -1182,6 +1244,7 @@ ENTRYPOINT chat
                 assert_eq!(local.alias, "demo");
                 assert_eq!(local.runner.command, "python3");
                 assert_eq!(local.runner.args, vec!["-u"]);
+                assert_eq!(local.risk, Some(ToolRiskLevel::Low));
                 assert_eq!(
                     local.description.as_deref(),
                     Some("Look up a record by id and print JSON.")
@@ -1191,6 +1254,8 @@ ENTRYPOINT chat
         }
         match &parcel.tools[1] {
             ToolConfig::Builtin(tool) => {
+                assert_eq!(tool.approval, Some(ToolApprovalPolicy::Confirm));
+                assert_eq!(tool.risk, Some(ToolRiskLevel::Medium));
                 assert_eq!(
                     tool.description.as_deref(),
                     Some("Search the web for live information.")
@@ -1270,6 +1335,102 @@ ENTRYPOINT chat
         let compaction = parcel.compaction.expect("expected compaction config");
         assert_eq!(compaction.interval, "200");
         assert_eq!(compaction.overlap, Some(32));
+    }
+
+    #[test]
+    fn build_rejects_invalid_tool_approval_policy() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL BUILTIN web_search APPROVAL bogus
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid tool approval policy"));
+    }
+
+    #[test]
+    fn build_rejects_invalid_tool_risk_level() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL BUILTIN web_search RISK dangerous
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid tool risk level"));
+    }
+
+    #[test]
+    fn build_rejects_invalid_limit_scope() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+LIMIT TOOL_CALL 5
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid limit scope"));
+    }
+
+    #[test]
+    fn build_rejects_a2a_tools_until_supported() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker-agent ORIGIN https://broker.example.com APPROVAL confirm
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("TOOL A2A is reserved"));
     }
 
     #[test]

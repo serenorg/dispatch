@@ -35,8 +35,8 @@ pub use manifest::{
     BuiltinToolConfig, CommandSpec, CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
     InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy,
     ModelReference, MountConfig, MountKind, NetworkRule, PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL,
-    ParcelFileRecord, ParcelManifest, SecretSpec, TimeoutSpec, ToolConfig, Visibility,
-    WasmComponentConfig,
+    ParcelFileRecord, ParcelManifest, SecretSpec, TimeoutSpec, ToolApprovalPolicy, ToolConfig,
+    ToolRiskLevel, Visibility, WasmComponentConfig,
 };
 pub use parse::{ParseError, parse_agentfile};
 pub use plugin_protocol::{

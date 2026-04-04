@@ -333,6 +333,8 @@ ROUTING deep
 ROUTING fast
 ```
 
+`ROUTING` is stored as parcel metadata. The reference implementation does not yet enforce routing-specific model selection behavior.
+
 ### Tools
 
 Tools must be explicitly declared.
@@ -341,7 +343,7 @@ Tools must be explicitly declared.
 
 ```dockerfile
 TOOL LOCAL tools/fetch_price.py AS fetch_price
-TOOL LOCAL tools/browser.ts AS browse APPROVAL required
+TOOL LOCAL tools/browser.ts AS browse APPROVAL confirm RISK medium
 TOOL LOCAL tools/report.py AS report USING python3 -u
 TOOL LOCAL tools/report.py AS report USING python3 -u DESCRIPTION "Generate a report from JSON input."
 TOOL LOCAL tools/report.py AS report SCHEMA schemas/report.json DESCRIPTION "Generate a report from structured JSON input."
@@ -351,7 +353,8 @@ Supported clauses:
 
 - `AS <alias>`
 - `USING <command> [args...]`
-- `APPROVAL <policy>`
+- `APPROVAL <policy>` where policy is `never`, `always`, `confirm`, or `audit`
+- `RISK <level>` where level is `low`, `medium`, or `high`
 - `DESCRIPTION "..."` for model/tooling guidance
 - `SCHEMA <file>` to package a JSON input schema for structured tool invocation
 
@@ -359,7 +362,7 @@ Supported clauses:
 
 ```dockerfile
 TOOL BUILTIN web_search
-TOOL BUILTIN human_approval APPROVAL audit DESCRIPTION "Request a human approval with an audit trail."
+TOOL BUILTIN human_approval APPROVAL audit RISK medium DESCRIPTION "Request a human approval with an audit trail."
 TOOL BUILTIN memory_put DESCRIPTION "Store a durable profile fact."
 TOOL BUILTIN memory_get DESCRIPTION "Load a durable profile fact."
 ```
@@ -373,14 +376,12 @@ Native courier note:
 
 ```dockerfile
 TOOL MCP slack
-TOOL MCP github APPROVAL required DESCRIPTION "Use the GitHub MCP server for repository operations."
+TOOL MCP github APPROVAL confirm RISK high DESCRIPTION "Use the GitHub MCP server for repository operations."
 ```
 
 #### `TOOL A2A`
 
-```dockerfile
-TOOL A2A broker-agent ORIGIN https://broker.example.com APPROVAL required
-```
+Reserved for future agent-to-agent courier integrations. The reference builder does not currently accept `TOOL A2A` declarations.
 
 ### Files and Assets
 

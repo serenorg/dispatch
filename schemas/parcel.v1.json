@@ -433,6 +433,25 @@
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
           ]
         },
         "description": {
@@ -481,6 +500,25 @@
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
           ]
         },
         "description": {
@@ -509,6 +547,25 @@
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
           ]
         },
         "description": {

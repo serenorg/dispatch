@@ -209,7 +209,8 @@ pub struct LocalToolConfig {
     pub alias: String,
     pub packaged_path: String,
     pub runner: CommandSpec,
-    pub approval: Option<String>,
+    pub approval: Option<ToolApprovalPolicy>,
+    pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema: Option<ToolInputSchemaRef>,
 }
@@ -217,15 +218,34 @@ pub struct LocalToolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuiltinToolConfig {
     pub capability: String,
-    pub approval: Option<String>,
+    pub approval: Option<ToolApprovalPolicy>,
+    pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpToolConfig {
     pub server: String,
-    pub approval: Option<String>,
+    pub approval: Option<ToolApprovalPolicy>,
+    pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalPolicy {
+    Never,
+    Always,
+    Confirm,
+    Audit,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRiskLevel {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

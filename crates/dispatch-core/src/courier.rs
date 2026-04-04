@@ -223,6 +223,8 @@ pub enum CourierError {
     ModelBackendRequest(String),
     #[error("model backend returned an unexpected response: {0}")]
     ModelBackendResponse(String),
+    #[error("model requested {attempted} tool calls, exceeding the configured limit of {limit}")]
+    ToolCallLimitExceeded { limit: u32, attempted: u32 },
     #[error(
         "parcel `{parcel_digest}` does not declare a usable memory mount for courier memory operations"
     )]
@@ -248,6 +250,22 @@ pub enum CourierError {
         #[source]
         source: rusqlite::Error,
     },
+}
+
+impl CourierError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::ModelBackendRequest(_)
+                | Self::ReadPluginResponse { .. }
+                | Self::WritePluginRequest { .. }
+                | Self::WaitPlugin { .. }
+                | Self::SpawnPlugin { .. }
+                | Self::SpawnTool { .. }
+                | Self::WriteToolInput { .. }
+                | Self::WaitTool { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -497,6 +515,8 @@ pub struct ModelRequest {
     pub model: String,
     pub provider: Option<String>,
     pub context_token_limit: Option<u32>,
+    pub tool_call_limit: Option<u32>,
+    pub tool_output_limit: Option<usize>,
     pub instructions: String,
     pub messages: Vec<ConversationMessage>,
     pub tools: Vec<ModelToolDefinition>,
@@ -3952,6 +3972,7 @@ fn execute_host_turn(
         }
         const MAX_TOOL_ROUNDS: u32 = 8;
         let mut rounds = 0u32;
+        let mut executed_tool_calls = 0u32;
         let mut backend = select_chat_backend(chat_backend_override, &request);
         let mut candidate_locked = false;
         let mut streamed_reply = false;
@@ -4033,6 +4054,13 @@ fn execute_host_turn(
 
             if !reply.tool_calls.is_empty() {
                 candidate_locked = true;
+                if let Some(limit) = request.tool_call_limit {
+                    let attempted =
+                        executed_tool_calls.saturating_add(reply.tool_calls.len() as u32);
+                    if attempted > limit {
+                        return Err(CourierError::ToolCallLimitExceeded { limit, attempted });
+                    }
+                }
                 let reply_tool_calls = reply.tool_calls.clone();
                 let mut tool_outputs = Vec::with_capacity(reply.tool_calls.len());
                 for tool_call in reply.tool_calls {
@@ -4089,6 +4117,8 @@ fn execute_host_turn(
                             tool_result.exit_code, tool_result.stdout, tool_result.stderr
                         )
                     };
+                    let combined_output =
+                        truncate_tool_output(combined_output, request.tool_output_limit);
                     events.push(CourierEvent::ToolCallFinished {
                         result: tool_result,
                     });
@@ -4098,6 +4128,7 @@ fn execute_host_turn(
                         output: combined_output,
                         kind: tool_call.kind,
                     });
+                    executed_tool_calls = executed_tool_calls.saturating_add(1);
                 }
 
                 if backend.supports_previous_response_id() {
@@ -4218,6 +4249,8 @@ fn build_model_requests(
             model: model.id,
             provider: model.provider,
             context_token_limit: configured_context_token_limit(&image.config.limits),
+            tool_call_limit: configured_tool_call_limit(&image.config.limits),
+            tool_output_limit: configured_tool_output_limit(&image.config.limits),
             instructions: instructions.clone(),
             messages: messages.to_vec(),
             tools: tools.clone(),
@@ -4284,6 +4317,8 @@ fn build_wasm_model_requests(
             model: model.id,
             provider: model.provider,
             context_token_limit: configured_context_token_limit(&parcel.config.limits),
+            tool_call_limit: configured_tool_call_limit(&parcel.config.limits),
+            tool_output_limit: configured_tool_output_limit(&parcel.config.limits),
             instructions: instructions.clone(),
             messages: messages.clone(),
             tools: tools.clone(),
@@ -4295,12 +4330,50 @@ fn build_wasm_model_requests(
 }
 
 fn configured_context_token_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
+    configured_limit_u32(limits, "CONTEXT_TOKENS")
+}
+
+fn configured_tool_call_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
+    configured_limit_u32(limits, "TOOL_CALLS")
+}
+
+fn configured_tool_output_limit(limits: &[crate::manifest::LimitSpec]) -> Option<usize> {
+    configured_limit_u32(limits, "TOOL_OUTPUT").map(|value| value as usize)
+}
+
+fn configured_limit_u32(limits: &[crate::manifest::LimitSpec], scope: &str) -> Option<u32> {
     limits
         .iter()
         .rev()
-        .find(|limit| limit.scope.eq_ignore_ascii_case("CONTEXT_TOKENS"))
+        .find(|limit| limit.scope.eq_ignore_ascii_case(scope))
         .and_then(|limit| limit.value.parse::<u32>().ok())
         .filter(|value| *value > 0)
+}
+
+fn truncate_tool_output(output: String, limit: Option<usize>) -> String {
+    const TRUNCATION_NOTE: &str = "\n\n[dispatch truncated tool output]";
+    let Some(limit) = limit else {
+        return output;
+    };
+    if output.len() <= limit {
+        return output;
+    }
+    if limit <= TRUNCATION_NOTE.len() {
+        return TRUNCATION_NOTE[..limit].to_string();
+    }
+    let keep = limit - TRUNCATION_NOTE.len();
+    let mut truncated = String::with_capacity(limit);
+    let mut used = 0usize;
+    for ch in output.chars() {
+        let ch_len = ch.len_utf8();
+        if used + ch_len > keep {
+            break;
+        }
+        truncated.push(ch);
+        used += ch_len;
+    }
+    truncated.push_str(TRUNCATION_NOTE);
+    truncated
 }
 
 fn select_chat_backend(
@@ -6576,11 +6649,68 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn configured_tool_limits_use_last_valid_values() {
+        let limits = vec![
+            crate::manifest::LimitSpec {
+                scope: "TOOL_CALLS".to_string(),
+                value: "2".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::LimitSpec {
+                scope: "TOOL_OUTPUT".to_string(),
+                value: "0".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::LimitSpec {
+                scope: "TOOL_CALLS".to_string(),
+                value: "5".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::LimitSpec {
+                scope: "TOOL_OUTPUT".to_string(),
+                value: "1024".to_string(),
+                qualifiers: Vec::new(),
+            },
+        ];
+
+        assert_eq!(configured_tool_call_limit(&limits), Some(5));
+        assert_eq!(configured_tool_output_limit(&limits), Some(1024));
+    }
+
+    #[test]
+    fn truncate_tool_output_preserves_utf8_boundaries() {
+        let output = "hello π world and a much longer tool output payload".to_string();
+        let truncated = truncate_tool_output(output, Some(40));
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.contains("[dispatch truncated tool output]"));
+    }
+
+    #[test]
+    fn courier_error_retryability_is_classified() {
+        assert!(CourierError::ModelBackendRequest("network".to_string()).is_retryable());
+        assert!(
+            !CourierError::ToolCallLimitExceeded {
+                limit: 2,
+                attempted: 3
+            }
+            .is_retryable()
+        );
+        assert!(
+            !CourierError::MissingSecret {
+                name: "OPENAI_API_KEY".to_string()
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
     fn anthropic_max_tokens_uses_context_token_limit_when_present() {
         let request = ModelRequest {
             model: "claude-sonnet-4".to_string(),
             provider: Some("anthropic".to_string()),
             context_token_limit: Some(16000),
+            tool_call_limit: None,
+            tool_output_limit: None,
             instructions: String::new(),
             messages: Vec::new(),
             tools: Vec::new(),
@@ -6614,6 +6744,8 @@ ENTRYPOINT chat
             model: "gpt-5-mini".to_string(),
             provider: Some("openai_compatible".to_string()),
             context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
             instructions: "Be helpful.".to_string(),
             messages: vec![ConversationMessage {
                 role: "user".to_string(),
@@ -6650,6 +6782,8 @@ ENTRYPOINT chat
             model: "claude-sonnet-4".to_string(),
             provider: Some("anthropic".to_string()),
             context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
             instructions: String::new(),
             messages: vec![ConversationMessage {
                 role: "user".to_string(),
@@ -6686,6 +6820,8 @@ ENTRYPOINT chat
             model: "gemini-2.5-pro".to_string(),
             provider: Some("gemini".to_string()),
             context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
             instructions: String::new(),
             messages: vec![ConversationMessage {
                 role: "user".to_string(),
