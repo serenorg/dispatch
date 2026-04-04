@@ -1,4 +1,4 @@
-use crate::manifest::{A2aAuthScheme, A2aEndpointMode};
+use crate::manifest::{A2aAuthConfig, A2aEndpointMode};
 use crate::trust::{A2aTrustPolicy, A2aTrustRequirement};
 use sha2::{Digest, Sha256};
 use std::{
@@ -260,24 +260,52 @@ fn apply_a2a_auth_headers<State, F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let (Some(secret_name), Some(auth_scheme)) = (tool.auth_secret_name(), tool.auth_scheme())
-    else {
+    let Some(auth) = tool.auth() else {
         return Ok(request);
     };
-    let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
-        tool: tool.alias.clone(),
-        message: format!("configured A2A auth secret `{secret_name}` is not available"),
-    })?;
-    request = match auth_scheme {
-        A2aAuthScheme::Bearer => request.header("authorization", &format!("Bearer {secret_value}")),
-        A2aAuthScheme::Header => {
-            let header_name =
-                tool.auth_header_name()
-                    .ok_or_else(|| CourierError::A2aToolRequest {
-                        tool: tool.alias.clone(),
-                        message: "configured A2A header auth is missing a header name".to_string(),
-                    })?;
+    request = match auth {
+        A2aAuthConfig::Bearer { secret_name } => {
+            let secret_value =
+                env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                    tool: tool.alias.clone(),
+                    message: format!("configured A2A auth secret `{secret_name}` is not available"),
+                })?;
+            request.header("authorization", &format!("Bearer {secret_value}"))
+        }
+        A2aAuthConfig::Header {
+            header_name,
+            secret_name,
+        } => {
+            let secret_value =
+                env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                    tool: tool.alias.clone(),
+                    message: format!("configured A2A auth secret `{secret_name}` is not available"),
+                })?;
             request.header(header_name, &secret_value)
+        }
+        A2aAuthConfig::Basic {
+            username_secret_name,
+            password_secret_name,
+        } => {
+            let username =
+                env_lookup(username_secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                    tool: tool.alias.clone(),
+                    message: format!(
+                        "configured A2A auth secret `{username_secret_name}` is not available"
+                    ),
+                })?;
+            let password =
+                env_lookup(password_secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                    tool: tool.alias.clone(),
+                    message: format!(
+                        "configured A2A auth secret `{password_secret_name}` is not available"
+                    ),
+                })?;
+            let encoded = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+            };
+            request.header("authorization", &format!("Basic {encoded}"))
         }
     };
     Ok(request)

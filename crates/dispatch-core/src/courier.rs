@@ -309,9 +309,7 @@ pub enum LocalToolTarget {
     A2a {
         endpoint_url: String,
         endpoint_mode: Option<A2aEndpointMode>,
-        auth_secret_name: Option<String>,
-        auth_scheme: Option<A2aAuthScheme>,
-        auth_header_name: Option<String>,
+        auth: Option<crate::manifest::A2aAuthConfig>,
         expected_agent_name: Option<String>,
         expected_card_sha256: Option<String>,
     },
@@ -370,19 +368,46 @@ impl LocalToolSpec {
         }
     }
 
-    pub fn auth_secret_name(&self) -> Option<&str> {
+    pub fn auth(&self) -> Option<&crate::manifest::A2aAuthConfig> {
         match &self.target {
-            LocalToolTarget::A2a {
-                auth_secret_name, ..
-            } => auth_secret_name.as_deref(),
+            LocalToolTarget::A2a { auth, .. } => auth.as_ref(),
             LocalToolTarget::Local { .. } => None,
         }
     }
 
+    pub fn auth_secret_name(&self) -> Option<&str> {
+        match self.auth() {
+            Some(crate::manifest::A2aAuthConfig::Bearer { secret_name }) => {
+                Some(secret_name.as_str())
+            }
+            Some(crate::manifest::A2aAuthConfig::Header { secret_name, .. }) => {
+                Some(secret_name.as_str())
+            }
+            _ => None,
+        }
+    }
+
     pub fn auth_scheme(&self) -> Option<A2aAuthScheme> {
-        match &self.target {
-            LocalToolTarget::A2a { auth_scheme, .. } => *auth_scheme,
-            LocalToolTarget::Local { .. } => None,
+        self.auth().map(crate::manifest::A2aAuthConfig::scheme)
+    }
+
+    pub fn auth_username_secret_name(&self) -> Option<&str> {
+        match self.auth() {
+            Some(crate::manifest::A2aAuthConfig::Basic {
+                username_secret_name,
+                ..
+            }) => Some(username_secret_name.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn auth_password_secret_name(&self) -> Option<&str> {
+        match self.auth() {
+            Some(crate::manifest::A2aAuthConfig::Basic {
+                password_secret_name,
+                ..
+            }) => Some(password_secret_name.as_str()),
+            _ => None,
         }
     }
 
@@ -407,11 +432,11 @@ impl LocalToolSpec {
     }
 
     pub fn auth_header_name(&self) -> Option<&str> {
-        match &self.target {
-            LocalToolTarget::A2a {
-                auth_header_name, ..
-            } => auth_header_name.as_deref(),
-            LocalToolTarget::Local { .. } => None,
+        match self.auth() {
+            Some(crate::manifest::A2aAuthConfig::Header { header_name, .. }) => {
+                Some(header_name.as_str())
+            }
+            _ => None,
         }
     }
 
@@ -1306,9 +1331,7 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 target: LocalToolTarget::A2a {
                     endpoint_url: a2a.url.clone(),
                     endpoint_mode: a2a.endpoint_mode,
-                    auth_secret_name: a2a.auth.as_ref().map(|auth| auth.secret_name.clone()),
-                    auth_scheme: a2a.auth.as_ref().map(|auth| auth.scheme),
-                    auth_header_name: a2a.auth.as_ref().and_then(|auth| auth.header_name.clone()),
+                    auth: a2a.auth.clone(),
                     expected_agent_name: a2a.expected_agent_name.clone(),
                     expected_card_sha256: a2a.expected_card_sha256.clone(),
                 },
@@ -6087,6 +6110,8 @@ ENTRYPOINT job
         assert_eq!(tools[0].endpoint_mode(), Some(A2aEndpointMode::Direct));
         assert_eq!(tools[0].auth_secret_name(), Some("A2A_TOKEN"));
         assert_eq!(tools[0].auth_scheme(), Some(A2aAuthScheme::Bearer));
+        assert_eq!(tools[0].auth_username_secret_name(), None);
+        assert_eq!(tools[0].auth_password_secret_name(), None);
         assert_eq!(tools[0].auth_header_name(), None);
         assert_eq!(tools[0].expected_agent_name(), Some("remote-broker"));
         assert_eq!(
@@ -6235,6 +6260,45 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn native_courier_executes_a2a_tools_with_basic_auth() {
+        let encoded = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode("demo-user:topsecret")
+        };
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            expected_auth: Some(format!("Basic {encoded}")),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+SECRET A2A_USER
+SECRET A2A_PASSWORD
+TOOL A2A broker URL {} AUTH basic A2A_USER A2A_PASSWORD
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let result =
+            run_local_tool_with_env(
+                &test_image.image,
+                "broker",
+                Some("hello"),
+                |name| match name {
+                    "A2A_USER" => Some("demo-user".to_string()),
+                    "A2A_PASSWORD" => Some("topsecret".to_string()),
+                    _ => None,
+                },
+            )
+            .unwrap();
+        assert!(result.stdout.contains("echo:hello"));
+    }
+
+    #[test]
     fn native_courier_rejects_a2a_call_when_auth_secret_is_missing() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
             expected_auth: Some("Bearer topsecret".to_string()),
@@ -6248,9 +6312,9 @@ ENTRYPOINT job
             target: LocalToolTarget::A2a {
                 endpoint_url: server.base_url.clone(),
                 endpoint_mode: None,
-                auth_secret_name: Some("A2A_TOKEN".to_string()),
-                auth_scheme: Some(A2aAuthScheme::Bearer),
-                auth_header_name: None,
+                auth: Some(crate::manifest::A2aAuthConfig::Bearer {
+                    secret_name: "A2A_TOKEN".to_string(),
+                }),
                 expected_agent_name: None,
                 expected_card_sha256: None,
             },

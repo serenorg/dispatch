@@ -79,6 +79,7 @@ TOOL BUILTIN memory_get
 SECRET PLANNER_TOKEN
 TOOL A2A planner URL https://planner.example.com DISCOVERY card AUTH bearer PLANNER_TOKEN EXPECT_AGENT_NAME planner-agent EXPECT_CARD_SHA256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef DESCRIPTION "Delegate planning to a remote agent."
 TOOL A2A search URL https://search.example.com AUTH header X-Api-Key SEARCH_TOKEN DESCRIPTION "Call a remote search agent with header auth."
+TOOL A2A backoffice URL https://backoffice.example.com AUTH basic BACKOFFICE_USER BACKOFFICE_PASSWORD DESCRIPTION "Call a remote backoffice agent with basic auth."
 
 MOUNT SESSION sqlite
 MOUNT MEMORY sqlite

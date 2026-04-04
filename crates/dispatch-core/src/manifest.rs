@@ -252,25 +252,44 @@ pub struct A2aToolConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum A2aEndpointMode {
-    Auto,
-    Card,
-    Direct,
+pub enum A2aAuthScheme {
+    Bearer,
+    Header,
+    Basic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct A2aAuthConfig {
-    pub scheme: A2aAuthScheme,
-    pub secret_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub header_name: Option<String>,
+#[serde(tag = "scheme", rename_all = "snake_case")]
+pub enum A2aAuthConfig {
+    Bearer {
+        secret_name: String,
+    },
+    Header {
+        header_name: String,
+        secret_name: String,
+    },
+    Basic {
+        username_secret_name: String,
+        password_secret_name: String,
+    },
+}
+
+impl A2aAuthConfig {
+    pub fn scheme(&self) -> A2aAuthScheme {
+        match self {
+            Self::Bearer { .. } => A2aAuthScheme::Bearer,
+            Self::Header { .. } => A2aAuthScheme::Header,
+            Self::Basic { .. } => A2aAuthScheme::Basic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum A2aAuthScheme {
-    Bearer,
-    Header,
+pub enum A2aEndpointMode {
+    Auto,
+    Card,
+    Direct,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -27,6 +27,7 @@ tar.workspace = true
 urlencoding.workspace = true
 serde_yaml.workspace = true
 url.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

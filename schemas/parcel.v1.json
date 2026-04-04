@@ -611,29 +611,64 @@
             "object",
             "null"
           ],
-          "additionalProperties": false,
-          "required": [
-            "scheme",
-            "secret_name"
-          ],
-          "properties": {
-            "scheme": {
-              "type": "string",
-              "enum": [
-                "bearer",
-                "header"
-              ]
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scheme",
+                "secret_name"
+              ],
+              "properties": {
+                "scheme": {
+                  "const": "bearer"
+                },
+                "secret_name": {
+                  "type": "string"
+                }
+              }
             },
-            "header_name": {
-              "type": [
-                "string",
-                "null"
-              ]
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scheme",
+                "header_name",
+                "secret_name"
+              ],
+              "properties": {
+                "scheme": {
+                  "const": "header"
+                },
+                "header_name": {
+                  "type": "string"
+                },
+                "secret_name": {
+                  "type": "string"
+                }
+              }
             },
-            "secret_name": {
-              "type": "string"
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scheme",
+                "username_secret_name",
+                "password_secret_name"
+              ],
+              "properties": {
+                "scheme": {
+                  "const": "basic"
+                },
+                "username_secret_name": {
+                  "type": "string"
+                },
+                "password_secret_name": {
+                  "type": "string"
+                }
+              }
             }
-          }
+          ]
         },
         "expected_agent_name": {
           "type": [

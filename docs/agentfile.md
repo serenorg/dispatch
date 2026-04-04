@@ -399,6 +399,7 @@ Reference implementation notes:
 - A2A URLs must not embed credentials; use `AUTH ...` with a declared `SECRET` instead
 - `AUTH bearer <secret_name>` sends `Authorization: Bearer ...` using a declared `SECRET`
 - `AUTH header <header_name> <secret_name>` sends the secret value in the named HTTP header for both discovery and RPC calls
+- `AUTH basic <username_secret_name> <password_secret_name>` sends `Authorization: Basic ...` using two declared `SECRET`s
 - `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match, or if card discovery succeeds without a `name`
 - `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific lowercase SHA256 digest
 - discovered agent cards may refine the RPC path, but they cannot pivot execution onto a different origin than the declared `URL`

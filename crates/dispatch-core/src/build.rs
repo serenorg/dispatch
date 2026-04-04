@@ -1,12 +1,12 @@
 use crate::{
     ParsedAgentfile, Value,
     manifest::{
-        A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, A2aToolConfig, BuiltinToolConfig,
-        CommandSpec, CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
-        FrameworkProvenance, InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig,
-        McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind, NetworkRule,
-        PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
-        TimeoutSpec, ToolApprovalPolicy, ToolConfig, ToolInputSchemaRef, ToolRiskLevel, Visibility,
+        A2aAuthConfig, A2aEndpointMode, A2aToolConfig, BuiltinToolConfig, CommandSpec,
+        CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar, FrameworkProvenance,
+        InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy,
+        ModelReference, MountConfig, MountKind, NetworkRule, PARCEL_FORMAT_VERSION,
+        PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec, TimeoutSpec,
+        ToolApprovalPolicy, ToolConfig, ToolInputSchemaRef, ToolRiskLevel, Visibility,
         WasmComponentConfig,
     },
     parse_agentfile,
@@ -411,15 +411,19 @@ pub fn build_agentfile(
     for tool in &resolved.tools {
         if let ToolConfig::A2a(tool) = tool
             && let Some(auth) = &tool.auth
-            && !resolved
-                .secrets
-                .iter()
-                .any(|secret| secret.name == auth.secret_name)
         {
-            return Err(BuildError::Validation(format!(
-                "TOOL A2A `{}` references auth secret `{}` which is not declared via `SECRET`",
-                tool.alias, auth.secret_name
-            )));
+            for secret_name in a2a_auth_secret_names(auth) {
+                if !resolved
+                    .secrets
+                    .iter()
+                    .any(|secret| secret.name == secret_name)
+                {
+                    return Err(BuildError::Validation(format!(
+                        "TOOL A2A `{}` references auth secret `{}` which is not declared via `SECRET`",
+                        tool.alias, secret_name
+                    )));
+                }
+            }
         }
     }
 
@@ -979,17 +983,19 @@ fn parse_a2a_auth(tokens: &[String]) -> Result<Option<A2aAuthConfig>, BuildError
     };
     let Some(scheme) = tokens.get(auth_index + 1) else {
         return Err(BuildError::Validation(
-            "TOOL A2A `AUTH` requires `bearer <secret_name>` or `header <header_name> <secret_name>`".to_string(),
+            "TOOL A2A `AUTH` requires `bearer <secret_name>`, `header <header_name> <secret_name>`, or `basic <username_secret_name> <password_secret_name>`".to_string(),
         ));
     };
-    let (scheme, header_name, secret_name) = match scheme.to_ascii_lowercase().as_str() {
+    let auth = match scheme.to_ascii_lowercase().as_str() {
         "bearer" => {
             let Some(secret_name) = tokens.get(auth_index + 2) else {
                 return Err(BuildError::Validation(
                     "TOOL A2A `AUTH bearer` requires `<secret_name>`".to_string(),
                 ));
             };
-            (A2aAuthScheme::Bearer, None, secret_name.clone())
+            A2aAuthConfig::Bearer {
+                secret_name: secret_name.clone(),
+            }
         }
         "header" => {
             let Some(header_name) = tokens.get(auth_index + 2) else {
@@ -1003,23 +1009,45 @@ fn parse_a2a_auth(tokens: &[String]) -> Result<Option<A2aAuthConfig>, BuildError
                 ));
             };
             validate_http_header_name(header_name)?;
-            (
-                A2aAuthScheme::Header,
-                Some(header_name.clone()),
-                secret_name.clone(),
-            )
+            A2aAuthConfig::Header {
+                header_name: header_name.clone(),
+                secret_name: secret_name.clone(),
+            }
+        }
+        "basic" => {
+            let Some(username_secret_name) = tokens.get(auth_index + 2) else {
+                return Err(BuildError::Validation(
+                    "TOOL A2A `AUTH basic` requires `<username_secret_name> <password_secret_name>`".to_string(),
+                ));
+            };
+            let Some(password_secret_name) = tokens.get(auth_index + 3) else {
+                return Err(BuildError::Validation(
+                    "TOOL A2A `AUTH basic` requires `<username_secret_name> <password_secret_name>`".to_string(),
+                ));
+            };
+            A2aAuthConfig::Basic {
+                username_secret_name: username_secret_name.clone(),
+                password_secret_name: password_secret_name.clone(),
+            }
         }
         other => {
             return Err(BuildError::Validation(format!(
-                "invalid A2A auth scheme `{other}`; expected `bearer` or `header`"
+                "invalid A2A auth scheme `{other}`; expected `bearer`, `header`, or `basic`"
             )));
         }
     };
-    Ok(Some(A2aAuthConfig {
-        scheme,
-        secret_name,
-        header_name,
-    }))
+    Ok(Some(auth))
+}
+
+fn a2a_auth_secret_names(auth: &A2aAuthConfig) -> Vec<&str> {
+    match auth {
+        A2aAuthConfig::Bearer { secret_name } => vec![secret_name.as_str()],
+        A2aAuthConfig::Header { secret_name, .. } => vec![secret_name.as_str()],
+        A2aAuthConfig::Basic {
+            username_secret_name,
+            password_secret_name,
+        } => vec![username_secret_name.as_str(), password_secret_name.as_str()],
+    }
 }
 
 fn validate_http_header_name(header_name: &str) -> Result<(), BuildError> {
@@ -1307,6 +1335,7 @@ fn validate_tool_schema(path: &Path, tool: &str) -> Result<(), BuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::A2aAuthScheme;
     use tempfile::tempdir;
 
     #[test]
@@ -1651,9 +1680,11 @@ ENTRYPOINT chat
                     Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 );
                 let auth = tool.auth.as_ref().expect("expected auth config");
-                assert_eq!(auth.scheme, A2aAuthScheme::Bearer);
-                assert_eq!(auth.secret_name, "A2A_TOKEN");
-                assert_eq!(auth.header_name, None);
+                assert_eq!(auth.scheme(), A2aAuthScheme::Bearer);
+                assert!(matches!(
+                    auth,
+                    A2aAuthConfig::Bearer { secret_name } if secret_name == "A2A_TOKEN"
+                ));
                 assert_eq!(tool.approval, Some(ToolApprovalPolicy::Confirm));
                 assert_eq!(tool.risk, Some(ToolRiskLevel::Medium));
                 assert_eq!(
@@ -1750,9 +1781,56 @@ ENTRYPOINT chat
         match &parcel.tools[0] {
             ToolConfig::A2a(tool) => {
                 let auth = tool.auth.as_ref().expect("expected auth config");
-                assert_eq!(auth.scheme, A2aAuthScheme::Header);
-                assert_eq!(auth.header_name.as_deref(), Some("X-Api-Key"));
-                assert_eq!(auth.secret_name, "API_KEY");
+                assert_eq!(auth.scheme(), A2aAuthScheme::Header);
+                assert!(matches!(
+                    auth,
+                    A2aAuthConfig::Header {
+                        header_name,
+                        secret_name,
+                    } if header_name == "X-Api-Key" && secret_name == "API_KEY"
+                ));
+            }
+            other => panic!("expected a2a tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_parses_a2a_basic_auth() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+SECRET A2A_USER
+SECRET A2A_PASSWORD
+TOOL A2A broker URL https://broker.example.com AUTH basic A2A_USER A2A_PASSWORD
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(&built.manifest_path).unwrap()).unwrap();
+        match &parcel.tools[0] {
+            ToolConfig::A2a(tool) => {
+                let auth = tool.auth.as_ref().expect("expected auth config");
+                assert_eq!(auth.scheme(), A2aAuthScheme::Basic);
+                assert!(matches!(
+                    auth,
+                    A2aAuthConfig::Basic {
+                        username_secret_name,
+                        password_secret_name,
+                    } if username_secret_name == "A2A_USER"
+                        && password_secret_name == "A2A_PASSWORD"
+                ));
             }
             other => panic!("expected a2a tool, got {other:?}"),
         }
