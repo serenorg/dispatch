@@ -459,6 +459,8 @@ TIMEOUT TOOL 60s
 TIMEOUT LLM 120s
 ```
 
+The reference implementation currently enforces `TIMEOUT TOOL` for host-executed local tools and host-executed `TOOL A2A` calls.
+
 #### `LIMIT`
 
 ```dockerfile

@@ -93,14 +93,15 @@ LIMIT CONTEXT_TOKENS 16000
 COMPACTION 200 OVERLAP 32
 TIMEOUT RUN 300s
 TIMEOUT TOOL 60s
-
-`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames. The current `TOOL A2A` contract is synchronous: remote tasks must complete in-band for the tool call to succeed.
 TIMEOUT LLM 120s
-
 EVAL evals/smoke.eval
 
 ENTRYPOINT chat
 ```
+
+`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames. The current `TOOL A2A` contract is synchronous: remote tasks must complete in-band for the tool call to succeed.
+
+`TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
 
 
 ## WASM Courier

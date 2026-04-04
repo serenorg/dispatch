@@ -23,7 +23,7 @@ use std::{
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use url::Url;
@@ -129,6 +129,8 @@ pub enum CourierError {
         #[source]
         source: std::io::Error,
     },
+    #[error("tool `{tool}` exceeded TIMEOUT TOOL `{timeout}`")]
+    ToolTimedOut { tool: String, timeout: String },
     #[error("failed to wait for tool `{tool}`: {source}")]
     WaitTool {
         tool: String,
@@ -255,6 +257,8 @@ pub enum CourierError {
         #[source]
         source: rusqlite::Error,
     },
+    #[error("invalid timeout `{duration}` for scope `{scope}`")]
+    InvalidTimeoutSpec { scope: String, duration: String },
 }
 
 impl CourierError {
@@ -2097,9 +2101,88 @@ fn read_a2a_json_response(
         })
 }
 
+fn configured_timeout_duration(
+    timeouts: &[crate::manifest::TimeoutSpec],
+    scope: &str,
+) -> Result<Option<Duration>, CourierError> {
+    let Some(timeout) = timeouts
+        .iter()
+        .rev()
+        .find(|timeout| timeout.scope.eq_ignore_ascii_case(scope))
+    else {
+        return Ok(None);
+    };
+    parse_timeout_duration(&timeout.duration)
+        .map(Some)
+        .ok_or_else(|| CourierError::InvalidTimeoutSpec {
+            scope: timeout.scope.clone(),
+            duration: timeout.duration.clone(),
+        })
+}
+
+fn parse_timeout_duration(raw: &str) -> Option<Duration> {
+    let trimmed = raw.trim();
+    let (value, unit) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value, "ms")
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value, "s")
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value, "m")
+    } else if let Some(value) = trimmed.strip_suffix('h') {
+        (value, "h")
+    } else {
+        return None;
+    };
+    let amount = value.trim().parse::<u64>().ok()?;
+    match unit {
+        "ms" => Some(Duration::from_millis(amount)),
+        "s" => Some(Duration::from_secs(amount)),
+        "m" => Some(Duration::from_secs(amount.saturating_mul(60))),
+        "h" => Some(Duration::from_secs(amount.saturating_mul(60 * 60))),
+        _ => None,
+    }
+}
+
+fn wait_for_tool_output(
+    mut child: Child,
+    tool: &str,
+    timeout_spec: Option<(&str, Duration)>,
+) -> Result<std::process::Output, CourierError> {
+    if let Some((timeout_label, timeout)) = timeout_spec {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CourierError::ToolTimedOut {
+                        tool: tool.to_string(),
+                        timeout: timeout_label.to_string(),
+                    });
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(source) => {
+                    return Err(CourierError::WaitTool {
+                        tool: tool.to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|source| CourierError::WaitTool {
+            tool: tool.to_string(),
+            source,
+        })
+}
+
 fn resolve_a2a_rpc_endpoint_with_env<F>(
     tool: &LocalToolSpec,
     mut env_lookup: F,
+    timeout: Option<Duration>,
 ) -> Result<(String, Option<String>), CourierError>
 where
     F: FnMut(&str) -> Option<String>,
@@ -2122,6 +2205,7 @@ where
     let mut request = ureq::get(&discovery_url)
         .config()
         .http_status_as_error(false)
+        .timeout_global(timeout)
         .build();
     if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
         (tool.auth_secret_name.as_deref(), tool.auth_scheme)
@@ -2394,12 +2478,14 @@ fn execute_a2a_tool_with_env<F>(
     tool: &LocalToolSpec,
     input: Option<&str>,
     env_lookup: F,
+    timeout_spec: Option<(&str, Duration)>,
 ) -> Result<ToolRunResult, CourierError>
 where
     F: FnMut(&str) -> Option<String>,
 {
     let mut env_lookup = env_lookup;
-    let (endpoint, agent_name) = resolve_a2a_rpc_endpoint_with_env(tool, &mut env_lookup)?;
+    let timeout = timeout_spec.map(|(_, duration)| duration);
+    let (endpoint, agent_name) = resolve_a2a_rpc_endpoint_with_env(tool, &mut env_lookup, timeout)?;
     let request_id = a2a_request_id();
     let input_value = input.unwrap_or_default();
     let part = if tool.input_schema_packaged_path.is_some() {
@@ -2428,6 +2514,7 @@ where
     let mut request = ureq::post(&endpoint)
         .config()
         .http_status_as_error(false)
+        .timeout_global(timeout)
         .build()
         .header("content-type", "application/json");
     if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
@@ -2506,7 +2593,9 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     if matches!(tool.transport, LocalToolTransport::A2a) {
-        return execute_a2a_tool_with_env(tool, input, env_lookup);
+        let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
+        let timeout_spec = timeout.map(|duration| ("TOOL", duration));
+        return execute_a2a_tool_with_env(tool, input, env_lookup, timeout_spec);
     }
 
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
@@ -2555,12 +2644,12 @@ where
             })?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|source| CourierError::WaitTool {
-            tool: tool.alias.clone(),
-            source,
-        })?;
+    let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
+    let output = wait_for_tool_output(
+        child,
+        &tool.alias,
+        timeout.map(|duration| ("TOOL", duration)),
+    )?;
 
     Ok(ToolRunResult {
         tool: tool.alias.clone(),
@@ -2579,7 +2668,9 @@ fn execute_local_tool_in_docker(
     courier: &DockerCourier,
 ) -> Result<ToolRunResult, CourierError> {
     if matches!(tool.transport, LocalToolTransport::A2a) {
-        return execute_a2a_tool_with_env(tool, input, process_env_lookup);
+        let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
+        let timeout_spec = timeout.map(|duration| ("TOOL", duration));
+        return execute_a2a_tool_with_env(tool, input, process_env_lookup, timeout_spec);
     }
 
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
@@ -2638,12 +2729,12 @@ fn execute_local_tool_in_docker(
             })?;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|source| CourierError::WaitTool {
-            tool: tool.alias.clone(),
-            source,
-        })?;
+    let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
+    let output = wait_for_tool_output(
+        child,
+        &tool.alias,
+        timeout.map(|duration| ("TOOL", duration)),
+    )?;
 
     Ok(ToolRunResult {
         tool: tool.alias.clone(),
@@ -5082,6 +5173,7 @@ mod tests {
         task_status_message: String,
         rpc_error: Option<(i64, String)>,
         card_url: Option<String>,
+        response_delay: Duration,
     }
 
     impl Default for TestA2aServerOptions {
@@ -5094,6 +5186,7 @@ mod tests {
                 task_status_message: "ok".to_string(),
                 rpc_error: None,
                 card_url: None,
+                response_delay: Duration::from_millis(0),
             }
         }
     }
@@ -5201,6 +5294,9 @@ mod tests {
                 .as_slice(),
             ),
             ("POST", "/a2a") => {
+                if !options.response_delay.is_zero() {
+                    thread::sleep(options.response_delay);
+                }
                 if let Some((code, message)) = &options.rpc_error {
                     let output = serde_json::json!({
                         "jsonrpc":"2.0",
@@ -6011,7 +6107,7 @@ ENTRYPOINT job
             input_schema_sha256: None,
         };
 
-        let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None).unwrap_err();
+        let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None, None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -6119,6 +6215,56 @@ ENTRYPOINT job
                 .to_string()
                 .contains("discovered agent card URL must stay on the declared origin")
         );
+    }
+
+    #[test]
+    fn native_courier_enforces_tool_timeout_for_a2a_tools() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            response_delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TIMEOUT TOOL 50ms
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::A2aToolRequest { ref message, .. } if message.contains("timeout")
+        ));
+    }
+
+    #[test]
+    fn native_courier_enforces_tool_timeout_for_local_tools() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TIMEOUT TOOL 50ms
+TOOL LOCAL tools/slow.py AS slow USING python3 -u
+ENTRYPOINT job
+",
+            &[(
+                "tools/slow.py",
+                "import time\n\
+time.sleep(0.2)\n\
+print('done')\n",
+            )],
+        );
+
+        let error = run_local_tool(&test_image.image, "slow", None).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::ToolTimedOut { ref tool, ref timeout } if tool == "slow" && timeout == "TOOL"
+        ));
     }
 
     #[test]
@@ -7801,6 +7947,13 @@ ENTRYPOINT chat
             !CourierError::ToolCallLimitExceeded {
                 limit: 2,
                 attempted: 3
+            }
+            .is_retryable()
+        );
+        assert!(
+            !CourierError::ToolTimedOut {
+                tool: "slow".to_string(),
+                timeout: "TOOL".to_string()
             }
             .is_retryable()
         );
