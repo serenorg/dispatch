@@ -262,12 +262,15 @@ pub enum A2aEndpointMode {
 pub struct A2aAuthConfig {
     pub scheme: A2aAuthScheme,
     pub secret_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum A2aAuthScheme {
     Bearer,
+    Header,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

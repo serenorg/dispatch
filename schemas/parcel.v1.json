@@ -620,7 +620,14 @@
             "scheme": {
               "type": "string",
               "enum": [
-                "bearer"
+                "bearer",
+                "header"
+              ]
+            },
+            "header_name": {
+              "type": [
+                "string",
+                "null"
               ]
             },
             "secret_name": {

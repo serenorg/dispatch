@@ -396,6 +396,7 @@ Reference implementation notes:
   - `card` requires successful agent-card discovery
   - `direct` skips discovery and normalizes the endpoint as a direct JSON-RPC target
 - `AUTH bearer <secret_name>` sends `Authorization: Bearer ...` using a declared `SECRET`
+- `AUTH header <header_name> <secret_name>` sends the secret value in the named HTTP header for both discovery and RPC calls
 - `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match, or if card discovery succeeds without a `name`
 - `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific lowercase SHA256 digest
 - discovered agent cards may refine the RPC path, but they cannot pivot execution onto a different origin than the declared `URL`

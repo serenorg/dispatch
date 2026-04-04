@@ -979,26 +979,60 @@ fn parse_a2a_auth(tokens: &[String]) -> Result<Option<A2aAuthConfig>, BuildError
     };
     let Some(scheme) = tokens.get(auth_index + 1) else {
         return Err(BuildError::Validation(
-            "TOOL A2A `AUTH` requires `<scheme> <secret_name>`".to_string(),
+            "TOOL A2A `AUTH` requires `bearer <secret_name>` or `header <header_name> <secret_name>`".to_string(),
         ));
     };
-    let Some(secret_name) = tokens.get(auth_index + 2) else {
-        return Err(BuildError::Validation(
-            "TOOL A2A `AUTH` requires `<scheme> <secret_name>`".to_string(),
-        ));
-    };
-    let scheme = match scheme.to_ascii_lowercase().as_str() {
-        "bearer" => A2aAuthScheme::Bearer,
+    let (scheme, header_name, secret_name) = match scheme.to_ascii_lowercase().as_str() {
+        "bearer" => {
+            let Some(secret_name) = tokens.get(auth_index + 2) else {
+                return Err(BuildError::Validation(
+                    "TOOL A2A `AUTH bearer` requires `<secret_name>`".to_string(),
+                ));
+            };
+            (A2aAuthScheme::Bearer, None, secret_name.clone())
+        }
+        "header" => {
+            let Some(header_name) = tokens.get(auth_index + 2) else {
+                return Err(BuildError::Validation(
+                    "TOOL A2A `AUTH header` requires `<header_name> <secret_name>`".to_string(),
+                ));
+            };
+            let Some(secret_name) = tokens.get(auth_index + 3) else {
+                return Err(BuildError::Validation(
+                    "TOOL A2A `AUTH header` requires `<header_name> <secret_name>`".to_string(),
+                ));
+            };
+            validate_http_header_name(header_name)?;
+            (
+                A2aAuthScheme::Header,
+                Some(header_name.clone()),
+                secret_name.clone(),
+            )
+        }
         other => {
             return Err(BuildError::Validation(format!(
-                "invalid A2A auth scheme `{other}`; expected `bearer`"
+                "invalid A2A auth scheme `{other}`; expected `bearer` or `header`"
             )));
         }
     };
     Ok(Some(A2aAuthConfig {
         scheme,
-        secret_name: secret_name.clone(),
+        secret_name,
+        header_name,
     }))
+}
+
+fn validate_http_header_name(header_name: &str) -> Result<(), BuildError> {
+    if header_name.is_empty()
+        || !header_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(BuildError::Validation(format!(
+            "invalid A2A auth header name `{header_name}`; expected ASCII letters, digits, or `-`"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_tool_runner(tokens: &[String], packaged_path: &str) -> CommandSpec {
@@ -1619,6 +1653,7 @@ ENTRYPOINT chat
                 let auth = tool.auth.as_ref().expect("expected auth config");
                 assert_eq!(auth.scheme, A2aAuthScheme::Bearer);
                 assert_eq!(auth.secret_name, "A2A_TOKEN");
+                assert_eq!(auth.header_name, None);
                 assert_eq!(tool.approval, Some(ToolApprovalPolicy::Confirm));
                 assert_eq!(tool.risk, Some(ToolRiskLevel::Medium));
                 assert_eq!(
@@ -1686,6 +1721,66 @@ ENTRYPOINT chat
         .unwrap_err();
 
         assert!(error.to_string().contains("EXPECT_CARD_SHA256"));
+    }
+
+    #[test]
+    fn build_parses_a2a_header_auth() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+SECRET API_KEY
+TOOL A2A broker URL https://broker.example.com AUTH header X-Api-Key API_KEY
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(&built.manifest_path).unwrap()).unwrap();
+        match &parcel.tools[0] {
+            ToolConfig::A2a(tool) => {
+                let auth = tool.auth.as_ref().expect("expected auth config");
+                assert_eq!(auth.scheme, A2aAuthScheme::Header);
+                assert_eq!(auth.header_name.as_deref(), Some("X-Api-Key"));
+                assert_eq!(auth.secret_name, "API_KEY");
+            }
+            other => panic!("expected a2a tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_invalid_a2a_header_name() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+SECRET API_KEY
+TOOL A2A broker URL https://broker.example.com AUTH header Bad:Header API_KEY
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid A2A auth header name"));
     }
 
     #[test]

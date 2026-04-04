@@ -102,15 +102,7 @@ where
         .timeout_global(timeout)
         .build()
         .header("content-type", "application/json");
-    if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
-        (tool.auth_secret_name(), tool.auth_scheme())
-    {
-        let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
-            tool: tool.alias.clone(),
-            message: format!("configured A2A auth secret `{secret_name}` is not available"),
-        })?;
-        request = request.header("authorization", &format!("Bearer {secret_value}"));
-    }
+    request = apply_a2a_auth_headers(tool, request, env_lookup)?;
     let response = request.send_json(payload).map_err(|error| {
         if error.to_string().to_ascii_lowercase().contains("timeout") {
             CourierError::ToolTimedOut {
@@ -154,15 +146,7 @@ where
         .http_status_as_error(false)
         .timeout_global(timeout)
         .build();
-    if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
-        (tool.auth_secret_name(), tool.auth_scheme())
-    {
-        let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
-            tool: tool.alias.clone(),
-            message: format!("configured A2A auth secret `{secret_name}` is not available"),
-        })?;
-        request = request.header("authorization", &format!("Bearer {secret_value}"));
-    }
+    request = apply_a2a_auth_headers(tool, request, &mut env_lookup)?;
     let response = request
         .call()
         .map_err(|error| CourierError::A2aToolRequest {
@@ -245,6 +229,37 @@ where
         });
     }
     Ok((normalize_a2a_rpc_endpoint(url), None))
+}
+
+fn apply_a2a_auth_headers<State, F>(
+    tool: &LocalToolSpec,
+    mut request: ureq::RequestBuilder<State>,
+    env_lookup: &mut F,
+) -> Result<ureq::RequestBuilder<State>, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let (Some(secret_name), Some(auth_scheme)) = (tool.auth_secret_name(), tool.auth_scheme())
+    else {
+        return Ok(request);
+    };
+    let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+        tool: tool.alias.clone(),
+        message: format!("configured A2A auth secret `{secret_name}` is not available"),
+    })?;
+    request = match auth_scheme {
+        A2aAuthScheme::Bearer => request.header("authorization", &format!("Bearer {secret_value}")),
+        A2aAuthScheme::Header => {
+            let header_name =
+                tool.auth_header_name()
+                    .ok_or_else(|| CourierError::A2aToolRequest {
+                        tool: tool.alias.clone(),
+                        message: "configured A2A header auth is missing a header name".to_string(),
+                    })?;
+            request.header(header_name, &secret_value)
+        }
+    };
+    Ok(request)
 }
 
 fn normalize_a2a_allowlist_entry(entry: &str) -> Option<String> {

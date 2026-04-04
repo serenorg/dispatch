@@ -307,6 +307,7 @@ pub enum LocalToolTarget {
         endpoint_mode: Option<A2aEndpointMode>,
         auth_secret_name: Option<String>,
         auth_scheme: Option<A2aAuthScheme>,
+        auth_header_name: Option<String>,
         expected_agent_name: Option<String>,
         expected_card_sha256: Option<String>,
     },
@@ -397,6 +398,15 @@ impl LocalToolSpec {
                 expected_card_sha256,
                 ..
             } => expected_card_sha256.as_deref(),
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn auth_header_name(&self) -> Option<&str> {
+        match &self.target {
+            LocalToolTarget::A2a {
+                auth_header_name, ..
+            } => auth_header_name.as_deref(),
             LocalToolTarget::Local { .. } => None,
         }
     }
@@ -1294,6 +1304,7 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                     endpoint_mode: a2a.endpoint_mode,
                     auth_secret_name: a2a.auth.as_ref().map(|auth| auth.secret_name.clone()),
                     auth_scheme: a2a.auth.as_ref().map(|auth| auth.scheme),
+                    auth_header_name: a2a.auth.as_ref().and_then(|auth| auth.header_name.clone()),
                     expected_agent_name: a2a.expected_agent_name.clone(),
                     expected_card_sha256: a2a.expected_card_sha256.clone(),
                 },
@@ -5143,6 +5154,7 @@ mod tests {
         let target = parts.next().unwrap_or_default();
         let mut content_length = 0usize;
         let mut authorization = None;
+        let mut headers = Vec::new();
         loop {
             let mut header_line = String::new();
             reader.read_line(&mut header_line).unwrap();
@@ -5150,6 +5162,7 @@ mod tests {
             if header_line.is_empty() {
                 break;
             }
+            headers.push(header_line.to_string());
             if let Some((name, value)) = header_line.split_once(':')
                 && name.eq_ignore_ascii_case("content-length")
             {
@@ -5163,11 +5176,15 @@ mod tests {
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body).unwrap();
 
-        if options
-            .expected_auth
-            .as_deref()
-            .is_some_and(|expected| authorization.as_deref() != Some(expected))
-        {
+        if options.expected_auth.as_deref().is_some_and(|expected| {
+            if expected.contains(':') {
+                !headers
+                    .iter()
+                    .any(|header| header.eq_ignore_ascii_case(expected))
+            } else {
+                authorization.as_deref() != Some(expected)
+            }
+        }) {
             write_test_http_response(&mut writer, 401, "text/plain", b"unauthorized");
             return;
         }
@@ -5922,6 +5939,7 @@ ENTRYPOINT job
         assert_eq!(tools[0].endpoint_mode(), Some(A2aEndpointMode::Direct));
         assert_eq!(tools[0].auth_secret_name(), Some("A2A_TOKEN"));
         assert_eq!(tools[0].auth_scheme(), Some(A2aAuthScheme::Bearer));
+        assert_eq!(tools[0].auth_header_name(), None);
         assert_eq!(tools[0].expected_agent_name(), Some("remote-broker"));
         assert_eq!(
             tools[0].expected_card_sha256(),
@@ -6005,6 +6023,32 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn native_courier_executes_a2a_tools_with_header_auth() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            expected_auth: Some("X-Api-Key: topsecret".to_string()),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+SECRET API_KEY
+TOOL A2A broker URL {} AUTH header X-Api-Key API_KEY
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "API_KEY").then(|| "topsecret".to_string())
+        })
+        .unwrap();
+        assert!(result.stdout.contains("echo:hello"));
+    }
+
+    #[test]
     fn native_courier_rejects_a2a_call_when_auth_secret_is_missing() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
             expected_auth: Some("Bearer topsecret".to_string()),
@@ -6020,6 +6064,7 @@ ENTRYPOINT job
                 endpoint_mode: None,
                 auth_secret_name: Some("A2A_TOKEN".to_string()),
                 auth_scheme: Some(A2aAuthScheme::Bearer),
+                auth_header_name: None,
                 expected_agent_name: None,
                 expected_card_sha256: None,
             },
