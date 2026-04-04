@@ -31,7 +31,7 @@ fn run_with_builtin_courier(courier: BuiltinCourier, args: crate::RunArgs) -> Re
     match courier {
         BuiltinCourier::Native => run_with_courier(NativeCourier::default(), args),
         BuiltinCourier::Docker => run_with_courier(DockerCourier::default(), args),
-        BuiltinCourier::Wasm => run_with_courier(WasmCourier::default(), args),
+        BuiltinCourier::Wasm => run_with_courier(WasmCourier::new()?, args),
     }
 }
 

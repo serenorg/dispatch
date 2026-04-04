@@ -935,13 +935,24 @@ fn parse_a2a_tool(tokens: &[String]) -> Result<Option<A2aToolConfig>, BuildError
             sha256: String::new(),
         });
 
+    let endpoint_mode = parse_a2a_endpoint_mode(tokens)?;
+    let expected_agent_name = parse_named_value(tokens, "EXPECT_AGENT_NAME");
+    let expected_card_sha256 = parse_a2a_card_sha256(tokens)?;
+    if matches!(endpoint_mode, Some(A2aEndpointMode::Direct))
+        && (expected_agent_name.is_some() || expected_card_sha256.is_some())
+    {
+        return Err(BuildError::Validation(format!(
+            "TOOL A2A `{alias}` cannot use `DISCOVERY direct` with `EXPECT_AGENT_NAME` or `EXPECT_CARD_SHA256`"
+        )));
+    }
+
     Ok(Some(A2aToolConfig {
         alias,
         url,
-        endpoint_mode: parse_a2a_endpoint_mode(tokens)?,
+        endpoint_mode,
         auth: parse_a2a_auth(tokens)?,
-        expected_agent_name: parse_named_value(tokens, "EXPECT_AGENT_NAME"),
-        expected_card_sha256: parse_a2a_card_sha256(tokens)?,
+        expected_agent_name,
+        expected_card_sha256,
         approval: parse_tool_approval(tokens)?,
         risk: parse_tool_risk(tokens)?,
         description: parse_named_value(tokens, "DESCRIPTION"),
@@ -1752,6 +1763,30 @@ ENTRYPOINT chat
         .unwrap_err();
 
         assert!(error.to_string().contains("EXPECT_CARD_SHA256"));
+    }
+
+    #[test]
+    fn build_rejects_direct_a2a_with_identity_requirements() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker URL https://broker.example.com DISCOVERY direct EXPECT_AGENT_NAME planner-agent
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot use `DISCOVERY direct`"));
     }
 
     #[test]

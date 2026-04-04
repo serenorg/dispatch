@@ -218,6 +218,12 @@ pub enum CourierError {
         #[source]
         source: wasmtime::Error,
     },
+    #[error("failed to initialize WASM engine for courier `{courier}`: {source}")]
+    InitWasmEngine {
+        courier: String,
+        #[source]
+        source: wasmtime::Error,
+    },
     #[error("failed to instantiate WASM component `{path}` for courier `{courier}`: {source}")]
     InstantiateWasmComponent {
         courier: String,
@@ -843,6 +849,24 @@ pub struct WasmCourier {
     component_cache: Arc<Mutex<BoundedLruCache<Component>>>,
 }
 
+impl WasmCourier {
+    pub fn new() -> Result<Self, CourierError> {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config).map_err(|source| CourierError::InitWasmEngine {
+            courier: "wasm".to_string(),
+            source,
+        })?;
+        Ok(Self {
+            engine,
+            chat_backend_override: None,
+            component_cache: Arc::new(Mutex::new(BoundedLruCache::new(
+                wasm_component_cache_limit(),
+            ))),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StubCourier {
     courier_id: &'static str,
@@ -858,21 +882,6 @@ impl Default for DockerCourier {
             helper_image: std::env::var("DISPATCH_DOCKER_IMAGE")
                 .unwrap_or_else(|_| "python:3.13-alpine".to_string()),
             chat_backend_override: None,
-        }
-    }
-}
-
-impl Default for WasmCourier {
-    fn default() -> Self {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        let engine = Engine::new(&config).expect("failed to initialize wasmtime engine");
-        Self {
-            engine,
-            chat_backend_override: None,
-            component_cache: Arc::new(Mutex::new(BoundedLruCache::new(
-                wasm_component_cache_limit(),
-            ))),
         }
     }
 }
@@ -6139,7 +6148,7 @@ ENTRYPOINT job
             "\
 FROM dispatch/native:latest
 SECRET A2A_TOKEN
-TOOL A2A broker URL https://broker.example.com DISCOVERY direct AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker EXPECT_CARD_SHA256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
+TOOL A2A broker URL https://broker.example.com DISCOVERY card AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker EXPECT_CARD_SHA256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
 ENTRYPOINT job
 ",
             &[(
@@ -6153,7 +6162,7 @@ ENTRYPOINT job
         assert_eq!(tools[0].alias, "broker");
         assert_eq!(tools[0].transport(), LocalToolTransport::A2a);
         assert_eq!(tools[0].endpoint_url(), Some("https://broker.example.com"));
-        assert_eq!(tools[0].endpoint_mode(), Some(A2aEndpointMode::Direct));
+        assert_eq!(tools[0].endpoint_mode(), Some(A2aEndpointMode::Card));
         assert_eq!(tools[0].auth_secret_name(), Some("A2A_TOKEN"));
         assert_eq!(tools[0].auth_scheme(), Some(A2aAuthScheme::Bearer));
         assert_eq!(tools[0].auth_username_secret_name(), None);
@@ -6757,13 +6766,35 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn native_courier_rejects_a2a_url_when_operator_allowlist_is_explicitly_empty() {
+        let server = start_test_a2a_server();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "DISPATCH_A2A_ALLOWED_ORIGINS").then(String::new)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("resolved to an empty allowlist"));
+    }
+
+    #[test]
     fn native_courier_rejects_a2a_url_outside_operator_trust_policy() {
         let server = start_test_a2a_server();
         let dir = tempdir().unwrap();
-        let policy_path = dir.path().join("a2a-trust.yaml");
+        let policy_path = dir.path().join("a2a-trust.toml");
         fs::write(
             &policy_path,
-            "rules:\n  - origin_prefix: \"https://agents.example.com\"\n",
+            "[[rules]]\norigin_prefix = \"https://agents.example.com\"\n",
         )
         .unwrap();
         let test_image = build_test_image(
@@ -6796,7 +6827,7 @@ ENTRYPOINT job
             ..Default::default()
         });
         let dir = tempdir().unwrap();
-        let policy_path = dir.path().join("a2a-trust.yaml");
+        let policy_path = dir.path().join("a2a-trust.toml");
         let card_body = serde_json::to_vec(&serde_json::json!({
             "name": "planner-agent",
             "url": format!("{}/a2a", server.base_url),
@@ -6806,7 +6837,7 @@ ENTRYPOINT job
         fs::write(
             &policy_path,
             format!(
-                "rules:\n  - hostname: \"127.0.0.1\"\n    expected_agent_name: \"planner-agent\"\n    expected_card_sha256: \"{}\"\n",
+                "[[rules]]\nhostname = \"127.0.0.1\"\nexpected_agent_name = \"planner-agent\"\nexpected_card_sha256 = \"{}\"\n",
                 card_sha
             ),
         )
@@ -6831,6 +6862,35 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn native_courier_rejects_direct_a2a_with_operator_identity_requirement() {
+        let server = start_test_a2a_server();
+        let dir = tempdir().unwrap();
+        let policy_path = dir.path().join("a2a-trust.toml");
+        fs::write(
+            &policy_path,
+            "[[rules]]\nhostname = \"127.0.0.1\"\nexpected_agent_name = \"planner-agent\"\n",
+        )
+        .unwrap();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} DISCOVERY direct
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "DISPATCH_A2A_TRUST_POLICY").then(|| policy_path.display().to_string())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("DISCOVERY direct"));
+    }
+
+    #[test]
     fn a2a_operator_policy_overrides_supply_allowed_origins_to_process_lookup() {
         let result = with_a2a_operator_policy_overrides(
             A2aOperatorPolicyOverrides {
@@ -6848,11 +6908,11 @@ ENTRYPOINT job
         let result = with_a2a_operator_policy_overrides(
             A2aOperatorPolicyOverrides {
                 allowed_origins: None,
-                trust_policy: Some("/tmp/dispatch-a2a-policy.yaml".to_string()),
+                trust_policy: Some("/tmp/dispatch-a2a-policy.toml".to_string()),
             },
             || process_env_lookup("DISPATCH_A2A_TRUST_POLICY"),
         );
-        assert_eq!(result.as_deref(), Some("/tmp/dispatch-a2a-policy.yaml"));
+        assert_eq!(result.as_deref(), Some("/tmp/dispatch-a2a-policy.toml"));
         assert!(a2a_operator_policy_override_value("DISPATCH_A2A_TRUST_POLICY").is_none());
     }
 
@@ -6958,7 +7018,7 @@ ENTRYPOINT chat
                 ("tools/demo.sh", "printf ok"),
             ],
         );
-        let courier = WasmCourier::default();
+        let courier = WasmCourier::new().unwrap();
 
         futures::executor::block_on(courier.validate_parcel(&test_image.image)).unwrap();
         let inspection = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap();
@@ -7163,7 +7223,7 @@ ENTRYPOINT heartbeat
             &[],
             &[("components/reference.wasm", REFERENCE_GUEST)],
         );
-        let courier = WasmCourier::default();
+        let courier = WasmCourier::new().unwrap();
 
         let job_session =
             futures::executor::block_on(courier.open_session(&job_image.image)).unwrap();
@@ -7231,7 +7291,7 @@ ENTRYPOINT chat
             &[],
             &[("components/reference.wasm", REFERENCE_GUEST)],
         );
-        let courier = WasmCourier::default();
+        let courier = WasmCourier::new().unwrap();
 
         let first_session =
             futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
@@ -7959,7 +8019,7 @@ ENTRYPOINT chat
             &[],
             &[("components/reference.wasm", REFERENCE_GUEST)],
         );
-        let courier = WasmCourier::default();
+        let courier = WasmCourier::new().unwrap();
         let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
 
         let error = futures::executor::block_on(courier.run(

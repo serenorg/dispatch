@@ -86,7 +86,7 @@ fn run_courier_conformance_with_builtin(courier: BuiltinCourier, emit_json: bool
             run_courier_conformance_with("docker".to_string(), DockerCourier::default(), emit_json)
         }
         BuiltinCourier::Wasm => {
-            run_courier_conformance_with("wasm".to_string(), WasmCourier::default(), emit_json)
+            run_courier_conformance_with("wasm".to_string(), WasmCourier::new()?, emit_json)
         }
     }
 }

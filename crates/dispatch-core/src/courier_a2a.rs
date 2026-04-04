@@ -11,6 +11,8 @@ use url::Url;
 use super::{CourierError, LocalToolSpec, ToolRunResult, encode_hex};
 
 static A2A_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+const A2A_TASK_POLL_INITIAL_INTERVAL_MS: u64 = 50;
+const A2A_TASK_POLL_MAX_INTERVAL_MS: u64 = 1_000;
 
 fn a2a_request_id() -> String {
     let now = SystemTime::now()
@@ -137,6 +139,25 @@ where
         })?;
     validate_a2a_url_allowed(tool, url, &mut env_lookup)?;
     if matches!(tool.endpoint_mode(), Some(A2aEndpointMode::Direct)) {
+        if tool.expected_agent_name().is_some() || tool.expected_card_sha256().is_some() {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message:
+                    "DISCOVERY direct cannot satisfy `EXPECT_AGENT_NAME` or `EXPECT_CARD_SHA256`"
+                        .to_string(),
+            });
+        }
+        if let Some(requirement) = resolve_a2a_trust_requirement(tool, url, &mut env_lookup)?
+            && (requirement.expected_agent_name.is_some()
+                || requirement.expected_card_sha256.is_some())
+        {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message:
+                    "A2A trust policy requires discovered agent-card identity, but `DISCOVERY direct` disables card discovery"
+                        .to_string(),
+            });
+        }
         return Ok((normalize_a2a_rpc_endpoint(url), None));
     }
     let discovery_url = format!(
@@ -424,6 +445,14 @@ where
         .split(',')
         .filter_map(normalize_a2a_allowlist_entry)
         .collect::<Vec<_>>();
+    if allowlist.is_empty() {
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message:
+                "A2A URL is not allowed because DISPATCH_A2A_ALLOWED_ORIGINS resolved to an empty allowlist"
+                    .to_string(),
+        });
+    }
     if !is_a2a_url_allowed(&parsed, &allowlist) {
         return Err(CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
@@ -634,6 +663,7 @@ where
     };
     let started_at = Instant::now();
     let deadline = timeout_spec.map(|(_, duration)| started_at + duration);
+    let mut poll_interval = Duration::from_millis(A2A_TASK_POLL_INITIAL_INTERVAL_MS);
     loop {
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
@@ -645,7 +675,7 @@ where
                 timeout: timeout_label.to_string(),
             });
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(poll_interval);
         let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -693,6 +723,8 @@ where
         if matches!(a2a_task_state(&current), Some("completed")) {
             return Ok(current);
         }
+        poll_interval =
+            (poll_interval * 2).min(Duration::from_millis(A2A_TASK_POLL_MAX_INTERVAL_MS));
     }
 }
 

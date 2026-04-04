@@ -98,14 +98,16 @@ Semantics:
 
 ### `DISPATCH_A2A_TRUST_POLICY`
 
-YAML policy file for structured allow/identity rules:
+TOML policy file for structured allow/identity rules:
 
-```yaml
-rules:
-  - origin_prefix: "https://planner.example.com"
-    expected_agent_name: "planner-agent"
-    expected_card_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  - hostname: "search.internal"
+```toml
+[[rules]]
+origin_prefix = "https://planner.example.com"
+expected_agent_name = "planner-agent"
+expected_card_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[[rules]]
+hostname = "search.internal"
 ```
 
 Rule semantics:
@@ -116,6 +118,11 @@ Rule semantics:
 - conflicting `expected_agent_name` or `expected_card_sha256` requirements fail closed
 - if a matched rule requires card identity but card discovery does not succeed, Dispatch rejects the call
 - if no rule matches, Dispatch rejects the call
+
+Discovery/auth note:
+
+- configured A2A auth headers are sent on the discovery request before card identity can be verified
+- `DISCOVERY direct` cannot satisfy parcel or operator discovered-identity requirements such as `EXPECT_AGENT_NAME` or `EXPECT_CARD_SHA256`
 
 ## Inspection Surfaces
 

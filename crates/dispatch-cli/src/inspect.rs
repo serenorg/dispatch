@@ -74,7 +74,7 @@ fn inspect_for_builtin_courier(courier: BuiltinCourier, parcel_path: &Path) -> R
     match courier {
         BuiltinCourier::Native => inspect_for_courier(NativeCourier::default(), parcel_path),
         BuiltinCourier::Docker => inspect_for_courier(DockerCourier::default(), parcel_path),
-        BuiltinCourier::Wasm => inspect_for_courier(WasmCourier::default(), parcel_path),
+        BuiltinCourier::Wasm => inspect_for_courier(WasmCourier::new()?, parcel_path),
     }
 }
 

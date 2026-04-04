@@ -786,7 +786,6 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
 ]
 
@@ -802,11 +801,11 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "toml",
  "ureq",
  "url",
  "urlencoding",

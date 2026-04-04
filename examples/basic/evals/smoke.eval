@@ -1,3 +1,4 @@
-name: smoke
-input: "What time is it?"
-expects_tool: "system_time"
+name = "smoke"
+input = "What time is it?"
+expects_no_tool = true
+expects_text_contains = "Native chat reference reply"

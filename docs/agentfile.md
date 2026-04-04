@@ -404,7 +404,7 @@ Reference implementation notes:
 - `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific lowercase SHA256 digest
 - discovered agent cards may refine the RPC path, but they cannot pivot execution onto a different origin than the declared `URL`
 - operators can constrain resolved A2A URLs at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated allowlist of origins or hostnames
-- operators can also enforce structured outbound A2A policy with `DISPATCH_A2A_TRUST_POLICY`, a YAML file whose rules match by `origin_prefix` and/or `hostname` and can require discovered agent-card `expected_agent_name` / `expected_card_sha256`
+- operators can also enforce structured outbound A2A policy with `DISPATCH_A2A_TRUST_POLICY`, a TOML file whose rules match by `origin_prefix` and/or `hostname` and can require discovered agent-card `expected_agent_name` / `expected_card_sha256`
 - `dispatch run`, `dispatch eval`, and `dispatch courier conformance` also accept `--a2a-allowed-origins` and `--a2a-trust-policy` for command-scoped operator overrides
 - `TOOL A2A` currently exposes a synchronous request/response tool surface; when `message/send` returns an unfinished task, Dispatch polls `tasks/get` until completion or the configured tool timeout
 - task polling and cancellation are not part of the current Dispatch tool contract
@@ -558,31 +558,33 @@ EVAL evals/safety.eval REQUIRED
 
 Minimal eval file:
 
-```yaml
-name: smoke
-input: "What time is it?"
-expects_tool: system_time
-expects_text_contains: "plugin reply"
+```toml
+name = "smoke"
+input = "What time is it?"
+expects_tool = "system_time"
+expects_text_contains = "plugin reply"
 ```
 
 Multi-case eval file:
 
-```yaml
-cases:
-  - name: smoke
-    input: "What time is it?"
-    expects_tool: system_time
-  - name: exact
-    input: "What time is it?"
-    expects_tool_count: 1
-    expects_tool_stdout_contains:
-      tool: system_time
-      contains: "2026-04-03"
-    expects_text_exact: "plugin reply"
-  - name: invalid-entrypoint
-    input: ""
-    entrypoint: unsupported
-    expects_error_contains: "unsupported eval entrypoint"
+```toml
+[[cases]]
+name = "smoke"
+input = "What time is it?"
+expects_tool = "system_time"
+
+[[cases]]
+name = "exact"
+input = "What time is it?"
+expects_tool_count = 1
+expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
+expects_text_exact = "plugin reply"
+
+[[cases]]
+name = "invalid-entrypoint"
+input = ""
+entrypoint = "unsupported"
+expects_error_contains = "unsupported eval entrypoint"
 ```
 
 Supported fields in the reference runner:
@@ -606,10 +608,8 @@ Tool result assertions accept either:
 - a plain value, for example `expects_tool_exit_code: 0`
 - a tool-scoped object, for example:
 
-```yaml
-expects_tool_stdout_contains:
-  tool: system_time
-  contains: "2026-04-03"
+```toml
+expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
 ```
 
 Run packaged evals with:

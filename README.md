@@ -101,7 +101,7 @@ EVAL evals/smoke.eval
 ENTRYPOINT chat
 ```
 
-`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Dispatch requires `https://` for non-loopback A2A endpoints and rejects URLs with embedded credentials; plain `http://` is only accepted for loopback development targets such as `localhost` or `127.0.0.1`. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames, or with `DISPATCH_A2A_TRUST_POLICY`, a YAML policy file that can match by origin/hostname and require discovered agent-card identity fields such as `expected_agent_name` and `expected_card_sha256`. Command-scoped CLI A2A policy flags override inherited environment values for that one invocation without mutating the process environment. The current `TOOL A2A` contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout. For the full declaration and operator model, see [docs/a2a.md](./docs/a2a.md).
+`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Dispatch requires `https://` for non-loopback A2A endpoints and rejects URLs with embedded credentials; plain `http://` is only accepted for loopback development targets such as `localhost` or `127.0.0.1`. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames, or with `DISPATCH_A2A_TRUST_POLICY`, a TOML policy file that can match by origin/hostname and require discovered agent-card identity fields such as `expected_agent_name` and `expected_card_sha256`. Command-scoped CLI A2A policy flags override inherited environment values for that one invocation without mutating the process environment. The current `TOOL A2A` contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout. For the full declaration and operator model, see [docs/a2a.md](./docs/a2a.md).
 
 `TIMEOUT RUN` is enforced as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes. It does not currently preempt a turn that has already started.
 `TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
@@ -204,7 +204,7 @@ dispatch pull file:///tmp/dispatch-depot::acme/basic:0.1.0 --json
 dispatch push examples/basic/.dispatch/parcels/<digest> https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0
 dispatch pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
-dispatch pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.yaml
+dispatch pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.toml
 ```
 
 Print the parsed AST:
@@ -226,27 +226,27 @@ The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
 
 Packaged eval files live under `context/` with the other authored inputs. A minimal eval file looks like:
 
-```yaml
-name: smoke
-input: "What time is it?"
-expects_tool: system_time
-expects_text_contains: "plugin reply"
+```toml
+name = "smoke"
+input = "What time is it?"
+expects_tool = "system_time"
+expects_text_contains = "plugin reply"
 ```
 
 Eval files can also group multiple cases:
 
-```yaml
-cases:
-  - name: smoke
-    input: "What time is it?"
-    expects_tool: system_time
-  - name: exact
-    input: "What time is it?"
-    expects_tool_count: 1
-    expects_tool_stdout_contains:
-      tool: system_time
-      contains: "2026-04-03"
-    expects_text_exact: "plugin reply"
+```toml
+[[cases]]
+name = "smoke"
+input = "What time is it?"
+expects_tool = "system_time"
+
+[[cases]]
+name = "exact"
+input = "What time is it?"
+expects_tool_count = 1
+expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
+expects_text_exact = "plugin reply"
 ```
 
 `dispatch eval` runs those packaged cases against a live courier and reports pass/fail per case.
@@ -370,7 +370,7 @@ State management:
 - HTTP depots expose parcel blobs at `/v1/parcels/<digest>.tar` and tag lookup at `/v1/tags?repository=<repo>&tag=<tag>`
 - set `DISPATCH_DEPOT_TOKEN` to send `Authorization: Bearer <token>` on HTTP depot requests
 - set `DISPATCH_TRUST_POLICY` to apply a default pull-time trust policy without passing `--trust-policy`
-- trust policy files are YAML documents with `rules`, optional `reference_prefix`, optional `repository_prefix`, `public_keys`, and optional `require_signatures`
+- trust policy files are TOML documents with `rules`, optional `reference_prefix`, optional `repository_prefix`, `public_keys`, and optional `require_signatures`
 - each trust-policy rule must set at least one matcher: `reference_prefix`, `repository_prefix`, or both
 - if a rule sets both prefixes, both must match for the rule to apply
 - matching rules compose:

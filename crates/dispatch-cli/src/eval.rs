@@ -109,7 +109,7 @@ fn eval_with_builtin_courier(
             eval_with_courier(DockerCourier::default(), parcel, courier_name, emit_json)
         }
         BuiltinCourier::Wasm => {
-            eval_with_courier(WasmCourier::default(), parcel, courier_name, emit_json)
+            eval_with_courier(WasmCourier::new()?, parcel, courier_name, emit_json)
         }
     }
 }

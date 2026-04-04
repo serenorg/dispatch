@@ -64,7 +64,7 @@ pub enum EvalError {
     ParseEval {
         path: String,
         #[source]
-        source: serde_yaml::Error,
+        source: toml::de::Error,
     },
 }
 
@@ -83,7 +83,7 @@ pub fn load_parcel_evals(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)
             source,
         })?;
         let parsed: EvalDocument =
-            serde_yaml::from_str(&source).map_err(|source| EvalError::ParseEval {
+            toml::from_str(&source).map_err(|source| EvalError::ParseEval {
                 path: path.display().to_string(),
                 source,
             })?;
@@ -117,12 +117,12 @@ mod tests {
         .unwrap();
         fs::write(
             context_dir.join("evals/single.eval"),
-            "name: single\ninput: hi\n",
+            "name = \"single\"\ninput = \"hi\"\n",
         )
         .unwrap();
         fs::write(
             context_dir.join("evals/multi.eval"),
-            "cases:\n  - name: first\n    input: one\n  - name: second\n    input: two\n",
+            "[[cases]]\nname = \"first\"\ninput = \"one\"\n\n[[cases]]\nname = \"second\"\ninput = \"two\"\n",
         )
         .unwrap();
 
@@ -156,7 +156,7 @@ mod tests {
         .unwrap();
         fs::write(
             context_dir.join("evals/scoped.eval"),
-            "name: scoped\ninput: hi\nexpects_tool_stdout_contains:\n  tool: search\n  contains: result\nexpects_tool_exit_code:\n  tool: search\n  exit_code: 0\n",
+            "name = \"scoped\"\ninput = \"hi\"\nexpects_tool_stdout_contains = { tool = \"search\", contains = \"result\" }\nexpects_tool_exit_code = { tool = \"search\", exit_code = 0 }\n",
         )
         .unwrap();
 

@@ -531,7 +531,7 @@ mod tests {
             "--a2a-allowed-origins",
             "https://agents.example.com,broker.internal",
             "--a2a-trust-policy",
-            "/tmp/a2a-policy.yaml",
+            "/tmp/a2a-policy.toml",
             "--print-prompt",
         ])
         .unwrap();
@@ -550,7 +550,7 @@ mod tests {
         );
         assert_eq!(
             args.a2a_trust_policy.as_deref(),
-            Some(Path::new("/tmp/a2a-policy.yaml"))
+            Some(Path::new("/tmp/a2a-policy.toml"))
         );
         assert!(args.print_prompt);
     }
@@ -566,7 +566,7 @@ mod tests {
             "--a2a-allowed-origins",
             "https://agents.example.com",
             "--a2a-trust-policy",
-            "/tmp/a2a-policy.yaml",
+            "/tmp/a2a-policy.toml",
         ])
         .unwrap();
 
@@ -584,7 +584,7 @@ mod tests {
         );
         assert_eq!(
             a2a_trust_policy.as_deref(),
-            Some(Path::new("/tmp/a2a-policy.yaml"))
+            Some(Path::new("/tmp/a2a-policy.toml"))
         );
     }
 
@@ -643,16 +643,16 @@ mod tests {
 
     #[test]
     fn resolve_trust_policy_path_prefers_explicit_then_env() {
-        let explicit = Some(PathBuf::from("/tmp/explicit.yaml"));
+        let explicit = Some(PathBuf::from("/tmp/explicit.toml"));
         let env_path = crate::parcel_ops::resolve_trust_policy_path(explicit.clone(), |_| {
-            Some(std::ffi::OsString::from("/tmp/env.yaml"))
+            Some(std::ffi::OsString::from("/tmp/env.toml"))
         });
         assert_eq!(env_path, explicit);
 
         let env_only = crate::parcel_ops::resolve_trust_policy_path(None, |_| {
-            Some(std::ffi::OsString::from("/tmp/env.yaml"))
+            Some(std::ffi::OsString::from("/tmp/env.toml"))
         });
-        assert_eq!(env_only, Some(PathBuf::from("/tmp/env.yaml")));
+        assert_eq!(env_only, Some(PathBuf::from("/tmp/env.toml")));
     }
 
     #[test]
@@ -947,7 +947,7 @@ mod tests {
             "--a2a-allowed-origins",
             "https://agents.example.com",
             "--a2a-trust-policy",
-            "/tmp/a2a-policy.yaml",
+            "/tmp/a2a-policy.toml",
         ])
         .unwrap();
 
@@ -972,7 +972,7 @@ mod tests {
         );
         assert_eq!(
             a2a_trust_policy.as_deref(),
-            Some(Path::new("/tmp/a2a-policy.yaml"))
+            Some(Path::new("/tmp/a2a-policy.toml"))
         );
         assert!(json);
     }
@@ -1261,7 +1261,7 @@ mod tests {
             dir.path().join("depot").display()
         );
         let pull_root = dir.path().join("pulled");
-        let policy_path = dir.path().join("trust-policy.yaml");
+        let policy_path = dir.path().join("trust-policy.toml");
 
         crate::parcel_ops::keygen("release", Some(keys_dir.clone())).unwrap();
         let secret_key = keys_dir.join("release.dispatch-secret.json");
@@ -1269,7 +1269,7 @@ mod tests {
         crate::parcel_ops::push(parcel_dir, &depot_ref, false).unwrap();
         fs::write(
             &policy_path,
-            "rules:\n  - repository_prefix: \"acme/trusted-fixture\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
+            "[[rules]]\nrepository_prefix = \"acme/trusted-fixture\"\nrequire_signatures = true\npublic_keys = [\"keys/release.dispatch-public.json\"]\n",
         )
         .unwrap();
 
@@ -1299,13 +1299,13 @@ mod tests {
             dir.path().join("depot").display()
         );
         let pull_root = dir.path().join("pulled");
-        let policy_path = dir.path().join("trust-policy.yaml");
+        let policy_path = dir.path().join("trust-policy.toml");
 
         crate::parcel_ops::keygen("release", Some(keys_dir.clone())).unwrap();
         crate::parcel_ops::push(parcel_dir, &depot_ref, false).unwrap();
         fs::write(
             &policy_path,
-            "rules:\n  - repository_prefix: \"acme/unsigned-fixture\"\n    require_signatures: true\n    public_keys:\n      - keys/release.dispatch-public.json\n",
+            "[[rules]]\nrepository_prefix = \"acme/unsigned-fixture\"\nrequire_signatures = true\npublic_keys = [\"keys/release.dispatch-public.json\"]\n",
         )
         .unwrap();
 
@@ -1420,23 +1420,25 @@ ENTRYPOINT chat\n",
         fs::write(
             context_dir.join("evals/smoke.eval"),
             concat!(
-                "cases:\n",
-                "  - name: smoke\n",
-                "    input: \"What time is it?\"\n",
-                "    expects_tool: \"system_time\"\n",
-                "    expects_text_contains: \"plugin reply\"\n",
-                "  - name: exact\n",
-                "    input: \"What time is it?\"\n",
-                "    expects_tools: [\"system_time\"]\n",
-                "    expects_tool_count: 1\n",
-                "    expects_tool_stdout_contains: \"2026-04-03\"\n",
-                "    expects_tool_exit_code: 0\n",
-                "    expects_text_exact: \"plugin reply\"\n",
-                "    expects_text_not_contains: \"wrong\"\n",
-                "  - name: invalid-entrypoint\n",
-                "    input: \"\"\n",
-                "    entrypoint: unsupported\n",
-                "    expects_error_contains: \"unsupported eval entrypoint\"\n",
+                "[[cases]]\n",
+                "name = \"smoke\"\n",
+                "input = \"What time is it?\"\n",
+                "expects_tool = \"system_time\"\n",
+                "expects_text_contains = \"plugin reply\"\n\n",
+                "[[cases]]\n",
+                "name = \"exact\"\n",
+                "input = \"What time is it?\"\n",
+                "expects_tools = [\"system_time\"]\n",
+                "expects_tool_count = 1\n",
+                "expects_tool_stdout_contains = \"2026-04-03\"\n",
+                "expects_tool_exit_code = 0\n",
+                "expects_text_exact = \"plugin reply\"\n",
+                "expects_text_not_contains = \"wrong\"\n\n",
+                "[[cases]]\n",
+                "name = \"invalid-entrypoint\"\n",
+                "input = \"\"\n",
+                "entrypoint = \"unsupported\"\n",
+                "expects_error_contains = \"unsupported eval entrypoint\"\n",
             ),
         )
         .unwrap();

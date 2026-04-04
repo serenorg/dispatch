@@ -7,12 +7,14 @@ use std::{
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PullTrustPolicy {
     #[serde(default)]
     pub rules: Vec<PullTrustRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PullTrustRule {
     #[serde(default)]
     pub reference_prefix: Option<String>,
@@ -31,12 +33,14 @@ pub struct PullTrustRequirement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct A2aTrustPolicy {
     #[serde(default)]
     pub rules: Vec<A2aTrustRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct A2aTrustRule {
     #[serde(default)]
     pub origin_prefix: Option<String>,
@@ -67,7 +71,7 @@ pub enum TrustPolicyError {
     ParsePolicy {
         path: String,
         #[source]
-        source: serde_yaml::Error,
+        source: toml::de::Error,
     },
     #[error("trust policy rule {index} must set `reference_prefix`, `repository_prefix`, or both")]
     MissingRuleMatcher { index: usize },
@@ -100,7 +104,7 @@ impl PullTrustPolicy {
             source,
         })?;
         let mut policy: PullTrustPolicy =
-            serde_yaml::from_str(&source).map_err(|source| TrustPolicyError::ParsePolicy {
+            toml::from_str(&source).map_err(|source| TrustPolicyError::ParsePolicy {
                 path: path.display().to_string(),
                 source,
             })?;
@@ -160,7 +164,7 @@ impl A2aTrustPolicy {
             source,
         })?;
         let policy: A2aTrustPolicy =
-            serde_yaml::from_str(&source).map_err(|source| TrustPolicyError::ParsePolicy {
+            toml::from_str(&source).map_err(|source| TrustPolicyError::ParsePolicy {
                 path: path.display().to_string(),
                 source,
             })?;
@@ -286,8 +290,8 @@ mod tests {
     #[test]
     fn trust_policy_requires_a_matcher() {
         let dir = tempdir().unwrap();
-        let policy_path = dir.path().join("trust.yaml");
-        fs::write(&policy_path, "rules:\n  - require_signatures: true\n").unwrap();
+        let policy_path = dir.path().join("trust.toml");
+        fs::write(&policy_path, "[[rules]]\nrequire_signatures = true\n").unwrap();
 
         let error = PullTrustPolicy::from_path(&policy_path).unwrap_err();
         assert!(matches!(
@@ -302,10 +306,10 @@ mod tests {
         let keys_dir = dir.path().join("keys");
         fs::create_dir_all(&keys_dir).unwrap();
         fs::write(keys_dir.join("release.pub"), "public-key").unwrap();
-        let policy_path = dir.path().join("trust.yaml");
+        let policy_path = dir.path().join("trust.toml");
         fs::write(
             &policy_path,
-            "rules:\n  - repository_prefix: \"acme/demo\"\n    require_signatures: true\n    public_keys:\n      - keys/release.pub\n",
+            "[[rules]]\nrepository_prefix = \"acme/demo\"\nrequire_signatures = true\npublic_keys = [\"keys/release.pub\"]\n",
         )
         .unwrap();
 
@@ -350,8 +354,12 @@ mod tests {
     #[test]
     fn a2a_trust_policy_requires_a_matcher() {
         let dir = tempdir().unwrap();
-        let policy_path = dir.path().join("a2a-trust.yaml");
-        fs::write(&policy_path, "rules:\n  - expected_agent_name: planner\n").unwrap();
+        let policy_path = dir.path().join("a2a-trust.toml");
+        fs::write(
+            &policy_path,
+            "[[rules]]\nexpected_agent_name = \"planner\"\n",
+        )
+        .unwrap();
 
         let error = A2aTrustPolicy::from_path(&policy_path).unwrap_err();
         assert!(matches!(
@@ -363,10 +371,10 @@ mod tests {
     #[test]
     fn a2a_trust_policy_validates_card_digests() {
         let dir = tempdir().unwrap();
-        let policy_path = dir.path().join("a2a-trust.yaml");
+        let policy_path = dir.path().join("a2a-trust.toml");
         fs::write(
             &policy_path,
-            "rules:\n  - hostname: planner.example.com\n    expected_card_sha256: ABCD\n",
+            "[[rules]]\nhostname = \"planner.example.com\"\nexpected_card_sha256 = \"ABCD\"\n",
         )
         .unwrap();
 
@@ -375,6 +383,34 @@ mod tests {
             error,
             TrustPolicyError::InvalidA2aCardDigest { index: 0, .. }
         ));
+    }
+
+    #[test]
+    fn trust_policy_rejects_unknown_fields() {
+        let dir = tempdir().unwrap();
+        let policy_path = dir.path().join("trust.toml");
+        fs::write(
+            &policy_path,
+            "[[rules]]\nrepository_prefix = \"acme/demo\"\norigin_prefx = \"typo\"\n",
+        )
+        .unwrap();
+
+        let error = PullTrustPolicy::from_path(&policy_path).unwrap_err();
+        assert!(matches!(error, TrustPolicyError::ParsePolicy { .. }));
+    }
+
+    #[test]
+    fn a2a_trust_policy_rejects_unknown_fields() {
+        let dir = tempdir().unwrap();
+        let policy_path = dir.path().join("a2a-trust.toml");
+        fs::write(
+            &policy_path,
+            "[[rules]]\nhostname = \"planner.example.com\"\norigin_prefx = \"typo\"\n",
+        )
+        .unwrap();
+
+        let error = A2aTrustPolicy::from_path(&policy_path).unwrap_err();
+        assert!(matches!(error, TrustPolicyError::ParsePolicy { .. }));
     }
 
     #[test]
