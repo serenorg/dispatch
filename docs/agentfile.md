@@ -396,8 +396,8 @@ Reference implementation notes:
   - `card` requires successful agent-card discovery
   - `direct` skips discovery and normalizes the endpoint as a direct JSON-RPC target
 - `AUTH bearer <secret_name>` sends `Authorization: Bearer ...` using a declared `SECRET`
-- `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match
-- `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific SHA256 digest
+- `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match, or if card discovery succeeds without a `name`
+- `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific lowercase SHA256 digest
 - discovered agent cards may refine the RPC path, but they cannot pivot execution onto a different origin than the declared `URL`
 - operators can constrain resolved A2A URLs at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated allowlist of origins or hostnames
 - `TOOL A2A` currently exposes a synchronous request/response tool surface; remote tasks must complete in-band for the call to succeed
@@ -459,7 +459,8 @@ TIMEOUT TOOL 60s
 TIMEOUT LLM 120s
 ```
 
-The reference implementation currently enforces `TIMEOUT RUN` as a persisted session budget using accumulated elapsed runtime across successful runs and resumes.
+The reference implementation currently enforces `TIMEOUT RUN` as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes.
+It does not currently preempt a turn that has already started.
 `TIMEOUT TOOL` is enforced for host-executed local tools and host-executed `TOOL A2A` calls.
 Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
 Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.

@@ -38,6 +38,7 @@ mod model_backends;
 use self::model_backends::*;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static A2A_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PARCEL_SCHEMA_VALIDATOR: OnceLock<Validator> = OnceLock::new();
 
 mod wasm_bindings {
@@ -2039,7 +2040,8 @@ fn a2a_request_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("dispatch-a2a-{now}")
+    let sequence = A2A_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("dispatch-a2a-{now}-{sequence}")
 }
 
 fn normalize_a2a_rpc_endpoint(endpoint_url: &str) -> String {
@@ -2190,17 +2192,37 @@ fn ensure_run_timeout_budget(
     session: &CourierSession,
     timeouts: &[crate::manifest::TimeoutSpec],
 ) -> Result<(), CourierError> {
-    let Some(timeout) = configured_timeout_duration(timeouts, "RUN")? else {
+    let Some(timeout_spec) = timeouts
+        .iter()
+        .rev()
+        .find(|timeout| timeout.scope.eq_ignore_ascii_case("RUN"))
+    else {
         return Ok(());
+    };
+    let Some(timeout) = parse_timeout_duration(&timeout_spec.duration) else {
+        return Err(CourierError::InvalidTimeoutSpec {
+            scope: timeout_spec.scope.clone(),
+            duration: timeout_spec.duration.clone(),
+        });
     };
     let limit_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     if session.elapsed_ms >= limit_ms {
         return Err(CourierError::RunTimedOut {
             session_id: session.id.clone(),
-            timeout: "RUN".to_string(),
+            timeout: timeout_spec.duration.clone(),
         });
     }
     Ok(())
+}
+
+fn operation_counts_toward_run_budget(operation: &CourierOperation) -> bool {
+    match operation {
+        CourierOperation::InvokeTool { .. }
+        | CourierOperation::Chat { .. }
+        | CourierOperation::Job { .. }
+        | CourierOperation::Heartbeat { .. } => true,
+        CourierOperation::ResolvePrompt | CourierOperation::ListLocalTools => false,
+    }
 }
 
 fn apply_session_run_elapsed(session: &mut CourierSession, started_at: Instant) {
@@ -2297,14 +2319,26 @@ where
             .get("name")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
-        if let (Some(expected), Some(actual)) =
-            (tool.expected_agent_name.as_deref(), agent_name.as_deref())
-            && expected != actual
-        {
-            return Err(CourierError::A2aToolRequest {
-                tool: tool.alias.clone(),
-                message: format!("agent card name mismatch: expected `{expected}`, got `{actual}`"),
-            });
+        if let Some(expected) = tool.expected_agent_name.as_deref() {
+            match agent_name.as_deref() {
+                Some(actual) if expected == actual => {}
+                Some(actual) => {
+                    return Err(CourierError::A2aToolRequest {
+                        tool: tool.alias.clone(),
+                        message: format!(
+                            "agent card name mismatch: expected `{expected}`, got `{actual}`"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(CourierError::A2aToolRequest {
+                        tool: tool.alias.clone(),
+                        message: format!(
+                            "agent card did not include `name`, but `{expected}` was required"
+                        ),
+                    });
+                }
+            }
         }
         return Ok((endpoint, agent_name));
     }
@@ -2880,7 +2914,10 @@ impl CourierBackend for NativeCourier {
             validate_native_parcel(image)?;
             ensure_session_matches_parcel(image, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
-            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            let consumes_run_budget = operation_counts_toward_run_budget(&operation);
+            if consumes_run_budget {
+                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            }
             session.turn_count += 1;
             let started_at = Instant::now();
 
@@ -2985,7 +3022,9 @@ impl CourierBackend for NativeCourier {
                 ),
             }?;
 
-            apply_session_run_elapsed(&mut response.session, started_at);
+            if consumes_run_budget {
+                apply_session_run_elapsed(&mut response.session, started_at);
+            }
             persist_session_mounts(&response.session)?;
             Ok(response)
         }
@@ -3091,7 +3130,10 @@ impl CourierBackend for DockerCourier {
             )?;
             ensure_session_matches_parcel(image, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
-            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            let consumes_run_budget = operation_counts_toward_run_budget(&operation);
+            if consumes_run_budget {
+                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            }
             session.turn_count += 1;
             let started_at = Instant::now();
 
@@ -3201,7 +3243,9 @@ impl CourierBackend for DockerCourier {
                 ),
             }?;
 
-            apply_session_run_elapsed(&mut response.session, started_at);
+            if consumes_run_budget {
+                apply_session_run_elapsed(&mut response.session, started_at);
+            }
             persist_session_mounts(&response.session)?;
             Ok(response)
         }
@@ -3326,7 +3370,10 @@ impl CourierBackend for JsonlCourierPlugin {
         let session = request.session;
         async move {
             ensure_session_matches_parcel(image, &session)?;
-            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            let consumes_run_budget = operation_counts_toward_run_budget(&operation);
+            if consumes_run_budget {
+                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            }
             let started_at = Instant::now();
             let parcel_dir = parcel_dir?;
             let session = courier.ensure_persistent_process(&parcel_dir, session)?;
@@ -3343,7 +3390,9 @@ impl CourierBackend for JsonlCourierPlugin {
                 session,
                 events,
             };
-            apply_session_run_elapsed(&mut response.session, started_at);
+            if consumes_run_budget {
+                apply_session_run_elapsed(&mut response.session, started_at);
+            }
             Ok(response)
         }
     }
@@ -3881,7 +3930,10 @@ impl CourierBackend for WasmCourier {
             )?;
             ensure_session_matches_parcel(&parcel, &session)?;
             validate_wasm_component_metadata(&parcel)?;
-            ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
+            let consumes_run_budget = operation_counts_toward_run_budget(&operation);
+            if consumes_run_budget {
+                ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
+            }
             let started_at = Instant::now();
 
             let mut response = match operation {
@@ -3966,7 +4018,9 @@ impl CourierBackend for WasmCourier {
                 }
             }?;
 
-            apply_session_run_elapsed(&mut response.session, started_at);
+            if consumes_run_budget {
+                apply_session_run_elapsed(&mut response.session, started_at);
+            }
             persist_session_mounts(&response.session)?;
             Ok(response)
         }
@@ -4073,7 +4127,10 @@ impl CourierBackend for StubCourier {
         async move {
             validate_courier_reference(&courier_id, kind, &reference)?;
             ensure_session_matches_parcel(image, &session)?;
-            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            let consumes_run_budget = operation_counts_toward_run_budget(&operation);
+            if consumes_run_budget {
+                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            }
             session.turn_count += 1;
             let started_at = Instant::now();
 
@@ -4116,7 +4173,9 @@ impl CourierBackend for StubCourier {
                 }),
             }?;
 
-            apply_session_run_elapsed(&mut response.session, started_at);
+            if consumes_run_budget {
+                apply_session_run_elapsed(&mut response.session, started_at);
+            }
             Ok(response)
         }
     }
@@ -5245,7 +5304,7 @@ mod tests {
 
     #[derive(Clone)]
     struct TestA2aServerOptions {
-        agent_name: String,
+        agent_name: Option<String>,
         expected_auth: Option<String>,
         publish_card: bool,
         task_state: String,
@@ -5258,7 +5317,7 @@ mod tests {
     impl Default for TestA2aServerOptions {
         fn default() -> Self {
             Self {
-                agent_name: "demo-a2a".to_string(),
+                agent_name: Some("demo-a2a".to_string()),
                 expected_auth: None,
                 publish_card: true,
                 task_state: "completed".to_string(),
@@ -6197,7 +6256,7 @@ ENTRYPOINT job
     #[test]
     fn native_courier_rejects_a2a_agent_name_mismatch() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
-            agent_name: "actual-agent".to_string(),
+            agent_name: Some("actual-agent".to_string()),
             ..Default::default()
         });
         let test_image = build_test_image(
@@ -6217,6 +6276,32 @@ ENTRYPOINT job
             error.to_string().contains(
                 "agent card name mismatch: expected `expected-agent`, got `actual-agent`"
             )
+        );
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_agent_name_requirement_when_card_has_no_name() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            agent_name: None,
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} EXPECT_AGENT_NAME expected-agent
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("agent card did not include `name`, but `expected-agent` was required")
         );
     }
 
@@ -6244,7 +6329,7 @@ ENTRYPOINT job
     #[test]
     fn native_courier_accepts_matching_a2a_card_digest() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
-            agent_name: "demo-a2a".to_string(),
+            agent_name: Some("demo-a2a".to_string()),
             ..Default::default()
         });
         let expected_card_sha256 = encode_hex(Sha256::digest(
@@ -7024,6 +7109,47 @@ ENTRYPOINT job
         assert!(result.stdout.contains("python:3.13-alpine"));
         assert!(result.stdout.contains("tools/demo.sh"));
         assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn docker_courier_enforces_tool_timeout_for_local_tools() {
+        let dir = tempdir().unwrap();
+        let docker_bin = dir.path().join("docker");
+        fs::write(&docker_bin, "#!/bin/sh\nsleep 0.2\ncat >/dev/null\n").unwrap();
+        fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let test_image = build_test_image(
+            "\
+FROM dispatch/docker:latest
+TIMEOUT TOOL 50ms
+TOOL LOCAL tools/demo.sh AS demo
+ENTRYPOINT job
+",
+            &[("tools/demo.sh", "printf ok")],
+        );
+        let courier = DockerCourier::new(&docker_bin, "python:3.13-alpine");
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let error = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::InvokeTool {
+                    invocation: ToolInvocation {
+                        name: "demo".to_string(),
+                        input: None,
+                    },
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CourierError::ToolTimedOut { ref tool, ref timeout }
+                if tool == "demo" && timeout == "TOOL"
+        ));
     }
 
     #[test]
@@ -9123,7 +9249,38 @@ ENTRYPOINT chat
 
         assert!(matches!(
             error,
-            CourierError::RunTimedOut { ref timeout, .. } if timeout == "RUN"
+            CourierError::RunTimedOut { ref timeout, .. } if timeout == "100ms"
+        ));
+    }
+
+    #[test]
+    fn native_courier_inspection_helpers_do_not_consume_run_budget() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TIMEOUT RUN 100ms
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let mut session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        session.elapsed_ms = 100;
+
+        let response = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::ListLocalTools,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.session.elapsed_ms, 100);
+        assert!(matches!(
+            response.events.first(),
+            Some(CourierEvent::LocalToolsListed { .. })
         ));
     }
 

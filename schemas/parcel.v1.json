@@ -639,7 +639,7 @@
             "string",
             "null"
           ],
-          "pattern": "^[a-fA-F0-9]{64}$"
+          "pattern": "^[a-f0-9]{64}$"
         },
         "approval": {
           "type": [
