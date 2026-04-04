@@ -4892,6 +4892,7 @@ mod tests {
         fs,
         io::{BufRead, BufReader, Read, Write},
         net::{TcpListener, TcpStream},
+        sync::atomic::AtomicU64,
         sync::mpsc,
         thread,
         time::Duration,
@@ -4918,6 +4919,7 @@ mod tests {
         task_status_message: String,
         task_get_state: Option<String>,
         task_get_status_message: Option<String>,
+        cancel_count: Option<Arc<AtomicU64>>,
         rpc_error: Option<(i64, String)>,
         card_url: Option<String>,
         response_delay: Duration,
@@ -4933,6 +4935,7 @@ mod tests {
                 task_status_message: "ok".to_string(),
                 task_get_state: None,
                 task_get_status_message: None,
+                cancel_count: None,
                 rpc_error: None,
                 card_url: None,
                 response_delay: Duration::from_millis(0),
@@ -5081,6 +5084,19 @@ mod tests {
                             "id":"task-1",
                             "status":{"state": state, "message": message},
                             "artifacts":[{"parts":[{"kind":"text","text":"echo:hello"}]}]
+                        }
+                    })
+                } else if method == "tasks/cancel" {
+                    if let Some(counter) = &options.cancel_count {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":"1",
+                        "result":{
+                            "id":"task-1",
+                            "status":{"state":"canceled","message":"canceled"},
+                            "artifacts":[]
                         }
                     })
                 } else {
@@ -6110,11 +6126,13 @@ ENTRYPOINT job
 
     #[test]
     fn native_courier_times_out_polling_non_completed_a2a_tasks() {
+        let cancel_count = Arc::new(AtomicU64::new(0));
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
             task_state: "working".to_string(),
             task_status_message: "queued for async execution".to_string(),
             task_get_state: Some("working".to_string()),
             task_get_status_message: Some("still running".to_string()),
+            cancel_count: Some(cancel_count.clone()),
             ..Default::default()
         });
         let test_image = build_test_image(
@@ -6136,6 +6154,7 @@ ENTRYPOINT job
             CourierError::ToolTimedOut { ref tool, ref timeout }
                 if tool == "broker" && timeout == "TOOL"
         ));
+        assert_eq!(cancel_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -479,6 +479,7 @@ where
             && Instant::now() >= deadline
         {
             let timeout_label = timeout_spec.map(|(label, _)| label).unwrap_or("TOOL");
+            best_effort_cancel_a2a_task(tool, endpoint, &task_id, env_lookup);
             return Err(CourierError::ToolTimedOut {
                 tool: tool.alias.clone(),
                 timeout: timeout_label.to_string(),
@@ -495,14 +496,21 @@ where
                 "historyLength": null
             }
         });
-        let body = send_a2a_json_rpc_with_env(
+        let body = match send_a2a_json_rpc_with_env(
             tool,
             endpoint,
             payload,
             remaining,
             timeout_spec.map(|(label, _)| label),
             env_lookup,
-        )?;
+        ) {
+            Ok(body) => body,
+            Err(timeout_error @ CourierError::ToolTimedOut { .. }) => {
+                best_effort_cancel_a2a_task(tool, endpoint, &task_id, env_lookup);
+                return Err(timeout_error);
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(error) = body.get("error") {
             let code = error
                 .get("code")
@@ -526,6 +534,32 @@ where
             return Ok(current);
         }
     }
+}
+
+fn best_effort_cancel_a2a_task<F>(
+    tool: &LocalToolSpec,
+    endpoint: &str,
+    task_id: &str,
+    env_lookup: &mut F,
+) where
+    F: FnMut(&str) -> Option<String>,
+{
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "tasks/cancel",
+        "id": a2a_request_id(),
+        "params": {
+            "taskId": task_id
+        }
+    });
+    let _ = send_a2a_json_rpc_with_env(
+        tool,
+        endpoint,
+        payload,
+        Some(Duration::from_millis(500)),
+        None,
+        env_lookup,
+    );
 }
 
 pub(super) fn execute_a2a_tool_with_env<F>(
