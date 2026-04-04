@@ -399,7 +399,8 @@ Reference implementation notes:
 - `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match
 - `EXPECT_CARD_SHA256 <digest>` pins the discovered agent card body to a specific SHA256 digest
 - operators can constrain resolved A2A URLs at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated allowlist of origins or hostnames
-- `TOOL A2A` currently exposes a synchronous request/response tool surface; task polling and cancellation are not part of the current Dispatch tool contract
+- `TOOL A2A` currently exposes a synchronous request/response tool surface; remote tasks must complete in-band for the call to succeed
+- task polling and cancellation are not part of the current Dispatch tool contract
 
 ### Files and Assets
 

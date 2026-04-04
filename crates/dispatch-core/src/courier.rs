@@ -2342,6 +2342,36 @@ fn extract_a2a_task_output(value: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Null
 }
 
+fn validate_a2a_task_state(
+    tool: &LocalToolSpec,
+    value: &serde_json::Value,
+) -> Result<(), CourierError> {
+    let task = if value.get("id").is_some() {
+        value
+    } else {
+        value.get("task").unwrap_or(value)
+    };
+    let Some(state) = task
+        .pointer("/status/state")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    if state == "completed" {
+        return Ok(());
+    }
+    let status_message = task
+        .pointer("/status/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("no status message");
+    Err(CourierError::A2aToolRequest {
+        tool: tool.alias.clone(),
+        message: format!(
+            "remote A2A task did not complete synchronously: state=`{state}` message=`{status_message}`"
+        ),
+    })
+}
+
 fn execute_a2a_tool_with_env<F>(
     tool: &LocalToolSpec,
     input: Option<&str>,
@@ -2407,12 +2437,18 @@ where
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown A2A JSON-RPC error");
+        let data_suffix = error
+            .get("data")
+            .map(|value| format!(" data={}", value))
+            .unwrap_or_default();
         return Err(CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
-            message: format!("JSON-RPC error {code}: {message}"),
+            message: format!("JSON-RPC error {code}: {message}{data_suffix}"),
         });
     }
-    let output = extract_a2a_task_output(body.get("result").unwrap_or(&body));
+    let result = body.get("result").unwrap_or(&body);
+    validate_a2a_task_state(tool, result)?;
+    let output = extract_a2a_task_output(result);
     let stdout = match output {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(text) => text,
@@ -5024,6 +5060,9 @@ mod tests {
         agent_name: String,
         expected_auth: Option<String>,
         publish_card: bool,
+        task_state: String,
+        task_status_message: String,
+        rpc_error: Option<(i64, String)>,
     }
 
     impl Default for TestA2aServerOptions {
@@ -5032,6 +5071,9 @@ mod tests {
                 agent_name: "demo-a2a".to_string(),
                 expected_auth: None,
                 publish_card: true,
+                task_state: "completed".to_string(),
+                task_status_message: "ok".to_string(),
+                rpc_error: None,
             }
         }
     }
@@ -5139,6 +5181,20 @@ mod tests {
                 .as_slice(),
             ),
             ("POST", "/a2a") => {
+                if let Some((code, message)) = &options.rpc_error {
+                    let output = serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":"1",
+                        "error":{"code": code, "message": message}
+                    });
+                    write_test_http_response(
+                        &mut writer,
+                        200,
+                        "application/json",
+                        serde_json::to_vec(&output).unwrap().as_slice(),
+                    );
+                    return;
+                }
                 let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let part = payload
                     .pointer_mut("/params/message/parts/0")
@@ -5151,7 +5207,7 @@ mod tests {
                         "id":"1",
                         "result":{
                             "id":"task-1",
-                            "status":{"state":"completed","message":"ok"},
+                            "status":{"state": options.task_state, "message": options.task_status_message},
                             "artifacts":[{"parts":[{"kind":"text","text":format!("echo:{text}")}]}]
                         }
                     })
@@ -5161,7 +5217,7 @@ mod tests {
                         "id":"1",
                         "result":{
                             "id":"task-1",
-                            "status":{"state":"completed","message":"ok"},
+                            "status":{"state": options.task_state, "message": options.task_status_message},
                             "artifacts":[{"parts":[{"kind":"data","data":part.get("data").cloned().unwrap_or(serde_json::Value::Null)}]}]
                         }
                     })
@@ -6042,6 +6098,57 @@ ENTRYPOINT job
             error
                 .to_string()
                 .contains("agent card discovery failed for required `DISCOVERY card` mode")
+        );
+    }
+
+    #[test]
+    fn native_courier_rejects_non_completed_a2a_task_states() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            task_state: "working".to_string(),
+            task_status_message: "queued for async execution".to_string(),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(error.to_string().contains(
+            "remote A2A task did not complete synchronously: state=`working` message=`queued for async execution`"
+        ));
+    }
+
+    #[test]
+    fn native_courier_surfaces_a2a_json_rpc_errors() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            rpc_error: Some((-32001, "remote agent unavailable".to_string())),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("JSON-RPC error -32001: remote agent unavailable")
         );
     }
 
