@@ -1,12 +1,12 @@
 use crate::{
     ParsedAgentfile, Value,
     manifest::{
-        BuiltinToolConfig, CommandSpec, CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar,
-        FrameworkProvenance, InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig,
-        McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind, NetworkRule,
-        PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
-        TimeoutSpec, ToolApprovalPolicy, ToolConfig, ToolInputSchemaRef, ToolRiskLevel, Visibility,
-        WasmComponentConfig,
+        A2aToolConfig, BuiltinToolConfig, CommandSpec, CompactionConfig, CourierTarget,
+        DISPATCH_WASM_ABI, EnvVar, FrameworkProvenance, InstructionConfig, InstructionKind,
+        LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy, ModelReference, MountConfig,
+        MountKind, NetworkRule, PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord,
+        ParcelManifest, SecretSpec, TimeoutSpec, ToolApprovalPolicy, ToolConfig,
+        ToolInputSchemaRef, ToolRiskLevel, Visibility, WasmComponentConfig,
     },
     parse_agentfile,
     validate::{Level, validate_agentfile},
@@ -266,23 +266,46 @@ pub fn build_agentfile(
             }
             "TOOL" => {
                 if let Some(mut tool) = parse_tool(&instruction.args)? {
-                    if let ToolConfig::Local(local) = &mut tool {
-                        let resolved_path = resolve_path(&context_dir, &local.packaged_path)?;
-                        let file_record =
-                            package_path(&context_dir, &resolved_path, &mut packaged)?;
-                        files.extend(file_record.expand());
-                        if let Some(schema) = &local.input_schema {
-                            let resolved_schema_path =
-                                resolve_path(&context_dir, &schema.packaged_path)?;
-                            validate_tool_schema(&resolved_schema_path, &local.alias)?;
-                            let schema_record =
-                                package_path(&context_dir, &resolved_schema_path, &mut packaged)?;
-                            local.input_schema = Some(ToolInputSchemaRef {
-                                packaged_path: schema.packaged_path.clone(),
-                                sha256: schema_record.sha256.clone(),
-                            });
-                            files.extend(schema_record.expand());
+                    match &mut tool {
+                        ToolConfig::Local(local) => {
+                            let resolved_path = resolve_path(&context_dir, &local.packaged_path)?;
+                            let file_record =
+                                package_path(&context_dir, &resolved_path, &mut packaged)?;
+                            files.extend(file_record.expand());
+                            if let Some(schema) = &local.input_schema {
+                                let resolved_schema_path =
+                                    resolve_path(&context_dir, &schema.packaged_path)?;
+                                validate_tool_schema(&resolved_schema_path, &local.alias)?;
+                                let schema_record = package_path(
+                                    &context_dir,
+                                    &resolved_schema_path,
+                                    &mut packaged,
+                                )?;
+                                local.input_schema = Some(ToolInputSchemaRef {
+                                    packaged_path: schema.packaged_path.clone(),
+                                    sha256: schema_record.sha256.clone(),
+                                });
+                                files.extend(schema_record.expand());
+                            }
                         }
+                        ToolConfig::A2a(tool) => {
+                            if let Some(schema) = &tool.input_schema {
+                                let resolved_schema_path =
+                                    resolve_path(&context_dir, &schema.packaged_path)?;
+                                validate_tool_schema(&resolved_schema_path, &tool.alias)?;
+                                let schema_record = package_path(
+                                    &context_dir,
+                                    &resolved_schema_path,
+                                    &mut packaged,
+                                )?;
+                                tool.input_schema = Some(ToolInputSchemaRef {
+                                    packaged_path: schema.packaged_path.clone(),
+                                    sha256: schema_record.sha256.clone(),
+                                });
+                                files.extend(schema_record.expand());
+                            }
+                        }
+                        ToolConfig::Builtin(_) | ToolConfig::Mcp(_) => {}
                     }
                     resolved.tools.push(tool);
                 }
@@ -832,9 +855,7 @@ fn parse_tool(args: &[Value]) -> Result<Option<ToolConfig>, BuildError> {
                 }))
             })
             .transpose(),
-        "A2A" => Err(BuildError::Validation(
-            "TOOL A2A is reserved but not yet supported by the reference builder".to_string(),
-        )),
+        "A2A" => parse_a2a_tool(&tokens).map(|tool| tool.map(ToolConfig::A2a)),
         _ => Ok(None),
     }
 }
@@ -876,6 +897,30 @@ fn parse_local_tool(tokens: &[String]) -> Result<Option<LocalToolConfig>, BuildE
         approval,
         risk,
         description,
+        input_schema,
+    }))
+}
+
+fn parse_a2a_tool(tokens: &[String]) -> Result<Option<A2aToolConfig>, BuildError> {
+    let Some(alias) = tokens.get(1).cloned() else {
+        return Ok(None);
+    };
+    let url = parse_named_value(tokens, "URL").ok_or_else(|| {
+        BuildError::Validation(format!("TOOL A2A `{alias}` requires `URL <endpoint>`"))
+    })?;
+
+    let input_schema =
+        parse_named_value(tokens, "SCHEMA").map(|packaged_path| ToolInputSchemaRef {
+            packaged_path,
+            sha256: String::new(),
+        });
+
+    Ok(Some(A2aToolConfig {
+        alias,
+        url,
+        approval: parse_tool_approval(tokens)?,
+        risk: parse_tool_risk(tokens)?,
+        description: parse_named_value(tokens, "DESCRIPTION"),
         input_schema,
     }))
 }
@@ -1410,27 +1455,53 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn build_rejects_a2a_tools_until_supported() {
+    fn build_records_a2a_tool_metadata() {
         let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("schemas")).unwrap();
+        fs::write(
+            dir.path().join("schemas/a2a-input.json"),
+            "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"query\": { \"type\": \"string\" }\n  },\n  \"required\": [\"query\"]\n}\n",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("Agentfile"),
             "\
 FROM dispatch/native:latest
-TOOL A2A broker-agent ORIGIN https://broker.example.com APPROVAL confirm
+TOOL A2A broker_agent URL https://broker.example.com APPROVAL confirm RISK medium SCHEMA schemas/a2a-input.json DESCRIPTION \"Delegate to a remote broker\"
 ENTRYPOINT chat
 ",
         )
         .unwrap();
 
-        let error = build_agentfile(
+        let built = build_agentfile(
             &dir.path().join("Agentfile"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("TOOL A2A is reserved"));
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(&built.manifest_path).unwrap()).unwrap();
+        match &parcel.tools[0] {
+            ToolConfig::A2a(tool) => {
+                assert_eq!(tool.alias, "broker_agent");
+                assert_eq!(tool.url, "https://broker.example.com");
+                assert_eq!(tool.approval, Some(ToolApprovalPolicy::Confirm));
+                assert_eq!(tool.risk, Some(ToolRiskLevel::Medium));
+                assert_eq!(
+                    tool.description.as_deref(),
+                    Some("Delegate to a remote broker")
+                );
+                let schema = tool
+                    .input_schema
+                    .as_ref()
+                    .expect("expected packaged a2a input schema");
+                assert_eq!(schema.packaged_path, "schemas/a2a-input.json");
+                assert_eq!(schema.sha256.len(), 64);
+            }
+            other => panic!("expected a2a tool, got {other:?}"),
+        }
     }
 
     #[test]

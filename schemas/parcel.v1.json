@@ -576,6 +576,77 @@
         }
       }
     },
+    "a2aTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "alias",
+        "url"
+      ],
+      "properties": {
+        "kind": {
+          "const": "a2a"
+        },
+        "alias": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "packaged_path",
+            "sha256"
+          ],
+          "properties": {
+            "packaged_path": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        }
+      }
+    },
     "tool": {
       "oneOf": [
         {
@@ -586,6 +657,9 @@
         },
         {
           "$ref": "#/$defs/mcpTool"
+        },
+        {
+          "$ref": "#/$defs/a2aTool"
         }
       ]
     },

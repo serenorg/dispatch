@@ -202,6 +202,7 @@ pub enum ToolConfig {
     Local(LocalToolConfig),
     Builtin(BuiltinToolConfig),
     Mcp(McpToolConfig),
+    A2a(A2aToolConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +230,16 @@ pub struct McpToolConfig {
     pub approval: Option<ToolApprovalPolicy>,
     pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aToolConfig {
+    pub alias: String,
+    pub url: String,
+    pub approval: Option<ToolApprovalPolicy>,
+    pub risk: Option<ToolRiskLevel>,
+    pub description: Option<String>,
+    pub input_schema: Option<ToolInputSchemaRef>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

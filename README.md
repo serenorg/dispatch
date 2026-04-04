@@ -76,6 +76,7 @@ TOOL BUILTIN topic_lookup
 TOOL BUILTIN human_approval
 TOOL BUILTIN memory_put
 TOOL BUILTIN memory_get
+TOOL A2A planner URL https://planner.example.com DESCRIPTION "Delegate planning to a remote agent."
 
 MOUNT SESSION sqlite
 MOUNT MEMORY sqlite

@@ -381,7 +381,18 @@ TOOL MCP github APPROVAL confirm RISK high DESCRIPTION "Use the GitHub MCP serve
 
 #### `TOOL A2A`
 
-Reserved for future agent-to-agent courier integrations. The reference builder does not currently accept `TOOL A2A` declarations.
+Declares a remote agent-to-agent tool backed by a fixed A2A endpoint.
+
+```dockerfile
+TOOL A2A planner URL https://planner.example.com DESCRIPTION "Delegate planning to a remote agent."
+TOOL A2A broker URL https://broker.example.com SCHEMA schemas/broker-input.json APPROVAL confirm RISK high
+```
+
+Reference implementation notes:
+
+- the endpoint is declared statically in the parcel via `URL`, not supplied by the model at call time
+- the reference couriers perform agent-card discovery when available and fall back to `<url>/a2a` for JSON-RPC `message/send`
+- `TOOL A2A` currently exposes a synchronous request/response tool surface; task polling and cancellation are not part of the v1 Dispatch tool contract
 
 ### Files and Assets
 

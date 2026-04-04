@@ -66,6 +66,10 @@ pub enum CourierError {
     UnknownLocalTool { tool: String },
     #[error("tool `{tool}` points to missing packaged file `{path}`")]
     MissingToolFile { tool: String, path: String },
+    #[error("A2A tool `{tool}` is missing a configured endpoint URL")]
+    MissingA2aToolUrl { tool: String },
+    #[error("A2A request for tool `{tool}` failed: {message}")]
+    A2aToolRequest { tool: String, message: String },
     #[error("builtin tool `{tool}` received invalid input: {message}")]
     InvalidBuiltinToolInput { tool: String, message: String },
     #[error("tool `{tool}` schema `{path}` is invalid: {source}")]
@@ -276,11 +280,20 @@ pub struct LoadedParcel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalToolTransport {
+    Local,
+    A2a,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalToolSpec {
     pub alias: String,
     pub packaged_path: String,
     pub command: String,
     pub args: Vec<String>,
+    pub transport: LocalToolTransport,
+    pub endpoint_url: Option<String>,
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
@@ -1111,12 +1124,31 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                 packaged_path: local.packaged_path.clone(),
                 command: local.runner.command.clone(),
                 args: local.runner.args.clone(),
+                transport: LocalToolTransport::Local,
+                endpoint_url: None,
                 description: local.description.clone(),
                 input_schema_packaged_path: local
                     .input_schema
                     .as_ref()
                     .map(|schema| schema.packaged_path.clone()),
                 input_schema_sha256: local
+                    .input_schema
+                    .as_ref()
+                    .map(|schema| schema.sha256.clone()),
+            }),
+            ToolConfig::A2a(a2a) => Some(LocalToolSpec {
+                alias: a2a.alias.clone(),
+                packaged_path: String::new(),
+                command: "dispatch-a2a".to_string(),
+                args: vec![a2a.url.clone()],
+                transport: LocalToolTransport::A2a,
+                endpoint_url: Some(a2a.url.clone()),
+                description: a2a.description.clone(),
+                input_schema_packaged_path: a2a
+                    .input_schema
+                    .as_ref()
+                    .map(|schema| schema.packaged_path.clone()),
+                input_schema_sha256: a2a
                     .input_schema
                     .as_ref()
                     .map(|schema| schema.sha256.clone()),
@@ -1975,6 +2007,266 @@ where
     env
 }
 
+fn a2a_request_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("dispatch-a2a-{now}")
+}
+
+fn normalize_a2a_rpc_endpoint(endpoint_url: &str) -> String {
+    let trimmed = endpoint_url.trim_end_matches('/');
+    if let Ok(parsed) = ureq::http::Uri::try_from(endpoint_url) {
+        let path = parsed.path().trim_end_matches('/');
+        if path.is_empty() || path == "/" {
+            return format!("{trimmed}/a2a");
+        }
+    }
+    trimmed.to_string()
+}
+
+fn normalize_a2a_discovery_base(endpoint_url: &str) -> String {
+    endpoint_url
+        .trim_end_matches('/')
+        .strip_suffix("/a2a")
+        .unwrap_or_else(|| endpoint_url.trim_end_matches('/'))
+        .to_string()
+}
+
+fn format_a2a_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(message) = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                value
+                    .pointer("/message")
+                    .and_then(serde_json::Value::as_str)
+            })
+    {
+        return message.to_string();
+    }
+    trimmed.to_string()
+}
+
+fn read_a2a_json_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    tool: &str,
+) -> Result<serde_json::Value, CourierError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = format_a2a_error_body(&body);
+        let message = if detail.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            format!("HTTP {}: {detail}", status.as_u16())
+        };
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.to_string(),
+            message,
+        });
+    }
+    response
+        .body_mut()
+        .read_json()
+        .map_err(|error| CourierError::A2aToolRequest {
+            tool: tool.to_string(),
+            message: format!("failed to parse A2A response: {error}"),
+        })
+}
+
+fn resolve_a2a_rpc_endpoint(
+    tool: &LocalToolSpec,
+) -> Result<(String, Option<String>), CourierError> {
+    let url = tool
+        .endpoint_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CourierError::MissingA2aToolUrl {
+            tool: tool.alias.clone(),
+        })?;
+    let discovery_url = format!(
+        "{}/.well-known/agent.json",
+        normalize_a2a_discovery_base(url)
+    );
+    let response = ureq::get(&discovery_url)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .map_err(|error| CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: error.to_string(),
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        let mut response = response;
+        let card = response
+            .body_mut()
+            .read_json::<serde_json::Value>()
+            .map_err(|error| CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("failed to parse agent card: {error}"),
+            })?;
+        let endpoint = card
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| normalize_a2a_rpc_endpoint(url));
+        let agent_name = card
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        return Ok((endpoint, agent_name));
+    }
+    Ok((normalize_a2a_rpc_endpoint(url), None))
+}
+
+fn collect_a2a_artifact_parts(
+    artifact: &serde_json::Value,
+    texts: &mut Vec<String>,
+    data_parts: &mut Vec<serde_json::Value>,
+) {
+    let Some(parts) = artifact.get("parts").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for part in parts {
+        match part.get("kind").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                    texts.push(text.to_string());
+                }
+            }
+            Some("data") => {
+                if let Some(data) = part.get("data") {
+                    data_parts.push(data.clone());
+                }
+            }
+            Some("file") => {
+                if let Some(file) = part.get("file") {
+                    data_parts.push(serde_json::json!({ "file": file }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_a2a_task_output(value: &serde_json::Value) -> serde_json::Value {
+    let task = if value.get("id").is_some() {
+        value
+    } else {
+        value.get("task").unwrap_or(value)
+    };
+    let mut texts = Vec::new();
+    let mut data_parts = Vec::new();
+    if let Some(artifacts) = task.get("artifacts").and_then(serde_json::Value::as_array) {
+        for artifact in artifacts {
+            collect_a2a_artifact_parts(artifact, &mut texts, &mut data_parts);
+        }
+    }
+    if data_parts.len() == 1 {
+        return data_parts.into_iter().next().unwrap();
+    }
+    if !data_parts.is_empty() {
+        return serde_json::Value::Array(data_parts);
+    }
+    if texts.len() == 1 {
+        return serde_json::Value::String(texts.into_iter().next().unwrap());
+    }
+    if !texts.is_empty() {
+        return serde_json::json!({ "text": texts.join("\n") });
+    }
+    if let Some(status_message) = task
+        .pointer("/status/message")
+        .and_then(serde_json::Value::as_str)
+    {
+        return serde_json::Value::String(status_message.to_string());
+    }
+    serde_json::Value::Null
+}
+
+fn execute_a2a_tool(
+    tool: &LocalToolSpec,
+    input: Option<&str>,
+) -> Result<ToolRunResult, CourierError> {
+    let (endpoint, agent_name) = resolve_a2a_rpc_endpoint(tool)?;
+    let request_id = a2a_request_id();
+    let input_value = input.unwrap_or_default();
+    let part = if tool.input_schema_packaged_path.is_some() {
+        let data = serde_json::from_str::<serde_json::Value>(input_value).map_err(|error| {
+            CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("A2A tool expected JSON input: {error}"),
+            }
+        })?;
+        serde_json::json!({ "kind": "data", "data": data })
+    } else {
+        serde_json::json!({ "kind": "text", "text": input_value })
+    };
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "message/send",
+        "id": request_id,
+        "params": {
+            "message": {
+                "messageId": a2a_request_id(),
+                "role": "user",
+                "parts": [part]
+            }
+        }
+    });
+    let response = ureq::post(&endpoint)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .header("content-type", "application/json")
+        .send_json(payload)
+        .map_err(|error| CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: error.to_string(),
+        })?;
+    let body = read_a2a_json_response(response, &tool.alias)?;
+    if let Some(error) = body.get("error") {
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown A2A JSON-RPC error");
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("JSON-RPC error {code}: {message}"),
+        });
+    }
+    let output = extract_a2a_task_output(body.get("result").unwrap_or(&body));
+    let stdout = match output {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text,
+        other => serde_json::to_string_pretty(&other).unwrap_or_else(|_| other.to_string()),
+    };
+    let mut args = vec![endpoint.clone()];
+    if let Some(name) = agent_name {
+        args.push(name);
+    }
+    Ok(ToolRunResult {
+        tool: tool.alias.clone(),
+        command: "dispatch-a2a".to_string(),
+        args,
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+    })
+}
+
 // Execute a tool whose spec has already been resolved. Callers are responsible
 // for validating required secrets before calling this function.
 fn execute_local_tool(
@@ -1994,6 +2286,10 @@ fn execute_local_tool_with_env<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
+    if matches!(tool.transport, LocalToolTransport::A2a) {
+        return execute_a2a_tool(tool, input);
+    }
+
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
     if !tool_path.exists() {
         return Err(CourierError::MissingToolFile {
@@ -2063,6 +2359,10 @@ fn execute_local_tool_in_docker(
     input: Option<&str>,
     courier: &DockerCourier,
 ) -> Result<ToolRunResult, CourierError> {
+    if matches!(tool.transport, LocalToolTransport::A2a) {
+        return execute_a2a_tool(tool, input);
+    }
+
     let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
     if !tool_path.exists() {
         return Err(CourierError::MissingToolFile {
@@ -4390,11 +4690,15 @@ fn build_model_tool_definition(
     image: &LoadedParcel,
     tool: &LocalToolSpec,
 ) -> Result<ModelToolDefinition, CourierError> {
-    let description = tool.description.clone().unwrap_or_else(|| {
-        format!(
+    let description = tool.description.clone().unwrap_or_else(|| match tool.transport {
+        LocalToolTransport::Local => format!(
             "Local Dispatch tool `{}` packaged at `{}`. Provide free-form text or JSON input appropriate for the tool.",
             tool.alias, tool.packaged_path
-        )
+        ),
+        LocalToolTransport::A2a => format!(
+            "Dispatch A2A tool `{}` delegates to the configured remote agent endpoint. Provide free-form text or JSON input appropriate for the remote agent.",
+            tool.alias
+        ),
     });
     let format = match (
         tool.input_schema_packaged_path.as_deref(),
@@ -4526,15 +4830,164 @@ mod tests {
     use crate::{BuildOptions, build_agentfile};
     use rusqlite::Connection;
     use serde_json::Value;
-    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
     use tempfile::tempdir;
 
     struct TestImage {
         _dir: tempfile::TempDir,
         image: LoadedParcel,
+    }
+
+    struct TestA2aServer {
+        base_url: String,
+        shutdown: mpsc::Sender<()>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TestA2aServer {
+        fn drop(&mut self) {
+            let _ = self.shutdown.send(());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn start_test_a2a_server() -> TestA2aServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let server_base_url = base_url.clone();
+        let handle = thread::spawn(move || {
+            loop {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => handle_test_a2a_connection(stream, &server_base_url),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("failed to accept A2A connection: {error}"),
+                }
+            }
+        });
+        TestA2aServer {
+            base_url,
+            shutdown: shutdown_tx,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle_test_a2a_connection(stream: TcpStream, base_url: &str) {
+        stream.set_nonblocking(false).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap() == 0 {
+            return;
+        }
+        let request_line = request_line.trim_end();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let mut content_length = 0usize;
+        loop {
+            let mut header_line = String::new();
+            reader.read_line(&mut header_line).unwrap();
+            let header_line = header_line.trim_end();
+            if header_line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header_line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+
+        match (method, target) {
+            ("GET", "/.well-known/agent.json") => write_test_http_response(
+                &mut writer,
+                200,
+                "application/json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name":"demo-a2a",
+                    "url": format!("{base_url}/a2a")
+                }))
+                .unwrap()
+                .as_slice(),
+            ),
+            ("POST", "/a2a") => {
+                let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let part = payload
+                    .pointer_mut("/params/message/parts/0")
+                    .expect("expected request part");
+                let output = if let Some(text) =
+                    part.get("text").and_then(serde_json::Value::as_str)
+                {
+                    serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":"1",
+                        "result":{
+                            "id":"task-1",
+                            "status":{"state":"completed","message":"ok"},
+                            "artifacts":[{"parts":[{"kind":"text","text":format!("echo:{text}")}]}]
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":"1",
+                        "result":{
+                            "id":"task-1",
+                            "status":{"state":"completed","message":"ok"},
+                            "artifacts":[{"parts":[{"kind":"data","data":part.get("data").cloned().unwrap_or(serde_json::Value::Null)}]}]
+                        }
+                    })
+                };
+                write_test_http_response(
+                    &mut writer,
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&output).unwrap().as_slice(),
+                );
+            }
+            _ => write_test_http_response(&mut writer, 404, "text/plain", b"not found"),
+        }
+    }
+
+    fn write_test_http_response(
+        writer: &mut TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+    ) {
+        let reason = match status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "OK",
+        };
+        let headers = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        writer.write_all(headers.as_bytes()).unwrap();
+        writer.write_all(body).unwrap();
+        writer.flush().unwrap();
     }
 
     fn build_test_image(agentfile: &str, files: &[(&str, &str)]) -> TestImage {
@@ -5138,6 +5591,80 @@ ENTRYPOINT job
         assert_eq!(tools[0].alias, "demo");
         assert_eq!(tools[0].command, "python3");
         assert_eq!(tools[0].args, vec!["-u"]);
+        assert_eq!(tools[0].transport, LocalToolTransport::Local);
+    }
+
+    #[test]
+    fn list_local_tools_includes_a2a_tools() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker URL https://broker.example.com SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
+ENTRYPOINT job
+",
+            &[(
+                "schemas/input.json",
+                "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"query\": { \"type\": \"string\" }\n  },\n  \"required\": [\"query\"]\n}\n",
+            )],
+        );
+
+        let tools = list_local_tools(&test_image.image);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].alias, "broker");
+        assert_eq!(tools[0].transport, LocalToolTransport::A2a);
+        assert_eq!(
+            tools[0].endpoint_url.as_deref(),
+            Some("https://broker.example.com")
+        );
+        assert_eq!(tools[0].command, "dispatch-a2a");
+    }
+
+    #[test]
+    fn native_courier_executes_a2a_tools_via_host_transport() {
+        let server = start_test_a2a_server();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} DESCRIPTION \"Delegate to broker\"
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let result = run_local_tool(&test_image.image, "broker", Some("hello remote")).unwrap();
+        assert_eq!(result.tool, "broker");
+        assert_eq!(result.command, "dispatch-a2a");
+        assert!(result.stdout.contains("echo:hello remote"));
+    }
+
+    #[test]
+    fn native_courier_executes_a2a_tools_with_json_payloads() {
+        let server = start_test_a2a_server();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {} SCHEMA schemas/input.json
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[(
+                "schemas/input.json",
+                "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"query\": { \"type\": \"string\" }\n  },\n  \"required\": [\"query\"]\n}\n",
+            )],
+        );
+
+        let result =
+            run_local_tool(&test_image.image, "broker", Some("{\"query\":\"weather\"}")).unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(
+            output.pointer("/query").and_then(serde_json::Value::as_str),
+            Some("weather")
+        );
     }
 
     #[test]
@@ -6729,6 +7256,8 @@ ENTRYPOINT chat
             packaged_path: "tools/demo.sh".to_string(),
             command: "bash".to_string(),
             args: Vec::new(),
+            transport: LocalToolTransport::Local,
+            endpoint_url: None,
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
