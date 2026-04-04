@@ -256,10 +256,10 @@ mod tests {
     #[test]
     fn chat_run_emits_message_and_updates_history() {
         let dir = tempdir().unwrap();
-        let image = build_test_image(dir.path());
+        let parcel = build_test_parcel(dir.path());
         let session = CourierSession {
-            id: format!("echo-{}", image.config.digest),
-            parcel_digest: image.config.digest.clone(),
+            id: format!("echo-{}", parcel.config.digest),
+            parcel_digest: parcel.config.digest.clone(),
             entrypoint: Some("chat".to_string()),
             label: None,
             turn_count: 0,
@@ -270,7 +270,7 @@ mod tests {
         };
 
         let responses = handle_run(
-            &image,
+            &parcel,
             session,
             CourierOperation::Chat {
                 input: "hello".to_string(),
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn resume_session_preserves_and_updates_backend_state() {
         let dir = tempdir().unwrap();
-        let parcel = build_test_image(dir.path());
+        let parcel = build_test_parcel(dir.path());
         let responses = handle_request(PluginRequest::ResumeSession {
             parcel_dir: parcel.parcel_dir.display().to_string(),
             session: CourierSession {
@@ -314,8 +314,8 @@ mod tests {
         assert_eq!(session.backend_state.as_deref(), Some("warm|resumed"));
     }
 
-    fn build_test_image(root: &Path) -> LoadedParcel {
-        let context_dir = root.join("image");
+    fn build_test_parcel(root: &Path) -> LoadedParcel {
+        let context_dir = root.join("parcel");
         std::fs::create_dir_all(&context_dir).unwrap();
         std::fs::write(
             context_dir.join("Agentfile"),

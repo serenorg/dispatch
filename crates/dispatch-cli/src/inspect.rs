@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use dispatch_core::{
-    A2aAuthConfig, BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry,
-    CourierInspection, DockerCourier, JsonlCourierPlugin, LocalToolTarget, NativeCourier,
-    ParcelManifest, ResolvedCourier, WasmCourier, load_parcel, resolve_courier,
+    BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry, CourierInspection,
+    DockerCourier, JsonlCourierPlugin, LocalToolTarget, NativeCourier, ParcelManifest,
+    ResolvedCourier, WasmCourier, load_parcel, resolve_courier,
 };
 use futures::executor::block_on;
 use std::{
@@ -161,7 +161,7 @@ fn print_courier_inspection(inspection: &CourierInspection) {
                     details.push(format!("discovery={mode:?}").to_ascii_lowercase());
                 }
                 if let Some(auth) = auth {
-                    details.push(format_a2a_auth_summary(auth));
+                    details.push(crate::tool_display::format_a2a_auth_summary(auth));
                 }
                 if let Some(name) = expected_agent_name {
                     details.push(format!("expected_agent_name={name}"));
@@ -172,20 +172,6 @@ fn print_courier_inspection(inspection: &CourierInspection) {
                 println!("  tool: {} a2a {}", tool.alias, details.join(" "));
             }
         }
-    }
-}
-
-fn format_a2a_auth_summary(auth: &A2aAuthConfig) -> String {
-    match auth {
-        A2aAuthConfig::Bearer { secret_name } => format!("auth=bearer:{secret_name}"),
-        A2aAuthConfig::Header {
-            header_name,
-            secret_name,
-        } => format!("auth=header:{header_name}({secret_name})"),
-        A2aAuthConfig::Basic {
-            username_secret_name,
-            password_secret_name,
-        } => format!("auth=basic:{username_secret_name}+{password_secret_name}"),
     }
 }
 

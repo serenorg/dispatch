@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::{
-    A2aAuthConfig, BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest,
-    CourierSession, DockerCourier, LoadedParcel, LocalToolSpec, LocalToolTarget, NativeCourier,
-    ResolvedCourier, ToolInvocation, WasmCourier, load_parcel, resolve_courier,
+    BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest, CourierSession,
+    DockerCourier, LoadedParcel, LocalToolSpec, LocalToolTarget, NativeCourier, ResolvedCourier,
+    ToolInvocation, WasmCourier, load_parcel, resolve_courier,
 };
 use futures::executor::block_on;
 use std::{
@@ -329,7 +329,7 @@ fn format_listed_tool(tool: &LocalToolSpec) -> String {
                 parts.push(format!("discovery={mode:?}").to_ascii_lowercase());
             }
             if let Some(auth) = auth {
-                parts.push(format_a2a_auth_summary(auth));
+                parts.push(crate::tool_display::format_a2a_auth_summary(auth));
             }
             if let Some(name) = expected_agent_name {
                 parts.push(format!("expected_agent_name={name}"));
@@ -339,19 +339,5 @@ fn format_listed_tool(tool: &LocalToolSpec) -> String {
             }
             format!("{} -> {} [{}]", tool.alias, endpoint_url, parts.join(" "))
         }
-    }
-}
-
-fn format_a2a_auth_summary(auth: &A2aAuthConfig) -> String {
-    match auth {
-        A2aAuthConfig::Bearer { secret_name } => format!("auth=bearer:{secret_name}"),
-        A2aAuthConfig::Header {
-            header_name,
-            secret_name,
-        } => format!("auth=header:{header_name}({secret_name})"),
-        A2aAuthConfig::Basic {
-            username_secret_name,
-            password_secret_name,
-        } => format!("auth=basic:{username_secret_name}+{password_secret_name}"),
     }
 }

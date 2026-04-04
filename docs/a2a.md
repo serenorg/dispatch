@@ -83,6 +83,11 @@ The CLI flags apply only to that command invocation. They do not mutate process-
 
 When both are present, CLI-scoped overrides win over inherited environment variables for that invocation.
 
+Implementation note:
+
+- the current override mechanism is thread-local and intended for the single-threaded CLI command path
+- code that moves courier execution onto other threads must propagate A2A operator policy explicitly instead of assuming the override will follow automatically
+
 ### `DISPATCH_A2A_ALLOWED_ORIGINS`
 
 Comma-separated hostnames or exact origins:

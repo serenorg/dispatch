@@ -408,18 +408,6 @@ impl LocalToolSpec {
         }
     }
 
-    pub fn auth_secret_name(&self) -> Option<&str> {
-        match self.auth() {
-            Some(crate::manifest::A2aAuthConfig::Bearer { secret_name }) => {
-                Some(secret_name.as_str())
-            }
-            Some(crate::manifest::A2aAuthConfig::Header { secret_name, .. }) => {
-                Some(secret_name.as_str())
-            }
-            _ => None,
-        }
-    }
-
     pub fn auth_scheme(&self) -> Option<A2aAuthScheme> {
         self.auth().map(crate::manifest::A2aAuthConfig::scheme)
     }
@@ -6163,7 +6151,7 @@ ENTRYPOINT job
         assert_eq!(tools[0].transport(), LocalToolTransport::A2a);
         assert_eq!(tools[0].endpoint_url(), Some("https://broker.example.com"));
         assert_eq!(tools[0].endpoint_mode(), Some(A2aEndpointMode::Card));
-        assert_eq!(tools[0].auth_secret_name(), Some("A2A_TOKEN"));
+        assert_eq!(tools[0].auth_scheme(), Some(A2aAuthScheme::Bearer));
         assert_eq!(tools[0].auth_scheme(), Some(A2aAuthScheme::Bearer));
         assert_eq!(tools[0].auth_username_secret_name(), None);
         assert_eq!(tools[0].auth_password_secret_name(), None);

@@ -5,6 +5,7 @@ mod inspect;
 mod parcel_ops;
 mod run;
 mod state;
+mod tool_display;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
