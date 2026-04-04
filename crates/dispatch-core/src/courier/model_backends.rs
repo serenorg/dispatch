@@ -2,6 +2,7 @@ use super::*;
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader},
+    time::Duration,
 };
 
 struct OpenAiResponsesBackend;
@@ -10,6 +11,10 @@ struct AnthropicMessagesBackend;
 struct GeminiGenerateContentBackend;
 
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 2048;
+
+fn request_timeout(request: &ModelRequest) -> Option<Duration> {
+    request.llm_timeout_ms.map(Duration::from_millis)
+}
 
 pub(super) fn default_chat_backend_for_provider(
     provider: Option<&str>,
@@ -66,6 +71,7 @@ impl ChatModelBackend for OpenAiResponsesBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("authorization", &format!("Bearer {api_key}"))
             .header("content-type", "application/json")
@@ -108,6 +114,7 @@ impl ChatModelBackend for OpenAiResponsesBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("authorization", &format!("Bearer {api_key}"))
             .header("content-type", "application/json")
@@ -150,6 +157,7 @@ impl ChatModelBackend for OpenAiChatCompletionsBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("authorization", &format!("Bearer {api_key}"))
             .header("content-type", "application/json")
@@ -192,6 +200,7 @@ impl ChatModelBackend for OpenAiChatCompletionsBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("authorization", &format!("Bearer {api_key}"))
             .header("content-type", "application/json")
@@ -239,6 +248,7 @@ impl ChatModelBackend for AnthropicMessagesBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
@@ -287,6 +297,7 @@ impl ChatModelBackend for AnthropicMessagesBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
@@ -353,6 +364,7 @@ impl ChatModelBackend for GeminiGenerateContentBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("x-goog-api-key", &api_key)
             .header("content-type", "application/json")
@@ -414,6 +426,7 @@ impl ChatModelBackend for GeminiGenerateContentBackend {
         let response = ureq::post(&url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(request_timeout(request))
             .build()
             .header("x-goog-api-key", &api_key)
             .header("content-type", "application/json")

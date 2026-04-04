@@ -537,6 +537,7 @@ pub trait ChatModelBackend: Send + Sync {
 pub struct ModelRequest {
     pub model: String,
     pub provider: Option<String>,
+    pub llm_timeout_ms: Option<u64>,
     pub context_token_limit: Option<u32>,
     pub tool_call_limit: Option<u32>,
     pub tool_output_limit: Option<usize>,
@@ -4853,11 +4854,14 @@ fn build_model_requests(
             .map(build_builtin_model_tool_definition),
     );
     let instructions = resolve_prompt_text(image)?;
+    let llm_timeout_ms = configured_llm_timeout_ms(&image.config.timeouts)?;
+
     Ok(model_refs
         .into_iter()
         .map(|model| ModelRequest {
             model: model.id,
             provider: model.provider,
+            llm_timeout_ms,
             context_token_limit: configured_context_token_limit(&image.config.limits),
             tool_call_limit: configured_tool_call_limit(&image.config.limits),
             tool_output_limit: configured_tool_output_limit(&image.config.limits),
@@ -4921,11 +4925,14 @@ fn build_wasm_model_requests(
         ));
     }
 
+    let llm_timeout_ms = configured_llm_timeout_ms(&parcel.config.timeouts)?;
+
     Ok(model_refs
         .into_iter()
         .map(|model| ModelRequest {
             model: model.id,
             provider: model.provider,
+            llm_timeout_ms,
             context_token_limit: configured_context_token_limit(&parcel.config.limits),
             tool_call_limit: configured_tool_call_limit(&parcel.config.limits),
             tool_output_limit: configured_tool_output_limit(&parcel.config.limits),
@@ -4941,6 +4948,13 @@ fn build_wasm_model_requests(
 
 fn configured_context_token_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
     configured_limit_u32(limits, "CONTEXT_TOKENS")
+}
+
+fn configured_llm_timeout_ms(
+    timeouts: &[crate::manifest::TimeoutSpec],
+) -> Result<Option<u64>, CourierError> {
+    configured_timeout_duration(timeouts, "LLM")
+        .map(|timeout| timeout.map(|duration| duration.as_millis() as u64))
 }
 
 fn configured_tool_call_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
@@ -7904,6 +7918,29 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn configured_llm_timeout_ms_uses_last_matching_timeout() {
+        let timeouts = vec![
+            crate::manifest::TimeoutSpec {
+                scope: "LLM".to_string(),
+                duration: "15s".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::TimeoutSpec {
+                scope: "TOOL".to_string(),
+                duration: "50ms".to_string(),
+                qualifiers: Vec::new(),
+            },
+            crate::manifest::TimeoutSpec {
+                scope: "LLM".to_string(),
+                duration: "1200ms".to_string(),
+                qualifiers: Vec::new(),
+            },
+        ];
+
+        assert_eq!(configured_llm_timeout_ms(&timeouts).unwrap(), Some(1200));
+    }
+
+    #[test]
     fn configured_tool_limits_use_last_valid_values() {
         let limits = vec![
             crate::manifest::LimitSpec {
@@ -7970,6 +8007,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "claude-sonnet-4".to_string(),
             provider: Some("anthropic".to_string()),
+            llm_timeout_ms: None,
             context_token_limit: Some(16000),
             tool_call_limit: None,
             tool_output_limit: None,
@@ -8012,6 +8050,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "gpt-5-mini".to_string(),
             provider: Some("openai_compatible".to_string()),
+            llm_timeout_ms: None,
             context_token_limit: None,
             tool_call_limit: None,
             tool_output_limit: None,
@@ -8050,6 +8089,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "claude-sonnet-4".to_string(),
             provider: Some("anthropic".to_string()),
+            llm_timeout_ms: None,
             context_token_limit: None,
             tool_call_limit: None,
             tool_output_limit: None,
@@ -8088,6 +8128,7 @@ ENTRYPOINT chat
         let request = ModelRequest {
             model: "gemini-2.5-pro".to_string(),
             provider: Some("gemini".to_string()),
+            llm_timeout_ms: None,
             context_token_limit: None,
             tool_call_limit: None,
             tool_output_limit: None,

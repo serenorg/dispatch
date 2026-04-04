@@ -460,6 +460,7 @@ TIMEOUT LLM 120s
 ```
 
 The reference implementation currently enforces `TIMEOUT TOOL` for host-executed local tools and host-executed `TOOL A2A` calls.
+Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
 
 #### `LIMIT`
 
