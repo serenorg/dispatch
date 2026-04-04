@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Manage parcel sources, signatures, and built artifacts
+    /// Build, validate, and inspect agent parcels
     Parcel {
         #[command(subcommand)]
         command: ParcelCommand,
@@ -38,7 +38,7 @@ enum Command {
     },
     /// Execute part of a built parcel locally
     Run(RunArgs),
-    /// Manage Agent Skills bundles and skill execution
+    /// Execute Agent Skills bundles and files
     Skill {
         #[command(subcommand)]
         command: SkillCommand,

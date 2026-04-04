@@ -8,7 +8,14 @@ use std::{
 use tempfile::TempDir;
 
 pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
-    if args.exec.session_file.is_some() {
+    let has_digest_changing_overrides =
+        args.model.is_some() || args.provider.is_some() || args.entrypoint.is_some();
+    let warned_about_resume = args
+        .exec
+        .session_file
+        .as_ref()
+        .is_some_and(|path| path.exists() || has_digest_changing_overrides);
+    if warned_about_resume {
         eprintln!(
             "warning: `dispatch skill run --session-file` only resumes cleanly when the synthesized parcel digest stays stable across invocations"
         );
@@ -39,14 +46,7 @@ fn synthesize_skill_parcel(args: &crate::RunSkillArgs) -> Result<SynthesizedSkil
     let copied_rel = copy_skill_source(&source.root, workspace.path(), &source.copied_name)?;
     let agentfile_path = workspace.path().join("Agentfile");
     let output_root = workspace.path().join(".dispatch/parcels");
-    let agentfile = render_skill_agentfile(
-        courier,
-        source
-            .agentfile_skill_path
-            .as_deref()
-            .unwrap_or(&copied_rel),
-        args,
-    );
+    let agentfile = render_skill_agentfile(courier, &copied_rel, args);
     fs::write(&agentfile_path, agentfile)
         .with_context(|| format!("failed to write {}", agentfile_path.display()))?;
     let built = build_agentfile(
@@ -70,7 +70,6 @@ fn synthesize_skill_parcel(args: &crate::RunSkillArgs) -> Result<SynthesizedSkil
 struct ResolvedSkillSource {
     root: PathBuf,
     copied_name: String,
-    agentfile_skill_path: Option<String>,
 }
 
 fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
@@ -100,13 +99,11 @@ fn resolve_skill_source(path: &Path) -> Result<ResolvedSkillSource> {
         return Ok(ResolvedSkillSource {
             root: source,
             copied_name,
-            agentfile_skill_path: None,
         });
     }
 
     if file_name == "SKILL.md"
         && let Some(parent) = source.parent()
-        && parent_looks_like_skill_bundle(parent)
     {
         let copied_name = parent
             .file_name()
@@ -117,22 +114,13 @@ fn resolve_skill_source(path: &Path) -> Result<ResolvedSkillSource> {
         return Ok(ResolvedSkillSource {
             root: parent.to_path_buf(),
             copied_name,
-            agentfile_skill_path: None,
         });
     }
 
     Ok(ResolvedSkillSource {
         root: source,
         copied_name,
-        agentfile_skill_path: None,
     })
-}
-
-fn parent_looks_like_skill_bundle(parent: &Path) -> bool {
-    parent.join("dispatch.toml").is_file()
-        || parent.join("scripts").is_dir()
-        || parent.join("references").is_dir()
-        || parent.join("assets").is_dir()
 }
 
 fn copy_skill_source(source: &Path, workspace: &Path, source_name: &str) -> Result<String> {
@@ -175,7 +163,7 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
             })?;
         } else {
             bail!(
-                "unsupported non-file entry `{}` in synthesized skill workspace",
+                "unsupported non-file entry `{}` in synthesized skill workspace; symlinks are rejected to match Dispatch parcel packaging rules",
                 src_path.display()
             );
         }
@@ -370,12 +358,12 @@ description = \"Read a file.\"\n",
     }
 
     #[test]
-    fn skill_md_input_escalates_to_bundle_when_sidecar_exists() {
+    fn skill_md_input_escalates_to_parent_bundle_directory() {
         let root = tempfile::tempdir().unwrap();
         let skill_dir = root.path().join("file-analyst");
-        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::create_dir_all(skill_dir.join("references")).unwrap();
         fs::write(skill_dir.join("SKILL.md"), "# skill\n").unwrap();
-        fs::write(skill_dir.join("dispatch.toml"), "entrypoint = \"chat\"\n").unwrap();
+        fs::write(skill_dir.join("references/README.md"), "context\n").unwrap();
 
         let resolved = resolve_skill_source(&skill_dir.join("SKILL.md")).unwrap();
 
@@ -384,6 +372,5 @@ description = \"Read a file.\"\n",
             skill_dir.canonicalize().unwrap()
         );
         assert_eq!(resolved.copied_name, "file-analyst");
-        assert!(resolved.agentfile_skill_path.is_none());
     }
 }
