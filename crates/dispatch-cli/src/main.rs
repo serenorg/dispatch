@@ -31,29 +31,11 @@ enum Command {
         #[command(subcommand)]
         command: ParcelCommand,
     },
-    #[command(hide = true)]
-    Lint(LintArgs),
-    #[command(hide = true)]
-    Build(BuildArgs),
-    /// Execute packaged evals against a live courier
-    Eval(EvalArgs),
-    #[command(hide = true)]
-    Inspect(InspectArgs),
-    #[command(hide = true)]
-    Verify(VerifyArgs),
-    #[command(hide = true)]
-    Keygen(KeygenArgs),
-    #[command(hide = true)]
-    Sign(SignArgs),
     /// Manage parcel distribution to and from depots
     Depot {
         #[command(subcommand)]
         command: DepotCommand,
     },
-    #[command(hide = true)]
-    Push(PushArgs),
-    #[command(hide = true)]
-    Pull(PullArgs),
     /// Execute part of a built parcel locally
     Run(RunArgs),
     /// Manage Agent Skills bundles and skill execution
@@ -200,6 +182,29 @@ struct PullArgs {
 struct RunArgs {
     /// Path to a parcel directory or a `manifest.json` file
     path: PathBuf,
+    #[command(flatten)]
+    exec: RunExecutionArgs,
+}
+
+#[derive(Debug, Args)]
+struct RunSkillArgs {
+    /// Path to a SKILL.md file or an Agent Skills bundle directory
+    path: PathBuf,
+    #[command(flatten)]
+    exec: RunExecutionArgs,
+    /// Primary model id override for synthesized skill execution
+    #[arg(long)]
+    model: Option<String>,
+    /// Provider override paired with `--model`
+    #[arg(long)]
+    provider: Option<String>,
+    /// Entrypoint override for synthesized skill execution
+    #[arg(long)]
+    entrypoint: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RunExecutionArgs {
     /// Courier backend to use for inspection and execution
     #[arg(long = "courier", default_value = "native")]
     courier: String,
@@ -248,72 +253,14 @@ struct RunArgs {
     a2a_trust_policy: Option<PathBuf>,
 }
 
-#[derive(Debug, Args)]
-struct RunSkillArgs {
-    /// Path to a SKILL.md file or an Agent Skills bundle directory
-    path: PathBuf,
-    /// Courier backend to synthesize and run against (`native` or `docker`)
-    #[arg(long = "courier", default_value = "native")]
-    courier: String,
-    /// Override the courier plugin registry path for execution
-    #[arg(long)]
-    registry: Option<PathBuf>,
-    /// Persist and resume dispatch state from a JSON file
-    #[arg(long)]
-    session_file: Option<PathBuf>,
-    /// Send a chat message through the courier
-    #[arg(long)]
-    chat: Option<String>,
-    /// Execute the parcel job entrypoint with a payload
-    #[arg(long)]
-    job: Option<String>,
-    /// Execute the parcel heartbeat entrypoint with an optional payload
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    heartbeat: Option<String>,
-    /// Start an interactive multi-turn chat session
-    #[arg(long)]
-    interactive: bool,
-    /// Print the resolved prompt stack
-    #[arg(long)]
-    print_prompt: bool,
-    /// List declared tools
-    #[arg(long)]
-    list_tools: bool,
-    /// Print machine-readable JSON when used with `--list-tools`
-    #[arg(long)]
-    json: bool,
-    /// Execute a declared tool by alias
-    #[arg(long)]
-    tool: Option<String>,
-    /// Pass raw input to the tool via stdin and `TOOL_INPUT`
-    #[arg(long)]
-    input: Option<String>,
-    /// Primary model id override for synthesized skill execution
-    #[arg(long)]
-    model: Option<String>,
-    /// Provider override paired with `--model`
-    #[arg(long)]
-    provider: Option<String>,
-    /// Entrypoint override for synthesized skill execution
-    #[arg(long)]
-    entrypoint: Option<String>,
-    /// How to handle tools declared with `APPROVAL confirm`
-    #[arg(long, value_enum)]
-    tool_approval: Option<CliToolApprovalMode>,
-    /// Override allowed outbound A2A origins or hostnames for this command
-    #[arg(long)]
-    a2a_allowed_origins: Option<String>,
-    /// Apply a structured A2A trust policy file for this command
-    #[arg(long)]
-    a2a_trust_policy: Option<PathBuf>,
-}
-
 #[derive(Debug, Subcommand)]
 enum ParcelCommand {
     /// Validate an Agentfile
     Lint(LintArgs),
     /// Build an immutable agent parcel
     Build(BuildArgs),
+    /// Execute packaged evals against a live courier
+    Eval(EvalArgs),
     /// Inspect a built parcel
     Inspect(InspectArgs),
     /// Verify parcel digest, lockfile, and packaged file integrity
@@ -528,9 +475,21 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Parcel { command } => parcel_command(command),
-        Command::Lint(args) => parcel_command(ParcelCommand::Lint(args)),
-        Command::Build(args) => parcel_command(ParcelCommand::Build(args)),
-        Command::Eval(EvalArgs {
+        Command::Depot { command } => depot_command(command),
+        Command::Run(args) => run::run(args),
+        Command::Skill { command } => match command {
+            SkillCommand::Run(args) => skill_run::run_skill(args),
+        },
+        Command::Courier { command } => courier_cmds::courier_command(command),
+        Command::State { command } => state_command(command),
+    }
+}
+
+fn parcel_command(command: ParcelCommand) -> Result<()> {
+    match command {
+        ParcelCommand::Lint(LintArgs { path, json }) => lint(path, json),
+        ParcelCommand::Build(BuildArgs { path, output_dir }) => build(path, output_dir),
+        ParcelCommand::Eval(EvalArgs {
             path,
             courier,
             registry,
@@ -551,26 +510,6 @@ fn main() -> Result<()> {
                 trust_policy: a2a_trust_policy,
             },
         ),
-        Command::Inspect(args) => parcel_command(ParcelCommand::Inspect(args)),
-        Command::Verify(args) => parcel_command(ParcelCommand::Verify(args)),
-        Command::Keygen(args) => parcel_command(ParcelCommand::Keygen(args)),
-        Command::Sign(args) => parcel_command(ParcelCommand::Sign(args)),
-        Command::Depot { command } => depot_command(command),
-        Command::Push(args) => depot_command(DepotCommand::Push(args)),
-        Command::Pull(args) => depot_command(DepotCommand::Pull(args)),
-        Command::Run(args) => run::run(args),
-        Command::Skill { command } => match command {
-            SkillCommand::Run(args) => skill_run::run_skill(args),
-        },
-        Command::Courier { command } => courier_cmds::courier_command(command),
-        Command::State { command } => state_command(command),
-    }
-}
-
-fn parcel_command(command: ParcelCommand) -> Result<()> {
-    match command {
-        ParcelCommand::Lint(LintArgs { path, json }) => lint(path, json),
-        ParcelCommand::Build(BuildArgs { path, output_dir }) => build(path, output_dir),
         ParcelCommand::Inspect(InspectArgs {
             path,
             courier,
@@ -805,26 +744,27 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(args.courier, "docker");
+        assert_eq!(args.exec.courier, "docker");
         assert_eq!(
-            args.registry.as_deref(),
+            args.exec.registry.as_deref(),
             Some(Path::new("/tmp/plugins.json"))
         );
         assert_eq!(
-            args.a2a_allowed_origins.as_deref(),
+            args.exec.a2a_allowed_origins.as_deref(),
             Some("https://agents.example.com,broker.internal")
         );
         assert_eq!(
-            args.a2a_trust_policy.as_deref(),
+            args.exec.a2a_trust_policy.as_deref(),
             Some(Path::new("/tmp/a2a-policy.toml"))
         );
-        assert!(args.print_prompt);
+        assert!(args.exec.print_prompt);
     }
 
     #[test]
     fn cli_parses_eval_a2a_policy_overrides() {
         let cli = Cli::try_parse_from([
             "dispatch",
+            "parcel",
             "eval",
             ".",
             "--courier",
@@ -836,13 +776,16 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::Eval(EvalArgs {
+        let Command::Parcel { command } = cli.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::Eval(EvalArgs {
             a2a_allowed_origins,
             a2a_trust_policy,
             ..
-        }) = cli.command
+        }) = command
         else {
-            panic!("expected eval command");
+            panic!("expected parcel eval command");
         };
         assert_eq!(
             a2a_allowed_origins.as_deref(),
@@ -1088,7 +1031,7 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(args.courier, "native");
+        assert_eq!(args.exec.courier, "native");
     }
 
     #[test]
@@ -1113,10 +1056,10 @@ mod tests {
         };
         let SkillCommand::Run(args) = command;
         assert_eq!(args.path, PathBuf::from("skills/file-analyst"));
-        assert_eq!(args.courier, "docker");
+        assert_eq!(args.exec.courier, "docker");
         assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));
         assert_eq!(args.provider.as_deref(), Some("openai"));
-        assert!(args.list_tools);
+        assert!(args.exec.list_tools);
     }
 
     #[test]
@@ -1126,7 +1069,7 @@ mod tests {
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(args.heartbeat.as_deref(), Some(""));
+        assert_eq!(args.exec.heartbeat.as_deref(), Some(""));
     }
 
     #[test]
@@ -1253,39 +1196,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_legacy_flat_parcel_commands() {
-        let lint = Cli::try_parse_from(["dispatch", "lint", "."]).unwrap();
-        let Command::Lint(_) = lint.command else {
-            panic!("expected legacy lint alias");
-        };
-
-        let verify = Cli::try_parse_from(["dispatch", "verify", "manifest.json"]).unwrap();
-        let Command::Verify(_) = verify.command else {
-            panic!("expected legacy verify alias");
-        };
-    }
-
-    #[test]
-    fn cli_accepts_legacy_flat_depot_commands() {
-        let push = Cli::try_parse_from([
-            "dispatch",
-            "push",
-            "manifest.json",
-            "file:///tmp/depot::acme/monitor:v1",
-        ])
-        .unwrap();
-        let Command::Push(_) = push.command else {
-            panic!("expected legacy push alias");
-        };
-
-        let pull = Cli::try_parse_from(["dispatch", "pull", "file:///tmp/depot::acme/monitor:v1"])
-            .unwrap();
-        let Command::Pull(_) = pull.command else {
-            panic!("expected legacy pull alias");
-        };
-    }
-
-    #[test]
     fn cli_parses_courier_conformance_subcommand() {
         let cli = Cli::try_parse_from([
             "dispatch",
@@ -1340,21 +1250,23 @@ mod tests {
 
         crate::run::run(super::RunArgs {
             path: parcel_dir,
-            courier: plugin_name.to_string(),
-            registry: Some(registry_path),
-            session_file: Some(session_path.clone()),
-            chat: Some("hello".to_string()),
-            job: None,
-            heartbeat: None,
-            interactive: false,
-            print_prompt: false,
-            list_tools: false,
-            json: false,
-            tool: None,
-            input: None,
-            tool_approval: None,
-            a2a_allowed_origins: None,
-            a2a_trust_policy: None,
+            exec: super::RunExecutionArgs {
+                courier: plugin_name.to_string(),
+                registry: Some(registry_path),
+                session_file: Some(session_path.clone()),
+                chat: Some("hello".to_string()),
+                job: None,
+                heartbeat: None,
+                interactive: false,
+                print_prompt: false,
+                list_tools: false,
+                json: false,
+                tool: None,
+                input: None,
+                tool_approval: None,
+                a2a_allowed_origins: None,
+                a2a_trust_policy: None,
+            },
         })
         .unwrap();
 

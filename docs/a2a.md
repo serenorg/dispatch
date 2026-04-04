@@ -76,7 +76,7 @@ Environment controls:
 CLI-scoped controls:
 
 - `dispatch run ... --a2a-allowed-origins ... --a2a-trust-policy ...`
-- `dispatch eval ... --a2a-allowed-origins ... --a2a-trust-policy ...`
+- `dispatch parcel eval ... --a2a-allowed-origins ... --a2a-trust-policy ...`
 - `dispatch courier conformance ... --a2a-allowed-origins ... --a2a-trust-policy ...`
 
 The CLI flags apply only to that command invocation. They do not mutate process-global environment state.

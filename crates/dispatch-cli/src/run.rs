@@ -16,12 +16,12 @@ use std::{
 
 pub(crate) fn run(args: crate::RunArgs) -> Result<()> {
     let policy = crate::CliA2aPolicy {
-        allowed_origins: args.a2a_allowed_origins.clone(),
-        trust_policy: args.a2a_trust_policy.clone(),
+        allowed_origins: args.exec.a2a_allowed_origins.clone(),
+        trust_policy: args.exec.a2a_trust_policy.clone(),
     };
-    let courier_name = args.courier.clone();
+    let courier_name = args.exec.courier.clone();
     crate::with_cli_a2a_policy(policy, || {
-        match resolve_courier(&courier_name, args.registry.as_deref())? {
+        match resolve_courier(&courier_name, args.exec.registry.as_deref())? {
             ResolvedCourier::Builtin(courier) => run_with_builtin_courier(courier, args),
             ResolvedCourier::Plugin(plugin) => {
                 run_with_courier(dispatch_core::JsonlCourierPlugin::new(plugin), args)
@@ -41,21 +41,24 @@ fn run_with_builtin_courier(courier: BuiltinCourier, args: crate::RunArgs) -> Re
 fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Result<()> {
     let crate::RunArgs {
         path,
-        courier: _,
-        registry: _,
-        session_file,
-        chat,
-        job,
-        heartbeat,
-        interactive,
-        print_prompt,
-        list_tools,
-        json,
-        tool,
-        input,
-        tool_approval,
-        a2a_allowed_origins: _,
-        a2a_trust_policy: _,
+        exec:
+            crate::RunExecutionArgs {
+                courier: _,
+                registry: _,
+                session_file,
+                chat,
+                job,
+                heartbeat,
+                interactive,
+                print_prompt,
+                list_tools,
+                json,
+                tool,
+                input,
+                tool_approval,
+                a2a_allowed_origins: _,
+                a2a_trust_policy: _,
+            },
     } = args;
     let parcel =
         load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))?;

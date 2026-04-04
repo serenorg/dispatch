@@ -122,7 +122,7 @@ ENTRYPOINT chat
 CLI-scoped A2A operator policy overrides are available on:
 
 - `dispatch run`
-- `dispatch eval`
+- `dispatch parcel eval`
 - `dispatch courier conformance`
 
 Use `--a2a-allowed-origins ...` and `--a2a-trust-policy ...` when you want command-scoped A2A policy without exporting environment variables.
@@ -250,9 +250,9 @@ cargo run -p dispatch -- parcel build examples/parcels/wasm-reference
 cargo run -p dispatch -- parcel build examples/skills/file-analyst
 
 # Run packaged evals
-cargo run -p dispatch -- eval examples/parcels/basic
-cargo run -p dispatch -- eval examples/parcels/basic --courier native
-cargo run -p dispatch -- eval examples/skills/file-analyst --courier native
+cargo run -p dispatch -- parcel eval examples/parcels/basic
+cargo run -p dispatch -- parcel eval examples/parcels/basic --courier native
+cargo run -p dispatch -- parcel eval examples/skills/file-analyst --courier native
 
 # Inspect a built parcel
 cargo run -p dispatch -- parcel inspect examples/parcels/basic/.dispatch/parcels/<digest>
@@ -337,7 +337,7 @@ expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
 expects_text_exact = "plugin reply"
 ```
 
-`dispatch eval` runs those packaged cases against a live courier and reports pass/fail per case.
+`dispatch parcel eval` runs those packaged cases against a live courier and reports pass/fail per case.
 Tool result assertions can be either a plain value or a tool-scoped object, so multi-tool evals can target one tool explicitly.
 `expects_no_tool = true` can be used for cases that should complete without invoking any tool.
 `expects_tool_stdout_matches_schema` validates JSON stdout from a tool against a packaged JSON schema file, and `expects_a2a_endpoint` asserts that an A2A tool alias resolved to the expected declared endpoint.

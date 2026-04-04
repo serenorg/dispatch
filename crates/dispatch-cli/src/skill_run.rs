@@ -1,32 +1,26 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::{BuildOptions, BuiltParcel, BuiltinCourier, build_agentfile};
-use std::{fs, path::Path};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 
 pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
+    if args.exec.session_file.is_some() {
+        eprintln!(
+            "warning: `dispatch skill run --session-file` only resumes cleanly when the synthesized parcel digest stays stable across invocations"
+        );
+    }
     let synthesized = synthesize_skill_parcel(&args)?;
     for warning in &synthesized.built.warnings {
         eprintln!("warning: {warning}");
     }
     crate::run::run(crate::RunArgs {
         path: synthesized.built.parcel_dir.clone(),
-        courier: args.courier,
-        registry: args.registry,
-        session_file: args.session_file,
-        chat: args.chat,
-        job: args.job,
-        heartbeat: args.heartbeat,
-        interactive: args.interactive,
-        print_prompt: args.print_prompt,
-        list_tools: args.list_tools,
-        json: args.json,
-        tool: args.tool,
-        input: args.input,
-        tool_approval: args.tool_approval,
-        a2a_allowed_origins: args.a2a_allowed_origins,
-        a2a_trust_policy: args.a2a_trust_policy,
+        exec: args.exec.clone(),
     })?;
-    drop(synthesized);
     Ok(())
 }
 
@@ -39,21 +33,20 @@ fn synthesize_skill_parcel(args: &crate::RunSkillArgs) -> Result<SynthesizedSkil
     if args.provider.is_some() && args.model.is_none() {
         bail!("`dispatch skill run --provider` requires `--model`");
     }
-    let courier = parse_skill_courier(&args.courier)?;
+    let courier = parse_skill_courier(&args.exec.courier)?;
     let workspace = tempfile::tempdir().context("failed to create temporary skill workspace")?;
-    let source = args
-        .path
-        .canonicalize()
-        .with_context(|| format!("failed to access skill source {}", args.path.display()))?;
-    let source_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("skill source must have a final path component"))?;
-    let copied_rel = copy_skill_source(&source, workspace.path(), source_name)?;
+    let source = resolve_skill_source(&args.path)?;
+    let copied_rel = copy_skill_source(&source.root, workspace.path(), &source.copied_name)?;
     let agentfile_path = workspace.path().join("Agentfile");
     let output_root = workspace.path().join(".dispatch/parcels");
-    let agentfile = render_skill_agentfile(courier, &copied_rel, args);
+    let agentfile = render_skill_agentfile(
+        courier,
+        source
+            .agentfile_skill_path
+            .as_deref()
+            .unwrap_or(&copied_rel),
+        args,
+    );
     fs::write(&agentfile_path, agentfile)
         .with_context(|| format!("failed to write {}", agentfile_path.display()))?;
     let built = build_agentfile(
@@ -74,6 +67,12 @@ fn synthesize_skill_parcel(args: &crate::RunSkillArgs) -> Result<SynthesizedSkil
     })
 }
 
+struct ResolvedSkillSource {
+    root: PathBuf,
+    copied_name: String,
+    agentfile_skill_path: Option<String>,
+}
+
 fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
     match name {
         "native" => Ok(BuiltinCourier::Native),
@@ -85,6 +84,55 @@ fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
             "`dispatch skill run` currently supports only built-in `native` and `docker` couriers, got `{other}`"
         ),
     }
+}
+
+fn resolve_skill_source(path: &Path) -> Result<ResolvedSkillSource> {
+    let source = path
+        .canonicalize()
+        .with_context(|| format!("failed to access skill source {}", path.display()))?;
+    let file_name = source
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("skill source must have a final path component"))?;
+    let copied_name = file_name.to_string();
+    if source.is_dir() {
+        return Ok(ResolvedSkillSource {
+            root: source,
+            copied_name,
+            agentfile_skill_path: None,
+        });
+    }
+
+    if file_name == "SKILL.md"
+        && let Some(parent) = source.parent()
+        && parent_looks_like_skill_bundle(parent)
+    {
+        let copied_name = parent
+            .file_name()
+            .and_then(OsStr::to_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("skill bundle must have a final path component"))?
+            .to_string();
+        return Ok(ResolvedSkillSource {
+            root: parent.to_path_buf(),
+            copied_name,
+            agentfile_skill_path: None,
+        });
+    }
+
+    Ok(ResolvedSkillSource {
+        root: source,
+        copied_name,
+        agentfile_skill_path: None,
+    })
+}
+
+fn parent_looks_like_skill_bundle(parent: &Path) -> bool {
+    parent.join("dispatch.toml").is_file()
+        || parent.join("scripts").is_dir()
+        || parent.join("references").is_dir()
+        || parent.join("assets").is_dir()
 }
 
 fn copy_skill_source(source: &Path, workspace: &Path, source_name: &str) -> Result<String> {
@@ -143,14 +191,14 @@ fn render_skill_agentfile(
     let mut lines = vec![format!("FROM {}", synthesized_from_reference(courier))];
     lines.push(format!("SKILL {}", quote_agentfile_scalar(skill_path)));
     if let Some(model) = args.model.as_deref() {
-        let mut line = format!("MODEL {model}");
+        let mut line = format!("MODEL {}", quote_agentfile_scalar(model));
         if let Some(provider) = args.provider.as_deref() {
-            line.push_str(&format!(" PROVIDER {provider}"));
+            line.push_str(&format!(" PROVIDER {}", quote_agentfile_scalar(provider)));
         }
         lines.push(line);
     }
     if let Some(entrypoint) = args.entrypoint.as_deref() {
-        lines.push(format!("ENTRYPOINT {entrypoint}"));
+        lines.push(format!("ENTRYPOINT {}", quote_agentfile_scalar(entrypoint)));
     }
     lines.push(String::new());
     lines.join("\n")
@@ -179,37 +227,38 @@ fn synthesized_from_reference(courier: BuiltinCourier) -> &'static str {
 mod tests {
     use super::*;
     use dispatch_core::{InstructionKind, ToolConfig, load_parcel};
-    use std::path::PathBuf;
 
     fn sample_args(path: PathBuf) -> crate::RunSkillArgs {
         crate::RunSkillArgs {
             path,
-            courier: "native".to_string(),
-            registry: None,
-            session_file: None,
-            chat: None,
-            job: None,
-            heartbeat: None,
-            interactive: false,
-            print_prompt: false,
-            list_tools: true,
-            json: false,
-            tool: None,
-            input: None,
+            exec: crate::RunExecutionArgs {
+                courier: "native".to_string(),
+                registry: None,
+                session_file: None,
+                chat: None,
+                job: None,
+                heartbeat: None,
+                interactive: false,
+                print_prompt: false,
+                list_tools: true,
+                json: false,
+                tool: None,
+                input: None,
+                tool_approval: None,
+                a2a_allowed_origins: None,
+                a2a_trust_policy: None,
+            },
             model: None,
             provider: None,
             entrypoint: None,
-            tool_approval: None,
-            a2a_allowed_origins: None,
-            a2a_trust_policy: None,
         }
     }
 
     #[test]
     fn render_skill_agentfile_uses_matching_courier_reference() {
         let mut args = sample_args(PathBuf::from("skills/file-analyst"));
-        args.courier = "docker".to_string();
-        args.json = true;
+        args.exec.courier = "docker".to_string();
+        args.exec.json = true;
         args.model = Some("gpt-5-mini".to_string());
         args.provider = Some("openai".to_string());
         args.entrypoint = Some("chat".to_string());
@@ -246,6 +295,17 @@ mod tests {
         let args = sample_args(PathBuf::from("skill.md"));
         let agentfile = render_skill_agentfile(BuiltinCourier::Native, "My Skill.md", &args);
         assert!(agentfile.contains("SKILL \"My Skill.md\""));
+    }
+
+    #[test]
+    fn render_skill_agentfile_quotes_model_provider_and_entrypoint() {
+        let mut args = sample_args(PathBuf::from("skill.md"));
+        args.model = Some("gpt 5".to_string());
+        args.provider = Some("openai compatible".to_string());
+        args.entrypoint = Some("job runner".to_string());
+        let agentfile = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args);
+        assert!(agentfile.contains("MODEL \"gpt 5\" PROVIDER \"openai compatible\""));
+        assert!(agentfile.contains("ENTRYPOINT \"job runner\""));
     }
 
     #[test]
@@ -307,5 +367,23 @@ description = \"Read a file.\"\n",
             })
             .expect("expected synthesized local tool");
         assert_eq!(tool.skill_source.as_deref(), Some("file-analyst"));
+    }
+
+    #[test]
+    fn skill_md_input_escalates_to_bundle_when_sidecar_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# skill\n").unwrap();
+        fs::write(skill_dir.join("dispatch.toml"), "entrypoint = \"chat\"\n").unwrap();
+
+        let resolved = resolve_skill_source(&skill_dir.join("SKILL.md")).unwrap();
+
+        assert_eq!(
+            resolved.root.canonicalize().unwrap(),
+            skill_dir.canonicalize().unwrap()
+        );
+        assert_eq!(resolved.copied_name, "file-analyst");
+        assert!(resolved.agentfile_skill_path.is_none());
     }
 }
