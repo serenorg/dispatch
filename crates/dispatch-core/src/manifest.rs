@@ -148,6 +148,10 @@ pub struct InstructionConfig {
     pub kind: InstructionKind,
     pub packaged_path: String,
     pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -214,6 +218,8 @@ pub struct LocalToolConfig {
     pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema: Option<ToolInputSchemaRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -247,6 +247,7 @@ Semantics:
 - the rest of the directory is packaged with the parcel so `scripts/`, `references/`, and `assets/` travel with the skill bundle
 - if the skill directory contains `dispatch.toml`, or `SKILL.md` frontmatter sets `metadata.dispatch-manifest = "..."`, Dispatch loads Dispatch-specific tool metadata from that TOML sidecar and synthesizes those entries into the parcel as normal local tools
 - the sidecar may also declare a default `entrypoint = "chat" | "job" | "heartbeat"` when the `Agentfile` does not set `ENTRYPOINT`
+- built parcels preserve skill annotations such as `allowed-tools`, and skill-generated tools keep `skill_source` provenance back to their originating `SKILL.md`
 - if the `Agentfile` later declares `TOOL ...` with the same alias as a skill-generated tool, the explicit `TOOL` declaration wins
 
 Recommended Agent Skills-compatible layout:

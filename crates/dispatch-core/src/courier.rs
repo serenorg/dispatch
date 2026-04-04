@@ -355,6 +355,7 @@ pub struct LocalToolSpec {
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
+    pub skill_source: Option<String>,
     #[serde(flatten)]
     pub target: LocalToolTarget,
 }
@@ -1341,6 +1342,7 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                     .input_schema
                     .as_ref()
                     .map(|schema| schema.sha256.clone()),
+                skill_source: local.skill_source.clone(),
                 target: LocalToolTarget::Local {
                     packaged_path: local.packaged_path.clone(),
                     command: local.runner.command.clone(),
@@ -1358,6 +1360,7 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                     .input_schema
                     .as_ref()
                     .map(|schema| schema.sha256.clone()),
+                skill_source: None,
                 target: LocalToolTarget::A2a {
                     endpoint_url: a2a.url.clone(),
                     endpoint_mode: a2a.endpoint_mode,
@@ -6390,6 +6393,7 @@ ENTRYPOINT job
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
+            skill_source: None,
             target: LocalToolTarget::A2a {
                 endpoint_url: server.base_url.clone(),
                 endpoint_mode: None,
@@ -8610,6 +8614,7 @@ ENTRYPOINT chat
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
+            skill_source: None,
             target: LocalToolTarget::Local {
                 packaged_path: "tools/demo.sh".to_string(),
                 command: "bash".to_string(),

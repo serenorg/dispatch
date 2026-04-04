@@ -343,6 +343,8 @@ pub fn build_agentfile(
                     kind: instruction_kind_from_keyword(&instruction.keyword),
                     packaged_path: source_path,
                     sha256: file_record.sha256.clone(),
+                    skill_name: None,
+                    allowed_tools: None,
                 });
                 files.extend(file_record.expand());
             }
@@ -357,6 +359,8 @@ pub fn build_agentfile(
                             kind: InstructionKind::Memory,
                             packaged_path: maybe_path,
                             sha256: file_record.sha256.clone(),
+                            skill_name: None,
+                            allowed_tools: None,
                         });
                         files.extend(file_record.expand());
                     }
@@ -374,6 +378,8 @@ pub fn build_agentfile(
                         kind: InstructionKind::Heartbeat,
                         packaged_path: source_path,
                         sha256: file_record.sha256.clone(),
+                        skill_name: None,
+                        allowed_tools: None,
                     });
                     files.extend(file_record.expand());
                 }
@@ -683,6 +689,13 @@ fn package_path(
             path: resolved.display().to_string(),
             source,
         })?;
+        if entry.file_type().is_symlink() {
+            return Err(BuildError::Validation(format!(
+                "packaged directory `{}` contains symlink `{}`; symlinks are not allowed in parcel content",
+                resolved.display(),
+                entry.path().display()
+            )));
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -725,6 +738,8 @@ fn process_skill_instruction(
             kind: InstructionKind::Skill,
             packaged_path: source_path.to_string(),
             sha256: file_record.sha256.clone(),
+            skill_name: None,
+            allowed_tools: None,
         });
         files.extend(file_record.expand());
         return Ok(());
@@ -770,8 +785,10 @@ fn process_skill_instruction(
 
     resolved.instructions.push(InstructionConfig {
         kind: InstructionKind::Skill,
-        packaged_path: skill_md_packaged_path,
+        packaged_path: skill_md_packaged_path.clone(),
         sha256: skill_file_record.sha256.clone(),
+        skill_name: Some(parsed_skill.frontmatter.name.clone()),
+        allowed_tools: parsed_skill.frontmatter.allowed_tools.clone(),
     });
 
     if let Some(sidecar_path) =
@@ -811,7 +828,12 @@ fn process_skill_instruction(
         }
 
         for skill_tool in skill_manifest.tools {
-            let mut tool = synthesize_skill_tool(context_dir, &skill_dir, &skill_tool)?;
+            let mut tool = synthesize_skill_tool(
+                context_dir,
+                &skill_dir,
+                &skill_md_packaged_path,
+                &skill_tool,
+            )?;
             package_tool_config(context_dir, packaged, files, &mut tool)?;
             insert_resolved_tool(&mut resolved.tools, tool);
         }
@@ -832,6 +854,7 @@ fn resolve_skill_dispatch_manifest_path(
 }
 
 fn resolve_skill_member_path(skill_dir: &Path, relative: &str) -> Result<PathBuf, BuildError> {
+    debug_assert!(skill_dir.is_absolute());
     let joined = skill_dir.join(relative);
     if !joined.exists() {
         return Err(BuildError::MissingPath {
@@ -856,6 +879,7 @@ fn resolve_skill_member_path(skill_dir: &Path, relative: &str) -> Result<PathBuf
 fn synthesize_skill_tool(
     context_dir: &Path,
     skill_dir: &Path,
+    skill_source: &str,
     skill_tool: &DispatchSkillTool,
 ) -> Result<ToolConfig, BuildError> {
     let resolved_script = resolve_skill_member_path(skill_dir, &skill_tool.script)?;
@@ -891,6 +915,7 @@ fn synthesize_skill_tool(
         risk: skill_tool.risk,
         description: skill_tool.description.clone(),
         input_schema,
+        skill_source: Some(skill_source.to_string()),
     }))
 }
 
@@ -940,6 +965,13 @@ fn insert_resolved_tool(tools: &mut Vec<ToolConfig>, tool: ToolConfig) {
             .iter_mut()
             .find(|existing| tool_alias(existing) == Some(alias.as_str()))
     {
+        if let Some(previous_skill_source) = tool_skill_source(existing)
+            && tool_skill_source(&tool) != Some(previous_skill_source)
+        {
+            eprintln!(
+                "warning: tool `{alias}` from skill `{previous_skill_source}` overridden by a later declaration"
+            );
+        }
         *existing = tool;
         return;
     }
@@ -951,6 +983,13 @@ fn tool_alias(tool: &ToolConfig) -> Option<&str> {
         ToolConfig::Local(local) => Some(local.alias.as_str()),
         ToolConfig::A2a(tool) => Some(tool.alias.as_str()),
         ToolConfig::Builtin(_) | ToolConfig::Mcp(_) => None,
+    }
+}
+
+fn tool_skill_source(tool: &ToolConfig) -> Option<&str> {
+    match tool {
+        ToolConfig::Local(local) => local.skill_source.as_deref(),
+        ToolConfig::Builtin(_) | ToolConfig::Mcp(_) | ToolConfig::A2a(_) => None,
     }
 }
 
@@ -1153,6 +1192,7 @@ fn parse_local_tool(tokens: &[String]) -> Result<Option<LocalToolConfig>, BuildE
         risk,
         description,
         input_schema,
+        skill_source: None,
     }))
 }
 
@@ -1761,12 +1801,18 @@ ENTRYPOINT chat
             parcel.instructions[0].packaged_path,
             "file-analyst/SKILL.md"
         );
+        assert_eq!(
+            parcel.instructions[0].skill_name.as_deref(),
+            Some("file-analyst")
+        );
+        assert_eq!(parcel.instructions[0].allowed_tools, None);
         assert_eq!(parcel.tools.len(), 2);
         match &parcel.tools[0] {
             ToolConfig::Local(local) => {
                 assert_eq!(local.alias, "read_file");
                 assert_eq!(local.packaged_path, "file-analyst/scripts/read_file.sh");
                 assert_eq!(local.risk, Some(ToolRiskLevel::Low));
+                assert_eq!(local.skill_source.as_deref(), Some("file-analyst/SKILL.md"));
             }
             other => panic!("expected local tool, got {other:?}"),
         }
@@ -1781,9 +1827,42 @@ ENTRYPOINT chat
                     Some("file-analyst/schemas/find_files.json")
                 );
                 assert_eq!(local.approval, Some(ToolApprovalPolicy::Confirm));
+                assert_eq!(local.skill_source.as_deref(), Some("file-analyst/SKILL.md"));
             }
             other => panic!("expected local tool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_skill_directory_records_allowed_tools_metadata() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\nallowed-tools: Bash, Grep\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            parcel.instructions[0].allowed_tools.as_deref(),
+            Some("Bash, Grep")
+        );
     }
 
     #[test]
@@ -1938,9 +2017,50 @@ ENTRYPOINT chat
                 assert_eq!(local.alias, "read_file");
                 assert_eq!(local.packaged_path, "tools/read_file.py");
                 assert_eq!(local.risk, Some(ToolRiskLevel::High));
+                assert_eq!(local.skill_source, None);
             }
             other => panic!("expected local tool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_deduplicates_file_records_for_skill_and_explicit_tool_overlap() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nTOOL LOCAL file-analyst/scripts/read_file.sh AS read_file_override\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        let read_file_records = parcel
+            .files
+            .iter()
+            .filter(|file| file.packaged_as == "file-analyst/scripts/read_file.sh")
+            .count();
+        assert_eq!(read_file_records, 1);
     }
 
     #[test]
@@ -2005,6 +2125,42 @@ ENTRYPOINT chat
                 .to_string()
                 .contains("must be one of `chat`, `job`, or `heartbeat`")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_rejects_skill_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("outside.txt"), "secret\n").unwrap();
+        symlink(
+            dir.path().join("outside.txt"),
+            skill_dir.join("scripts/exfil"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("symlinks are not allowed"));
     }
 
     #[test]

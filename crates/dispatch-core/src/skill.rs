@@ -8,8 +8,6 @@ pub(crate) struct AgentSkillFrontmatter {
     pub name: String,
     pub description: String,
     #[serde(default)]
-    pub license: Option<String>,
-    #[serde(default)]
     pub compatibility: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
@@ -133,7 +131,7 @@ fn validate_skill_compatibility(compatibility: Option<&str>) -> Result<(), Strin
 }
 
 fn is_skill_name_char(ch: char) -> bool {
-    ch == '-' || ch.is_numeric() || ch.is_lowercase()
+    ch == '-' || ch.is_ascii_digit() || ch.is_ascii_lowercase()
 }
 
 fn split_skill_frontmatter(source: &str) -> (&str, &str) {
@@ -189,7 +187,6 @@ mod tests {
         let frontmatter = AgentSkillFrontmatter {
             name: "file-analyst".to_string(),
             description: "x".repeat(1025),
-            license: None,
             compatibility: None,
             metadata: BTreeMap::new(),
             allowed_tools: None,
@@ -205,7 +202,6 @@ mod tests {
         let frontmatter = AgentSkillFrontmatter {
             name: "file-analyst".to_string(),
             description: "Analyze files".to_string(),
-            license: None,
             compatibility: Some("   ".to_string()),
             metadata: BTreeMap::new(),
             allowed_tools: None,

@@ -144,9 +144,14 @@ fn print_courier_inspection(inspection: &CourierInspection) {
                 } else {
                     format!(" {}", args.join(" "))
                 };
+                let skill_suffix = tool
+                    .skill_source
+                    .as_deref()
+                    .map(|source| format!(" skill={source}"))
+                    .unwrap_or_default();
                 println!(
-                    "  tool: {} local path={} runner={}{}",
-                    tool.alias, packaged_path, command, arg_suffix
+                    "  tool: {} local path={} runner={}{}{}",
+                    tool.alias, packaged_path, command, arg_suffix, skill_suffix
                 );
             }
             LocalToolTarget::A2a {

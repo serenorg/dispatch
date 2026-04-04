@@ -313,9 +313,17 @@ fn print_courier_events(events: &[CourierEvent]) {
 }
 
 fn format_listed_tool(tool: &LocalToolSpec) -> String {
+    let skill_suffix = tool
+        .skill_source
+        .as_deref()
+        .map(|source| format!(" skill={source}"))
+        .unwrap_or_default();
     match &tool.target {
         LocalToolTarget::Local { packaged_path, .. } => {
-            format!("{} -> {} [local]", tool.alias, packaged_path)
+            format!(
+                "{} -> {} [local{}]",
+                tool.alias, packaged_path, skill_suffix
+            )
         }
         LocalToolTarget::A2a {
             endpoint_url,
@@ -337,7 +345,13 @@ fn format_listed_tool(tool: &LocalToolSpec) -> String {
             if let Some(digest) = expected_card_sha256 {
                 parts.push(format!("expected_card_sha256={digest}"));
             }
-            format!("{} -> {} [{}]", tool.alias, endpoint_url, parts.join(" "))
+            format!(
+                "{} -> {} [{}{}]",
+                tool.alias,
+                endpoint_url,
+                parts.join(" "),
+                skill_suffix
+            )
         }
     }
 }
