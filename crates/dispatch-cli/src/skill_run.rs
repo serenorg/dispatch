@@ -16,8 +16,9 @@ struct SkillSynthesisArgs<'a> {
 }
 
 pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
-    let has_digest_changing_overrides =
-        args.model.is_some() || args.provider.is_some() || args.entrypoint.is_some();
+    let has_digest_changing_overrides = args.synthesis.model.is_some()
+        || args.synthesis.provider.is_some()
+        || args.synthesis.entrypoint.is_some();
     let warned_about_resume = args
         .exec
         .session_file
@@ -31,9 +32,9 @@ pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
     let synthesized = synthesize_skill_parcel(&SkillSynthesisArgs {
         path: &args.path,
         courier: &args.exec.courier,
-        model: args.model.as_deref(),
-        provider: args.provider.as_deref(),
-        entrypoint: args.entrypoint.as_deref(),
+        model: args.synthesis.model.as_deref(),
+        provider: args.synthesis.provider.as_deref(),
+        entrypoint: args.synthesis.entrypoint.as_deref(),
     })?;
     for warning in &synthesized.built.warnings {
         eprintln!("warning: {warning}");
@@ -49,20 +50,29 @@ pub(crate) fn validate_skill(args: crate::ValidateSkillArgs) -> Result<()> {
     let synthesized = synthesize_skill_parcel(&SkillSynthesisArgs {
         path: &args.path,
         courier: &args.courier,
-        model: args.model.as_deref(),
-        provider: args.provider.as_deref(),
-        entrypoint: args.entrypoint.as_deref(),
+        model: args.synthesis.model.as_deref(),
+        provider: args.synthesis.provider.as_deref(),
+        entrypoint: args.synthesis.entrypoint.as_deref(),
     })?;
     for warning in &synthesized.built.warnings {
         eprintln!("warning: {warning}");
     }
-    println!("OK {}", args.path.display());
+    if synthesized.source.escalated_from_skill_md {
+        println!(
+            "OK {} (resolved from {})",
+            synthesized.source.root.display(),
+            args.path.display()
+        );
+    } else {
+        println!("OK {}", args.path.display());
+    }
     Ok(())
 }
 
 struct SynthesizedSkillParcel {
     _workspace: TempDir,
     built: BuiltParcel,
+    source: ResolvedSkillSource,
 }
 
 fn synthesize_skill_parcel(args: &SkillSynthesisArgs<'_>) -> Result<SynthesizedSkillParcel> {
@@ -75,7 +85,7 @@ fn synthesize_skill_parcel(args: &SkillSynthesisArgs<'_>) -> Result<SynthesizedS
     let copied_rel = copy_skill_source(&source.root, workspace.path(), &source.copied_name)?;
     let agentfile_path = workspace.path().join("Agentfile");
     let output_root = workspace.path().join(".dispatch/parcels");
-    let agentfile = render_skill_agentfile(courier, &copied_rel, args);
+    let agentfile = render_skill_agentfile(courier, &copied_rel, args)?;
     fs::write(&agentfile_path, agentfile)
         .with_context(|| format!("failed to write {}", agentfile_path.display()))?;
     let built = build_agentfile(
@@ -93,12 +103,14 @@ fn synthesize_skill_parcel(args: &SkillSynthesisArgs<'_>) -> Result<SynthesizedS
     Ok(SynthesizedSkillParcel {
         _workspace: workspace,
         built,
+        source,
     })
 }
 
 struct ResolvedSkillSource {
     root: PathBuf,
     copied_name: String,
+    escalated_from_skill_md: bool,
 }
 
 fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
@@ -128,12 +140,21 @@ fn resolve_skill_source(path: &Path) -> Result<ResolvedSkillSource> {
         return Ok(ResolvedSkillSource {
             root: source,
             copied_name,
+            escalated_from_skill_md: false,
         });
     }
 
-    if file_name == "SKILL.md"
-        && let Some(parent) = source.parent()
-    {
+    let canonical_skill_md = source.parent().map(|parent| parent.join("SKILL.md"));
+    // Accept a case-insensitive alias only when `SKILL.md` resolves to the same file, so a
+    // distinct lowercase markdown file on a case-sensitive filesystem still behaves like a file.
+    let matches_skill_md = file_name == "SKILL.md"
+        || file_name.eq_ignore_ascii_case("SKILL.md")
+            && canonical_skill_md
+                .as_ref()
+                .and_then(|path| path.canonicalize().ok())
+                .as_ref()
+                == Some(&source);
+    if matches_skill_md && let Some(parent) = source.parent() {
         let copied_name = parent
             .file_name()
             .and_then(OsStr::to_str)
@@ -143,12 +164,14 @@ fn resolve_skill_source(path: &Path) -> Result<ResolvedSkillSource> {
         return Ok(ResolvedSkillSource {
             root: parent.to_path_buf(),
             copied_name,
+            escalated_from_skill_md: true,
         });
     }
 
     Ok(ResolvedSkillSource {
         root: source,
         copied_name,
+        escalated_from_skill_md: false,
     })
 }
 
@@ -204,31 +227,40 @@ fn render_skill_agentfile(
     courier: BuiltinCourier,
     skill_path: &str,
     args: &SkillSynthesisArgs<'_>,
-) -> String {
+) -> Result<String> {
     let mut lines = vec![format!("FROM {}", synthesized_from_reference(courier))];
-    lines.push(format!("SKILL {}", quote_agentfile_scalar(skill_path)));
+    lines.push(format!("SKILL {}", render_agentfile_scalar(skill_path)?));
     if let Some(model) = args.model {
-        let mut line = format!("MODEL {}", quote_agentfile_scalar(model));
+        let mut line = format!("MODEL {}", render_agentfile_scalar(model)?);
         if let Some(provider) = args.provider {
-            line.push_str(&format!(" PROVIDER {}", quote_agentfile_scalar(provider)));
+            line.push_str(&format!(" PROVIDER {}", render_agentfile_scalar(provider)?));
         }
         lines.push(line);
     }
     if let Some(entrypoint) = args.entrypoint {
-        lines.push(format!("ENTRYPOINT {}", quote_agentfile_scalar(entrypoint)));
+        lines.push(format!(
+            "ENTRYPOINT {}",
+            render_agentfile_scalar(entrypoint)?
+        ));
     }
     lines.push(String::new());
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-fn quote_agentfile_scalar(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
-    {
-        value.to_string()
+fn render_agentfile_scalar(value: &str) -> Result<String> {
+    if value.contains(['\n', '\r', '\0']) {
+        bail!(
+            "cannot synthesize an Agentfile scalar containing newline, carriage return, or NUL bytes"
+        );
+    }
+    // Keep this aligned with `dispatch_core::parse::tokenize`: quoted scalars are only delimited
+    // by `"` and do not support backslash escapes, so unsupported values must be rejected here.
+    if !value.is_empty() && value.chars().all(|ch| !ch.is_whitespace()) && !value.starts_with('"') {
+        Ok(value.to_string())
+    } else if value.contains('"') {
+        bail!("cannot synthesize an Agentfile scalar containing `\"`")
     } else {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+        Ok(format!("\"{value}\""))
     }
 }
 
@@ -270,7 +302,8 @@ mod tests {
             Some("openai"),
             Some("chat"),
         );
-        let agentfile = render_skill_agentfile(BuiltinCourier::Docker, "file-analyst", &args);
+        let agentfile =
+            render_skill_agentfile(BuiltinCourier::Docker, "file-analyst", &args).unwrap();
         assert!(agentfile.contains("FROM dispatch/docker:latest"));
         assert!(agentfile.contains("SKILL file-analyst"));
         assert!(agentfile.contains("MODEL gpt-5-mini PROVIDER openai"));
@@ -301,7 +334,8 @@ mod tests {
     #[test]
     fn render_skill_agentfile_quotes_paths_with_spaces() {
         let args = sample_synthesis_args(Path::new("skill.md"), "native", None, None, None);
-        let agentfile = render_skill_agentfile(BuiltinCourier::Native, "My Skill.md", &args);
+        let agentfile =
+            render_skill_agentfile(BuiltinCourier::Native, "My Skill.md", &args).unwrap();
         assert!(agentfile.contains("SKILL \"My Skill.md\""));
     }
 
@@ -314,9 +348,43 @@ mod tests {
             Some("openai compatible"),
             Some("job runner"),
         );
-        let agentfile = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args);
+        let agentfile = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args).unwrap();
         assert!(agentfile.contains("MODEL \"gpt 5\" PROVIDER \"openai compatible\""));
         assert!(agentfile.contains("ENTRYPOINT \"job runner\""));
+    }
+
+    #[test]
+    fn render_skill_agentfile_rejects_control_characters_in_scalars() {
+        let args = sample_synthesis_args(
+            Path::new("skill.md"),
+            "native",
+            Some("gpt-5\nmini"),
+            None,
+            None,
+        );
+        let error = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("newline, carriage return, or NUL bytes")
+        );
+    }
+
+    #[test]
+    fn render_skill_agentfile_rejects_quoted_scalars_that_cannot_round_trip() {
+        let args = sample_synthesis_args(
+            Path::new("skill.md"),
+            "native",
+            Some("gpt \"5\" mini"),
+            None,
+            None,
+        );
+        let error = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot synthesize an Agentfile scalar containing `\"`")
+        );
     }
 
     #[test]
@@ -396,6 +464,7 @@ description = \"Read a file.\"\n",
             skill_dir.canonicalize().unwrap()
         );
         assert_eq!(resolved.copied_name, "file-analyst");
+        assert!(resolved.escalated_from_skill_md);
     }
 
     #[test]
@@ -417,9 +486,11 @@ Use careful reasoning.\n",
         validate_skill(crate::ValidateSkillArgs {
             path: skill_dir.join("SKILL.md"),
             courier: "native".to_string(),
-            model: None,
-            provider: None,
-            entrypoint: None,
+            synthesis: crate::SkillSynthesisOverrideArgs {
+                model: None,
+                provider: None,
+                entrypoint: None,
+            },
         })
         .unwrap();
     }
@@ -443,9 +514,11 @@ Read files carefully.\n",
         let error = validate_skill(crate::ValidateSkillArgs {
             path: skill_dir,
             courier: "native".to_string(),
-            model: None,
-            provider: Some("openai".to_string()),
-            entrypoint: None,
+            synthesis: crate::SkillSynthesisOverrideArgs {
+                model: None,
+                provider: Some("openai".to_string()),
+                entrypoint: None,
+            },
         })
         .unwrap_err();
 

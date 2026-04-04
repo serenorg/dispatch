@@ -39,27 +39,21 @@ fn run_with_builtin_courier(courier: BuiltinCourier, args: crate::RunArgs) -> Re
 }
 
 fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Result<()> {
-    let crate::RunArgs {
-        path,
-        exec:
-            crate::RunExecutionArgs {
-                courier: _,
-                registry: _,
-                session_file,
-                chat,
-                job,
-                heartbeat,
-                interactive,
-                print_prompt,
-                list_tools,
-                json,
-                tool,
-                input,
-                tool_approval,
-                a2a_allowed_origins: _,
-                a2a_trust_policy: _,
-            },
-    } = args;
+    let crate::RunArgs { path, exec } = args;
+    let crate::RunExecutionArgs {
+        session_file,
+        chat,
+        job,
+        heartbeat,
+        interactive,
+        print_prompt,
+        list_tools,
+        json,
+        tool,
+        input,
+        tool_approval,
+        ..
+    } = exec;
     let parcel =
         load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))?;
     if list_tools && json {

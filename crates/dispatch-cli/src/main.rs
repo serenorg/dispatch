@@ -187,11 +187,7 @@ struct RunArgs {
 }
 
 #[derive(Debug, Args)]
-struct RunSkillArgs {
-    /// Path to a SKILL.md file or an Agent Skills bundle directory
-    path: PathBuf,
-    #[command(flatten)]
-    exec: RunExecutionArgs,
+struct SkillSynthesisOverrideArgs {
     /// Primary model id override for synthesized skill execution
     #[arg(long)]
     model: Option<String>,
@@ -204,21 +200,24 @@ struct RunSkillArgs {
 }
 
 #[derive(Debug, Args)]
+struct RunSkillArgs {
+    /// Path to a SKILL.md file or an Agent Skills bundle directory
+    path: PathBuf,
+    #[command(flatten)]
+    exec: RunExecutionArgs,
+    #[command(flatten)]
+    synthesis: SkillSynthesisOverrideArgs,
+}
+
+#[derive(Debug, Args)]
 struct ValidateSkillArgs {
     /// Path to a SKILL.md file or an Agent Skills bundle directory
     path: PathBuf,
     /// Built-in courier to target when synthesizing the temporary parcel
     #[arg(long = "courier", default_value = "native")]
     courier: String,
-    /// Primary model id override for synthesized skill validation
-    #[arg(long)]
-    model: Option<String>,
-    /// Provider override paired with `--model`
-    #[arg(long)]
-    provider: Option<String>,
-    /// Entrypoint override for synthesized skill validation
-    #[arg(long)]
-    entrypoint: Option<String>,
+    #[command(flatten)]
+    synthesis: SkillSynthesisOverrideArgs,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -675,7 +674,7 @@ mod tests {
     use super::{
         Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, DepotCommand, EvalArgs,
         InspectArgs, KeygenArgs, ParcelCommand, PullArgs, PushArgs, SignArgs, SkillCommand,
-        StateCommand, ValidateSkillArgs, VerifyArgs,
+        SkillSynthesisOverrideArgs, StateCommand, ValidateSkillArgs, VerifyArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -1080,8 +1079,8 @@ mod tests {
         };
         assert_eq!(args.path, PathBuf::from("skills/file-analyst"));
         assert_eq!(args.exec.courier, "docker");
-        assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));
-        assert_eq!(args.provider.as_deref(), Some("openai"));
+        assert_eq!(args.synthesis.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(args.synthesis.provider.as_deref(), Some("openai"));
         assert!(args.exec.list_tools);
     }
 
@@ -1112,9 +1111,12 @@ mod tests {
         let ValidateSkillArgs {
             path,
             courier,
-            model,
-            provider,
-            entrypoint,
+            synthesis:
+                SkillSynthesisOverrideArgs {
+                    model,
+                    provider,
+                    entrypoint,
+                },
         } = *args;
         assert_eq!(path, PathBuf::from("skills/file-analyst/SKILL.md"));
         assert_eq!(courier, "docker");

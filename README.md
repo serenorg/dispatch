@@ -392,7 +392,7 @@ Supported backends:
 - `--tool-approval <ask|always|never>` - control how `APPROVAL confirm` tools are handled at the CLI
 - `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
 
-`dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and build a temporary parcel. `dispatch skill validate` stops after build validation, while `dispatch skill run` then delegates to `dispatch run`. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
+`dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and run the same synthesis and parcel build that an authored `Agentfile` would use. `dispatch skill validate` stops after that build-time validation, while `dispatch skill run` then delegates to `dispatch run`. This means `validate` surfaces sidecar, frontmatter, packaging, and build errors directly and is suitable for CI, but it is intentionally heavier than a schema-only lint. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 
 ## Courier Architecture
 
