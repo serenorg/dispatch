@@ -333,7 +333,7 @@ fn native_courier_conformance_supports_a2a_tools() {
         &format!(
             "\
 FROM dispatch/native:latest
-TOOL A2A broker URL {}
+TOOL A2A broker URL {} DISCOVERY card EXPECT_AGENT_NAME conformance-a2a
 ENTRYPOINT job
 ",
             server.base_url
@@ -445,7 +445,7 @@ fn docker_courier_conformance_supports_a2a_tools() {
         &format!(
             "\
 FROM dispatch/docker:latest
-TOOL A2A broker URL {}
+TOOL A2A broker URL {} DISCOVERY card EXPECT_AGENT_NAME conformance-a2a
 ENTRYPOINT job
 ",
             server.base_url

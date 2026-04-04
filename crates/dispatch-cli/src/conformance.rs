@@ -690,7 +690,7 @@ fn build_conformance_a2a_fixture(
 NAME conformance-{name}\n\
 VERSION 0.1.0\n\
 SOUL SOUL.md\n\
-TOOL A2A broker URL {endpoint_url}\n\
+TOOL A2A broker URL {endpoint_url} DISCOVERY card EXPECT_AGENT_NAME conformance-a2a\n\
 ENTRYPOINT job\n"
         ),
     )

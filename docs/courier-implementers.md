@@ -125,6 +125,7 @@ The current suite checks:
 - conditional job execution
 - conditional heartbeat execution
 - conditional direct local tool invocation
+- conditional A2A tool invocation through card discovery and expected agent identity
 - explicit rejection of unsupported execution in stub couriers
 
 If you are building a new courier, these tests are the minimum target. Add courier-specific tests in your own crate, but keep the shared public contract passing.
