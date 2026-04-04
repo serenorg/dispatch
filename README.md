@@ -101,10 +101,18 @@ EVAL evals/smoke.eval
 ENTRYPOINT chat
 ```
 
-`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Dispatch requires `https://` for non-loopback A2A endpoints and rejects URLs with embedded credentials; plain `http://` is only accepted for loopback development targets such as `localhost` or `127.0.0.1`. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames, or with `DISPATCH_A2A_TRUST_POLICY`, a YAML policy file that can match by origin/hostname and require discovered agent-card identity fields such as `expected_agent_name` and `expected_card_sha256`. The current `TOOL A2A` contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout.
+`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Dispatch requires `https://` for non-loopback A2A endpoints and rejects URLs with embedded credentials; plain `http://` is only accepted for loopback development targets such as `localhost` or `127.0.0.1`. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames, or with `DISPATCH_A2A_TRUST_POLICY`, a YAML policy file that can match by origin/hostname and require discovered agent-card identity fields such as `expected_agent_name` and `expected_card_sha256`. The current `TOOL A2A` contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout. For the full declaration and operator model, see [docs/a2a.md](./docs/a2a.md).
 
 `TIMEOUT RUN` is enforced as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes. It does not currently preempt a turn that has already started.
 `TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
+
+CLI-scoped A2A operator policy overrides are available on:
+
+- `dispatch run`
+- `dispatch eval`
+- `dispatch courier conformance`
+
+Use `--a2a-allowed-origins ...` and `--a2a-trust-policy ...` when you want command-scoped A2A policy without exporting environment variables.
 Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
 Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.
 

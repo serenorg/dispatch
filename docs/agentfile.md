@@ -405,8 +405,11 @@ Reference implementation notes:
 - discovered agent cards may refine the RPC path, but they cannot pivot execution onto a different origin than the declared `URL`
 - operators can constrain resolved A2A URLs at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated allowlist of origins or hostnames
 - operators can also enforce structured outbound A2A policy with `DISPATCH_A2A_TRUST_POLICY`, a YAML file whose rules match by `origin_prefix` and/or `hostname` and can require discovered agent-card `expected_agent_name` / `expected_card_sha256`
+- `dispatch run`, `dispatch eval`, and `dispatch courier conformance` also accept `--a2a-allowed-origins` and `--a2a-trust-policy` for command-scoped operator overrides
 - `TOOL A2A` currently exposes a synchronous request/response tool surface; when `message/send` returns an unfinished task, Dispatch polls `tasks/get` until completion or the configured tool timeout
 - task polling and cancellation are not part of the current Dispatch tool contract
+
+See [a2a.md](./a2a.md) for the full operator and trust model.
 
 ### Files and Assets
 
