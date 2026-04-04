@@ -6141,6 +6141,44 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn native_courier_rejects_non_loopback_cleartext_a2a_urls() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker URL http://example.com DISCOVERY direct
+ENTRYPOINT job
+",
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::A2aToolRequest { ref message, .. }
+                if message.contains("must use https unless it targets a loopback host")
+        ));
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_urls_with_embedded_credentials() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker URL http://user:pass@127.0.0.1:7777 DISCOVERY direct
+ENTRYPOINT job
+",
+            &[],
+        );
+
+        let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+        assert!(matches!(
+            error,
+            CourierError::A2aToolRequest { ref message, .. }
+                if message.contains("must not embed credentials")
+        ));
+    }
+
+    #[test]
     fn native_courier_executes_a2a_tools_with_bearer_auth() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
             expected_auth: Some("Bearer topsecret".to_string()),

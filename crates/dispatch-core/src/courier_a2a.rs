@@ -289,6 +289,44 @@ pub(super) fn a2a_origin(url: &Url) -> Option<String> {
     }
 }
 
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
+fn validate_a2a_url_security(tool: &LocalToolSpec, url: &Url) -> Result<(), CourierError> {
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(url) => {}
+        "http" => {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!(
+                    "A2A URL `{}` must use https unless it targets a loopback host",
+                    url
+                ),
+            });
+        }
+        scheme => {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("A2A URL must use http or https, received `{scheme}`"),
+            });
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("A2A URL `{}` must not embed credentials", url),
+        });
+    }
+    Ok(())
+}
+
 fn is_a2a_url_allowed(url: &Url, allowlist: &[String]) -> bool {
     if allowlist.is_empty() {
         return true;
@@ -325,22 +363,14 @@ fn validate_a2a_url_allowed<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let Some(raw_allowlist) = env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS") else {
-        return Ok(());
-    };
     let parsed = Url::parse(url).map_err(|error| CourierError::A2aToolRequest {
         tool: tool.alias.clone(),
         message: format!("invalid A2A URL `{url}`: {error}"),
     })?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        scheme => {
-            return Err(CourierError::A2aToolRequest {
-                tool: tool.alias.clone(),
-                message: format!("A2A URL must use http or https, received `{scheme}`"),
-            });
-        }
-    }
+    validate_a2a_url_security(tool, &parsed)?;
+    let Some(raw_allowlist) = env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS") else {
+        return Ok(());
+    };
     let allowlist = raw_allowlist
         .split(',')
         .filter_map(normalize_a2a_allowlist_entry)

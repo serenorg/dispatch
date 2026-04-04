@@ -395,6 +395,8 @@ Reference implementation notes:
   - `auto` tries `/.well-known/agent.json` and falls back to `<url>/a2a`
   - `card` requires successful agent-card discovery
   - `direct` skips discovery and normalizes the endpoint as a direct JSON-RPC target
+- non-loopback A2A endpoints must use `https://`; plain `http://` is accepted only for loopback development targets like `localhost` or `127.0.0.1`
+- A2A URLs must not embed credentials; use `AUTH ...` with a declared `SECRET` instead
 - `AUTH bearer <secret_name>` sends `Authorization: Bearer ...` using a declared `SECRET`
 - `AUTH header <header_name> <secret_name>` sends the secret value in the named HTTP header for both discovery and RPC calls
 - `EXPECT_AGENT_NAME <name>` fails the call if discovered agent-card identity does not match, or if card discovery succeeds without a `name`
