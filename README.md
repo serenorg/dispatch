@@ -93,6 +93,8 @@ LIMIT CONTEXT_TOKENS 16000
 COMPACTION 200 OVERLAP 32
 TIMEOUT RUN 300s
 TIMEOUT TOOL 60s
+
+`TOOL A2A` endpoints are declared in the parcel, but operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames.
 TIMEOUT LLM 120s
 
 EVAL evals/smoke.eval

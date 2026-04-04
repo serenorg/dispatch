@@ -26,6 +26,7 @@ rusqlite.workspace = true
 tar.workspace = true
 urlencoding.workspace = true
 serde_yaml.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

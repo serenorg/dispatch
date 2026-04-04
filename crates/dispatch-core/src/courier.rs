@@ -26,6 +26,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+use url::Url;
 use wasmtime::{
     Config, Engine, Store,
     component::{Component, HasSelf, Linker, ResourceTable},
@@ -2110,6 +2111,7 @@ where
         .ok_or_else(|| CourierError::MissingA2aToolUrl {
             tool: tool.alias.clone(),
         })?;
+    validate_a2a_url_allowed(tool, url, &mut env_lookup)?;
     if matches!(tool.endpoint_mode, Some(A2aEndpointMode::Direct)) {
         return Ok((normalize_a2a_rpc_endpoint(url), None));
     }
@@ -2123,8 +2125,11 @@ where
         .build();
     if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
         (tool.auth_secret_name.as_deref(), tool.auth_scheme)
-        && let Some(secret_value) = env_lookup(secret_name)
     {
+        let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("configured A2A auth secret `{secret_name}` is not available"),
+        })?;
         request = request.header("authorization", &format!("Bearer {secret_value}"));
     }
     let response = request
@@ -2166,6 +2171,7 @@ where
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| normalize_a2a_rpc_endpoint(url));
+        validate_a2a_url_allowed(tool, &endpoint, &mut env_lookup)?;
         let agent_name = card
             .get("name")
             .and_then(serde_json::Value::as_str)
@@ -2188,6 +2194,88 @@ where
         });
     }
     Ok((normalize_a2a_rpc_endpoint(url), None))
+}
+
+fn normalize_a2a_allowlist_entry(entry: &str) -> Option<String> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") {
+        let parsed = Url::parse(trimmed).ok()?;
+        return a2a_origin(&parsed);
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn a2a_origin(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let scheme = url.scheme();
+    let default_port = match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    let port = url.port_or_known_default();
+    match (port, default_port) {
+        (Some(port), Some(default)) if port != default => Some(format!("{scheme}://{host}:{port}")),
+        (Some(_), _) | (None, _) => Some(format!("{scheme}://{host}")),
+    }
+}
+
+fn is_a2a_url_allowed(url: &Url, allowlist: &[String]) -> bool {
+    if allowlist.is_empty() {
+        return true;
+    }
+    let host = url
+        .host_str()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let origin = a2a_origin(url);
+    allowlist.iter().any(|entry| {
+        if entry.contains("://") {
+            origin.as_ref().is_some_and(|candidate| candidate == entry)
+        } else {
+            host == *entry
+        }
+    })
+}
+
+fn validate_a2a_url_allowed<F>(
+    tool: &LocalToolSpec,
+    url: &str,
+    env_lookup: &mut F,
+) -> Result<(), CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let Some(raw_allowlist) = env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS") else {
+        return Ok(());
+    };
+    let parsed = Url::parse(url).map_err(|error| CourierError::A2aToolRequest {
+        tool: tool.alias.clone(),
+        message: format!("invalid A2A URL `{url}`: {error}"),
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("A2A URL must use http or https, received `{scheme}`"),
+            });
+        }
+    }
+    let allowlist = raw_allowlist
+        .split(',')
+        .filter_map(normalize_a2a_allowlist_entry)
+        .collect::<Vec<_>>();
+    if is_a2a_url_allowed(&parsed, &allowlist) {
+        return Ok(());
+    }
+    Err(CourierError::A2aToolRequest {
+        tool: tool.alias.clone(),
+        message: format!("A2A URL `{url}` is not allowed by DISPATCH_A2A_ALLOWED_ORIGINS"),
+    })
 }
 
 fn collect_a2a_artifact_parts(
@@ -2296,8 +2384,11 @@ where
         .header("content-type", "application/json");
     if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
         (tool.auth_secret_name.as_deref(), tool.auth_scheme)
-        && let Some(secret_value) = env_lookup(secret_name)
     {
+        let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("configured A2A auth secret `{secret_name}` is not available"),
+        })?;
         request = request.header("authorization", &format!("Bearer {secret_value}"));
     }
     let response = request
@@ -5822,6 +5913,37 @@ ENTRYPOINT job
     }
 
     #[test]
+    fn native_courier_rejects_a2a_call_when_auth_secret_is_missing() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            expected_auth: Some("Bearer topsecret".to_string()),
+            ..Default::default()
+        });
+        let tool = LocalToolSpec {
+            alias: "broker".to_string(),
+            packaged_path: String::new(),
+            command: "dispatch-a2a".to_string(),
+            args: vec![],
+            transport: LocalToolTransport::A2a,
+            endpoint_url: Some(server.base_url.clone()),
+            endpoint_mode: None,
+            auth_secret_name: Some("A2A_TOKEN".to_string()),
+            auth_scheme: Some(A2aAuthScheme::Bearer),
+            expected_agent_name: None,
+            expected_card_sha256: None,
+            description: None,
+            input_schema_packaged_path: None,
+            input_schema_sha256: None,
+        };
+
+        let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configured A2A auth secret `A2A_TOKEN` is not available")
+        );
+    }
+
+    #[test]
     fn native_courier_rejects_a2a_agent_name_mismatch() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
             agent_name: "actual-agent".to_string(),
@@ -5921,6 +6043,57 @@ ENTRYPOINT job
                 .to_string()
                 .contains("agent card discovery failed for required `DISCOVERY card` mode")
         );
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_url_outside_operator_allowlist() {
+        let server = start_test_a2a_server();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "DISPATCH_A2A_ALLOWED_ORIGINS")
+                .then(|| "https://agents.example.com,broker.internal".to_string())
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not allowed by DISPATCH_A2A_ALLOWED_ORIGINS")
+        );
+    }
+
+    #[test]
+    fn native_courier_allows_a2a_url_with_matching_operator_allowlist_origin() {
+        let server = start_test_a2a_server();
+        let parsed = Url::parse(&server.base_url).unwrap();
+        let origin = a2a_origin(&parsed).unwrap();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "DISPATCH_A2A_ALLOWED_ORIGINS").then(|| origin.clone())
+        })
+        .unwrap();
+        assert!(result.stdout.contains("echo:hello"));
     }
 
     #[test]
