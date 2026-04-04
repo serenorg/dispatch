@@ -166,6 +166,7 @@ struct ResolvedAgentSpec {
     timeouts: Vec<TimeoutSpec>,
     network: Vec<NetworkRule>,
     labels: BTreeMap<String, String>,
+    entrypoint_declared: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -246,7 +247,15 @@ pub fn build_agentfile(
             "NAME" => resolved.name = first_scalar(instruction.args.first()),
             "VERSION" => resolved.version = first_scalar(instruction.args.first()),
             "FRAMEWORK" => resolved.framework = parse_framework(&instruction.args),
-            "ENTRYPOINT" => resolved.entrypoint = first_scalar(instruction.args.first()),
+            "ENTRYPOINT" => {
+                if let Some(entrypoint) = first_scalar(instruction.args.first()) {
+                    resolved.entrypoint = Some(validate_entrypoint_value(
+                        &entrypoint,
+                        "Agentfile ENTRYPOINT",
+                    )?);
+                    resolved.entrypoint_declared = true;
+                }
+            }
             "VISIBILITY" => {
                 resolved.visibility = first_scalar(instruction.args.first())
                     .and_then(|value| parse_visibility(&value))
@@ -787,6 +796,26 @@ fn process_skill_instruction(
                 ))
             })?;
 
+        if let Some(entrypoint) = skill_manifest.entrypoint.as_deref() {
+            let entrypoint = validate_entrypoint_value(
+                entrypoint,
+                &format!("skill sidecar `{}` entrypoint", sidecar_path.display()),
+            )?;
+            if !resolved.entrypoint_declared {
+                match resolved.entrypoint.as_deref() {
+                    None => resolved.entrypoint = Some(entrypoint),
+                    Some(existing) if existing == entrypoint => {}
+                    Some(existing) => {
+                        return Err(BuildError::Validation(format!(
+                            "skill sidecar `{}` entrypoint `{}` conflicts with previously resolved entrypoint `{existing}`",
+                            sidecar_path.display(),
+                            entrypoint
+                        )));
+                    }
+                }
+            }
+        }
+
         for skill_tool in skill_manifest.tools {
             let mut tool = synthesize_skill_tool(context_dir, &skill_dir, &skill_tool)?;
             package_tool_config(context_dir, packaged, files, &mut tool)?;
@@ -964,6 +993,15 @@ fn instruction_kind_from_keyword(keyword: &str) -> InstructionKind {
         "MEMORY" => InstructionKind::Memory,
         "HEARTBEAT" => InstructionKind::Heartbeat,
         _ => unreachable!("unexpected instruction keyword `{keyword}`"),
+    }
+}
+
+fn validate_entrypoint_value(value: &str, context: &str) -> Result<String, BuildError> {
+    match value {
+        "chat" | "job" | "heartbeat" => Ok(value.to_string()),
+        _ => Err(BuildError::Validation(format!(
+            "{context} must be one of `chat`, `job`, or `heartbeat`, got `{value}`"
+        ))),
     }
 }
 
@@ -1755,6 +1793,163 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn build_skill_directory_autodetects_dispatch_sidecar_and_sets_entrypoint_default() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "entrypoint = \"job\"\n\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        assert_eq!(parcel.entrypoint.as_deref(), Some("job"));
+        assert_eq!(parcel.tools.len(), 1);
+    }
+
+    #[test]
+    fn build_agentfile_entrypoint_overrides_skill_sidecar_entrypoint() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "entrypoint = \"job\"\n\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        assert_eq!(parcel.entrypoint.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn build_rejects_conflicting_skill_sidecar_entrypoints() {
+        let dir = tempdir().unwrap();
+        for (name, entrypoint) in [("file-analyst", "job"), ("web-search", "heartbeat")] {
+            let skill_dir = dir.path().join(name);
+            fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Skill.\n---\nBody\n"),
+            )
+            .unwrap();
+            fs::write(
+                skill_dir.join("dispatch.toml"),
+                format!(
+                    "entrypoint = \"{entrypoint}\"\n\n[[tools]]\nname = \"{name}_tool\"\nscript = \"scripts/run.sh\"\n"
+                ),
+            )
+            .unwrap();
+            fs::write(skill_dir.join("scripts/run.sh"), "echo ok\n").unwrap();
+        }
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nSKILL web-search\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with previously resolved entrypoint")
+        );
+    }
+
+    #[test]
+    fn build_explicit_tool_overrides_skill_generated_alias() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\nrisk = \"low\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::create_dir_all(dir.path().join("tools")).unwrap();
+        fs::write(dir.path().join("tools/read_file.py"), "print('override')\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nTOOL LOCAL tools/read_file.py AS read_file RISK high\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        assert_eq!(parcel.tools.len(), 1);
+        match &parcel.tools[0] {
+            ToolConfig::Local(local) => {
+                assert_eq!(local.alias, "read_file");
+                assert_eq!(local.packaged_path, "tools/read_file.py");
+                assert_eq!(local.risk, Some(ToolRiskLevel::High));
+            }
+            other => panic!("expected local tool, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_rejects_skill_directory_with_mismatched_agent_skill_name() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
@@ -1779,6 +1974,43 @@ ENTRYPOINT chat
         .unwrap_err();
 
         assert!(error.to_string().contains("must match skill directory"));
+    }
+
+    #[test]
+    fn build_rejects_invalid_skill_sidecar_entrypoint() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "entrypoint = \"unsupported\"\n\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be one of `chat`, `job`, or `heartbeat`")
+        );
     }
 
     #[test]

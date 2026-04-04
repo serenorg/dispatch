@@ -163,6 +163,8 @@ ENTRYPOINT chat
 Example `dispatch.toml` sidecar:
 
 ```toml
+entrypoint = "chat"
+
 [[tools]]
 name = "read_file"
 script = "scripts/read_file.sh"
@@ -177,7 +179,7 @@ risk = "low"
 description = "Find files matching a pattern."
 ```
 
-Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. If the `Agentfile` also declares `TOOL ...` entries with the same alias, the explicit `TOOL` declaration wins.
+Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. If the `Agentfile` also declares `TOOL ...` entries with the same alias, the explicit `TOOL` declaration wins.
 
 
 ## WASM Courier
