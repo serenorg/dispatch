@@ -4916,6 +4916,8 @@ mod tests {
         publish_card: bool,
         task_state: String,
         task_status_message: String,
+        task_get_state: Option<String>,
+        task_get_status_message: Option<String>,
         rpc_error: Option<(i64, String)>,
         card_url: Option<String>,
         response_delay: Duration,
@@ -4929,6 +4931,8 @@ mod tests {
                 publish_card: true,
                 task_state: "completed".to_string(),
                 task_status_message: "ok".to_string(),
+                task_get_state: None,
+                task_get_status_message: None,
                 rpc_error: None,
                 card_url: None,
                 response_delay: Duration::from_millis(0),
@@ -5038,7 +5042,7 @@ mod tests {
                 .unwrap()
                 .as_slice(),
             ),
-            ("POST", "/a2a") => {
+            ("POST", path) if path.ends_with("/a2a") => {
                 if !options.response_delay.is_zero() {
                     thread::sleep(options.response_delay);
                 }
@@ -5057,31 +5061,53 @@ mod tests {
                     return;
                 }
                 let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let part = payload
-                    .pointer_mut("/params/message/parts/0")
-                    .expect("expected request part");
-                let output = if let Some(text) =
-                    part.get("text").and_then(serde_json::Value::as_str)
-                {
+                let method = payload
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let output = if method == "tasks/get" {
+                    let state = options
+                        .task_get_state
+                        .as_deref()
+                        .unwrap_or(options.task_state.as_str());
+                    let message = options
+                        .task_get_status_message
+                        .as_deref()
+                        .unwrap_or(options.task_status_message.as_str());
                     serde_json::json!({
                         "jsonrpc":"2.0",
                         "id":"1",
                         "result":{
                             "id":"task-1",
-                            "status":{"state": options.task_state, "message": options.task_status_message},
-                            "artifacts":[{"parts":[{"kind":"text","text":format!("echo:{text}")}]}]
+                            "status":{"state": state, "message": message},
+                            "artifacts":[{"parts":[{"kind":"text","text":"echo:hello"}]}]
                         }
                     })
                 } else {
-                    serde_json::json!({
-                        "jsonrpc":"2.0",
-                        "id":"1",
-                        "result":{
-                            "id":"task-1",
-                            "status":{"state": options.task_state, "message": options.task_status_message},
-                            "artifacts":[{"parts":[{"kind":"data","data":part.get("data").cloned().unwrap_or(serde_json::Value::Null)}]}]
-                        }
-                    })
+                    let part = payload
+                        .pointer_mut("/params/message/parts/0")
+                        .expect("expected request part");
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":"1",
+                            "result":{
+                                "id":"task-1",
+                                "status":{"state": options.task_state, "message": options.task_status_message},
+                                "artifacts":[{"parts":[{"kind":"text","text":format!("echo:{text}")}]}]
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":"1",
+                            "result":{
+                                "id":"task-1",
+                                "status":{"state": options.task_state, "message": options.task_status_message},
+                                "artifacts":[{"parts":[{"kind":"data","data":part.get("data").cloned().unwrap_or(serde_json::Value::Null)}]}]
+                            }
+                        })
+                    }
                 };
                 write_test_http_response(
                     &mut writer,
@@ -5109,9 +5135,9 @@ mod tests {
             "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        writer.write_all(headers.as_bytes()).unwrap();
-        writer.write_all(body).unwrap();
-        writer.flush().unwrap();
+        let _ = writer.write_all(headers.as_bytes());
+        let _ = writer.write_all(body);
+        let _ = writer.flush();
     }
 
     fn build_test_image(agentfile: &str, files: &[(&str, &str)]) -> TestImage {
@@ -6002,7 +6028,8 @@ ENTRYPOINT job
         let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
         assert!(matches!(
             error,
-            CourierError::A2aToolRequest { ref message, .. } if message.contains("timeout")
+            CourierError::ToolTimedOut { ref tool, ref timeout }
+                if tool == "broker" && timeout == "TOOL"
         ));
     }
 
@@ -6057,10 +6084,12 @@ ENTRYPOINT job
     }
 
     #[test]
-    fn native_courier_rejects_non_completed_a2a_task_states() {
+    fn native_courier_polls_non_completed_a2a_tasks_until_completion() {
         let server = start_test_a2a_server_with_options(TestA2aServerOptions {
             task_state: "working".to_string(),
             task_status_message: "queued for async execution".to_string(),
+            task_get_state: Some("completed".to_string()),
+            task_get_status_message: Some("done".to_string()),
             ..Default::default()
         });
         let test_image = build_test_image(
@@ -6075,9 +6104,37 @@ ENTRYPOINT job
             &[],
         );
 
+        let result = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap();
+        assert!(result.stdout.contains("echo:hello"));
+    }
+
+    #[test]
+    fn native_courier_times_out_polling_non_completed_a2a_tasks() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            task_state: "working".to_string(),
+            task_status_message: "queued for async execution".to_string(),
+            task_get_state: Some("working".to_string()),
+            task_get_status_message: Some("still running".to_string()),
+            ..Default::default()
+        });
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TIMEOUT TOOL 75ms
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
         let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
-        assert!(error.to_string().contains(
-            "remote A2A task did not complete synchronously: state=`working` message=`queued for async execution`"
+        assert!(matches!(
+            error,
+            CourierError::ToolTimedOut { ref tool, ref timeout }
+                if tool == "broker" && timeout == "TOOL"
         ));
     }
 

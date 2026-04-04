@@ -2,7 +2,7 @@ use crate::manifest::{A2aAuthScheme, A2aEndpointMode};
 use sha2::{Digest, Sha256};
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 
@@ -83,6 +83,48 @@ fn read_a2a_json_response(
             tool: tool.to_string(),
             message: format!("failed to parse A2A response: {error}"),
         })
+}
+
+fn send_a2a_json_rpc_with_env<F>(
+    tool: &LocalToolSpec,
+    endpoint: &str,
+    payload: serde_json::Value,
+    timeout: Option<Duration>,
+    timeout_label: Option<&str>,
+    env_lookup: &mut F,
+) -> Result<serde_json::Value, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut request = ureq::post(endpoint)
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(timeout)
+        .build()
+        .header("content-type", "application/json");
+    if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
+        (tool.auth_secret_name(), tool.auth_scheme())
+    {
+        let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("configured A2A auth secret `{secret_name}` is not available"),
+        })?;
+        request = request.header("authorization", &format!("Bearer {secret_value}"));
+    }
+    let response = request.send_json(payload).map_err(|error| {
+        if error.to_string().to_ascii_lowercase().contains("timeout") {
+            CourierError::ToolTimedOut {
+                tool: tool.alias.clone(),
+                timeout: timeout_label.unwrap_or("TOOL").to_string(),
+            }
+        } else {
+            CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: error.to_string(),
+            }
+        }
+    })?;
+    read_a2a_json_response(response, &tool.alias)
 }
 
 fn resolve_a2a_rpc_endpoint_with_env<F>(
@@ -391,6 +433,101 @@ fn validate_a2a_task_state(
     })
 }
 
+fn a2a_task_id(value: &serde_json::Value) -> Option<&str> {
+    if value.get("id").is_some() {
+        value.get("id").and_then(serde_json::Value::as_str)
+    } else {
+        value
+            .pointer("/task/id")
+            .and_then(serde_json::Value::as_str)
+    }
+}
+
+fn a2a_task_state(value: &serde_json::Value) -> Option<&str> {
+    if value.get("id").is_some() {
+        value
+            .pointer("/status/state")
+            .and_then(serde_json::Value::as_str)
+    } else {
+        value
+            .pointer("/task/status/state")
+            .and_then(serde_json::Value::as_str)
+    }
+}
+
+fn poll_a2a_task_until_complete<F>(
+    tool: &LocalToolSpec,
+    endpoint: &str,
+    initial_result: serde_json::Value,
+    timeout_spec: Option<(&str, Duration)>,
+    env_lookup: &mut F,
+) -> Result<serde_json::Value, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if matches!(a2a_task_state(&initial_result), Some("completed")) {
+        return Ok(initial_result);
+    }
+    let Some(task_id) = a2a_task_id(&initial_result).map(ToString::to_string) else {
+        validate_a2a_task_state(tool, &initial_result)?;
+        return Ok(initial_result);
+    };
+    let started_at = Instant::now();
+    let deadline = timeout_spec.map(|(_, duration)| started_at + duration);
+    loop {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let timeout_label = timeout_spec.map(|(label, _)| label).unwrap_or("TOOL");
+            return Err(CourierError::ToolTimedOut {
+                tool: tool.alias.clone(),
+                timeout: timeout_label.to_string(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tasks/get",
+            "id": a2a_request_id(),
+            "params": {
+                "taskId": task_id,
+                "historyLength": null
+            }
+        });
+        let body = send_a2a_json_rpc_with_env(
+            tool,
+            endpoint,
+            payload,
+            remaining,
+            timeout_spec.map(|(label, _)| label),
+            env_lookup,
+        )?;
+        if let Some(error) = body.get("error") {
+            let code = error
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            let message = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown A2A JSON-RPC error");
+            let data_suffix = error
+                .get("data")
+                .map(|value| format!(" data={}", value))
+                .unwrap_or_default();
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("JSON-RPC error {code}: {message}{data_suffix}"),
+            });
+        }
+        let current = body.get("result").cloned().unwrap_or(body);
+        if matches!(a2a_task_state(&current), Some("completed")) {
+            return Ok(current);
+        }
+    }
+}
+
 pub(super) fn execute_a2a_tool_with_env<F>(
     tool: &LocalToolSpec,
     input: Option<&str>,
@@ -428,28 +565,14 @@ where
             }
         }
     });
-    let mut request = ureq::post(&endpoint)
-        .config()
-        .http_status_as_error(false)
-        .timeout_global(timeout)
-        .build()
-        .header("content-type", "application/json");
-    if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
-        (tool.auth_secret_name(), tool.auth_scheme())
-    {
-        let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
-            tool: tool.alias.clone(),
-            message: format!("configured A2A auth secret `{secret_name}` is not available"),
-        })?;
-        request = request.header("authorization", &format!("Bearer {secret_value}"));
-    }
-    let response = request
-        .send_json(payload)
-        .map_err(|error| CourierError::A2aToolRequest {
-            tool: tool.alias.clone(),
-            message: error.to_string(),
-        })?;
-    let body = read_a2a_json_response(response, &tool.alias)?;
+    let body = send_a2a_json_rpc_with_env(
+        tool,
+        &endpoint,
+        payload,
+        timeout,
+        timeout_spec.map(|(label, _)| label),
+        &mut env_lookup,
+    )?;
     if let Some(error) = body.get("error") {
         let code = error
             .get("code")
@@ -468,9 +591,11 @@ where
             message: format!("JSON-RPC error {code}: {message}{data_suffix}"),
         });
     }
-    let result = body.get("result").unwrap_or(&body);
-    validate_a2a_task_state(tool, result)?;
-    let output = extract_a2a_task_output(result);
+    let result = body.get("result").cloned().unwrap_or(body);
+    let result =
+        poll_a2a_task_until_complete(tool, &endpoint, result, timeout_spec, &mut env_lookup)?;
+    validate_a2a_task_state(tool, &result)?;
+    let output = extract_a2a_task_output(&result);
     let stdout = match output {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(text) => text,

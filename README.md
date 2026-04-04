@@ -99,7 +99,7 @@ EVAL evals/smoke.eval
 ENTRYPOINT chat
 ```
 
-`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames. The current `TOOL A2A` contract is synchronous: remote tasks must complete in-band for the tool call to succeed.
+`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames. The current `TOOL A2A` contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout.
 
 `TIMEOUT RUN` is enforced as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes. It does not currently preempt a turn that has already started.
 `TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
