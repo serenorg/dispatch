@@ -37,6 +37,7 @@ pub struct BuiltParcel {
     pub parcel_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub lockfile_path: PathBuf,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +168,7 @@ struct ResolvedAgentSpec {
     network: Vec<NetworkRule>,
     labels: BTreeMap<String, String>,
     entrypoint_declared: bool,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +283,7 @@ pub fn build_agentfile(
             "TOOL" => {
                 if let Some(mut tool) = parse_tool(&instruction.args)? {
                     package_tool_config(&context_dir, &mut packaged, &mut files, &mut tool)?;
-                    insert_resolved_tool(&mut resolved.tools, tool);
+                    insert_resolved_tool(&mut resolved.tools, &mut resolved.warnings, tool)?;
                 }
             }
             "MODEL" => {
@@ -395,6 +397,14 @@ pub fn build_agentfile(
     }
 
     files.sort_by(|left, right| left.packaged_as.cmp(&right.packaged_as));
+    for pair in files.windows(2) {
+        if pair[0].packaged_as == pair[1].packaged_as && pair[0].sha256 != pair[1].sha256 {
+            return Err(BuildError::Validation(format!(
+                "packaged file `{}` was recorded more than once with conflicting content hashes",
+                pair[0].packaged_as
+            )));
+        }
+    }
     files.dedup_by(|left, right| left.packaged_as == right.packaged_as);
 
     for tool in &resolved.tools {
@@ -528,6 +538,7 @@ pub fn build_agentfile(
         parcel_dir,
         manifest_path,
         lockfile_path,
+        warnings: resolved.warnings,
     })
 }
 
@@ -831,11 +842,11 @@ fn process_skill_instruction(
             let mut tool = synthesize_skill_tool(
                 context_dir,
                 &skill_dir,
-                &skill_md_packaged_path,
+                &parsed_skill.frontmatter.name,
                 &skill_tool,
             )?;
             package_tool_config(context_dir, packaged, files, &mut tool)?;
-            insert_resolved_tool(&mut resolved.tools, tool);
+            insert_resolved_tool(&mut resolved.tools, &mut resolved.warnings, tool)?;
         }
     }
 
@@ -850,7 +861,10 @@ fn resolve_skill_dispatch_manifest_path(
         return Ok(Some(resolve_skill_member_path(skill_dir, path)?));
     }
     let default = skill_dir.join("dispatch.toml");
-    Ok(default.exists().then_some(default))
+    if default.exists() {
+        return Ok(Some(resolve_skill_member_path(skill_dir, "dispatch.toml")?));
+    }
+    Ok(None)
 }
 
 fn resolve_skill_member_path(skill_dir: &Path, relative: &str) -> Result<PathBuf, BuildError> {
@@ -958,24 +972,37 @@ fn package_tool_config(
     Ok(())
 }
 
-fn insert_resolved_tool(tools: &mut Vec<ToolConfig>, tool: ToolConfig) {
+fn insert_resolved_tool(
+    tools: &mut Vec<ToolConfig>,
+    warnings: &mut Vec<String>,
+    tool: ToolConfig,
+) -> Result<(), BuildError> {
     let alias = tool_alias(&tool).map(ToOwned::to_owned);
     if let Some(alias) = alias
         && let Some(existing) = tools
             .iter_mut()
             .find(|existing| tool_alias(existing) == Some(alias.as_str()))
     {
-        if let Some(previous_skill_source) = tool_skill_source(existing)
-            && tool_skill_source(&tool) != Some(previous_skill_source)
-        {
-            eprintln!(
-                "warning: tool `{alias}` from skill `{previous_skill_source}` overridden by a later declaration"
-            );
+        match (tool_skill_source(existing), tool_skill_source(&tool)) {
+            (Some(previous_skill_source), Some(new_skill_source))
+                if previous_skill_source != new_skill_source =>
+            {
+                return Err(BuildError::Validation(format!(
+                    "tool `{alias}` is declared by multiple skills (`{previous_skill_source}` and `{new_skill_source}`)"
+                )));
+            }
+            (Some(previous_skill_source), None) => {
+                warnings.push(format!(
+                    "tool `{alias}` from skill `{previous_skill_source}` overridden by an explicit Agentfile tool declaration"
+                ));
+            }
+            _ => {}
         }
         *existing = tool;
-        return;
+        return Ok(());
     }
     tools.push(tool);
+    Ok(())
 }
 
 fn tool_alias(tool: &ToolConfig) -> Option<&str> {
@@ -1765,7 +1792,7 @@ ENTRYPOINT chat
         fs::create_dir_all(skill_dir.join("schemas")).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: file-analyst\ndescription: Analyze files.\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nUse the bundled tools.\n",
+            "---\nname: file-analyst\ndescription: Analyze files.\nlicense: MIT\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nUse the bundled tools.\n",
         )
         .unwrap();
         fs::write(
@@ -1812,7 +1839,7 @@ ENTRYPOINT chat
                 assert_eq!(local.alias, "read_file");
                 assert_eq!(local.packaged_path, "file-analyst/scripts/read_file.sh");
                 assert_eq!(local.risk, Some(ToolRiskLevel::Low));
-                assert_eq!(local.skill_source.as_deref(), Some("file-analyst/SKILL.md"));
+                assert_eq!(local.skill_source.as_deref(), Some("file-analyst"));
             }
             other => panic!("expected local tool, got {other:?}"),
         }
@@ -1827,7 +1854,7 @@ ENTRYPOINT chat
                     Some("file-analyst/schemas/find_files.json")
                 );
                 assert_eq!(local.approval, Some(ToolApprovalPolicy::Confirm));
-                assert_eq!(local.skill_source.as_deref(), Some("file-analyst/SKILL.md"));
+                assert_eq!(local.skill_source.as_deref(), Some("file-analyst"));
             }
             other => panic!("expected local tool, got {other:?}"),
         }
@@ -1840,7 +1867,7 @@ ENTRYPOINT chat
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: file-analyst\ndescription: Analyze files.\nallowed-tools: Bash, Grep\n---\nUse the bundled tools.\n",
+            "---\nname: file-analyst\ndescription: Analyze files.\nallowed-tools:\n  - Bash\n  - Grep\n---\nUse the bundled tools.\n",
         )
         .unwrap();
         fs::write(
@@ -1861,7 +1888,7 @@ ENTRYPOINT chat
             serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
         assert_eq!(
             parcel.instructions[0].allowed_tools.as_deref(),
-            Some("Bash, Grep")
+            Some(&["Bash".to_string(), "Grep".to_string()][..])
         );
     }
 
@@ -1978,6 +2005,41 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn build_rejects_conflicting_skill_tool_aliases() {
+        let dir = tempdir().unwrap();
+        for name in ["file-analyst", "web-search"] {
+            let skill_dir = dir.path().join(name);
+            fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Skill.\n---\nBody\n"),
+            )
+            .unwrap();
+            fs::write(
+                skill_dir.join("dispatch.toml"),
+                "[[tools]]\nname = \"shared\"\nscript = \"scripts/run.sh\"\n",
+            )
+            .unwrap();
+            fs::write(skill_dir.join("scripts/run.sh"), "echo ok\n").unwrap();
+        }
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nSKILL web-search\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("declared by multiple skills"));
+    }
+
+    #[test]
     fn build_explicit_tool_overrides_skill_generated_alias() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
@@ -2021,6 +2083,13 @@ ENTRYPOINT chat
             }
             other => panic!("expected local tool, got {other:?}"),
         }
+        assert_eq!(
+            built.warnings,
+            vec![
+                "tool `read_file` from skill `file-analyst` overridden by an explicit Agentfile tool declaration"
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

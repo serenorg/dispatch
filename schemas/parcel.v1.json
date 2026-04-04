@@ -334,9 +334,12 @@
         },
         "allowed_tools": {
           "type": [
-            "string",
+            "array",
             "null"
-          ]
+          ],
+          "items": {
+            "type": "string"
+          }
         }
       }
     },

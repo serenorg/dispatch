@@ -179,7 +179,7 @@ risk = "low"
 description = "Find files matching a pattern."
 ```
 
-Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. The built parcel preserves skill annotations such as `allowed-tools`, and skill-generated tools retain `skill_source` provenance back to their originating `SKILL.md`. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. If the `Agentfile` also declares `TOOL ...` entries with the same alias, the explicit `TOOL` declaration wins.
+Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but conflicting aliases across multiple skills fail the build.
 
 
 ## WASM Courier

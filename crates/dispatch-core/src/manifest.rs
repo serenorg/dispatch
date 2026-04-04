@@ -151,7 +151,7 @@ pub struct InstructionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_tools: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

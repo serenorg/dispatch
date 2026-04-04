@@ -3,16 +3,17 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AgentSkillFrontmatter {
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub license: Option<String>,
     #[serde(default)]
     pub compatibility: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     #[serde(default, rename = "allowed-tools")]
-    pub allowed_tools: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -80,6 +81,7 @@ pub(crate) fn validate_agent_skill_frontmatter(
     validate_skill_name_matches_dir(skill_dir, &frontmatter.name)?;
     validate_skill_description(&frontmatter.description)?;
     validate_skill_compatibility(frontmatter.compatibility.as_deref())?;
+    validate_allowed_tools(frontmatter.allowed_tools.as_deref())?;
     Ok(())
 }
 
@@ -130,6 +132,22 @@ fn validate_skill_compatibility(compatibility: Option<&str>) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_allowed_tools(allowed_tools: Option<&[String]>) -> Result<(), String> {
+    if let Some(allowed_tools) = allowed_tools {
+        if allowed_tools.is_empty() {
+            return Err("Agent Skills `allowed-tools` must not be an empty list".to_string());
+        }
+        for tool in allowed_tools {
+            if tool.trim().is_empty() {
+                return Err(
+                    "Agent Skills `allowed-tools` entries must be non-empty strings".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_skill_name_char(ch: char) -> bool {
     ch == '-' || ch.is_ascii_digit() || ch.is_ascii_lowercase()
 }
@@ -162,13 +180,18 @@ mod tests {
     #[test]
     fn parse_skill_markdown_extracts_frontmatter_and_body() {
         let parsed = parse_skill_markdown(
-            "---\nname: file-analyst\ndescription: Analyze files\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nBody\n",
+            "---\nname: file-analyst\ndescription: Analyze files\nlicense: MIT\nmetadata:\n  dispatch-manifest: dispatch.toml\nallowed-tools:\n  - Bash\n---\nBody\n",
         )
         .unwrap();
         assert_eq!(parsed.frontmatter.name, "file-analyst");
+        assert_eq!(parsed.frontmatter.license.as_deref(), Some("MIT"));
         assert_eq!(
             dispatch_skill_manifest_path(&parsed.frontmatter),
             Some("dispatch.toml")
+        );
+        assert_eq!(
+            parsed.frontmatter.allowed_tools.as_deref(),
+            Some(&["Bash".to_string()][..])
         );
         assert_eq!(parsed.body.trim(), "Body");
     }
@@ -187,6 +210,7 @@ mod tests {
         let frontmatter = AgentSkillFrontmatter {
             name: "file-analyst".to_string(),
             description: "x".repeat(1025),
+            license: None,
             compatibility: None,
             metadata: BTreeMap::new(),
             allowed_tools: None,
@@ -202,6 +226,7 @@ mod tests {
         let frontmatter = AgentSkillFrontmatter {
             name: "file-analyst".to_string(),
             description: "Analyze files".to_string(),
+            license: None,
             compatibility: Some("   ".to_string()),
             metadata: BTreeMap::new(),
             allowed_tools: None,
@@ -209,5 +234,21 @@ mod tests {
 
         let error = validate_agent_skill_frontmatter(skill_dir, &frontmatter).unwrap_err();
         assert!(error.contains("compatibility"));
+    }
+
+    #[test]
+    fn validate_agent_skill_frontmatter_rejects_empty_allowed_tools_entries() {
+        let skill_dir = Path::new("file-analyst");
+        let frontmatter = AgentSkillFrontmatter {
+            name: "file-analyst".to_string(),
+            description: "Analyze files".to_string(),
+            license: None,
+            compatibility: None,
+            metadata: BTreeMap::new(),
+            allowed_tools: Some(vec!["Bash".to_string(), " ".to_string()]),
+        };
+
+        let error = validate_agent_skill_frontmatter(skill_dir, &frontmatter).unwrap_err();
+        assert!(error.contains("allowed-tools"));
     }
 }

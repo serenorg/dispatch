@@ -425,6 +425,9 @@ fn build(path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
     println!("Parcel dir: {}", built.parcel_dir.display());
     println!("Manifest: {}", built.manifest_path.display());
     println!("Lockfile: {}", built.lockfile_path.display());
+    for warning in &built.warnings {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 
