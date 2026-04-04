@@ -1520,6 +1520,46 @@ fn builtin_memory_tool_schema(capability: &str) -> Option<serde_json::Value> {
             },
             "additionalProperties": false
         })),
+        "memory_list_range" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "start_key": { "type": "string" },
+                "end_key": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1 }
+            },
+            "additionalProperties": false
+        })),
+        "memory_delete_range" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "start_key": { "type": "string" },
+                "end_key": { "type": "string" }
+            },
+            "additionalProperties": false
+        })),
+        "memory_put_many" => Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "entries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string" },
+                            "value": { "type": "string" }
+                        },
+                        "required": ["key", "value"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["entries"],
+            "additionalProperties": false
+        })),
         _ => None,
     }
 }
@@ -1539,6 +1579,18 @@ fn builtin_memory_tool_description(tool: &BuiltinToolSpec) -> String {
             }
             "memory_list" => {
                 "List stored values from the configured Dispatch memory mount by prefix."
+                    .to_string()
+            }
+            "memory_list_range" => {
+                "List stored values from the configured Dispatch memory mount over a key range."
+                    .to_string()
+            }
+            "memory_delete_range" => {
+                "Delete stored values from the configured Dispatch memory mount over a key range."
+                    .to_string()
+            }
+            "memory_put_many" => {
+                "Store or update multiple values in the configured Dispatch memory mount."
                     .to_string()
             }
             _ => format!("Dispatch builtin capability `{}`.", tool.capability),
@@ -1876,6 +1928,15 @@ struct MemoryEntry {
     updated_at: u64,
 }
 
+fn map_memory_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    Ok(MemoryEntry {
+        namespace: row.get(0)?,
+        key: row.get(1)?,
+        value: row.get(2)?,
+        updated_at: row.get::<_, i64>(3)? as u64,
+    })
+}
+
 fn memory_mount_path(session: &CourierSession) -> Option<&Path> {
     session
         .resolved_mounts
@@ -1936,14 +1997,7 @@ fn memory_get(
                 "WHERE parcel_digest = ?1 AND namespace = ?2 AND key = ?3"
             ),
             params![session.parcel_digest, namespace, key],
-            |row| {
-                Ok(MemoryEntry {
-                    namespace: row.get(0)?,
-                    key: row.get(1)?,
-                    value: row.get(2)?,
-                    updated_at: row.get::<_, i64>(3)? as u64,
-                })
-            },
+            map_memory_entry,
         )
         .map(Some)
         .or_else(|error| match error {
@@ -2079,14 +2133,7 @@ fn memory_list(
     let rows = statement
         .query_map(
             params![session.parcel_digest, namespace, prefix_like],
-            |row| {
-                Ok(MemoryEntry {
-                    namespace: row.get(0)?,
-                    key: row.get(1)?,
-                    value: row.get(2)?,
-                    updated_at: row.get::<_, i64>(3)? as u64,
-                })
-            },
+            map_memory_entry,
         )
         .map_err(|source| CourierError::SqliteMount {
             path: path.display().to_string(),
@@ -2102,6 +2149,200 @@ fn memory_list(
         })?);
     }
     Ok(entries)
+}
+
+fn memory_list_range(
+    session: &CourierSession,
+    namespace: &str,
+    start_key: Option<&str>,
+    end_key: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<MemoryEntry>, CourierError> {
+    let path = require_memory_mount_path(session)?;
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_list_range",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    let mut query = String::from(concat!(
+        "SELECT namespace, key, value, updated_at ",
+        "FROM dispatch_memory ",
+        "WHERE parcel_digest = ?1 AND namespace = ?2 "
+    ));
+    if start_key.is_some() {
+        query.push_str("AND key >= ?3 ");
+    }
+    if end_key.is_some() {
+        query.push_str(if start_key.is_some() {
+            "AND key < ?4 "
+        } else {
+            "AND key < ?3 "
+        });
+    }
+    query.push_str("ORDER BY key ASC");
+    if let Some(limit) = limit {
+        query.push_str(&format!(" LIMIT {}", limit));
+    }
+
+    let mut statement = connection
+        .prepare(&query)
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "prepare_memory_list_range",
+            source,
+        })?;
+    let rows = match (start_key, end_key) {
+        (Some(start_key), Some(end_key)) => statement.query_map(
+            params![session.parcel_digest, namespace, start_key, end_key],
+            map_memory_entry,
+        ),
+        (Some(start_key), None) => statement.query_map(
+            params![session.parcel_digest, namespace, start_key],
+            map_memory_entry,
+        ),
+        (None, Some(end_key)) => statement.query_map(
+            params![session.parcel_digest, namespace, end_key],
+            map_memory_entry,
+        ),
+        (None, None) => {
+            statement.query_map(params![session.parcel_digest, namespace], map_memory_entry)
+        }
+    }
+    .map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "query_memory_list_range",
+        source,
+    })?;
+    let mut entries = Vec::new();
+    for entry in rows {
+        entries.push(entry.map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "read_memory_list_range",
+            source,
+        })?);
+    }
+    Ok(entries)
+}
+
+fn memory_delete_range(
+    session: &CourierSession,
+    namespace: &str,
+    start_key: Option<&str>,
+    end_key: Option<&str>,
+) -> Result<usize, CourierError> {
+    let path = require_memory_mount_path(session)?;
+    let connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_delete_range",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    let mut query = String::from(concat!(
+        "DELETE FROM dispatch_memory ",
+        "WHERE parcel_digest = ?1 AND namespace = ?2 "
+    ));
+    if start_key.is_some() {
+        query.push_str("AND key >= ?3 ");
+    }
+    if end_key.is_some() {
+        query.push_str(if start_key.is_some() {
+            "AND key < ?4"
+        } else {
+            "AND key < ?3"
+        });
+    }
+    let deleted = match (start_key, end_key) {
+        (Some(start_key), Some(end_key)) => connection.execute(
+            &query,
+            params![session.parcel_digest, namespace, start_key, end_key],
+        ),
+        (Some(start_key), None) => {
+            connection.execute(&query, params![session.parcel_digest, namespace, start_key])
+        }
+        (None, Some(end_key)) => {
+            connection.execute(&query, params![session.parcel_digest, namespace, end_key])
+        }
+        (None, None) => connection.execute(&query, params![session.parcel_digest, namespace]),
+    }
+    .map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "delete_memory_range",
+        source,
+    })?;
+    Ok(deleted)
+}
+
+fn memory_put_many(
+    session: &CourierSession,
+    namespace: &str,
+    entries: &[BuiltinMemoryPutEntry],
+) -> Result<usize, CourierError> {
+    let path = require_memory_mount_path(session)?;
+    let mut connection = Connection::open(path).map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "open_memory_put_many",
+        source,
+    })?;
+    ensure_memory_sqlite(&connection, path)?;
+    let tx = connection
+        .transaction()
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "begin_memory_put_many",
+            source,
+        })?;
+    let mut replaced = 0usize;
+    for entry in entries {
+        let existed = tx
+            .query_row(
+                concat!(
+                    "SELECT EXISTS(",
+                    "SELECT 1 FROM dispatch_memory ",
+                    "WHERE parcel_digest = ?1 AND namespace = ?2 AND key = ?3",
+                    ")"
+                ),
+                params![session.parcel_digest, namespace, entry.key],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(|source| CourierError::SqliteMount {
+                path: path.display().to_string(),
+                operation: "query_memory_put_many_exists",
+                source,
+            })?;
+        if existed {
+            replaced += 1;
+        }
+        tx.execute(
+            concat!(
+                "INSERT INTO dispatch_memory ",
+                "(parcel_digest, namespace, key, value, updated_at) ",
+                "VALUES (?1, ?2, ?3, ?4, ?5) ",
+                "ON CONFLICT(parcel_digest, namespace, key) DO UPDATE SET ",
+                "value = excluded.value, ",
+                "updated_at = excluded.updated_at"
+            ),
+            params![
+                session.parcel_digest,
+                namespace,
+                entry.key,
+                entry.value,
+                current_unix_timestamp() as i64,
+            ],
+        )
+        .map_err(|source| CourierError::SqliteMount {
+            path: path.display().to_string(),
+            operation: "upsert_memory_put_many",
+            source,
+        })?;
+    }
+    tx.commit().map_err(|source| CourierError::SqliteMount {
+        path: path.display().to_string(),
+        operation: "commit_memory_put_many",
+        source,
+    })?;
+    Ok(replaced)
 }
 
 fn escape_sql_like_prefix(prefix: &str) -> String {
@@ -2147,6 +2388,28 @@ struct BuiltinMemoryListInput {
     #[serde(default = "default_memory_namespace")]
     namespace: String,
     prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinMemoryRangeInput {
+    #[serde(default = "default_memory_namespace")]
+    namespace: String,
+    start_key: Option<String>,
+    end_key: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinMemoryPutEntry {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuiltinMemoryPutManyInput {
+    #[serde(default = "default_memory_namespace")]
+    namespace: String,
+    entries: Vec<BuiltinMemoryPutEntry>,
 }
 
 fn parse_builtin_tool_input<T>(tool: &str, input: &str) -> Result<T, CourierError>
@@ -2202,6 +2465,59 @@ fn execute_builtin_tool(
                     .collect::<Vec<_>>()
                     .join("\n")
             }
+        }
+        "memory_list_range" => {
+            let input: BuiltinMemoryRangeInput = parse_builtin_tool_input(capability, input)?;
+            let entries = memory_list_range(
+                session,
+                &input.namespace,
+                input.start_key.as_deref(),
+                input.end_key.as_deref(),
+                input.limit,
+            )?;
+            if entries.is_empty() {
+                format!("No memory entries in namespace `{}`.", input.namespace)
+            } else {
+                entries
+                    .into_iter()
+                    .map(|entry| format!("{}:{} = {}", entry.namespace, entry.key, entry.value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        "memory_delete_range" => {
+            let input: BuiltinMemoryRangeInput = parse_builtin_tool_input(capability, input)?;
+            let deleted = memory_delete_range(
+                session,
+                &input.namespace,
+                input.start_key.as_deref(),
+                input.end_key.as_deref(),
+            )?;
+            if deleted == 0 {
+                format!(
+                    "No memory entries deleted from namespace `{}`.",
+                    input.namespace
+                )
+            } else {
+                format!(
+                    "Deleted {} memory entr{} from namespace `{}`.",
+                    deleted,
+                    if deleted == 1 { "y" } else { "ies" },
+                    input.namespace
+                )
+            }
+        }
+        "memory_put_many" => {
+            let input: BuiltinMemoryPutManyInput = parse_builtin_tool_input(capability, input)?;
+            let replaced = memory_put_many(session, &input.namespace, &input.entries)?;
+            let stored = input.entries.len().saturating_sub(replaced);
+            format!(
+                "Stored {} and updated {} memory entr{} in namespace `{}`.",
+                stored,
+                replaced,
+                if input.entries.len() == 1 { "y" } else { "ies" },
+                input.namespace
+            )
         }
         _ => {
             return Err(CourierError::InvalidBuiltinToolInput {
@@ -8518,6 +8834,9 @@ FROM dispatch/native:latest
 MODEL gpt-5-mini
 TOOL BUILTIN memory_put
 TOOL BUILTIN memory_get DESCRIPTION \"Read remembered state.\"
+TOOL BUILTIN memory_list_range
+TOOL BUILTIN memory_delete_range
+TOOL BUILTIN memory_put_many
 TOOL BUILTIN web_search
 ENTRYPOINT chat
 ",
@@ -8525,9 +8844,12 @@ ENTRYPOINT chat
         );
 
         let tools = list_native_builtin_tools(&test_image.image);
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 5);
         assert_eq!(tools[0].capability, "memory_put");
         assert_eq!(tools[1].capability, "memory_get");
+        assert_eq!(tools[2].capability, "memory_list_range");
+        assert_eq!(tools[3].capability, "memory_delete_range");
+        assert_eq!(tools[4].capability, "memory_put_many");
         assert_eq!(
             tools[1].description.as_deref(),
             Some("Read remembered state.")
@@ -8542,6 +8864,9 @@ FROM dispatch/native:latest
 MODEL gpt-5-mini
 TOOL BUILTIN memory_put
 TOOL BUILTIN memory_get
+TOOL BUILTIN memory_list_range
+TOOL BUILTIN memory_delete_range
+TOOL BUILTIN memory_put_many
 ENTRYPOINT chat
 ",
             &[],
@@ -8558,13 +8883,16 @@ ENTRYPOINT chat
         .unwrap()
         .expect("expected model request");
 
-        assert_eq!(request.tools.len(), 2);
+        assert_eq!(request.tools.len(), 5);
         assert_eq!(request.tools[0].name, "memory_put");
         assert!(matches!(
             request.tools[0].format,
             ModelToolFormat::JsonSchema { .. }
         ));
         assert_eq!(request.tools[1].name, "memory_get");
+        assert_eq!(request.tools[2].name, "memory_list_range");
+        assert_eq!(request.tools[3].name, "memory_delete_range");
+        assert_eq!(request.tools[4].name, "memory_put_many");
     }
 
     #[test]
@@ -9809,6 +10137,57 @@ ENTRYPOINT chat
             Some(CourierEvent::Message { content, .. }) if content == "memory complete"
         ));
         assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
+    }
+
+    #[test]
+    fn execute_builtin_memory_range_and_batch_tools() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+MOUNT MEMORY sqlite
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        let put_many = execute_builtin_tool(
+            &session,
+            "memory_put_many",
+            r#"{"namespace":"profile","entries":[{"key":"a","value":"one"},{"key":"b","value":"two"},{"key":"c","value":"three"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            put_many
+                .stdout
+                .contains("Stored 3 and updated 0 memory entries in namespace `profile`.")
+        );
+
+        let range = execute_builtin_tool(
+            &session,
+            "memory_list_range",
+            r#"{"namespace":"profile","start_key":"b","end_key":"d"}"#,
+        )
+        .unwrap();
+        assert_eq!(range.stdout, "profile:b = two\nprofile:c = three");
+
+        let delete = execute_builtin_tool(
+            &session,
+            "memory_delete_range",
+            r#"{"namespace":"profile","start_key":"b","end_key":"c"}"#,
+        )
+        .unwrap();
+        assert!(
+            delete
+                .stdout
+                .contains("Deleted 1 memory entry from namespace `profile`.")
+        );
+
+        let remaining =
+            execute_builtin_tool(&session, "memory_list_range", r#"{"namespace":"profile"}"#)
+                .unwrap();
+        assert_eq!(remaining.stdout, "profile:a = one\nprofile:c = three");
     }
 
     #[test]

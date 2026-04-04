@@ -432,11 +432,15 @@ TOOL BUILTIN web_search
 TOOL BUILTIN human_approval APPROVAL audit RISK medium DESCRIPTION "Request a human approval with an audit trail."
 TOOL BUILTIN memory_put DESCRIPTION "Store a durable profile fact."
 TOOL BUILTIN memory_get DESCRIPTION "Load a durable profile fact."
+TOOL BUILTIN memory_list_range DESCRIPTION "List durable facts over a key range."
+TOOL BUILTIN memory_delete_range APPROVAL confirm RISK medium DESCRIPTION "Delete durable facts over a key range."
+TOOL BUILTIN memory_put_many DESCRIPTION "Store multiple durable facts in one call."
 ```
 
 Native courier note:
 
 - the native reference courier currently host-implements `memory_get`, `memory_put`, `memory_delete`, and `memory_list` for model-backed turns when a parcel declares `MOUNT MEMORY sqlite`
+- it also host-implements `memory_list_range`, `memory_delete_range`, and `memory_put_many` when a parcel declares `MOUNT MEMORY sqlite`
 - other builtin capabilities remain declarative until a courier provides a concrete implementation
 
 #### `TOOL MCP`
@@ -664,8 +668,10 @@ Supported fields in the reference runner:
 - `expects_tools`
 - `expects_tool_count`
 - `expects_tool_stdout_contains`
+- `expects_tool_stdout_matches_schema`
 - `expects_tool_stderr_contains`
 - `expects_tool_exit_code`
+- `expects_a2a_endpoint`
 - `expects_text_contains`
 - `expects_text_exact`
 - `expects_text_not_contains`
@@ -679,6 +685,8 @@ Tool result assertions accept either:
 ```toml
 expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
 ```
+
+Schema assertions resolve relative to the eval file's packaged directory and must point at JSON files already packaged into the parcel, for example via a declared tool schema.
 
 Run packaged evals with:
 

@@ -33,9 +33,13 @@ pub struct EvalSpec {
     #[serde(default)]
     pub expects_tool_stdout_contains: Option<ToolTextExpectation>,
     #[serde(default)]
+    pub expects_tool_stdout_matches_schema: Option<ToolSchemaExpectation>,
+    #[serde(default)]
     pub expects_tool_stderr_contains: Option<ToolTextExpectation>,
     #[serde(default)]
     pub expects_tool_exit_code: Option<ToolExitExpectation>,
+    #[serde(default)]
+    pub expects_a2a_endpoint: Option<ToolA2aEndpointExpectation>,
     #[serde(default)]
     pub expects_error_contains: Option<String>,
 }
@@ -52,6 +56,20 @@ pub enum ToolTextExpectation {
 pub enum ToolExitExpectation {
     ExitCode(i32),
     Scoped { tool: String, exit_code: i32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ToolSchemaExpectation {
+    Schema(String),
+    Scoped { tool: String, schema: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ToolA2aEndpointExpectation {
+    Url(String),
+    Scoped { tool: String, url: String },
 }
 
 #[derive(Debug, Error)]
@@ -217,5 +235,52 @@ mod tests {
 
         assert_eq!(evals.len(), 1);
         assert!(evals[0].1.expects_no_tool);
+    }
+
+    #[test]
+    fn load_parcel_evals_supports_schema_and_a2a_expectations() {
+        let dir = tempdir().unwrap();
+        let context_dir = dir.path().join("image");
+        fs::create_dir_all(context_dir.join("evals")).unwrap();
+        fs::write(
+            context_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nEVAL evals/expectations.eval\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+        fs::write(
+            context_dir.join("evals/expectations.eval"),
+            concat!(
+                "name = \"expectations\"\n",
+                "input = \"hi\"\n",
+                "expects_tool_stdout_matches_schema = { tool = \"broker\", schema = \"schemas/output.json\" }\n",
+                "expects_a2a_endpoint = { tool = \"broker\", url = \"https://broker.example.com\" }\n",
+            ),
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &context_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: context_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let parcel = load_parcel(&built.parcel_dir).unwrap();
+        let evals = load_parcel_evals(&parcel).unwrap();
+
+        assert_eq!(
+            evals[0].1.expects_tool_stdout_matches_schema,
+            Some(ToolSchemaExpectation::Scoped {
+                tool: "broker".to_string(),
+                schema: "schemas/output.json".to_string(),
+            })
+        );
+        assert_eq!(
+            evals[0].1.expects_a2a_endpoint,
+            Some(ToolA2aEndpointExpectation::Scoped {
+                tool: "broker".to_string(),
+                url: "https://broker.example.com".to_string(),
+            })
+        );
     }
 }

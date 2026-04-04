@@ -1,13 +1,18 @@
 use anyhow::{Context, Result, bail};
+use dispatch_core::eval::{ToolA2aEndpointExpectation, ToolSchemaExpectation};
 use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest,
     DockerCourier, EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier, ResolvedCourier,
-    ToolExitExpectation, ToolRunResult, ToolTextExpectation, WasmCourier, build_agentfile,
-    load_parcel, load_parcel_evals, resolve_courier,
+    ToolConfig, ToolExitExpectation, ToolRunResult, ToolTextExpectation, WasmCourier,
+    build_agentfile, load_parcel, load_parcel_evals, resolve_courier,
 };
 use futures::executor::block_on;
+use jsonschema::Validator;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct EvalCaseResult {
@@ -190,7 +195,7 @@ fn run_eval_case<R: CourierBackend>(
         },
         other => {
             result.error = Some(format!("unsupported eval entrypoint `{other}`"));
-            apply_eval_expectations(&mut result, spec, &[]);
+            apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
             return result;
         }
     };
@@ -199,7 +204,7 @@ fn run_eval_case<R: CourierBackend>(
         Ok(session) => session,
         Err(error) => {
             result.error = Some(error.to_string());
-            apply_eval_expectations(&mut result, spec, &[]);
+            apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
             return result;
         }
     };
@@ -208,7 +213,7 @@ fn run_eval_case<R: CourierBackend>(
             "courier returned session for parcel {} while evaluating {}",
             session.parcel_digest, parcel.config.digest
         ));
-        apply_eval_expectations(&mut result, spec, &[]);
+        apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
         return result;
     }
 
@@ -216,7 +221,7 @@ fn run_eval_case<R: CourierBackend>(
         Ok(response) => response,
         Err(error) => {
             result.error = Some(error.to_string());
-            apply_eval_expectations(&mut result, spec, &[]);
+            apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
             return result;
         }
     };
@@ -244,16 +249,18 @@ fn run_eval_case<R: CourierBackend>(
             "courier returned response session for parcel {} while evaluating {}",
             response.session.parcel_digest, parcel.config.digest
         ));
-        apply_eval_expectations(&mut result, spec, &text_observations);
+        apply_eval_expectations(&mut result, parcel, packaged_path, spec, &text_observations);
         return result;
     }
 
-    apply_eval_expectations(&mut result, spec, &text_observations);
+    apply_eval_expectations(&mut result, parcel, packaged_path, spec, &text_observations);
     result
 }
 
 fn apply_eval_expectations(
     result: &mut EvalCaseResult,
+    parcel: &LoadedParcel,
+    packaged_eval_path: &str,
     spec: &EvalSpec,
     text_observations: &[String],
 ) {
@@ -332,6 +339,17 @@ fn apply_eval_expectations(
         });
     }
 
+    if let Some(expected_schema) = &spec.expects_tool_stdout_matches_schema
+        && let Err(message) = validate_tool_stdout_schema(
+            parcel,
+            packaged_eval_path,
+            &result.tool_results,
+            expected_schema,
+        )
+    {
+        result.failures.push(message);
+    }
+
     if let Some(expected_stderr) = &spec.expects_tool_stderr_contains
         && !tool_text_expectation_satisfied(&result.tool_results, expected_stderr, |tool_result| {
             &tool_result.stderr
@@ -358,6 +376,13 @@ fn apply_eval_expectations(
                 format!("expected tool `{tool}` exit code `{exit_code}`")
             }
         });
+    }
+
+    if let Some(expected_endpoint) = &spec.expects_a2a_endpoint
+        && let Err(message) =
+            validate_a2a_endpoint_expectation(parcel, &result.tool_calls, expected_endpoint)
+    {
+        result.failures.push(message);
     }
 
     let error_expectation_satisfied = if let Some(expected_error) = &spec.expects_error_contains {
@@ -396,6 +421,118 @@ pub(crate) fn tool_text_expectation_satisfied(
             .iter()
             .any(|tool_result| tool_result.tool == *tool && field(tool_result).contains(contains)),
     }
+}
+
+fn validate_tool_stdout_schema(
+    parcel: &LoadedParcel,
+    packaged_eval_path: &str,
+    tool_results: &[ToolRunResult],
+    expectation: &ToolSchemaExpectation,
+) -> Result<(), String> {
+    let (tool_name, schema_path) = match expectation {
+        ToolSchemaExpectation::Schema(schema) => (None, schema.as_str()),
+        ToolSchemaExpectation::Scoped { tool, schema } => (Some(tool.as_str()), schema.as_str()),
+    };
+    let Some(tool_result) = tool_results.iter().find(|tool_result| match tool_name {
+        Some(tool) => tool_result.tool == tool,
+        None => true,
+    }) else {
+        return Err(match tool_name {
+            Some(tool) => format!("expected tool `{tool}` output for schema validation"),
+            None => "expected at least one tool output for schema validation".to_string(),
+        });
+    };
+
+    let stdout_json: serde_json::Value =
+        serde_json::from_str(&tool_result.stdout).map_err(|error| match tool_name {
+            Some(tool) => format!("expected tool `{tool}` stdout to be JSON: {error}"),
+            None => format!("expected tool stdout to be JSON: {error}"),
+        })?;
+    let schema = load_eval_relative_json(parcel, packaged_eval_path, schema_path)
+        .map_err(|error| format!("failed to load schema `{schema_path}`: {error}"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("invalid schema `{schema_path}`: {error}"))?;
+    validate_json_against_schema(
+        &validator,
+        &stdout_json,
+        tool_name.unwrap_or(tool_result.tool.as_str()),
+    )
+}
+
+fn validate_json_against_schema(
+    validator: &Validator,
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<(), String> {
+    let mut errors = validator.iter_errors(value);
+    match errors.next() {
+        Some(error) => Err(format!(
+            "expected tool `{label}` stdout to match schema: {error}"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn validate_a2a_endpoint_expectation(
+    parcel: &LoadedParcel,
+    tool_calls: &[String],
+    expectation: &ToolA2aEndpointExpectation,
+) -> Result<(), String> {
+    let (tool_name, expected_url) = match expectation {
+        ToolA2aEndpointExpectation::Url(url) => (None, url.as_str()),
+        ToolA2aEndpointExpectation::Scoped { tool, url } => (Some(tool.as_str()), url.as_str()),
+    };
+    let Some(a2a_alias) = parcel.config.tools.iter().find_map(|tool| match tool {
+        ToolConfig::A2a(a2a)
+            if match tool_name {
+                Some(expected_tool_name) => a2a.alias == expected_tool_name,
+                None => true,
+            } && a2a.url == expected_url
+                && tool_calls.iter().any(|called| called == &a2a.alias) =>
+        {
+            Some(a2a.alias.as_str())
+        }
+        _ => None,
+    }) else {
+        return Err(match tool_name {
+            Some(tool) => format!("expected A2A tool `{tool}` to call endpoint `{expected_url}`"),
+            None => format!("expected an A2A tool call to endpoint `{expected_url}`"),
+        });
+    };
+    if let Some(tool_name) = tool_name
+        && a2a_alias != tool_name
+    {
+        return Err(format!(
+            "expected A2A tool `{tool_name}` to call endpoint `{expected_url}`"
+        ));
+    }
+    Ok(())
+}
+
+fn load_eval_relative_json(
+    parcel: &LoadedParcel,
+    packaged_eval_path: &str,
+    relative_path: &str,
+) -> Result<serde_json::Value> {
+    let context_root = parcel.parcel_dir.join("context");
+    let context_root = context_root
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("failed to access parcel context: {error}"))?;
+    let eval_dir = Path::new(packaged_eval_path)
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let candidate = context_root.join(eval_dir).join(relative_path);
+    let resolved = candidate.canonicalize().map_err(|error| {
+        anyhow::anyhow!("failed to resolve path {}: {error}", candidate.display())
+    })?;
+    if !resolved.starts_with(&context_root) {
+        bail!("path `{relative_path}` resolves outside parcel context");
+    }
+    let source = fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read {}", resolved.display()))?;
+    serde_json::from_str(&source)
+        .with_context(|| format!("failed to parse JSON from {}", resolved.display()))
 }
 
 pub(crate) fn tool_exit_expectation_satisfied(
@@ -438,5 +575,153 @@ fn print_eval_report(report: &EvalReport) {
         for failure in &result.failures {
             println!("failure: {failure}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dispatch_core::build_agentfile;
+    use tempfile::tempdir;
+
+    fn build_eval_parcel(
+        agentfile: &str,
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, LoadedParcel) {
+        let dir = tempdir().unwrap();
+        let context_dir = dir.path().join("image");
+        fs::create_dir_all(&context_dir).unwrap();
+        fs::write(context_dir.join("Agentfile"), agentfile).unwrap();
+        for (path, contents) in files {
+            let full = context_dir.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(full, contents).unwrap();
+        }
+        let built = build_agentfile(
+            &context_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: context_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let parcel = load_parcel(&built.parcel_dir).unwrap();
+        (dir, parcel)
+    }
+
+    #[test]
+    fn apply_eval_expectations_validates_tool_stdout_against_schema() {
+        let (_dir, parcel) = build_eval_parcel(
+            concat!(
+                "FROM dispatch/native:latest\n",
+                "TOOL LOCAL scripts/demo.sh AS demo SCHEMA schemas/output.json\n",
+                "EVAL evals/output.eval\n",
+                "ENTRYPOINT chat\n",
+            ),
+            &[
+                ("evals/output.eval", "name = \"demo\"\ninput = \"hi\"\n"),
+                ("scripts/demo.sh", "#!/bin/sh\necho ok\n"),
+                (
+                    "schemas/output.json",
+                    r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#,
+                ),
+            ],
+        );
+        let mut result = EvalCaseResult {
+            name: "demo".to_string(),
+            packaged_path: "evals/output.eval".to_string(),
+            entrypoint: "chat".to_string(),
+            passed: false,
+            tool_calls: vec!["demo".to_string()],
+            tool_results: vec![ToolRunResult {
+                tool: "demo".to_string(),
+                command: "sh".to_string(),
+                args: Vec::new(),
+                exit_code: 0,
+                stdout: r#"{"ok":true}"#.to_string(),
+                stderr: String::new(),
+            }],
+            assistant_messages: Vec::new(),
+            failures: Vec::new(),
+            error: None,
+        };
+        let spec = EvalSpec {
+            name: "demo".to_string(),
+            input: "hi".to_string(),
+            entrypoint: Some("chat".to_string()),
+            expects_tool: None,
+            expects_text: None,
+            expects_text_exact: None,
+            expects_text_not_contains: None,
+            expects_tool_count: None,
+            expects_tools: Vec::new(),
+            expects_no_tool: false,
+            expects_tool_stdout_contains: None,
+            expects_tool_stdout_matches_schema: Some(ToolSchemaExpectation::Scoped {
+                tool: "demo".to_string(),
+                schema: "../schemas/output.json".to_string(),
+            }),
+            expects_tool_stderr_contains: None,
+            expects_tool_exit_code: None,
+            expects_a2a_endpoint: None,
+            expects_error_contains: None,
+        };
+
+        apply_eval_expectations(&mut result, &parcel, "evals/output.eval", &spec, &[]);
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn apply_eval_expectations_rejects_wrong_a2a_endpoint() {
+        let (_dir, parcel) = build_eval_parcel(
+            concat!(
+                "FROM dispatch/native:latest\n",
+                "TOOL A2A broker URL https://broker.example.com\n",
+                "EVAL evals/output.eval\n",
+                "ENTRYPOINT chat\n",
+            ),
+            &[("evals/output.eval", "name = \"demo\"\ninput = \"hi\"\n")],
+        );
+        let mut result = EvalCaseResult {
+            name: "demo".to_string(),
+            packaged_path: "evals/output.eval".to_string(),
+            entrypoint: "chat".to_string(),
+            passed: false,
+            tool_calls: vec!["broker".to_string()],
+            tool_results: Vec::new(),
+            assistant_messages: Vec::new(),
+            failures: Vec::new(),
+            error: None,
+        };
+        let spec = EvalSpec {
+            name: "demo".to_string(),
+            input: "hi".to_string(),
+            entrypoint: Some("chat".to_string()),
+            expects_tool: None,
+            expects_text: None,
+            expects_text_exact: None,
+            expects_text_not_contains: None,
+            expects_tool_count: None,
+            expects_tools: Vec::new(),
+            expects_no_tool: false,
+            expects_tool_stdout_contains: None,
+            expects_tool_stdout_matches_schema: None,
+            expects_tool_stderr_contains: None,
+            expects_tool_exit_code: None,
+            expects_a2a_endpoint: Some(ToolA2aEndpointExpectation::Scoped {
+                tool: "broker".to_string(),
+                url: "https://other.example.com".to_string(),
+            }),
+            expects_error_contains: None,
+        };
+
+        apply_eval_expectations(&mut result, &parcel, "evals/output.eval", &spec, &[]);
+        assert_eq!(
+            result.failures,
+            vec!["expected A2A tool `broker` to call endpoint `https://other.example.com`"]
+        );
+        assert!(!result.passed);
     }
 }
