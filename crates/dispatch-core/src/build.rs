@@ -802,20 +802,27 @@ fn process_skill_instruction(
         allowed_tools: parsed_skill.frontmatter.allowed_tools.clone(),
     });
 
-    if let Some(sidecar_path) =
+    if let Some(sidecar) =
         resolve_skill_dispatch_manifest_path(&skill_dir, &parsed_skill.frontmatter)?
     {
+        let sidecar_path = sidecar.path();
         let sidecar_source =
-            fs::read_to_string(&sidecar_path).map_err(|source| BuildError::ReadFile {
+            fs::read_to_string(sidecar_path).map_err(|source| BuildError::ReadFile {
                 path: sidecar_path.display().to_string(),
                 source,
             })?;
         let skill_manifest: DispatchSkillManifest =
             toml::from_str(&sidecar_source).map_err(|source| {
-                BuildError::Validation(format!(
+                let mut message = format!(
                     "failed to parse Dispatch skill manifest `{}`: {source}",
                     sidecar_path.display()
-                ))
+                );
+                if sidecar.is_auto_detected() {
+                    message.push_str(
+                        "; `dispatch.toml` is reserved for skill sidecars and is auto-detected inside skill directories. Rename the file or set `metadata.dispatch-manifest` to an explicit sidecar path."
+                    );
+                }
+                BuildError::Validation(message)
             })?;
 
         if let Some(entrypoint) = skill_manifest.entrypoint.as_deref() {
@@ -853,16 +860,37 @@ fn process_skill_instruction(
     Ok(())
 }
 
+enum SkillDispatchManifestSource {
+    Explicit(PathBuf),
+    AutoDetected(PathBuf),
+}
+
+impl SkillDispatchManifestSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Explicit(path) | Self::AutoDetected(path) => path,
+        }
+    }
+
+    fn is_auto_detected(&self) -> bool {
+        matches!(self, Self::AutoDetected(_))
+    }
+}
+
 fn resolve_skill_dispatch_manifest_path(
     skill_dir: &Path,
     frontmatter: &crate::skill::AgentSkillFrontmatter,
-) -> Result<Option<PathBuf>, BuildError> {
+) -> Result<Option<SkillDispatchManifestSource>, BuildError> {
     if let Some(path) = dispatch_skill_manifest_path(frontmatter) {
-        return Ok(Some(resolve_skill_member_path(skill_dir, path)?));
+        return Ok(Some(SkillDispatchManifestSource::Explicit(
+            resolve_skill_member_path(skill_dir, path)?,
+        )));
     }
     let default = skill_dir.join("dispatch.toml");
     if default.is_file() {
-        return Ok(Some(resolve_skill_member_path(skill_dir, "dispatch.toml")?));
+        return Ok(Some(SkillDispatchManifestSource::AutoDetected(
+            resolve_skill_member_path(skill_dir, "dispatch.toml")?,
+        )));
     }
     Ok(None)
 }
@@ -2226,6 +2254,37 @@ ENTRYPOINT chat
                 .to_string()
                 .contains("tool `read_file` is declared more than once by skill `file-analyst`")
         );
+    }
+
+    #[test]
+    fn build_reports_reserved_dispatch_toml_on_autodetect_parse_failure() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("dispatch.toml"), "this is not toml\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("failed to parse Dispatch skill manifest"));
+        assert!(message.contains("`dispatch.toml` is reserved for skill sidecars"));
+        assert!(message.contains("metadata.dispatch-manifest"));
     }
 
     #[test]
