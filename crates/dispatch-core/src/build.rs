@@ -10,6 +10,10 @@ use crate::{
         WasmComponentConfig,
     },
     parse_agentfile,
+    skill::{
+        DispatchSkillManifest, DispatchSkillTool, dispatch_skill_manifest_path,
+        parse_skill_markdown, validate_skill_name_matches_dir,
+    },
     validate::{Level, validate_agentfile},
 };
 use serde::{Deserialize, Serialize};
@@ -267,48 +271,8 @@ pub fn build_agentfile(
             }
             "TOOL" => {
                 if let Some(mut tool) = parse_tool(&instruction.args)? {
-                    match &mut tool {
-                        ToolConfig::Local(local) => {
-                            let resolved_path = resolve_path(&context_dir, &local.packaged_path)?;
-                            let file_record =
-                                package_path(&context_dir, &resolved_path, &mut packaged)?;
-                            files.extend(file_record.expand());
-                            if let Some(schema) = &local.input_schema {
-                                let resolved_schema_path =
-                                    resolve_path(&context_dir, &schema.packaged_path)?;
-                                validate_tool_schema(&resolved_schema_path, &local.alias)?;
-                                let schema_record = package_path(
-                                    &context_dir,
-                                    &resolved_schema_path,
-                                    &mut packaged,
-                                )?;
-                                local.input_schema = Some(ToolInputSchemaRef {
-                                    packaged_path: schema.packaged_path.clone(),
-                                    sha256: schema_record.sha256.clone(),
-                                });
-                                files.extend(schema_record.expand());
-                            }
-                        }
-                        ToolConfig::A2a(tool) => {
-                            if let Some(schema) = &tool.input_schema {
-                                let resolved_schema_path =
-                                    resolve_path(&context_dir, &schema.packaged_path)?;
-                                validate_tool_schema(&resolved_schema_path, &tool.alias)?;
-                                let schema_record = package_path(
-                                    &context_dir,
-                                    &resolved_schema_path,
-                                    &mut packaged,
-                                )?;
-                                tool.input_schema = Some(ToolInputSchemaRef {
-                                    packaged_path: schema.packaged_path.clone(),
-                                    sha256: schema_record.sha256.clone(),
-                                });
-                                files.extend(schema_record.expand());
-                            }
-                        }
-                        ToolConfig::Builtin(_) | ToolConfig::Mcp(_) => {}
-                    }
-                    resolved.tools.push(tool);
+                    package_tool_config(&context_dir, &mut packaged, &mut files, &mut tool)?;
+                    insert_resolved_tool(&mut resolved.tools, tool);
                 }
             }
             "MODEL" => {
@@ -352,7 +316,17 @@ pub fn build_agentfile(
                     }
                 }
             }
-            "IDENTITY" | "SOUL" | "SKILL" | "AGENTS" | "USER" | "TOOLS" | "EVAL" => {
+            "SKILL" => {
+                let source_path = scalar_at(&instruction.args, 0);
+                process_skill_instruction(
+                    &context_dir,
+                    &source_path,
+                    &mut packaged,
+                    &mut files,
+                    &mut resolved,
+                )?;
+            }
+            "IDENTITY" | "SOUL" | "AGENTS" | "USER" | "TOOLS" | "EVAL" => {
                 let source_path = scalar_at(&instruction.args, 0);
                 let resolved_path = resolve_path(&context_dir, &source_path)?;
                 let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
@@ -726,6 +700,235 @@ fn package_path(
         sha256: encode_hex(hasher.finalize()),
         entries,
     })
+}
+
+fn process_skill_instruction(
+    context_dir: &Path,
+    source_path: &str,
+    packaged: &mut BTreeMap<String, Vec<u8>>,
+    files: &mut Vec<ParcelFileRecord>,
+    resolved: &mut ResolvedAgentSpec,
+) -> Result<(), BuildError> {
+    let resolved_path = resolve_path(context_dir, source_path)?;
+    if resolved_path.is_file() {
+        let file_record = package_path(context_dir, &resolved_path, packaged)?;
+        resolved.instructions.push(InstructionConfig {
+            kind: InstructionKind::Skill,
+            packaged_path: source_path.to_string(),
+            sha256: file_record.sha256.clone(),
+        });
+        files.extend(file_record.expand());
+        return Ok(());
+    }
+
+    let skill_dir = resolved_path;
+    let skill_md_path = skill_dir.join("SKILL.md");
+    if !skill_md_path.exists() {
+        return Err(BuildError::Validation(format!(
+            "SKILL directory `{source_path}` must contain `SKILL.md`"
+        )));
+    }
+
+    let skill_source =
+        fs::read_to_string(&skill_md_path).map_err(|source| BuildError::ReadFile {
+            path: skill_md_path.display().to_string(),
+            source,
+        })?;
+    let parsed_skill = parse_skill_markdown(&skill_source).map_err(|source| {
+        BuildError::Validation(format!(
+            "failed to parse Agent Skills frontmatter in `{}`: {source}",
+            skill_md_path.display()
+        ))
+    })?;
+    validate_skill_name_matches_dir(&skill_dir, &parsed_skill.frontmatter.name)
+        .map_err(BuildError::Validation)?;
+    if parsed_skill.frontmatter.description.trim().is_empty() {
+        return Err(BuildError::Validation(format!(
+            "Agent Skills `description` in `{}` must be non-empty",
+            skill_md_path.display()
+        )));
+    }
+
+    let bundle_record = package_path(context_dir, &skill_dir, packaged)?;
+    let skill_md_packaged_path = relative_display(context_dir, &skill_md_path);
+    let skill_file_record = bundle_record
+        .entries
+        .iter()
+        .find(|entry| entry.packaged_as == skill_md_packaged_path)
+        .cloned()
+        .ok_or_else(|| {
+            BuildError::Validation(format!(
+                "packaged skill bundle `{}` did not include `{}`",
+                skill_dir.display(),
+                skill_md_packaged_path
+            ))
+        })?;
+    files.extend(bundle_record.expand());
+
+    resolved.instructions.push(InstructionConfig {
+        kind: InstructionKind::Skill,
+        packaged_path: skill_md_packaged_path,
+        sha256: skill_file_record.sha256.clone(),
+    });
+
+    if let Some(sidecar_path) =
+        resolve_skill_dispatch_manifest_path(&skill_dir, &parsed_skill.frontmatter)?
+    {
+        let sidecar_source =
+            fs::read_to_string(&sidecar_path).map_err(|source| BuildError::ReadFile {
+                path: sidecar_path.display().to_string(),
+                source,
+            })?;
+        let skill_manifest: DispatchSkillManifest =
+            toml::from_str(&sidecar_source).map_err(|source| {
+                BuildError::Validation(format!(
+                    "failed to parse Dispatch skill manifest `{}`: {source}",
+                    sidecar_path.display()
+                ))
+            })?;
+
+        for skill_tool in skill_manifest.tools {
+            let mut tool = synthesize_skill_tool(context_dir, &skill_dir, &skill_tool)?;
+            package_tool_config(context_dir, packaged, files, &mut tool)?;
+            insert_resolved_tool(&mut resolved.tools, tool);
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_skill_dispatch_manifest_path(
+    skill_dir: &Path,
+    frontmatter: &crate::skill::AgentSkillFrontmatter,
+) -> Result<Option<PathBuf>, BuildError> {
+    if let Some(path) = dispatch_skill_manifest_path(frontmatter) {
+        return Ok(Some(resolve_skill_member_path(skill_dir, path)?));
+    }
+    let default = skill_dir.join("dispatch.toml");
+    Ok(default.exists().then_some(default))
+}
+
+fn resolve_skill_member_path(skill_dir: &Path, relative: &str) -> Result<PathBuf, BuildError> {
+    let joined = skill_dir.join(relative);
+    if !joined.exists() {
+        return Err(BuildError::MissingPath {
+            path: relative.to_string(),
+        });
+    }
+    let resolved = joined
+        .canonicalize()
+        .map_err(|source| BuildError::ReadFile {
+            path: joined.display().to_string(),
+            source,
+        })?;
+    if !resolved.starts_with(skill_dir) {
+        return Err(BuildError::Validation(format!(
+            "skill path `{relative}` escapes skill directory `{}`",
+            skill_dir.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn synthesize_skill_tool(
+    context_dir: &Path,
+    skill_dir: &Path,
+    skill_tool: &DispatchSkillTool,
+) -> Result<ToolConfig, BuildError> {
+    let resolved_script = resolve_skill_member_path(skill_dir, &skill_tool.script)?;
+    let packaged_path = relative_display(context_dir, &resolved_script);
+    let runner = match &skill_tool.runner {
+        Some(runner) => CommandSpec {
+            command: runner.clone(),
+            args: skill_tool.args.clone(),
+        },
+        None => {
+            let mut inferred = infer_runner(&packaged_path);
+            inferred.args = skill_tool.args.clone();
+            inferred
+        }
+    };
+
+    let input_schema = if let Some(schema_path) = &skill_tool.schema {
+        let resolved_schema = resolve_skill_member_path(skill_dir, schema_path)?;
+        validate_tool_schema(&resolved_schema, &skill_tool.name)?;
+        Some(ToolInputSchemaRef {
+            packaged_path: relative_display(context_dir, &resolved_schema),
+            sha256: String::new(),
+        })
+    } else {
+        None
+    };
+
+    Ok(ToolConfig::Local(LocalToolConfig {
+        alias: skill_tool.name.clone(),
+        packaged_path,
+        runner,
+        approval: skill_tool.approval,
+        risk: skill_tool.risk,
+        description: skill_tool.description.clone(),
+        input_schema,
+    }))
+}
+
+fn package_tool_config(
+    context_dir: &Path,
+    packaged: &mut BTreeMap<String, Vec<u8>>,
+    files: &mut Vec<ParcelFileRecord>,
+    tool: &mut ToolConfig,
+) -> Result<(), BuildError> {
+    match tool {
+        ToolConfig::Local(local) => {
+            let resolved_path = resolve_path(context_dir, &local.packaged_path)?;
+            let file_record = package_path(context_dir, &resolved_path, packaged)?;
+            files.extend(file_record.expand());
+            if let Some(schema) = &local.input_schema {
+                let resolved_schema_path = resolve_path(context_dir, &schema.packaged_path)?;
+                validate_tool_schema(&resolved_schema_path, &local.alias)?;
+                let schema_record = package_path(context_dir, &resolved_schema_path, packaged)?;
+                local.input_schema = Some(ToolInputSchemaRef {
+                    packaged_path: schema.packaged_path.clone(),
+                    sha256: schema_record.sha256.clone(),
+                });
+                files.extend(schema_record.expand());
+            }
+        }
+        ToolConfig::A2a(tool) => {
+            if let Some(schema) = &tool.input_schema {
+                let resolved_schema_path = resolve_path(context_dir, &schema.packaged_path)?;
+                validate_tool_schema(&resolved_schema_path, &tool.alias)?;
+                let schema_record = package_path(context_dir, &resolved_schema_path, packaged)?;
+                tool.input_schema = Some(ToolInputSchemaRef {
+                    packaged_path: schema.packaged_path.clone(),
+                    sha256: schema_record.sha256.clone(),
+                });
+                files.extend(schema_record.expand());
+            }
+        }
+        ToolConfig::Builtin(_) | ToolConfig::Mcp(_) => {}
+    }
+    Ok(())
+}
+
+fn insert_resolved_tool(tools: &mut Vec<ToolConfig>, tool: ToolConfig) {
+    let alias = tool_alias(&tool).map(ToOwned::to_owned);
+    if let Some(alias) = alias
+        && let Some(existing) = tools
+            .iter_mut()
+            .find(|existing| tool_alias(existing) == Some(alias.as_str()))
+    {
+        *existing = tool;
+        return;
+    }
+    tools.push(tool);
+}
+
+fn tool_alias(tool: &ToolConfig) -> Option<&str> {
+    match tool {
+        ToolConfig::Local(local) => Some(local.alias.as_str()),
+        ToolConfig::A2a(tool) => Some(tool.alias.as_str()),
+        ToolConfig::Builtin(_) | ToolConfig::Mcp(_) => None,
+    }
 }
 
 fn resolve_path(context_dir: &Path, relative: &str) -> Result<PathBuf, BuildError> {
@@ -1480,6 +1683,102 @@ ENTRYPOINT chat
             }
             other => panic!("expected builtin tool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_supports_agent_skill_directory_bundles() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::create_dir_all(skill_dir.join("schemas")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\nrisk = \"low\"\ndescription = \"Read a file\"\n\n[[tools]]\nname = \"find_files\"\nscript = \"scripts/find_files.sh\"\nschema = \"schemas/find_files.json\"\napproval = \"confirm\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::write(skill_dir.join("scripts/find_files.sh"), "echo ok\n").unwrap();
+        fs::write(
+            skill_dir.join("schemas/find_files.json"),
+            "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"pattern\": { \"type\": \"string\" }\n  },\n  \"required\": [\"pattern\"]\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        assert_eq!(parcel.instructions.len(), 1);
+        assert_eq!(
+            parcel.instructions[0].packaged_path,
+            "file-analyst/SKILL.md"
+        );
+        assert_eq!(parcel.tools.len(), 2);
+        match &parcel.tools[0] {
+            ToolConfig::Local(local) => {
+                assert_eq!(local.alias, "read_file");
+                assert_eq!(local.packaged_path, "file-analyst/scripts/read_file.sh");
+                assert_eq!(local.risk, Some(ToolRiskLevel::Low));
+            }
+            other => panic!("expected local tool, got {other:?}"),
+        }
+        match &parcel.tools[1] {
+            ToolConfig::Local(local) => {
+                assert_eq!(local.alias, "find_files");
+                assert_eq!(
+                    local
+                        .input_schema
+                        .as_ref()
+                        .map(|schema| schema.packaged_path.as_str()),
+                    Some("file-analyst/schemas/find_files.json")
+                );
+                assert_eq!(local.approval, Some(ToolApprovalPolicy::Confirm));
+            }
+            other => panic!("expected local tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_skill_directory_with_mismatched_agent_skill_name() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: wrong-name\ndescription: Analyze files.\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must match skill directory"));
     }
 
     #[test]

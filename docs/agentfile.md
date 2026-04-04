@@ -235,6 +235,59 @@ Primary task instructions and operating playbook.
 
 ```dockerfile
 SKILL SKILL.md
+SKILL skills/file-analyst
+```
+
+Semantics:
+
+- accepts either a markdown file or an [Agent Skills](https://agentskills.io/specification) directory
+- when the argument is a file, Dispatch packages it as a normal skill instruction
+- when the argument is a directory, Dispatch requires `SKILL.md` in that directory
+- `SKILL.md` frontmatter is parsed for Agent Skills metadata and stripped from the prompt text seen by the model
+- the rest of the directory is packaged with the parcel so `scripts/`, `references/`, and `assets/` travel with the skill bundle
+- if the skill directory contains `dispatch.toml`, or `SKILL.md` frontmatter sets `metadata.dispatch-manifest = "..."`, Dispatch loads Dispatch-specific tool metadata from that TOML sidecar and synthesizes those entries into the parcel as normal local tools
+- if the `Agentfile` later declares `TOOL ...` with the same alias as a skill-generated tool, the explicit `TOOL` declaration wins
+
+Recommended Agent Skills-compatible layout:
+
+```text
+skills/file-analyst/
+|-- SKILL.md
+|-- dispatch.toml
+|-- scripts/
+|-- references/
+|-- assets/
+\-- schemas/
+```
+
+Example `SKILL.md`:
+
+```markdown
+---
+name: file-analyst
+description: Analyze files and directories.
+metadata:
+  dispatch-manifest: dispatch.toml
+---
+
+Use the file tools before answering.
+```
+
+Example `dispatch.toml`:
+
+```toml
+[[tools]]
+name = "read_file"
+script = "scripts/read_file.sh"
+risk = "low"
+description = "Read the full contents of a file."
+
+[[tools]]
+name = "find_files"
+script = "scripts/find_files.sh"
+schema = "schemas/find_files.json"
+risk = "low"
+description = "Find files matching a pattern."
 ```
 
 #### `IDENTITY`

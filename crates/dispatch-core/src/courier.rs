@@ -5,6 +5,7 @@ use crate::{
     },
     plugin_protocol::{PluginRequest, PluginRequestEnvelope, PluginResponse},
     plugins::CourierPluginManifest,
+    skill::strip_skill_frontmatter,
 };
 use dispatch_wasm_abi::ABI as DISPATCH_WASM_COMPONENT_ABI;
 use jsonschema::Validator;
@@ -1304,6 +1305,11 @@ pub fn resolve_prompt_text(parcel: &LoadedParcel) -> Result<String, CourierError
             path: path.display().to_string(),
             source,
         })?;
+        let body = if matches!(instruction.kind, InstructionKind::Skill) {
+            strip_skill_frontmatter(&body)
+        } else {
+            body.as_str()
+        };
         sections.push(format!(
             "# {}\n\n{}",
             instruction_heading(instruction.kind),
@@ -5813,6 +5819,38 @@ ENTRYPOINT chat
         assert!(prompt.contains("# MEMORY"));
         assert!(!prompt.contains("smoke.eval"));
         assert!(!prompt.contains("# EVAL"));
+    }
+
+    #[test]
+    fn resolve_prompt_strips_agent_skill_frontmatter_for_skill_directories() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+SKILL file-analyst
+ENTRYPOINT chat
+",
+            &[
+                (
+                    "file-analyst/SKILL.md",
+                    "---\nname: file-analyst\ndescription: Analyze files\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nUse the file tools before answering.\n",
+                ),
+                (
+                    "file-analyst/dispatch.toml",
+                    "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
+                ),
+                (
+                    "file-analyst/scripts/read_file.sh",
+                    "#!/bin/sh\ncat \"$1\"\n",
+                ),
+            ],
+        );
+
+        let prompt = resolve_prompt_text(&test_image.image).unwrap();
+        assert!(prompt.contains("# SKILL"));
+        assert!(prompt.contains("Use the file tools before answering."));
+        assert!(!prompt.contains("dispatch-manifest"));
+        assert!(!prompt.contains("name: file-analyst"));
+        assert!(!prompt.contains("description: Analyze files"));
     }
 
     #[test]

@@ -48,6 +48,7 @@ An agent project has:
 
 - an `Agentfile`
 - optional instruction files: `IDENTITY.md`, `SOUL.md`, `SKILL.md`, `AGENTS.md`, `USER.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`
+- optional [Agent Skills](https://agentskills.io/specification) bundles referenced with `SKILL path/to/skill-dir`
 - an explicit `COMPONENT` for `dispatch/wasm` parcels
 - local tools, reference assets, evals, and code
 
@@ -115,6 +116,68 @@ CLI-scoped A2A operator policy overrides are available on:
 Use `--a2a-allowed-origins ...` and `--a2a-trust-policy ...` when you want command-scoped A2A policy without exporting environment variables.
 Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
 Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.
+
+## Agent Skills Compatibility
+
+Dispatch supports the [Agent Skills specification](https://agentskills.io/specification) as a first-class skill packaging layout.
+
+`SKILL` accepts either:
+
+- a markdown file such as `SKILL SKILL.md`
+- a skill directory such as `SKILL skills/file-analyst`
+
+When `SKILL` points at a directory, Dispatch expects:
+
+- `SKILL.md` for the skill instructions
+- an optional `dispatch.toml` sidecar for Dispatch-executable tool metadata
+- the rest of the Agent Skills bundle layout such as `scripts/`, `references/`, and `assets/`
+
+`SKILL.md` stays Agent Skills compliant. Dispatch-specific execution metadata lives in `dispatch.toml`, or in a sidecar path referenced by `metadata.dispatch-manifest` in the skill frontmatter.
+
+Example skill bundle:
+
+```text
+skills/file-analyst/
+|-- SKILL.md
+|-- dispatch.toml
+|-- scripts/
+|   |-- read_file.sh
+|   \-- find_files.sh
+|-- schemas/
+|   \-- find_files.json
+\-- references/
+    \-- REFERENCE.md
+```
+
+Example `Agentfile`:
+
+```dockerfile
+FROM dispatch/native:latest
+NAME file-analyst-agent
+SOUL SOUL.md
+SKILL skills/file-analyst
+MODEL claude-sonnet-4-6 PROVIDER anthropic
+ENTRYPOINT chat
+```
+
+Example `dispatch.toml` sidecar:
+
+```toml
+[[tools]]
+name = "read_file"
+script = "scripts/read_file.sh"
+risk = "low"
+description = "Read the full contents of a file."
+
+[[tools]]
+name = "find_files"
+script = "scripts/find_files.sh"
+schema = "schemas/find_files.json"
+risk = "low"
+description = "Find files matching a pattern."
+```
+
+Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. If the `Agentfile` also declares `TOOL ...` entries with the same alias, the explicit `TOOL` declaration wins.
 
 
 ## WASM Courier

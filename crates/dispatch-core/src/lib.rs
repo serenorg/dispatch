@@ -8,6 +8,7 @@ pub mod parse;
 pub mod plugin_protocol;
 pub mod plugins;
 pub mod signing;
+mod skill;
 pub mod trust;
 pub mod validate;
 
