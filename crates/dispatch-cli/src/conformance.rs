@@ -7,7 +7,15 @@ use dispatch_core::{
 };
 use futures::executor::block_on;
 use serde::Serialize;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::Path,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 use tempfile::TempDir;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -32,6 +40,23 @@ struct ConformanceFixtures {
     incompatible: LoadedParcel,
     job: LoadedParcel,
     heartbeat: LoadedParcel,
+    a2a: Option<LoadedParcel>,
+    _a2a_server: Option<ConformanceA2aServer>,
+}
+
+struct ConformanceA2aServer {
+    base_url: String,
+    shutdown: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ConformanceA2aServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub(crate) fn courier_conformance(
@@ -375,9 +400,52 @@ fn run_courier_conformance_with<R: CourierBackend>(
                 },
                 "expected successful tool execution and Done event",
             ));
+
+            if let Some(a2a_fixture) = &fixtures.a2a {
+                let a2a_response = match block_on(courier.open_session(a2a_fixture)) {
+                    Ok(a2a_session) => block_on(courier.run(
+                        a2a_fixture,
+                        CourierRequest {
+                            session: a2a_session,
+                            operation: CourierOperation::InvokeTool {
+                                invocation: ToolInvocation {
+                                    name: "broker".to_string(),
+                                    input: Some("hello a2a".to_string()),
+                                },
+                            },
+                        },
+                    )),
+                    Err(error) => Err(error),
+                };
+                checks.push(run_conformance_operation_check(
+                    "invoke-a2a-tool",
+                    a2a_response,
+                    |response| {
+                        response.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                CourierEvent::ToolCallFinished { result }
+                                    if result.tool == "broker"
+                                        && result.exit_code == 0
+                                        && result.stdout.contains("echo:hello a2a")
+                            )
+                        }) && matches!(response.events.last(), Some(CourierEvent::Done))
+                    },
+                    "expected successful A2A tool execution and Done event",
+                ));
+            } else {
+                checks.push(skipped_check(
+                    "invoke-a2a-tool",
+                    "no A2A conformance fixture for this courier kind",
+                ));
+            }
         } else {
             checks.push(skipped_check(
                 "invoke-tool",
+                "courier does not advertise local tool support",
+            ));
+            checks.push(skipped_check(
+                "invoke-a2a-tool",
                 "courier does not advertise local tool support",
             ));
         }
@@ -530,12 +598,27 @@ fn build_conformance_fixtures(kind: CourierKind) -> Result<ConformanceFixtures> 
         "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
         "heartbeat",
     )?;
+    let (a2a, a2a_server) = match kind {
+        CourierKind::Native | CourierKind::Docker => {
+            let server = start_conformance_a2a_server()?;
+            let fixture = build_conformance_a2a_fixture(
+                dir.path(),
+                "a2a",
+                compatible_reference_for_kind(kind),
+                &server.base_url,
+            )?;
+            (Some(fixture), Some(server))
+        }
+        CourierKind::Wasm | CourierKind::Custom => (None, None),
+    };
     Ok(ConformanceFixtures {
         _dir: dir,
         compatible,
         incompatible,
         job,
         heartbeat,
+        a2a,
+        _a2a_server: a2a_server,
     })
 }
 
@@ -589,6 +672,172 @@ ENTRYPOINT {entrypoint}\n"
     })?;
     load_parcel(&built.parcel_dir)
         .with_context(|| format!("failed to load parcel {}", built.parcel_dir.display()))
+}
+
+fn build_conformance_a2a_fixture(
+    root: &Path,
+    name: &str,
+    courier_reference: &str,
+    endpoint_url: &str,
+) -> Result<LoadedParcel> {
+    let context_dir = root.join(name);
+    fs::create_dir_all(&context_dir)
+        .with_context(|| format!("failed to create {}", context_dir.display()))?;
+    fs::write(
+        context_dir.join("Agentfile"),
+        format!(
+            "FROM {courier_reference}\n\
+NAME conformance-{name}\n\
+VERSION 0.1.0\n\
+SOUL SOUL.md\n\
+TOOL A2A broker URL {endpoint_url}\n\
+ENTRYPOINT job\n"
+        ),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            context_dir.join("Agentfile").display()
+        )
+    })?;
+    fs::write(context_dir.join("SOUL.md"), "Soul body\n")
+        .with_context(|| format!("failed to write {}", context_dir.join("SOUL.md").display()))?;
+    let built = build_agentfile(
+        &context_dir.join("Agentfile"),
+        &BuildOptions {
+            output_root: context_dir.join(".dispatch/parcels"),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to build {}",
+            context_dir.join("Agentfile").display()
+        )
+    })?;
+    load_parcel(&built.parcel_dir)
+        .with_context(|| format!("failed to load parcel {}", built.parcel_dir.display()))
+}
+
+fn start_conformance_a2a_server() -> Result<ConformanceA2aServer> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind A2A test server")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure A2A test server")?;
+    let base_url = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .context("failed to read A2A test server address")?
+    );
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let server_base_url = base_url.clone();
+    let thread = thread::spawn(move || {
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => handle_conformance_a2a_connection(stream, &server_base_url),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept A2A conformance connection: {error}"),
+            }
+        }
+    });
+    Ok(ConformanceA2aServer {
+        base_url,
+        shutdown: shutdown_tx,
+        thread: Some(thread),
+    })
+}
+
+fn handle_conformance_a2a_connection(stream: TcpStream, base_url: &str) {
+    stream.set_nonblocking(false).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).unwrap() == 0 {
+        return;
+    }
+    let request_line = request_line.trim_end();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let mut content_length = 0usize;
+    loop {
+        let mut header_line = String::new();
+        reader.read_line(&mut header_line).unwrap();
+        let header_line = header_line.trim_end();
+        if header_line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header_line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap();
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).unwrap();
+
+    match (method, target) {
+        ("GET", "/.well-known/agent.json") => write_conformance_http_response(
+            &mut writer,
+            200,
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "conformance-a2a",
+                "url": format!("{base_url}/a2a")
+            }))
+            .unwrap()
+            .as_slice(),
+        ),
+        ("POST", path) if path.ends_with("/a2a") => {
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let text = payload
+                .pointer("/params/message/parts/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            write_conformance_http_response(
+                &mut writer,
+                200,
+                "application/json",
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":"1",
+                    "result":{
+                        "id":"task-1",
+                        "status":{"state":"completed","message":"ok"},
+                        "artifacts":[{"parts":[{"kind":"text","text":format!("echo:{text}")}]}]
+                    }
+                }))
+                .unwrap()
+                .as_slice(),
+            );
+        }
+        _ => write_conformance_http_response(&mut writer, 404, "text/plain", b"not found"),
+    }
+}
+
+fn write_conformance_http_response(
+    writer: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let headers = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = writer.write_all(headers.as_bytes());
+    let _ = writer.write_all(body);
+    let _ = writer.flush();
 }
 
 fn compatible_reference_for_kind(kind: CourierKind) -> &'static str {
