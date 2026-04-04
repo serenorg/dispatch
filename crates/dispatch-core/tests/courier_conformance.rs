@@ -1,11 +1,18 @@
 use dispatch_core::{
     BuildOptions, CourierBackend, CourierError, CourierEvent, CourierKind, CourierOperation,
-    CourierRequest, CourierResponse, DockerCourier, MountKind, NativeCourier, ToolConfig,
-    build_agentfile, load_parcel,
+    CourierRequest, CourierResponse, DockerCourier, LocalToolTarget, MountKind, NativeCourier,
+    ToolConfig, build_agentfile, load_parcel,
 };
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 use tempfile::tempdir;
 
 struct FixtureImage {
@@ -48,6 +55,132 @@ fn assert_assistant_message(response: &CourierResponse) {
             |event| matches!(event, CourierEvent::Message { role, .. } if role == "assistant")
         )
     );
+}
+
+struct TestA2aServer {
+    base_url: String,
+    shutdown: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for TestA2aServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn start_test_a2a_server() -> TestA2aServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let server_base_url = base_url.clone();
+    let thread = thread::spawn(move || {
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => handle_test_a2a_connection(stream, &server_base_url),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept A2A connection: {error}"),
+            }
+        }
+    });
+
+    TestA2aServer {
+        base_url,
+        shutdown: shutdown_tx,
+        thread: Some(thread),
+    }
+}
+
+fn handle_test_a2a_connection(stream: TcpStream, base_url: &str) {
+    stream.set_nonblocking(false).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).unwrap() == 0 {
+        return;
+    }
+    let request_line = request_line.trim_end();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let mut content_length = 0usize;
+    loop {
+        let mut header_line = String::new();
+        reader.read_line(&mut header_line).unwrap();
+        let header_line = header_line.trim_end();
+        if header_line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header_line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap();
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).unwrap();
+
+    match (method, target) {
+        ("GET", "/.well-known/agent.json") => write_test_http_response(
+            &mut writer,
+            200,
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "conformance-a2a",
+                "url": format!("{base_url}/a2a")
+            }))
+            .unwrap()
+            .as_slice(),
+        ),
+        ("POST", path) if path.ends_with("/a2a") => {
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let text = payload
+                .pointer("/params/message/parts/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            write_test_http_response(
+                &mut writer,
+                200,
+                "application/json",
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":"1",
+                    "result":{
+                        "id":"task-1",
+                        "status":{"state":"completed","message":"ok"},
+                        "artifacts":[{"parts":[{"kind":"text","text":format!("echo:{text}")}]}]
+                    }
+                }))
+                .unwrap()
+                .as_slice(),
+            );
+        }
+        _ => write_test_http_response(&mut writer, 404, "text/plain", b"not found"),
+    }
+}
+
+fn write_test_http_response(writer: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let headers = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = writer.write_all(headers.as_bytes());
+    let _ = writer.write_all(body);
+    let _ = writer.flush();
 }
 
 #[test]
@@ -194,6 +327,53 @@ ENTRYPOINT heartbeat
 }
 
 #[test]
+fn native_courier_conformance_supports_a2a_tools() {
+    let server = start_test_a2a_server();
+    let fixture = build_fixture(
+        &format!(
+            "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+            server.base_url
+        ),
+        &[],
+    );
+    let courier = NativeCourier::default();
+
+    let inspection = futures::executor::block_on(courier.inspect(&fixture.image)).unwrap();
+    assert_eq!(inspection.local_tools.len(), 1);
+    assert!(matches!(
+        inspection.local_tools[0].target,
+        LocalToolTarget::A2a { .. }
+    ));
+
+    let session = futures::executor::block_on(courier.open_session(&fixture.image)).unwrap();
+    let tool = futures::executor::block_on(courier.run(
+        &fixture.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::InvokeTool {
+                invocation: dispatch_core::ToolInvocation {
+                    name: "broker".to_string(),
+                    input: Some("hello a2a".to_string()),
+                },
+            },
+        },
+    ))
+    .unwrap();
+    assert!(tool.events.iter().any(|event| {
+        matches!(
+            event,
+            CourierEvent::ToolCallFinished { result }
+                if result.tool == "broker" && result.stdout.contains("echo:hello a2a")
+        )
+    }));
+    assert_done(&tool);
+}
+
+#[test]
 fn docker_courier_conformance_supports_prompt_tools_and_chat() {
     let fixture = build_fixture(
         "\
@@ -256,6 +436,53 @@ ENTRYPOINT chat
     assert_eq!(chat.session.turn_count, 1);
     assert_eq!(chat.session.history.len(), 2);
     assert_done(&chat);
+}
+
+#[test]
+fn docker_courier_conformance_supports_a2a_tools() {
+    let server = start_test_a2a_server();
+    let fixture = build_fixture(
+        &format!(
+            "\
+FROM dispatch/docker:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+            server.base_url
+        ),
+        &[],
+    );
+    let courier = DockerCourier::default();
+
+    let inspection = futures::executor::block_on(courier.inspect(&fixture.image)).unwrap();
+    assert_eq!(inspection.local_tools.len(), 1);
+    assert!(matches!(
+        inspection.local_tools[0].target,
+        LocalToolTarget::A2a { .. }
+    ));
+
+    let session = futures::executor::block_on(courier.open_session(&fixture.image)).unwrap();
+    let tool = futures::executor::block_on(courier.run(
+        &fixture.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::InvokeTool {
+                invocation: dispatch_core::ToolInvocation {
+                    name: "broker".to_string(),
+                    input: Some("hello a2a".to_string()),
+                },
+            },
+        },
+    ))
+    .unwrap();
+    assert!(tool.events.iter().any(|event| {
+        matches!(
+            event,
+            CourierEvent::ToolCallFinished { result }
+                if result.tool == "broker" && result.stdout.contains("echo:hello a2a")
+        )
+    }));
+    assert_done(&tool);
 }
 
 #[test]
