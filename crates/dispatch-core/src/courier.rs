@@ -1306,7 +1306,9 @@ pub fn resolve_prompt_text(parcel: &LoadedParcel) -> Result<String, CourierError
             path: path.display().to_string(),
             source,
         })?;
-        let body = if matches!(instruction.kind, InstructionKind::Skill) {
+        let body = if matches!(instruction.kind, InstructionKind::Skill)
+            && instruction.skill_name.is_some()
+        {
             strip_skill_frontmatter(&body)
         } else {
             body.as_str()
@@ -5854,6 +5856,26 @@ ENTRYPOINT chat
         assert!(!prompt.contains("dispatch-manifest"));
         assert!(!prompt.contains("name: file-analyst"));
         assert!(!prompt.contains("description: Analyze files"));
+    }
+
+    #[test]
+    fn resolve_prompt_keeps_file_based_skill_frontmatter_unchanged() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+SKILL SKILL.md
+ENTRYPOINT chat
+",
+            &[(
+                "SKILL.md",
+                "---\nname: file-analyst\ndescription: Analyze files\n---\nUse the file tools before answering.\n",
+            )],
+        );
+
+        let prompt = resolve_prompt_text(&test_image.image).unwrap();
+        assert!(prompt.contains("name: file-analyst"));
+        assert!(prompt.contains("description: Analyze files"));
+        assert!(prompt.contains("Use the file tools before answering."));
     }
 
     #[test]

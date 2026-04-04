@@ -179,7 +179,9 @@ risk = "low"
 description = "Find files matching a pattern."
 ```
 
-Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but conflicting aliases across multiple skills fail the build.
+Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model for directory-based skill bundles, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. File-based `SKILL path/to/file.md` instructions are left unchanged even if they happen to contain YAML frontmatter. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but conflicting aliases across multiple skills fail the build.
+
+`allowed-tools` is currently preserved as informational metadata for interoperability and downstream policy engines. The reference courier does not enforce it yet.
 
 
 ## WASM Courier

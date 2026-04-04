@@ -984,17 +984,30 @@ fn insert_resolved_tool(
             .find(|existing| tool_alias(existing) == Some(alias.as_str()))
     {
         match (tool_skill_source(existing), tool_skill_source(&tool)) {
-            (Some(previous_skill_source), Some(new_skill_source))
-                if previous_skill_source != new_skill_source =>
-            {
-                return Err(BuildError::Validation(format!(
-                    "tool `{alias}` is declared by multiple skills (`{previous_skill_source}` and `{new_skill_source}`)"
-                )));
+            (Some(previous_skill_source), Some(new_skill_source)) => {
+                let message = if previous_skill_source == new_skill_source {
+                    format!(
+                        "tool `{alias}` is declared more than once by skill `{previous_skill_source}`"
+                    )
+                } else {
+                    format!(
+                        "tool `{alias}` is declared by multiple skills (`{previous_skill_source}` and `{new_skill_source}`)"
+                    )
+                };
+                return Err(BuildError::Validation(message));
             }
             (Some(previous_skill_source), None) => {
                 warnings.push(format!(
                     "tool `{alias}` from skill `{previous_skill_source}` overridden by an explicit Agentfile tool declaration"
                 ));
+                *existing = tool;
+                return Ok(());
+            }
+            (None, Some(new_skill_source)) => {
+                warnings.push(format!(
+                    "tool `{alias}` from skill `{new_skill_source}` was shadowed by an explicit Agentfile tool declaration"
+                ));
+                return Ok(());
             }
             _ => {}
         }
@@ -2087,6 +2100,58 @@ ENTRYPOINT chat
             built.warnings,
             vec![
                 "tool `read_file` from skill `file-analyst` overridden by an explicit Agentfile tool declaration"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_explicit_tool_declared_before_skill_still_wins() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("file-analyst");
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("dispatch.toml"),
+            "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\nrisk = \"low\"\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
+        fs::create_dir_all(dir.path().join("tools")).unwrap();
+        fs::write(dir.path().join("tools/read_file.py"), "print('override')\n").unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nTOOL LOCAL tools/read_file.py AS read_file RISK high\nSKILL file-analyst\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        match &parcel.tools[0] {
+            ToolConfig::Local(local) => {
+                assert_eq!(local.alias, "read_file");
+                assert_eq!(local.packaged_path, "tools/read_file.py");
+                assert_eq!(local.risk, Some(ToolRiskLevel::High));
+                assert_eq!(local.skill_source, None);
+            }
+            other => panic!("expected local tool, got {other:?}"),
+        }
+        assert_eq!(
+            built.warnings,
+            vec![
+                "tool `read_file` from skill `file-analyst` was shadowed by an explicit Agentfile tool declaration"
                     .to_string()
             ]
         );

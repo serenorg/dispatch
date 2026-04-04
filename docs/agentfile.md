@@ -243,11 +243,13 @@ Semantics:
 - accepts either a markdown file or an [Agent Skills](https://agentskills.io/specification) directory
 - when the argument is a file, Dispatch packages it as a normal skill instruction
 - when the argument is a directory, Dispatch requires `SKILL.md` in that directory
-- `SKILL.md` frontmatter is parsed for Agent Skills metadata and stripped from the prompt text seen by the model
+- `SKILL.md` frontmatter is parsed for Agent Skills metadata and stripped from the prompt text seen by the model for directory-based skill bundles
+- file-based `SKILL path/to/file.md` inputs are left unchanged even if they contain YAML frontmatter
 - the rest of the directory is packaged with the parcel so `scripts/`, `references/`, and `assets/` travel with the skill bundle
 - if the skill directory contains `dispatch.toml`, or `SKILL.md` frontmatter sets `metadata.dispatch-manifest = "..."`, Dispatch loads Dispatch-specific tool metadata from that TOML sidecar and synthesizes those entries into the parcel as normal local tools
 - the sidecar may also declare a default `entrypoint = "chat" | "job" | "heartbeat"` when the `Agentfile` does not set `ENTRYPOINT`
 - built parcels preserve skill annotations such as `allowed-tools` as structured lists, and skill-generated tools keep `skill_source` provenance using the skill's canonical `name`
+- `allowed-tools` is currently stored as informational parcel metadata for interoperability and downstream policy engines; the reference courier does not enforce it yet
 - if the `Agentfile` later declares `TOOL ...` with the same alias as a skill-generated tool, the explicit `TOOL` declaration wins
 - if multiple skills declare the same tool alias, Dispatch fails the build instead of picking one silently
 
