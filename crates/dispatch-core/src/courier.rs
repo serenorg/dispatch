@@ -131,6 +131,8 @@ pub enum CourierError {
     },
     #[error("tool `{tool}` exceeded TIMEOUT TOOL `{timeout}`")]
     ToolTimedOut { tool: String, timeout: String },
+    #[error("session `{session_id}` exceeded TIMEOUT RUN `{timeout}`")]
+    RunTimedOut { session_id: String, timeout: String },
     #[error("failed to wait for tool `{tool}`: {source}")]
     WaitTool {
         tool: String,
@@ -402,7 +404,11 @@ pub struct CourierSession {
     pub id: String,
     pub parcel_digest: String,
     pub entrypoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub turn_count: u64,
+    #[serde(default)]
+    pub elapsed_ms: u64,
     pub history: Vec<ConversationMessage>,
     #[serde(default)]
     pub resolved_mounts: Vec<ResolvedMount>,
@@ -2180,6 +2186,28 @@ fn wait_for_tool_output(
         })
 }
 
+fn ensure_run_timeout_budget(
+    session: &CourierSession,
+    timeouts: &[crate::manifest::TimeoutSpec],
+) -> Result<(), CourierError> {
+    let Some(timeout) = configured_timeout_duration(timeouts, "RUN")? else {
+        return Ok(());
+    };
+    let limit_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    if session.elapsed_ms >= limit_ms {
+        return Err(CourierError::RunTimedOut {
+            session_id: session.id.clone(),
+            timeout: "RUN".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn apply_session_run_elapsed(session: &mut CourierSession, started_at: Instant) {
+    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    session.elapsed_ms = session.elapsed_ms.saturating_add(elapsed_ms);
+}
+
 fn resolve_a2a_rpc_endpoint_with_env<F>(
     tool: &LocalToolSpec,
     mut env_lookup: F,
@@ -2827,7 +2855,9 @@ impl CourierBackend for NativeCourier {
                 id: session_id,
                 parcel_digest,
                 entrypoint,
+                label: image.config.name.clone(),
                 turn_count: 0,
+                elapsed_ms: 0,
                 history: Vec::new(),
                 backend_state: None,
             };
@@ -2850,9 +2880,11 @@ impl CourierBackend for NativeCourier {
             validate_native_parcel(image)?;
             ensure_session_matches_parcel(image, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
+            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
             session.turn_count += 1;
+            let started_at = Instant::now();
 
-            match operation {
+            let mut response = match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id,
                     session: {
@@ -2951,7 +2983,11 @@ impl CourierBackend for NativeCourier {
                     HostToolRunner::Native,
                     "Native",
                 ),
-            }
+            }?;
+
+            apply_session_run_elapsed(&mut response.session, started_at);
+            persist_session_mounts(&response.session)?;
+            Ok(response)
         }
     }
 }
@@ -3026,7 +3062,9 @@ impl CourierBackend for DockerCourier {
                 id: session_id,
                 parcel_digest,
                 entrypoint,
+                label: image.config.name.clone(),
                 turn_count: 0,
+                elapsed_ms: 0,
                 history: Vec::new(),
                 backend_state: None,
             };
@@ -3053,9 +3091,11 @@ impl CourierBackend for DockerCourier {
             )?;
             ensure_session_matches_parcel(image, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
+            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
             session.turn_count += 1;
+            let started_at = Instant::now();
 
-            match operation {
+            let mut response = match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id: "docker".to_string(),
                     session: {
@@ -3159,7 +3199,11 @@ impl CourierBackend for DockerCourier {
                     HostToolRunner::Docker(&docker_courier),
                     "Docker",
                 ),
-            }
+            }?;
+
+            apply_session_run_elapsed(&mut response.session, started_at);
+            persist_session_mounts(&response.session)?;
+            Ok(response)
         }
     }
 }
@@ -3278,23 +3322,29 @@ impl CourierBackend for JsonlCourierPlugin {
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let courier = self.clone();
         let parcel_dir = canonical_parcel_dir(image);
+        let operation = request.operation;
+        let session = request.session;
         async move {
-            ensure_session_matches_parcel(image, &request.session)?;
+            ensure_session_matches_parcel(image, &session)?;
+            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+            let started_at = Instant::now();
             let parcel_dir = parcel_dir?;
-            let session = courier.ensure_persistent_process(&parcel_dir, request.session)?;
-            let response = courier.run_persistent_plugin(
+            let session = courier.ensure_persistent_process(&parcel_dir, session)?;
+            let (session, events) = courier.run_persistent_plugin(
                 session.id.clone(),
                 PluginRequest::Run {
                     parcel_dir,
                     session,
-                    operation: request.operation,
+                    operation,
                 },
             )?;
-            Ok(CourierResponse {
+            let mut response = CourierResponse {
                 courier_id: courier.manifest.name.clone(),
-                session: response.0,
-                events: response.1,
-            })
+                session,
+                events,
+            };
+            apply_session_run_elapsed(&mut response.session, started_at);
+            Ok(response)
         }
     }
 }
@@ -3801,7 +3851,9 @@ impl CourierBackend for WasmCourier {
                 id: session_id,
                 parcel_digest: parcel.config.digest.clone(),
                 entrypoint: parcel.config.entrypoint.clone(),
+                label: parcel.config.name.clone(),
                 turn_count: 0,
+                elapsed_ms: 0,
                 history: Vec::new(),
                 backend_state: None,
             };
@@ -3829,8 +3881,10 @@ impl CourierBackend for WasmCourier {
             )?;
             ensure_session_matches_parcel(&parcel, &session)?;
             validate_wasm_component_metadata(&parcel)?;
+            ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
+            let started_at = Instant::now();
 
-            match operation {
+            let mut response = match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id: "wasm".to_string(),
                     session: {
@@ -3910,7 +3964,11 @@ impl CourierBackend for WasmCourier {
                         events: wasm_events_to_courier_events(result.events),
                     })
                 }
-            }
+            }?;
+
+            apply_session_run_elapsed(&mut response.session, started_at);
+            persist_session_mounts(&response.session)?;
+            Ok(response)
         }
     }
 }
@@ -3990,7 +4048,9 @@ impl CourierBackend for StubCourier {
                 id: format!("{courier_id}-{parcel_digest}-{sequence}"),
                 parcel_digest,
                 entrypoint,
+                label: image.config.name.clone(),
                 turn_count: 0,
+                elapsed_ms: 0,
                 history: Vec::new(),
                 resolved_mounts: Vec::new(),
                 backend_state: None,
@@ -4013,9 +4073,11 @@ impl CourierBackend for StubCourier {
         async move {
             validate_courier_reference(&courier_id, kind, &reference)?;
             ensure_session_matches_parcel(image, &session)?;
+            ensure_run_timeout_budget(&session, &image.config.timeouts)?;
             session.turn_count += 1;
+            let started_at = Instant::now();
 
-            match operation {
+            let mut response = match operation {
                 CourierOperation::ResolvePrompt => Ok(CourierResponse {
                     courier_id,
                     session,
@@ -4052,7 +4114,10 @@ impl CourierBackend for StubCourier {
                     courier: courier_id,
                     operation: "heartbeat".to_string(),
                 }),
-            }
+            }?;
+
+            apply_session_run_elapsed(&mut response.session, started_at);
+            Ok(response)
         }
     }
 }
@@ -7995,6 +8060,13 @@ ENTRYPOINT chat
             .is_retryable()
         );
         assert!(
+            !CourierError::RunTimedOut {
+                session_id: "session-1".to_string(),
+                timeout: "RUN".to_string()
+            }
+            .is_retryable()
+        );
+        assert!(
             !CourierError::MissingSecret {
                 name: "OPENAI_API_KEY".to_string()
             }
@@ -9003,6 +9075,56 @@ ENTRYPOINT chat
             )
             .unwrap();
         assert_eq!(updated_turn_count, 1);
+    }
+
+    #[test]
+    fn open_session_sets_label_and_zero_elapsed_budget() {
+        let test_image = build_test_image(
+            "\
+NAME demo
+FROM dispatch/native:latest
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+
+        let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+        assert_eq!(session.label.as_deref(), Some("demo"));
+        assert_eq!(session.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn native_courier_rejects_runs_that_exceed_timeout_budget() {
+        let test_image = build_test_image(
+            "\
+FROM dispatch/native:latest
+TIMEOUT RUN 100ms
+ENTRYPOINT chat
+",
+            &[],
+        );
+        let courier = NativeCourier::default();
+        let mut session =
+            futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        session.elapsed_ms = 100;
+
+        let error = futures::executor::block_on(courier.run(
+            &test_image.image,
+            CourierRequest {
+                session,
+                operation: CourierOperation::Chat {
+                    input: "hello".to_string(),
+                },
+            },
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CourierError::RunTimedOut { ref timeout, .. } if timeout == "RUN"
+        ));
     }
 
     #[test]

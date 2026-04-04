@@ -422,7 +422,9 @@ mod tests {
             id: "native-demo-1".to_string(),
             parcel_digest: "digest-123".to_string(),
             entrypoint: Some("chat".to_string()),
+            label: Some("demo".to_string()),
             turn_count: 2,
+            elapsed_ms: 42,
             history: vec![
                 ConversationMessage {
                     role: "user".to_string(),

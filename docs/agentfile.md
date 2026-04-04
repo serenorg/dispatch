@@ -459,7 +459,8 @@ TIMEOUT TOOL 60s
 TIMEOUT LLM 120s
 ```
 
-The reference implementation currently enforces `TIMEOUT TOOL` for host-executed local tools and host-executed `TOOL A2A` calls.
+The reference implementation currently enforces `TIMEOUT RUN` as a persisted session budget using accumulated elapsed runtime across successful runs and resumes.
+`TIMEOUT TOOL` is enforced for host-executed local tools and host-executed `TOOL A2A` calls.
 Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
 Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.
 

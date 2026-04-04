@@ -69,7 +69,9 @@ mod tests {
                     id: "session-1".to_string(),
                     parcel_digest: "digest".to_string(),
                     entrypoint: Some("chat".to_string()),
+                    label: None,
                     turn_count: 1,
+                    elapsed_ms: 0,
                     history: vec![ConversationMessage {
                         role: "user".to_string(),
                         content: "hello".to_string(),
@@ -98,7 +100,9 @@ mod tests {
                     id: "session-1".to_string(),
                     parcel_digest: "digest".to_string(),
                     entrypoint: Some("chat".to_string()),
+                    label: None,
                     turn_count: 1,
+                    elapsed_ms: 0,
                     history: vec![ConversationMessage {
                         role: "user".to_string(),
                         content: "hello".to_string(),
