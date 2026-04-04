@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::{
     BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest, CourierSession,
-    DockerCourier, LoadedParcel, NativeCourier, ResolvedCourier, ToolInvocation, WasmCourier,
-    load_parcel, resolve_courier,
+    DockerCourier, LoadedParcel, LocalToolTarget, NativeCourier, ResolvedCourier, ToolInvocation,
+    WasmCourier, load_parcel, resolve_courier,
 };
 use futures::executor::block_on;
 use std::{
@@ -256,7 +256,14 @@ fn print_courier_events(events: &[CourierEvent]) {
             CourierEvent::PromptResolved { text } => println!("{text}"),
             CourierEvent::LocalToolsListed { tools } => {
                 for tool in tools {
-                    println!("{} -> {}", tool.alias, tool.packaged_path);
+                    match &tool.target {
+                        LocalToolTarget::Local { packaged_path, .. } => {
+                            println!("{} -> {}", tool.alias, packaged_path);
+                        }
+                        LocalToolTarget::A2a { endpoint_url, .. } => {
+                            println!("{} -> {}", tool.alias, endpoint_url);
+                        }
+                    }
                 }
             }
             CourierEvent::BackendFallback { backend, error } => {

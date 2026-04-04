@@ -295,21 +295,115 @@ pub enum LocalToolTransport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum LocalToolTarget {
+    Local {
+        packaged_path: String,
+        command: String,
+        args: Vec<String>,
+    },
+    A2a {
+        endpoint_url: String,
+        endpoint_mode: Option<A2aEndpointMode>,
+        auth_secret_name: Option<String>,
+        auth_scheme: Option<A2aAuthScheme>,
+        expected_agent_name: Option<String>,
+        expected_card_sha256: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalToolSpec {
     pub alias: String,
-    pub packaged_path: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub transport: LocalToolTransport,
-    pub endpoint_url: Option<String>,
-    pub endpoint_mode: Option<A2aEndpointMode>,
-    pub auth_secret_name: Option<String>,
-    pub auth_scheme: Option<A2aAuthScheme>,
-    pub expected_agent_name: Option<String>,
-    pub expected_card_sha256: Option<String>,
     pub description: Option<String>,
     pub input_schema_packaged_path: Option<String>,
     pub input_schema_sha256: Option<String>,
+    #[serde(flatten)]
+    pub target: LocalToolTarget,
+}
+
+impl LocalToolSpec {
+    pub fn transport(&self) -> LocalToolTransport {
+        match self.target {
+            LocalToolTarget::Local { .. } => LocalToolTransport::Local,
+            LocalToolTarget::A2a { .. } => LocalToolTransport::A2a,
+        }
+    }
+
+    pub fn packaged_path(&self) -> Option<&str> {
+        match &self.target {
+            LocalToolTarget::Local { packaged_path, .. } => Some(packaged_path.as_str()),
+            LocalToolTarget::A2a { .. } => None,
+        }
+    }
+
+    pub fn command(&self) -> &str {
+        match &self.target {
+            LocalToolTarget::Local { command, .. } => command.as_str(),
+            LocalToolTarget::A2a { .. } => "dispatch-a2a",
+        }
+    }
+
+    pub fn args(&self) -> &[String] {
+        match &self.target {
+            LocalToolTarget::Local { args, .. } => args.as_slice(),
+            LocalToolTarget::A2a { .. } => &[],
+        }
+    }
+
+    pub fn endpoint_url(&self) -> Option<&str> {
+        match &self.target {
+            LocalToolTarget::A2a { endpoint_url, .. } => Some(endpoint_url.as_str()),
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn endpoint_mode(&self) -> Option<A2aEndpointMode> {
+        match &self.target {
+            LocalToolTarget::A2a { endpoint_mode, .. } => *endpoint_mode,
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn auth_secret_name(&self) -> Option<&str> {
+        match &self.target {
+            LocalToolTarget::A2a {
+                auth_secret_name, ..
+            } => auth_secret_name.as_deref(),
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn auth_scheme(&self) -> Option<A2aAuthScheme> {
+        match &self.target {
+            LocalToolTarget::A2a { auth_scheme, .. } => *auth_scheme,
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn expected_agent_name(&self) -> Option<&str> {
+        match &self.target {
+            LocalToolTarget::A2a {
+                expected_agent_name,
+                ..
+            } => expected_agent_name.as_deref(),
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn expected_card_sha256(&self) -> Option<&str> {
+        match &self.target {
+            LocalToolTarget::A2a {
+                expected_card_sha256,
+                ..
+            } => expected_card_sha256.as_deref(),
+            LocalToolTarget::Local { .. } => None,
+        }
+    }
+
+    pub fn matches_name(&self, tool_name: &str) -> bool {
+        self.alias == tool_name || self.packaged_path().is_some_and(|path| path == tool_name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1139,16 +1233,6 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
         .filter_map(|tool| match tool {
             ToolConfig::Local(local) => Some(LocalToolSpec {
                 alias: local.alias.clone(),
-                packaged_path: local.packaged_path.clone(),
-                command: local.runner.command.clone(),
-                args: local.runner.args.clone(),
-                transport: LocalToolTransport::Local,
-                endpoint_url: None,
-                endpoint_mode: None,
-                auth_secret_name: None,
-                auth_scheme: None,
-                expected_agent_name: None,
-                expected_card_sha256: None,
                 description: local.description.clone(),
                 input_schema_packaged_path: local
                     .input_schema
@@ -1158,19 +1242,14 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                     .input_schema
                     .as_ref()
                     .map(|schema| schema.sha256.clone()),
+                target: LocalToolTarget::Local {
+                    packaged_path: local.packaged_path.clone(),
+                    command: local.runner.command.clone(),
+                    args: local.runner.args.clone(),
+                },
             }),
             ToolConfig::A2a(a2a) => Some(LocalToolSpec {
                 alias: a2a.alias.clone(),
-                packaged_path: String::new(),
-                command: "dispatch-a2a".to_string(),
-                args: vec![a2a.url.clone()],
-                transport: LocalToolTransport::A2a,
-                endpoint_url: Some(a2a.url.clone()),
-                endpoint_mode: a2a.endpoint_mode,
-                auth_secret_name: a2a.auth.as_ref().map(|auth| auth.secret_name.clone()),
-                auth_scheme: a2a.auth.as_ref().map(|auth| auth.scheme),
-                expected_agent_name: a2a.expected_agent_name.clone(),
-                expected_card_sha256: a2a.expected_card_sha256.clone(),
                 description: a2a.description.clone(),
                 input_schema_packaged_path: a2a
                     .input_schema
@@ -1180,6 +1259,14 @@ pub fn list_local_tools(parcel: &LoadedParcel) -> Vec<LocalToolSpec> {
                     .input_schema
                     .as_ref()
                     .map(|schema| schema.sha256.clone()),
+                target: LocalToolTarget::A2a {
+                    endpoint_url: a2a.url.clone(),
+                    endpoint_mode: a2a.endpoint_mode,
+                    auth_secret_name: a2a.auth.as_ref().map(|auth| auth.secret_name.clone()),
+                    auth_scheme: a2a.auth.as_ref().map(|auth| auth.scheme),
+                    expected_agent_name: a2a.expected_agent_name.clone(),
+                    expected_card_sha256: a2a.expected_card_sha256.clone(),
+                },
             }),
             _ => None,
         })
@@ -1310,7 +1397,7 @@ where
     validate_required_secrets_with(parcel, env_lookup)?;
     list_local_tools(parcel)
         .into_iter()
-        .find(|tool| tool.alias == tool_name || tool.packaged_path == tool_name)
+        .find(|tool| tool.matches_name(tool_name))
         .ok_or_else(|| CourierError::UnknownLocalTool {
             tool: tool_name.to_string(),
         })
@@ -2239,14 +2326,13 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     let url = tool
-        .endpoint_url
-        .as_deref()
+        .endpoint_url()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CourierError::MissingA2aToolUrl {
             tool: tool.alias.clone(),
         })?;
     validate_a2a_url_allowed(tool, url, &mut env_lookup)?;
-    if matches!(tool.endpoint_mode, Some(A2aEndpointMode::Direct)) {
+    if matches!(tool.endpoint_mode(), Some(A2aEndpointMode::Direct)) {
         return Ok((normalize_a2a_rpc_endpoint(url), None));
     }
     let discovery_url = format!(
@@ -2259,7 +2345,7 @@ where
         .timeout_global(timeout)
         .build();
     if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
-        (tool.auth_secret_name.as_deref(), tool.auth_scheme)
+        (tool.auth_secret_name(), tool.auth_scheme())
     {
         let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
@@ -2285,7 +2371,7 @@ where
                     message: format!("failed to read agent card: {error}"),
                 })?;
         let actual_sha256 = encode_hex(Sha256::digest(body.as_bytes()));
-        if let Some(expected_sha256) = tool.expected_card_sha256.as_deref()
+        if let Some(expected_sha256) = tool.expected_card_sha256()
             && expected_sha256 != actual_sha256
         {
             return Err(CourierError::A2aToolRequest {
@@ -2319,7 +2405,7 @@ where
             .get("name")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
-        if let Some(expected) = tool.expected_agent_name.as_deref() {
+        if let Some(expected) = tool.expected_agent_name() {
             match agent_name.as_deref() {
                 Some(actual) if expected == actual => {}
                 Some(actual) => {
@@ -2342,7 +2428,7 @@ where
         }
         return Ok((endpoint, agent_name));
     }
-    if matches!(tool.endpoint_mode, Some(A2aEndpointMode::Card)) {
+    if matches!(tool.endpoint_mode(), Some(A2aEndpointMode::Card)) {
         return Err(CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
             message: "agent card discovery failed for required `DISCOVERY card` mode".to_string(),
@@ -2581,7 +2667,7 @@ where
         .build()
         .header("content-type", "application/json");
     if let (Some(secret_name), Some(A2aAuthScheme::Bearer)) =
-        (tool.auth_secret_name.as_deref(), tool.auth_scheme)
+        (tool.auth_secret_name(), tool.auth_scheme())
     {
         let secret_value = env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
@@ -2628,7 +2714,7 @@ where
     }
     Ok(ToolRunResult {
         tool: tool.alias.clone(),
-        command: "dispatch-a2a".to_string(),
+        command: tool.command().to_string(),
         args,
         exit_code: 0,
         stdout,
@@ -2655,13 +2741,14 @@ fn execute_local_tool_with_env<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if matches!(tool.transport, LocalToolTransport::A2a) {
+    if matches!(tool.target, LocalToolTarget::A2a { .. }) {
         let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
         let timeout_spec = timeout.map(|duration| ("TOOL", duration));
         return execute_a2a_tool_with_env(tool, input, env_lookup, timeout_spec);
     }
 
-    let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
+    let packaged_path = tool.packaged_path().expect("local tool path");
+    let tool_path = parcel.parcel_dir.join("context").join(packaged_path);
     if !tool_path.exists() {
         return Err(CourierError::MissingToolFile {
             tool: tool.alias.clone(),
@@ -2669,9 +2756,9 @@ where
         });
     }
 
-    let mut command = Command::new(&tool.command);
-    command.args(&tool.args);
-    if tool.command == tool.packaged_path {
+    let mut command = Command::new(tool.command());
+    command.args(tool.args());
+    if tool.command() == packaged_path {
         command.current_dir(parcel.parcel_dir.join("context"));
     } else {
         command.arg(&tool_path);
@@ -2716,8 +2803,8 @@ where
 
     Ok(ToolRunResult {
         tool: tool.alias.clone(),
-        command: tool.command.clone(),
-        args: tool.args.clone(),
+        command: tool.command().to_string(),
+        args: tool.args().to_vec(),
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -2730,13 +2817,14 @@ fn execute_local_tool_in_docker(
     input: Option<&str>,
     courier: &DockerCourier,
 ) -> Result<ToolRunResult, CourierError> {
-    if matches!(tool.transport, LocalToolTransport::A2a) {
+    if matches!(tool.target, LocalToolTarget::A2a { .. }) {
         let timeout = configured_timeout_duration(&parcel.config.timeouts, "TOOL")?;
         let timeout_spec = timeout.map(|duration| ("TOOL", duration));
         return execute_a2a_tool_with_env(tool, input, process_env_lookup, timeout_spec);
     }
 
-    let tool_path = parcel.parcel_dir.join("context").join(&tool.packaged_path);
+    let packaged_path = tool.packaged_path().expect("local tool path");
+    let tool_path = parcel.parcel_dir.join("context").join(packaged_path);
     if !tool_path.exists() {
         return Err(CourierError::MissingToolFile {
             tool: tool.alias.clone(),
@@ -2766,10 +2854,10 @@ fn execute_local_tool_in_docker(
         command.arg("-e").arg(format!("{name}={value}"));
     }
     command.arg(&courier.helper_image);
-    command.arg(&tool.command);
-    command.args(&tool.args);
-    if tool.command != tool.packaged_path {
-        command.arg(&tool.packaged_path);
+    command.arg(tool.command());
+    command.args(tool.args());
+    if tool.command() != packaged_path {
+        command.arg(packaged_path);
     }
     command.stdin(std::process::Stdio::piped());
     command.stdout(std::process::Stdio::piped());
@@ -2801,8 +2889,8 @@ fn execute_local_tool_in_docker(
 
     Ok(ToolRunResult {
         tool: tool.alias.clone(),
-        command: tool.command.clone(),
-        args: tool.args.clone(),
+        command: tool.command().to_string(),
+        args: tool.args().to_vec(),
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -4803,16 +4891,15 @@ fn execute_host_turn(
                         name: tool_call.name.clone(),
                         input: Some(tool_call.input.clone()),
                     };
-                    let tool_result = if let Some(tool) = local_tools
-                        .iter()
-                        .find(|t| t.alias == tool_call.name || t.packaged_path == tool_call.name)
+                    let tool_result = if let Some(tool) =
+                        local_tools.iter().find(|t| t.matches_name(&tool_call.name))
                     {
                         let normalized_input =
                             normalize_local_tool_input(tool, tool_call.input.as_str())?;
                         events.push(CourierEvent::ToolCallStarted {
                             invocation,
-                            command: tool.command.clone(),
-                            args: tool.args.clone(),
+                            command: tool.command().to_string(),
+                            args: tool.args().to_vec(),
                         });
                         execute_host_local_tool(
                             image,
@@ -5138,12 +5225,12 @@ fn build_model_tool_definition(
     image: &LoadedParcel,
     tool: &LocalToolSpec,
 ) -> Result<ModelToolDefinition, CourierError> {
-    let description = tool.description.clone().unwrap_or_else(|| match tool.transport {
-        LocalToolTransport::Local => format!(
+    let description = tool.description.clone().unwrap_or_else(|| match &tool.target {
+        LocalToolTarget::Local { packaged_path, .. } => format!(
             "Local Dispatch tool `{}` packaged at `{}`. Provide free-form text or JSON input appropriate for the tool.",
-            tool.alias, tool.packaged_path
+            tool.alias, packaged_path
         ),
-        LocalToolTransport::A2a => format!(
+        LocalToolTarget::A2a { .. } => format!(
             "Dispatch A2A tool `{}` delegates to the configured remote agent endpoint. Provide free-form text or JSON input appropriate for the remote agent.",
             tool.alias
         ),
@@ -6106,9 +6193,9 @@ ENTRYPOINT job
         let tools = list_local_tools(&test_image.image);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].alias, "demo");
-        assert_eq!(tools[0].command, "python3");
-        assert_eq!(tools[0].args, vec!["-u"]);
-        assert_eq!(tools[0].transport, LocalToolTransport::Local);
+        assert_eq!(tools[0].command(), "python3");
+        assert_eq!(tools[0].args(), ["-u".to_string()]);
+        assert_eq!(tools[0].transport(), LocalToolTransport::Local);
     }
 
     #[test]
@@ -6129,23 +6216,17 @@ ENTRYPOINT job
         let tools = list_local_tools(&test_image.image);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].alias, "broker");
-        assert_eq!(tools[0].transport, LocalToolTransport::A2a);
+        assert_eq!(tools[0].transport(), LocalToolTransport::A2a);
+        assert_eq!(tools[0].endpoint_url(), Some("https://broker.example.com"));
+        assert_eq!(tools[0].endpoint_mode(), Some(A2aEndpointMode::Direct));
+        assert_eq!(tools[0].auth_secret_name(), Some("A2A_TOKEN"));
+        assert_eq!(tools[0].auth_scheme(), Some(A2aAuthScheme::Bearer));
+        assert_eq!(tools[0].expected_agent_name(), Some("remote-broker"));
         assert_eq!(
-            tools[0].endpoint_url.as_deref(),
-            Some("https://broker.example.com")
-        );
-        assert_eq!(tools[0].endpoint_mode, Some(A2aEndpointMode::Direct));
-        assert_eq!(tools[0].auth_secret_name.as_deref(), Some("A2A_TOKEN"));
-        assert_eq!(tools[0].auth_scheme, Some(A2aAuthScheme::Bearer));
-        assert_eq!(
-            tools[0].expected_agent_name.as_deref(),
-            Some("remote-broker")
-        );
-        assert_eq!(
-            tools[0].expected_card_sha256.as_deref(),
+            tools[0].expected_card_sha256(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
-        assert_eq!(tools[0].command, "dispatch-a2a");
+        assert_eq!(tools[0].command(), "dispatch-a2a");
     }
 
     #[test]
@@ -6230,19 +6311,17 @@ ENTRYPOINT job
         });
         let tool = LocalToolSpec {
             alias: "broker".to_string(),
-            packaged_path: String::new(),
-            command: "dispatch-a2a".to_string(),
-            args: vec![],
-            transport: LocalToolTransport::A2a,
-            endpoint_url: Some(server.base_url.clone()),
-            endpoint_mode: None,
-            auth_secret_name: Some("A2A_TOKEN".to_string()),
-            auth_scheme: Some(A2aAuthScheme::Bearer),
-            expected_agent_name: None,
-            expected_card_sha256: None,
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
+            target: LocalToolTarget::A2a {
+                endpoint_url: server.base_url.clone(),
+                endpoint_mode: None,
+                auth_secret_name: Some("A2A_TOKEN".to_string()),
+                auth_scheme: Some(A2aAuthScheme::Bearer),
+                expected_agent_name: None,
+                expected_card_sha256: None,
+            },
         };
 
         let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None, None).unwrap_err();
@@ -8224,19 +8303,14 @@ ENTRYPOINT chat
     fn normalize_local_tool_input_extracts_function_style_text_payload() {
         let tool = LocalToolSpec {
             alias: "demo".to_string(),
-            packaged_path: "tools/demo.sh".to_string(),
-            command: "bash".to_string(),
-            args: Vec::new(),
-            transport: LocalToolTransport::Local,
-            endpoint_url: None,
-            endpoint_mode: None,
-            auth_secret_name: None,
-            auth_scheme: None,
-            expected_agent_name: None,
-            expected_card_sha256: None,
             description: None,
             input_schema_packaged_path: None,
             input_schema_sha256: None,
+            target: LocalToolTarget::Local {
+                packaged_path: "tools/demo.sh".to_string(),
+                command: "bash".to_string(),
+                args: Vec::new(),
+            },
         };
 
         let normalized = normalize_local_tool_input(&tool, "{\"input\":\"echo hi\"}").unwrap();

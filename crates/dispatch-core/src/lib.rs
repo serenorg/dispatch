@@ -20,9 +20,10 @@ pub use courier::{
     ChatModelBackend, ConversationMessage, CourierBackend, CourierCapabilities, CourierError,
     CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierRequest,
     CourierResponse, CourierSession, DockerCourier, JsonlCourierPlugin, LoadedParcel,
-    LocalToolSpec, ModelReply, ModelRequest, ModelToolCall, ModelToolDefinition, ModelToolOutput,
-    MountProvider, MountRequest, NativeCourier, ResolvedMount, StubCourier, ToolInvocation,
-    ToolRunResult, WasmCourier, list_local_tools, load_parcel, resolve_prompt_text, run_local_tool,
+    LocalToolSpec, LocalToolTarget, ModelReply, ModelRequest, ModelToolCall, ModelToolDefinition,
+    ModelToolOutput, MountProvider, MountRequest, NativeCourier, ResolvedMount, StubCourier,
+    ToolInvocation, ToolRunResult, WasmCourier, list_local_tools, load_parcel, resolve_prompt_text,
+    run_local_tool,
 };
 pub use depot::{
     DepotError, DepotLocator, DepotReference, DepotTagRecord, PulledParcel, PushedParcel,
