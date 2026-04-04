@@ -341,10 +341,10 @@ fn prompt_for_tool_approval(
 
 fn truncate_tool_approval_input(input: &str) -> String {
     const LIMIT: usize = 200;
-    let truncated = input.chars().take(LIMIT).collect::<String>();
-    if truncated.len() == input.len() {
-        truncated
+    if input.chars().count() <= LIMIT {
+        input.to_string()
     } else {
+        let truncated = input.chars().take(LIMIT).collect::<String>();
         format!("{truncated}...")
     }
 }

@@ -1113,6 +1113,11 @@ impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
     ) -> Result<wasm_bindings::dispatch::courier::host::ToolResult, String> {
         let tool = resolve_local_tool(&self.parcel, &invocation.name)
             .map_err(|error| error.to_string())?;
+        if let Some(request) = build_local_tool_approval_request(&tool, invocation.input.as_deref())
+            && !check_tool_approval(&request).map_err(|error| error.to_string())?
+        {
+            return Err(CourierError::ApprovalDenied { tool: request.tool }.to_string());
+        }
         let result = execute_local_tool_with_env(
             &self.parcel,
             &tool,
@@ -1974,7 +1979,7 @@ fn ensure_session_sqlite(connection: &Connection, path: &Path) -> Result<(), Cou
                 checkpoint_name TEXT NOT NULL,
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
-                PRIMARY KEY(session_id, checkpoint_name)
+                PRIMARY KEY(session_id, parcel_digest, checkpoint_name)
             );",
         )
         .map_err(|source| CourierError::SqliteMount {
@@ -2490,10 +2495,10 @@ fn checkpoint_put(session: &CourierSession, name: &str, value: &str) -> Result<b
             concat!(
                 "SELECT EXISTS(",
                 "SELECT 1 FROM dispatch_checkpoints ",
-                "WHERE session_id = ?1 AND checkpoint_name = ?2",
+                "WHERE session_id = ?1 AND parcel_digest = ?2 AND checkpoint_name = ?3",
                 ")"
             ),
-            params![session.id, name],
+            params![session.id, session.parcel_digest, name],
             |row| row.get::<_, i64>(0),
         )
         .map(|value| value != 0)
@@ -2507,8 +2512,7 @@ fn checkpoint_put(session: &CourierSession, name: &str, value: &str) -> Result<b
             "INSERT INTO dispatch_checkpoints ",
             "(session_id, parcel_digest, checkpoint_name, value, updated_at) ",
             "VALUES (?1, ?2, ?3, ?4, ?5) ",
-            "ON CONFLICT(session_id, checkpoint_name) DO UPDATE SET ",
-            "parcel_digest = excluded.parcel_digest, ",
+            "ON CONFLICT(session_id, parcel_digest, checkpoint_name) DO UPDATE SET ",
             "value = excluded.value, ",
             "updated_at = excluded.updated_at"
         ),
@@ -2741,6 +2745,12 @@ fn execute_builtin_tool(
         }
         "memory_list_range" => {
             let input: BuiltinMemoryRangeInput = parse_builtin_tool_input(capability, input)?;
+            if input.limit == Some(0) {
+                return Err(CourierError::InvalidBuiltinToolInput {
+                    tool: capability.to_string(),
+                    message: "`limit` must be at least 1".to_string(),
+                });
+            }
             let entries = memory_list_range(
                 session,
                 &input.namespace,

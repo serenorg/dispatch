@@ -34,7 +34,8 @@ pub use depot::{
     parse_depot_reference, pull_parcel, pull_parcel_verified, push_parcel,
 };
 pub use eval::{
-    EvalDocument, EvalError, EvalSpec, ToolExitExpectation, ToolTextExpectation, load_parcel_evals,
+    EvalDocument, EvalError, EvalSpec, ToolA2aEndpointExpectation, ToolExitExpectation,
+    ToolSchemaExpectation, ToolTextExpectation, load_parcel_evals,
 };
 pub use manifest::{
     A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, A2aToolConfig, BuiltinToolConfig, CommandSpec,
