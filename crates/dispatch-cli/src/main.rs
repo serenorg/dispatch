@@ -203,6 +203,24 @@ struct RunSkillArgs {
     entrypoint: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct ValidateSkillArgs {
+    /// Path to a SKILL.md file or an Agent Skills bundle directory
+    path: PathBuf,
+    /// Built-in courier to target when synthesizing the temporary parcel
+    #[arg(long = "courier", default_value = "native")]
+    courier: String,
+    /// Primary model id override for synthesized skill validation
+    #[arg(long)]
+    model: Option<String>,
+    /// Provider override paired with `--model`
+    #[arg(long)]
+    provider: Option<String>,
+    /// Entrypoint override for synthesized skill validation
+    #[arg(long)]
+    entrypoint: Option<String>,
+}
+
 #[derive(Debug, Args, Clone)]
 struct RunExecutionArgs {
     /// Courier backend to use for inspection and execution
@@ -273,8 +291,10 @@ enum ParcelCommand {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
+    /// Validate a skill file or Agent Skills bundle without executing it
+    Validate(Box<ValidateSkillArgs>),
     /// Execute a skill file or Agent Skills bundle without an authored Agentfile
-    Run(RunSkillArgs),
+    Run(Box<RunSkillArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -478,7 +498,8 @@ fn main() -> Result<()> {
         Command::Depot { command } => depot_command(command),
         Command::Run(args) => run::run(args),
         Command::Skill { command } => match command {
-            SkillCommand::Run(args) => skill_run::run_skill(args),
+            SkillCommand::Validate(args) => skill_run::validate_skill(*args),
+            SkillCommand::Run(args) => skill_run::run_skill(*args),
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
@@ -654,7 +675,7 @@ mod tests {
     use super::{
         Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, DepotCommand, EvalArgs,
         InspectArgs, KeygenArgs, ParcelCommand, PullArgs, PushArgs, SignArgs, SkillCommand,
-        StateCommand, VerifyArgs,
+        StateCommand, ValidateSkillArgs, VerifyArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -1054,12 +1075,52 @@ mod tests {
         let Command::Skill { command } = cli.command else {
             panic!("expected skill command");
         };
-        let SkillCommand::Run(args) = command;
+        let SkillCommand::Run(args) = command else {
+            panic!("expected skill run command");
+        };
         assert_eq!(args.path, PathBuf::from("skills/file-analyst"));
         assert_eq!(args.exec.courier, "docker");
         assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));
         assert_eq!(args.provider.as_deref(), Some("openai"));
         assert!(args.exec.list_tools);
+    }
+
+    #[test]
+    fn cli_parses_validate_skill_command() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "skill",
+            "validate",
+            "skills/file-analyst/SKILL.md",
+            "--courier",
+            "docker",
+            "--model",
+            "gpt-5-mini",
+            "--provider",
+            "openai",
+            "--entrypoint",
+            "chat",
+        ])
+        .unwrap();
+
+        let Command::Skill { command } = cli.command else {
+            panic!("expected skill command");
+        };
+        let SkillCommand::Validate(args) = command else {
+            panic!("expected skill validate command");
+        };
+        let ValidateSkillArgs {
+            path,
+            courier,
+            model,
+            provider,
+            entrypoint,
+        } = *args;
+        assert_eq!(path, PathBuf::from("skills/file-analyst/SKILL.md"));
+        assert_eq!(courier, "docker");
+        assert_eq!(model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(provider.as_deref(), Some("openai"));
+        assert_eq!(entrypoint.as_deref(), Some("chat"));
     }
 
     #[test]

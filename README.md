@@ -146,7 +146,7 @@ When `SKILL` points at a directory, Dispatch expects:
 
 `SKILL.md` stays Agent Skills compliant. Dispatch-specific execution metadata lives in `dispatch.toml`, or in a sidecar path referenced by `metadata.dispatch-manifest` in the skill frontmatter.
 `dispatch.toml` is a reserved filename inside skill directories: if it exists, Dispatch will try to load it as the sidecar unless frontmatter points at a different file.
-If you only want to execute a skill locally, `dispatch skill run <path>` can synthesize a temporary parcel around a `SKILL.md` file or skill bundle directory without requiring an authored `Agentfile`.
+If you only want to work with a skill locally, `dispatch skill validate <path>` checks that Dispatch can synthesize a parcel from a `SKILL.md` file or skill bundle directory, and `dispatch skill run <path>` executes that synthesized parcel without requiring an authored `Agentfile`.
 
 Example skill bundle:
 
@@ -271,6 +271,7 @@ cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> -
 cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
 
 # Run a skill bundle directly without authoring an Agentfile
+cargo run -p dispatch -- skill validate examples/skills/file-analyst/skills/file-analyst
 cargo run -p dispatch -- skill run examples/skills/file-analyst/skills/file-analyst --list-tools
 cargo run -p dispatch -- skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5-mini --provider openai --chat "Summarize this repository."
 
@@ -391,7 +392,7 @@ Supported backends:
 - `--tool-approval <ask|always|never>` - control how `APPROVAL confirm` tools are handled at the CLI
 - `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
 
-`dispatch skill run` is a convenience wrapper over the same build/load/run path. It copies the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesizes a minimal `Agentfile`, builds a temporary parcel, and then delegates to `dispatch run`. The current shortcut supports built-in `native` and `docker` couriers and accepts the same execution flags plus `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
+`dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and build a temporary parcel. `dispatch skill validate` stops after build validation, while `dispatch skill run` then delegates to `dispatch run`. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 
 ## Courier Architecture
 

@@ -7,6 +7,14 @@ use std::{
 };
 use tempfile::TempDir;
 
+struct SkillSynthesisArgs<'a> {
+    path: &'a Path,
+    courier: &'a str,
+    model: Option<&'a str>,
+    provider: Option<&'a str>,
+    entrypoint: Option<&'a str>,
+}
+
 pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
     let has_digest_changing_overrides =
         args.model.is_some() || args.provider.is_some() || args.entrypoint.is_some();
@@ -20,7 +28,13 @@ pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
             "warning: `dispatch skill run --session-file` only resumes cleanly when the synthesized parcel digest stays stable across invocations"
         );
     }
-    let synthesized = synthesize_skill_parcel(&args)?;
+    let synthesized = synthesize_skill_parcel(&SkillSynthesisArgs {
+        path: &args.path,
+        courier: &args.exec.courier,
+        model: args.model.as_deref(),
+        provider: args.provider.as_deref(),
+        entrypoint: args.entrypoint.as_deref(),
+    })?;
     for warning in &synthesized.built.warnings {
         eprintln!("warning: {warning}");
     }
@@ -31,18 +45,33 @@ pub(crate) fn run_skill(args: crate::RunSkillArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_skill(args: crate::ValidateSkillArgs) -> Result<()> {
+    let synthesized = synthesize_skill_parcel(&SkillSynthesisArgs {
+        path: &args.path,
+        courier: &args.courier,
+        model: args.model.as_deref(),
+        provider: args.provider.as_deref(),
+        entrypoint: args.entrypoint.as_deref(),
+    })?;
+    for warning in &synthesized.built.warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!("OK {}", args.path.display());
+    Ok(())
+}
+
 struct SynthesizedSkillParcel {
     _workspace: TempDir,
     built: BuiltParcel,
 }
 
-fn synthesize_skill_parcel(args: &crate::RunSkillArgs) -> Result<SynthesizedSkillParcel> {
+fn synthesize_skill_parcel(args: &SkillSynthesisArgs<'_>) -> Result<SynthesizedSkillParcel> {
     if args.provider.is_some() && args.model.is_none() {
-        bail!("`dispatch skill run --provider` requires `--model`");
+        bail!("`dispatch skill --provider` requires `--model`");
     }
-    let courier = parse_skill_courier(&args.exec.courier)?;
+    let courier = parse_skill_courier(args.courier)?;
     let workspace = tempfile::tempdir().context("failed to create temporary skill workspace")?;
-    let source = resolve_skill_source(&args.path)?;
+    let source = resolve_skill_source(args.path)?;
     let copied_rel = copy_skill_source(&source.root, workspace.path(), &source.copied_name)?;
     let agentfile_path = workspace.path().join("Agentfile");
     let output_root = workspace.path().join(".dispatch/parcels");
@@ -77,10 +106,10 @@ fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
         "native" => Ok(BuiltinCourier::Native),
         "docker" => Ok(BuiltinCourier::Docker),
         "wasm" => bail!(
-            "`dispatch skill run` does not support `--courier wasm`; use an Agentfile with `FROM dispatch/wasm:...` and `COMPONENT ...`"
+            "`dispatch skill` does not support `--courier wasm`; use an Agentfile with `FROM dispatch/wasm:...` and `COMPONENT ...`"
         ),
         other => bail!(
-            "`dispatch skill run` currently supports only built-in `native` and `docker` couriers, got `{other}`"
+            "`dispatch skill` currently supports only built-in `native` and `docker` couriers, got `{other}`"
         ),
     }
 }
@@ -174,18 +203,18 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
 fn render_skill_agentfile(
     courier: BuiltinCourier,
     skill_path: &str,
-    args: &crate::RunSkillArgs,
+    args: &SkillSynthesisArgs<'_>,
 ) -> String {
     let mut lines = vec![format!("FROM {}", synthesized_from_reference(courier))];
     lines.push(format!("SKILL {}", quote_agentfile_scalar(skill_path)));
-    if let Some(model) = args.model.as_deref() {
+    if let Some(model) = args.model {
         let mut line = format!("MODEL {}", quote_agentfile_scalar(model));
-        if let Some(provider) = args.provider.as_deref() {
+        if let Some(provider) = args.provider {
             line.push_str(&format!(" PROVIDER {}", quote_agentfile_scalar(provider)));
         }
         lines.push(line);
     }
-    if let Some(entrypoint) = args.entrypoint.as_deref() {
+    if let Some(entrypoint) = args.entrypoint {
         lines.push(format!("ENTRYPOINT {}", quote_agentfile_scalar(entrypoint)));
     }
     lines.push(String::new());
@@ -216,40 +245,31 @@ mod tests {
     use super::*;
     use dispatch_core::{InstructionKind, ToolConfig, load_parcel};
 
-    fn sample_args(path: PathBuf) -> crate::RunSkillArgs {
-        crate::RunSkillArgs {
+    fn sample_synthesis_args<'a>(
+        path: &'a Path,
+        courier: &'a str,
+        model: Option<&'a str>,
+        provider: Option<&'a str>,
+        entrypoint: Option<&'a str>,
+    ) -> SkillSynthesisArgs<'a> {
+        SkillSynthesisArgs {
             path,
-            exec: crate::RunExecutionArgs {
-                courier: "native".to_string(),
-                registry: None,
-                session_file: None,
-                chat: None,
-                job: None,
-                heartbeat: None,
-                interactive: false,
-                print_prompt: false,
-                list_tools: true,
-                json: false,
-                tool: None,
-                input: None,
-                tool_approval: None,
-                a2a_allowed_origins: None,
-                a2a_trust_policy: None,
-            },
-            model: None,
-            provider: None,
-            entrypoint: None,
+            courier,
+            model,
+            provider,
+            entrypoint,
         }
     }
 
     #[test]
     fn render_skill_agentfile_uses_matching_courier_reference() {
-        let mut args = sample_args(PathBuf::from("skills/file-analyst"));
-        args.exec.courier = "docker".to_string();
-        args.exec.json = true;
-        args.model = Some("gpt-5-mini".to_string());
-        args.provider = Some("openai".to_string());
-        args.entrypoint = Some("chat".to_string());
+        let args = sample_synthesis_args(
+            Path::new("skills/file-analyst"),
+            "docker",
+            Some("gpt-5-mini"),
+            Some("openai"),
+            Some("chat"),
+        );
         let agentfile = render_skill_agentfile(BuiltinCourier::Docker, "file-analyst", &args);
         assert!(agentfile.contains("FROM dispatch/docker:latest"));
         assert!(agentfile.contains("SKILL file-analyst"));
@@ -280,17 +300,20 @@ mod tests {
 
     #[test]
     fn render_skill_agentfile_quotes_paths_with_spaces() {
-        let args = sample_args(PathBuf::from("skill.md"));
+        let args = sample_synthesis_args(Path::new("skill.md"), "native", None, None, None);
         let agentfile = render_skill_agentfile(BuiltinCourier::Native, "My Skill.md", &args);
         assert!(agentfile.contains("SKILL \"My Skill.md\""));
     }
 
     #[test]
     fn render_skill_agentfile_quotes_model_provider_and_entrypoint() {
-        let mut args = sample_args(PathBuf::from("skill.md"));
-        args.model = Some("gpt 5".to_string());
-        args.provider = Some("openai compatible".to_string());
-        args.entrypoint = Some("job runner".to_string());
+        let args = sample_synthesis_args(
+            Path::new("skill.md"),
+            "native",
+            Some("gpt 5"),
+            Some("openai compatible"),
+            Some("job runner"),
+        );
         let agentfile = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args);
         assert!(agentfile.contains("MODEL \"gpt 5\" PROVIDER \"openai compatible\""));
         assert!(agentfile.contains("ENTRYPOINT \"job runner\""));
@@ -330,7 +353,8 @@ description = \"Read a file.\"\n",
         )
         .unwrap();
 
-        let built = synthesize_skill_parcel(&sample_args(skill_dir)).unwrap();
+        let synthesis_args = sample_synthesis_args(&skill_dir, "native", None, None, None);
+        let built = synthesize_skill_parcel(&synthesis_args).unwrap();
         let parcel = load_parcel(&built.built.parcel_dir).unwrap();
 
         assert_eq!(parcel.config.courier.reference(), "dispatch/native:latest");
@@ -372,5 +396,63 @@ description = \"Read a file.\"\n",
             skill_dir.canonicalize().unwrap()
         );
         assert_eq!(resolved.copied_name, "file-analyst");
+    }
+
+    #[test]
+    fn validate_skill_accepts_instructions_only_bundle_via_skill_md_path() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join("docs-only-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+name: docs-only-skill\n\
+description: Documentation-only skill\n\
+---\n\
+\n\
+Use careful reasoning.\n",
+        )
+        .unwrap();
+
+        validate_skill(crate::ValidateSkillArgs {
+            path: skill_dir.join("SKILL.md"),
+            courier: "native".to_string(),
+            model: None,
+            provider: None,
+            entrypoint: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_skill_rejects_provider_without_model() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join("file-analyst");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+name: file-analyst\n\
+description: Analyze files\n\
+---\n\
+\n\
+Read files carefully.\n",
+        )
+        .unwrap();
+
+        let error = validate_skill(crate::ValidateSkillArgs {
+            path: skill_dir,
+            courier: "native".to_string(),
+            model: None,
+            provider: Some("openai".to_string()),
+            entrypoint: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("`dispatch skill --provider` requires `--model`")
+        );
     }
 }
