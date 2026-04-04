@@ -142,8 +142,11 @@ enum Command {
     },
     /// Execute part of a built parcel locally
     Run(RunArgs),
-    /// Execute a skill file or Agent Skills bundle without an authored Agentfile
-    RunSkill(RunSkillArgs),
+    /// Manage Agent Skills bundles and skill execution
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Manage installed courier backends
     Courier {
         #[command(subcommand)]
@@ -266,6 +269,12 @@ struct RunSkillArgs {
     /// Apply a structured A2A trust policy file for this command
     #[arg(long)]
     a2a_trust_policy: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Execute a skill file or Agent Skills bundle without an authored Agentfile
+    Run(RunSkillArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -506,7 +515,9 @@ fn main() -> Result<()> {
             json,
         } => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
         Command::Run(args) => run::run(args),
-        Command::RunSkill(args) => skill_run::run_skill(args),
+        Command::Skill { command } => match command {
+            SkillCommand::Run(args) => skill_run::run_skill(args),
+        },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
     }
@@ -618,7 +629,9 @@ fn state_command(command: StateCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, StateCommand};
+    use super::{
+        Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, SkillCommand, StateCommand,
+    };
     use clap::Parser;
     use dispatch_core::{
         BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
@@ -977,7 +990,8 @@ mod tests {
     fn cli_parses_run_skill_command() {
         let cli = Cli::try_parse_from([
             "dispatch",
-            "run-skill",
+            "skill",
+            "run",
             "skills/file-analyst",
             "--courier",
             "docker",
@@ -989,9 +1003,10 @@ mod tests {
         ])
         .unwrap();
 
-        let Command::RunSkill(args) = cli.command else {
-            panic!("expected run-skill command");
+        let Command::Skill { command } = cli.command else {
+            panic!("expected skill command");
         };
+        let SkillCommand::Run(args) = command;
         assert_eq!(args.path, PathBuf::from("skills/file-analyst"));
         assert_eq!(args.courier, "docker");
         assert_eq!(args.model.as_deref(), Some("gpt-5-mini"));

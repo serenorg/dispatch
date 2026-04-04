@@ -37,7 +37,7 @@ struct SynthesizedSkillParcel {
 
 fn synthesize_skill_parcel(args: &crate::RunSkillArgs) -> Result<SynthesizedSkillParcel> {
     if args.provider.is_some() && args.model.is_none() {
-        bail!("`dispatch run-skill --provider` requires `--model`");
+        bail!("`dispatch skill run --provider` requires `--model`");
     }
     let courier = parse_skill_courier(&args.courier)?;
     let workspace = tempfile::tempdir().context("failed to create temporary skill workspace")?;
@@ -79,10 +79,10 @@ fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
         "native" => Ok(BuiltinCourier::Native),
         "docker" => Ok(BuiltinCourier::Docker),
         "wasm" => bail!(
-            "`dispatch run-skill` does not support `--courier wasm`; use an Agentfile with `FROM dispatch/wasm:...` and `COMPONENT ...`"
+            "`dispatch skill run` does not support `--courier wasm`; use an Agentfile with `FROM dispatch/wasm:...` and `COMPONENT ...`"
         ),
         other => bail!(
-            "`dispatch run-skill` currently supports only built-in `native` and `docker` couriers, got `{other}`"
+            "`dispatch skill run` currently supports only built-in `native` and `docker` couriers, got `{other}`"
         ),
     }
 }

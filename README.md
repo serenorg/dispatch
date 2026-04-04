@@ -146,7 +146,7 @@ When `SKILL` points at a directory, Dispatch expects:
 
 `SKILL.md` stays Agent Skills compliant. Dispatch-specific execution metadata lives in `dispatch.toml`, or in a sidecar path referenced by `metadata.dispatch-manifest` in the skill frontmatter.
 `dispatch.toml` is a reserved filename inside skill directories: if it exists, Dispatch will try to load it as the sidecar unless frontmatter points at a different file.
-If you only want to execute a skill locally, `dispatch run-skill <path>` can synthesize a temporary parcel around a `SKILL.md` file or skill bundle directory without requiring an authored `Agentfile`.
+If you only want to execute a skill locally, `dispatch skill run <path>` can synthesize a temporary parcel around a `SKILL.md` file or skill bundle directory without requiring an authored `Agentfile`.
 
 Example skill bundle:
 
@@ -271,8 +271,8 @@ cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> -
 cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
 
 # Run a skill bundle directly without authoring an Agentfile
-cargo run -p dispatch -- run-skill examples/skills/file-analyst/skills/file-analyst --list-tools
-cargo run -p dispatch -- run-skill examples/skills/file-analyst/skills/file-analyst --model gpt-5-mini --provider openai --chat "Summarize this repository."
+cargo run -p dispatch -- skill run examples/skills/file-analyst/skills/file-analyst --list-tools
+cargo run -p dispatch -- skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5-mini --provider openai --chat "Summarize this repository."
 
 # Run a WASM parcel
 cargo run -p dispatch -- run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
@@ -391,7 +391,7 @@ Supported backends:
 - `--tool-approval <ask|always|never>` - control how `APPROVAL confirm` tools are handled at the CLI
 - `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
 
-`run-skill` is a convenience wrapper over the same build/load/run path. It copies the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesizes a minimal `Agentfile`, builds a temporary parcel, and then delegates to `dispatch run`. The current shortcut supports built-in `native` and `docker` couriers and accepts the same execution flags plus `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
+`dispatch skill run` is a convenience wrapper over the same build/load/run path. It copies the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesizes a minimal `Agentfile`, builds a temporary parcel, and then delegates to `dispatch run`. The current shortcut supports built-in `native` and `docker` couriers and accepts the same execution flags plus `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 
 ## Courier Architecture
 
