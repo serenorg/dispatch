@@ -75,7 +75,17 @@ pub(crate) fn dispatch_skill_manifest_path(frontmatter: &AgentSkillFrontmatter) 
         .map(String::as_str)
 }
 
-pub(crate) fn validate_skill_name_matches_dir(skill_dir: &Path, name: &str) -> Result<(), String> {
+pub(crate) fn validate_agent_skill_frontmatter(
+    skill_dir: &Path,
+    frontmatter: &AgentSkillFrontmatter,
+) -> Result<(), String> {
+    validate_skill_name_matches_dir(skill_dir, &frontmatter.name)?;
+    validate_skill_description(&frontmatter.description)?;
+    validate_skill_compatibility(frontmatter.compatibility.as_deref())?;
+    Ok(())
+}
+
+fn validate_skill_name_matches_dir(skill_dir: &Path, name: &str) -> Result<(), String> {
     let actual = skill_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -85,20 +95,45 @@ pub(crate) fn validate_skill_name_matches_dir(skill_dir: &Path, name: &str) -> R
             "Agent Skills `name` `{name}` must match skill directory `{actual}`"
         ));
     }
-    if name.is_empty()
-        || name.len() > 64
-        || name.starts_with('-')
-        || name.ends_with('-')
-        || name.contains("--")
-        || !name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    if name.is_empty() || name.chars().count() > 64 || name.starts_with('-') || name.ends_with('-')
     {
         return Err(format!(
-            "Agent Skills `name` `{name}` must use lowercase letters, digits, and single hyphens only"
+            "Agent Skills `name` `{name}` must be 1-64 characters and must not start or end with a hyphen"
+        ));
+    }
+    if name.contains("--") || !name.chars().all(is_skill_name_char) {
+        return Err(format!(
+            "Agent Skills `name` `{name}` must use lowercase alphanumeric characters and single hyphens only"
         ));
     }
     Ok(())
+}
+
+fn validate_skill_description(description: &str) -> Result<(), String> {
+    let trimmed = description.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 1024 {
+        return Err(
+            "Agent Skills `description` must be non-empty and at most 1024 characters".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_skill_compatibility(compatibility: Option<&str>) -> Result<(), String> {
+    if let Some(compatibility) = compatibility {
+        let trimmed = compatibility.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 500 {
+            return Err(
+                "Agent Skills `compatibility` must be non-empty and at most 500 characters"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_skill_name_char(ch: char) -> bool {
+    ch == '-' || ch.is_numeric() || ch.is_lowercase()
 }
 
 fn split_skill_frontmatter(source: &str) -> (&str, &str) {
@@ -146,5 +181,37 @@ mod tests {
             "---\nname: file-analyst\ndescription: Analyze files\n---\nBody\n",
         );
         assert_eq!(body.trim(), "Body");
+    }
+
+    #[test]
+    fn validate_agent_skill_frontmatter_rejects_long_description() {
+        let skill_dir = Path::new("file-analyst");
+        let frontmatter = AgentSkillFrontmatter {
+            name: "file-analyst".to_string(),
+            description: "x".repeat(1025),
+            license: None,
+            compatibility: None,
+            metadata: BTreeMap::new(),
+            allowed_tools: None,
+        };
+
+        let error = validate_agent_skill_frontmatter(skill_dir, &frontmatter).unwrap_err();
+        assert!(error.contains("description"));
+    }
+
+    #[test]
+    fn validate_agent_skill_frontmatter_rejects_empty_compatibility() {
+        let skill_dir = Path::new("file-analyst");
+        let frontmatter = AgentSkillFrontmatter {
+            name: "file-analyst".to_string(),
+            description: "Analyze files".to_string(),
+            license: None,
+            compatibility: Some("   ".to_string()),
+            metadata: BTreeMap::new(),
+            allowed_tools: None,
+        };
+
+        let error = validate_agent_skill_frontmatter(skill_dir, &frontmatter).unwrap_err();
+        assert!(error.contains("compatibility"));
     }
 }

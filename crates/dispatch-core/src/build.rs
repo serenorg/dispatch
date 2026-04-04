@@ -12,7 +12,7 @@ use crate::{
     parse_agentfile,
     skill::{
         DispatchSkillManifest, DispatchSkillTool, dispatch_skill_manifest_path,
-        parse_skill_markdown, validate_skill_name_matches_dir,
+        parse_skill_markdown, validate_agent_skill_frontmatter,
     },
     validate::{Level, validate_agentfile},
 };
@@ -749,14 +749,8 @@ fn process_skill_instruction(
             skill_md_path.display()
         ))
     })?;
-    validate_skill_name_matches_dir(&skill_dir, &parsed_skill.frontmatter.name)
+    validate_agent_skill_frontmatter(&skill_dir, &parsed_skill.frontmatter)
         .map_err(BuildError::Validation)?;
-    if parsed_skill.frontmatter.description.trim().is_empty() {
-        return Err(BuildError::Validation(format!(
-            "Agent Skills `description` in `{}` must be non-empty",
-            skill_md_path.display()
-        )));
-    }
 
     let bundle_record = package_path(context_dir, &skill_dir, packaged)?;
     let skill_md_packaged_path = relative_display(context_dir, &skill_md_path);
