@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::BTreeMap,
     fs,
     future::Future,
@@ -40,6 +41,11 @@ use self::{a2a::execute_a2a_tool_with_env, model_backends::*};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PARCEL_SCHEMA_VALIDATOR: OnceLock<Validator> = OnceLock::new();
+thread_local! {
+    static A2A_OPERATOR_POLICY_OVERRIDES: RefCell<Option<A2aOperatorPolicyOverrides>> = const {
+        RefCell::new(None)
+    };
+}
 
 pub(crate) fn a2a_origin_for_trust(url: &url::Url) -> Option<String> {
     a2a::a2a_origin(url)
@@ -289,6 +295,27 @@ pub struct LoadedParcel {
     pub parcel_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub config: ParcelManifest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct A2aOperatorPolicyOverrides {
+    pub allowed_origins: Option<String>,
+    pub trust_policy: Option<String>,
+}
+
+pub fn with_a2a_operator_policy_overrides<T>(
+    overrides: A2aOperatorPolicyOverrides,
+    f: impl FnOnce() -> T,
+) -> T {
+    if overrides.allowed_origins.is_none() && overrides.trust_policy.is_none() {
+        return f();
+    }
+    A2A_OPERATOR_POLICY_OVERRIDES.with(|slot| {
+        let previous = slot.replace(Some(overrides));
+        let result = f();
+        slot.replace(previous);
+        result
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1494,7 +1521,26 @@ where
 }
 
 fn process_env_lookup(name: &str) -> Option<String> {
+    if let Some(override_value) = a2a_operator_policy_override_value(name) {
+        return Some(override_value);
+    }
     std::env::var(name).ok()
+}
+
+fn a2a_operator_policy_override_value(name: &str) -> Option<String> {
+    match name {
+        "DISPATCH_A2A_ALLOWED_ORIGINS" => A2A_OPERATOR_POLICY_OVERRIDES.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|overrides| overrides.allowed_origins.clone())
+        }),
+        "DISPATCH_A2A_TRUST_POLICY" => A2A_OPERATOR_POLICY_OVERRIDES.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|overrides| overrides.trust_policy.clone())
+        }),
+        _ => None,
+    }
 }
 
 fn ensure_mounts_supported(

@@ -17,13 +17,14 @@ pub use build::{
     verify_parcel,
 };
 pub use courier::{
-    ChatModelBackend, ConversationMessage, CourierBackend, CourierCapabilities, CourierError,
-    CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierRequest,
-    CourierResponse, CourierSession, DockerCourier, JsonlCourierPlugin, LoadedParcel,
-    LocalToolSpec, LocalToolTarget, ModelReply, ModelRequest, ModelToolCall, ModelToolDefinition,
-    ModelToolOutput, MountProvider, MountRequest, NativeCourier, ResolvedMount, StubCourier,
-    ToolInvocation, ToolRunResult, WasmCourier, list_local_tools, load_parcel, resolve_prompt_text,
-    run_local_tool,
+    A2aOperatorPolicyOverrides, ChatModelBackend, ConversationMessage, CourierBackend,
+    CourierCapabilities, CourierError, CourierEvent, CourierInspection, CourierKind,
+    CourierOperation, CourierRequest, CourierResponse, CourierSession, DockerCourier,
+    JsonlCourierPlugin, LoadedParcel, LocalToolSpec, LocalToolTarget, ModelReply, ModelRequest,
+    ModelToolCall, ModelToolDefinition, ModelToolOutput, MountProvider, MountRequest,
+    NativeCourier, ResolvedMount, StubCourier, ToolInvocation, ToolRunResult, WasmCourier,
+    list_local_tools, load_parcel, resolve_prompt_text, run_local_tool,
+    with_a2a_operator_policy_overrides,
 };
 pub use depot::{
     DepotError, DepotLocator, DepotReference, DepotTagRecord, PulledParcel, PushedParcel,

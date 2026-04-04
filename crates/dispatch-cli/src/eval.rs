@@ -35,19 +35,22 @@ pub(crate) fn eval(
     registry: Option<PathBuf>,
     emit_json: bool,
     output_dir: Option<PathBuf>,
+    policy: crate::CliA2aPolicy,
 ) -> Result<()> {
-    let parcel = load_or_build_parcel_for_eval(path, output_dir)?;
-    match resolve_courier(courier_name, registry.as_deref())? {
-        ResolvedCourier::Builtin(courier) => {
-            eval_with_builtin_courier(courier, &parcel, courier_name, emit_json)
+    crate::with_cli_a2a_policy(policy, || {
+        let parcel = load_or_build_parcel_for_eval(path, output_dir)?;
+        match resolve_courier(courier_name, registry.as_deref())? {
+            ResolvedCourier::Builtin(courier) => {
+                eval_with_builtin_courier(courier, &parcel, courier_name, emit_json)
+            }
+            ResolvedCourier::Plugin(plugin) => eval_with_courier(
+                JsonlCourierPlugin::new(plugin),
+                &parcel,
+                courier_name,
+                emit_json,
+            ),
         }
-        ResolvedCourier::Plugin(plugin) => eval_with_courier(
-            JsonlCourierPlugin::new(plugin),
-            &parcel,
-            courier_name,
-            emit_json,
-        ),
-    }
+    })
 }
 
 fn load_or_build_parcel_for_eval(

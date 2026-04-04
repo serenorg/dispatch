@@ -63,8 +63,9 @@ pub(crate) fn courier_conformance(
     name: &str,
     registry: Option<&Path>,
     emit_json: bool,
+    policy: crate::CliA2aPolicy,
 ) -> Result<()> {
-    match resolve_courier(name, registry)? {
+    crate::with_cli_a2a_policy(policy, || match resolve_courier(name, registry)? {
         ResolvedCourier::Builtin(courier) => {
             run_courier_conformance_with_builtin(courier, emit_json)
         }
@@ -73,7 +74,7 @@ pub(crate) fn courier_conformance(
             JsonlCourierPlugin::new(plugin),
             emit_json,
         ),
-    }
+    })
 }
 
 fn run_courier_conformance_with_builtin(courier: BuiltinCourier, emit_json: bool) -> Result<()> {

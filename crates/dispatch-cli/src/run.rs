@@ -12,13 +12,19 @@ use std::{
 };
 
 pub(crate) fn run(args: crate::RunArgs) -> Result<()> {
+    let policy = crate::CliA2aPolicy {
+        allowed_origins: args.a2a_allowed_origins.clone(),
+        trust_policy: args.a2a_trust_policy.clone(),
+    };
     let courier_name = args.courier.clone();
-    match resolve_courier(&courier_name, args.registry.as_deref())? {
-        ResolvedCourier::Builtin(courier) => run_with_builtin_courier(courier, args),
-        ResolvedCourier::Plugin(plugin) => {
-            run_with_courier(dispatch_core::JsonlCourierPlugin::new(plugin), args)
+    crate::with_cli_a2a_policy(policy, || {
+        match resolve_courier(&courier_name, args.registry.as_deref())? {
+            ResolvedCourier::Builtin(courier) => run_with_builtin_courier(courier, args),
+            ResolvedCourier::Plugin(plugin) => {
+                run_with_courier(dispatch_core::JsonlCourierPlugin::new(plugin), args)
+            }
         }
-    }
+    })
 }
 
 fn run_with_builtin_courier(courier: BuiltinCourier, args: crate::RunArgs) -> Result<()> {
@@ -43,6 +49,8 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
         list_tools,
         tool,
         input,
+        a2a_allowed_origins: _,
+        a2a_trust_policy: _,
     } = args;
     let parcel =
         load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))?;

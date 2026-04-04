@@ -8,7 +8,10 @@ mod state;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use dispatch_core::{BuildOptions, Level, build_agentfile, parse_agentfile, validate_agentfile};
+use dispatch_core::{
+    A2aOperatorPolicyOverrides, BuildOptions, Level, build_agentfile, parse_agentfile,
+    validate_agentfile, with_a2a_operator_policy_overrides,
+};
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, Parser)]
@@ -56,6 +59,12 @@ enum Command {
         /// Output directory for built parcels when evaluating an Agentfile source
         #[arg(long)]
         output_dir: Option<PathBuf>,
+        /// Override allowed outbound A2A origins or hostnames for this command
+        #[arg(long)]
+        a2a_allowed_origins: Option<String>,
+        /// Apply a structured A2A trust policy file for this command
+        #[arg(long)]
+        a2a_trust_policy: Option<PathBuf>,
     },
     /// Inspect a built parcel
     Inspect {
@@ -178,6 +187,12 @@ struct RunArgs {
     /// Pass raw input to the tool via stdin and `TOOL_INPUT`
     #[arg(long)]
     input: Option<String>,
+    /// Override allowed outbound A2A origins or hostnames for this command
+    #[arg(long)]
+    a2a_allowed_origins: Option<String>,
+    /// Apply a structured A2A trust policy file for this command
+    #[arg(long)]
+    a2a_trust_policy: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -220,7 +235,19 @@ enum CourierCommand {
         /// Print the full conformance report as JSON
         #[arg(long)]
         json: bool,
+        /// Override allowed outbound A2A origins or hostnames for this command
+        #[arg(long)]
+        a2a_allowed_origins: Option<String>,
+        /// Apply a structured A2A trust policy file for this command
+        #[arg(long)]
+        a2a_trust_policy: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CliA2aPolicy {
+    pub allowed_origins: Option<String>,
+    pub trust_policy: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,7 +303,19 @@ fn main() -> Result<()> {
             registry,
             json,
             output_dir,
-        } => eval::eval(path, &courier, registry, json, output_dir),
+            a2a_allowed_origins,
+            a2a_trust_policy,
+        } => eval::eval(
+            path,
+            &courier,
+            registry,
+            json,
+            output_dir,
+            CliA2aPolicy {
+                allowed_origins: a2a_allowed_origins,
+                trust_policy: a2a_trust_policy,
+            },
+        ),
         Command::Inspect {
             path,
             courier,
@@ -306,6 +345,16 @@ fn main() -> Result<()> {
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
     }
+}
+
+pub(crate) fn with_cli_a2a_policy<T>(policy: CliA2aPolicy, f: impl FnOnce() -> T) -> T {
+    with_a2a_operator_policy_overrides(
+        A2aOperatorPolicyOverrides {
+            allowed_origins: policy.allowed_origins,
+            trust_policy: policy.trust_policy.map(|path| path.display().to_string()),
+        },
+        f,
+    )
 }
 
 fn lint(path: PathBuf, emit_json: bool) -> Result<()> {
@@ -401,7 +450,7 @@ fn state_command(command: StateCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, CourierCommand, StateCommand};
+    use super::{Cli, CliA2aPolicy, Command, CourierCommand, StateCommand};
     use clap::Parser;
     use dispatch_core::{
         BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
@@ -479,6 +528,10 @@ mod tests {
             "docker",
             "--registry",
             "/tmp/plugins.json",
+            "--a2a-allowed-origins",
+            "https://agents.example.com,broker.internal",
+            "--a2a-trust-policy",
+            "/tmp/a2a-policy.yaml",
             "--print-prompt",
         ])
         .unwrap();
@@ -491,7 +544,48 @@ mod tests {
             args.registry.as_deref(),
             Some(Path::new("/tmp/plugins.json"))
         );
+        assert_eq!(
+            args.a2a_allowed_origins.as_deref(),
+            Some("https://agents.example.com,broker.internal")
+        );
+        assert_eq!(
+            args.a2a_trust_policy.as_deref(),
+            Some(Path::new("/tmp/a2a-policy.yaml"))
+        );
         assert!(args.print_prompt);
+    }
+
+    #[test]
+    fn cli_parses_eval_a2a_policy_overrides() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "eval",
+            ".",
+            "--courier",
+            "native",
+            "--a2a-allowed-origins",
+            "https://agents.example.com",
+            "--a2a-trust-policy",
+            "/tmp/a2a-policy.yaml",
+        ])
+        .unwrap();
+
+        let Command::Eval {
+            a2a_allowed_origins,
+            a2a_trust_policy,
+            ..
+        } = cli.command
+        else {
+            panic!("expected eval command");
+        };
+        assert_eq!(
+            a2a_allowed_origins.as_deref(),
+            Some("https://agents.example.com")
+        );
+        assert_eq!(
+            a2a_trust_policy.as_deref(),
+            Some(Path::new("/tmp/a2a-policy.yaml"))
+        );
     }
 
     #[test]
@@ -850,6 +944,10 @@ mod tests {
             "--json",
             "--registry",
             "/tmp/plugins.json",
+            "--a2a-allowed-origins",
+            "https://agents.example.com",
+            "--a2a-trust-policy",
+            "/tmp/a2a-policy.yaml",
         ])
         .unwrap();
 
@@ -860,12 +958,22 @@ mod tests {
             name,
             registry,
             json,
+            a2a_allowed_origins,
+            a2a_trust_policy,
         } = command
         else {
             panic!("expected courier conformance subcommand");
         };
         assert_eq!(name, "native");
         assert_eq!(registry.as_deref(), Some(Path::new("/tmp/plugins.json")));
+        assert_eq!(
+            a2a_allowed_origins.as_deref(),
+            Some("https://agents.example.com")
+        );
+        assert_eq!(
+            a2a_trust_policy.as_deref(),
+            Some(Path::new("/tmp/a2a-policy.yaml"))
+        );
         assert!(json);
     }
 
@@ -892,6 +1000,8 @@ mod tests {
             list_tools: false,
             tool: None,
             input: None,
+            a2a_allowed_origins: None,
+            a2a_trust_policy: None,
         })
         .unwrap();
 
@@ -946,6 +1056,7 @@ mod tests {
             Some(registry_path),
             false,
             None,
+            CliA2aPolicy::default(),
         )
         .unwrap();
     }
@@ -977,6 +1088,7 @@ mod tests {
             Some(registry_path),
             false,
             None,
+            CliA2aPolicy::default(),
         )
         .unwrap_err();
 
@@ -985,7 +1097,8 @@ mod tests {
 
     #[test]
     fn courier_conformance_runs_against_native() {
-        crate::conformance::courier_conformance("native", None, false).unwrap();
+        crate::conformance::courier_conformance("native", None, false, CliA2aPolicy::default())
+            .unwrap();
     }
 
     #[test]

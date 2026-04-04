@@ -20,7 +20,17 @@ pub(crate) fn courier_command(command: crate::CourierCommand) -> Result<()> {
             name,
             registry,
             json,
-        } => crate::conformance::courier_conformance(&name, registry.as_deref(), json),
+            a2a_allowed_origins,
+            a2a_trust_policy,
+        } => crate::conformance::courier_conformance(
+            &name,
+            registry.as_deref(),
+            json,
+            crate::CliA2aPolicy {
+                allowed_origins: a2a_allowed_origins,
+                trust_policy: a2a_trust_policy,
+            },
+        ),
     }
 }
 
