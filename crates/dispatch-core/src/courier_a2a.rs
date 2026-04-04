@@ -1,6 +1,8 @@
 use crate::manifest::{A2aAuthScheme, A2aEndpointMode};
+use crate::trust::{A2aTrustPolicy, A2aTrustRequirement};
 use sha2::{Digest, Sha256};
 use std::{
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -165,16 +167,6 @@ where
                     message: format!("failed to read agent card: {error}"),
                 })?;
         let actual_sha256 = encode_hex(Sha256::digest(body.as_bytes()));
-        if let Some(expected_sha256) = tool.expected_card_sha256()
-            && expected_sha256 != actual_sha256
-        {
-            return Err(CourierError::A2aToolRequest {
-                tool: tool.alias.clone(),
-                message: format!(
-                    "agent card digest mismatch: expected `{expected_sha256}`, got `{actual_sha256}`"
-                ),
-            });
-        }
         let card = serde_json::from_str::<serde_json::Value>(&body).map_err(|error| {
             CourierError::A2aToolRequest {
                 tool: tool.alias.clone(),
@@ -186,6 +178,20 @@ where
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| normalize_a2a_rpc_endpoint(url));
+        let trust_requirement = resolve_a2a_trust_requirement(tool, &endpoint, &mut env_lookup)?;
+        if let Some(expected_sha256) = tool.expected_card_sha256().or_else(|| {
+            trust_requirement
+                .as_ref()
+                .and_then(|requirement| requirement.expected_card_sha256.as_deref())
+        }) && expected_sha256 != actual_sha256
+        {
+            return Err(CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!(
+                    "agent card digest mismatch: expected `{expected_sha256}`, got `{actual_sha256}`"
+                ),
+            });
+        }
         if !a2a_urls_share_origin(url, &endpoint) {
             return Err(CourierError::A2aToolRequest {
                 tool: tool.alias.clone(),
@@ -199,7 +205,11 @@ where
             .get("name")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
-        if let Some(expected) = tool.expected_agent_name() {
+        if let Some(expected) = tool.expected_agent_name().or_else(|| {
+            trust_requirement
+                .as_ref()
+                .and_then(|requirement| requirement.expected_agent_name.as_deref())
+        }) {
             match agent_name.as_deref() {
                 Some(actual) if expected == actual => {}
                 Some(actual) => {
@@ -226,6 +236,17 @@ where
         return Err(CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
             message: "agent card discovery failed for required `DISCOVERY card` mode".to_string(),
+        });
+    }
+    if let Some(requirement) =
+        resolve_a2a_trust_requirement(tool, &normalize_a2a_rpc_endpoint(url), &mut env_lookup)?
+        && (requirement.expected_agent_name.is_some() || requirement.expected_card_sha256.is_some())
+    {
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message:
+                "A2A trust policy requires discovered agent-card identity, but card discovery did not succeed"
+                    .to_string(),
         });
     }
     Ok((normalize_a2a_rpc_endpoint(url), None))
@@ -274,7 +295,7 @@ fn normalize_a2a_allowlist_entry(entry: &str) -> Option<String> {
     Some(trimmed.to_ascii_lowercase())
 }
 
-pub(super) fn a2a_origin(url: &Url) -> Option<String> {
+pub(crate) fn a2a_origin(url: &Url) -> Option<String> {
     let host = url.host_str()?;
     let scheme = url.scheme();
     let default_port = match scheme {
@@ -369,19 +390,85 @@ where
     })?;
     validate_a2a_url_security(tool, &parsed)?;
     let Some(raw_allowlist) = env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS") else {
-        return Ok(());
+        return validate_a2a_url_trust_policy(tool, &parsed, env_lookup);
     };
     let allowlist = raw_allowlist
         .split(',')
         .filter_map(normalize_a2a_allowlist_entry)
         .collect::<Vec<_>>();
-    if is_a2a_url_allowed(&parsed, &allowlist) {
-        return Ok(());
+    if !is_a2a_url_allowed(&parsed, &allowlist) {
+        return Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("A2A URL `{url}` is not allowed by DISPATCH_A2A_ALLOWED_ORIGINS"),
+        });
     }
-    Err(CourierError::A2aToolRequest {
+    validate_a2a_url_trust_policy(tool, &parsed, env_lookup)
+}
+
+fn validate_a2a_url_trust_policy<F>(
+    tool: &LocalToolSpec,
+    parsed: &Url,
+    env_lookup: &mut F,
+) -> Result<(), CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let Some(requirement) = resolve_a2a_trust_requirement_for_url(tool, parsed, env_lookup)? else {
+        return Ok(());
+    };
+    if requirement.matched {
+        Ok(())
+    } else {
+        Err(CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!(
+                "A2A URL `{}` is not allowed by DISPATCH_A2A_TRUST_POLICY",
+                parsed
+            ),
+        })
+    }
+}
+
+fn resolve_a2a_trust_requirement_for_url<F>(
+    tool: &LocalToolSpec,
+    parsed: &Url,
+    env_lookup: &mut F,
+) -> Result<Option<A2aTrustRequirement>, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let Some(policy_path) = env_lookup("DISPATCH_A2A_TRUST_POLICY") else {
+        return Ok(None);
+    };
+    let policy = A2aTrustPolicy::from_path(Path::new(&policy_path)).map_err(|error| {
+        CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: format!("failed to load A2A trust policy `{policy_path}`: {error}"),
+        }
+    })?;
+    let requirement =
+        policy
+            .resolve_for_url(parsed)
+            .map_err(|error| CourierError::A2aToolRequest {
+                tool: tool.alias.clone(),
+                message: format!("A2A trust policy conflict for `{}`: {error}", parsed),
+            })?;
+    Ok(Some(requirement))
+}
+
+fn resolve_a2a_trust_requirement<F>(
+    tool: &LocalToolSpec,
+    endpoint: &str,
+    env_lookup: &mut F,
+) -> Result<Option<A2aTrustRequirement>, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let parsed = Url::parse(endpoint).map_err(|error| CourierError::A2aToolRequest {
         tool: tool.alias.clone(),
-        message: format!("A2A URL `{url}` is not allowed by DISPATCH_A2A_ALLOWED_ORIGINS"),
-    })
+        message: format!("invalid A2A URL `{endpoint}`: {error}"),
+    })?;
+    resolve_a2a_trust_requirement_for_url(tool, &parsed, env_lookup)
 }
 
 fn collect_a2a_artifact_parts(

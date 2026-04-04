@@ -56,5 +56,8 @@ pub use signing::{
     PublicKeyFile, SecretKeyFile, SignatureVerification, SigningError, generate_keypair_files,
     sign_parcel, verify_parcel_signature,
 };
-pub use trust::{PullTrustPolicy, PullTrustRequirement, PullTrustRule, TrustPolicyError};
+pub use trust::{
+    A2aTrustPolicy, A2aTrustRequirement, A2aTrustRule, PullTrustPolicy, PullTrustRequirement,
+    PullTrustRule, TrustPolicyError,
+};
 pub use validate::{Diagnostic, Level, ValidationReport, validate_agentfile};

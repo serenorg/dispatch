@@ -41,6 +41,10 @@ use self::{a2a::execute_a2a_tool_with_env, model_backends::*};
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PARCEL_SCHEMA_VALIDATOR: OnceLock<Validator> = OnceLock::new();
 
+pub(crate) fn a2a_origin_for_trust(url: &url::Url) -> Option<String> {
+    a2a::a2a_origin(url)
+}
+
 mod wasm_bindings {
     wasmtime::component::bindgen!({
         path: "../dispatch-wasm-abi/wit",
@@ -6637,6 +6641,80 @@ ENTRYPOINT job
 
         let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
             (name == "DISPATCH_A2A_ALLOWED_ORIGINS").then(|| origin.clone())
+        })
+        .unwrap();
+        assert!(result.stdout.contains("echo:hello"));
+    }
+
+    #[test]
+    fn native_courier_rejects_a2a_url_outside_operator_trust_policy() {
+        let server = start_test_a2a_server();
+        let dir = tempdir().unwrap();
+        let policy_path = dir.path().join("a2a-trust.yaml");
+        fs::write(
+            &policy_path,
+            "rules:\n  - origin_prefix: \"https://agents.example.com\"\n",
+        )
+        .unwrap();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "DISPATCH_A2A_TRUST_POLICY").then(|| policy_path.display().to_string())
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not allowed by DISPATCH_A2A_TRUST_POLICY")
+        );
+    }
+
+    #[test]
+    fn native_courier_enforces_operator_a2a_trust_policy_identity() {
+        let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+            agent_name: Some("planner-agent".to_string()),
+            ..Default::default()
+        });
+        let dir = tempdir().unwrap();
+        let policy_path = dir.path().join("a2a-trust.yaml");
+        let card_body = serde_json::to_vec(&serde_json::json!({
+            "name": "planner-agent",
+            "url": format!("{}/a2a", server.base_url),
+        }))
+        .unwrap();
+        let card_sha = encode_hex(Sha256::digest(card_body));
+        fs::write(
+            &policy_path,
+            format!(
+                "rules:\n  - hostname: \"127.0.0.1\"\n    expected_agent_name: \"planner-agent\"\n    expected_card_sha256: \"{}\"\n",
+                card_sha
+            ),
+        )
+        .unwrap();
+        let test_image = build_test_image(
+            &format!(
+                "\
+FROM dispatch/native:latest
+TOOL A2A broker URL {}
+ENTRYPOINT job
+",
+                server.base_url
+            ),
+            &[],
+        );
+
+        let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+            (name == "DISPATCH_A2A_TRUST_POLICY").then(|| policy_path.display().to_string())
         })
         .unwrap();
         assert!(result.stdout.contains("echo:hello"));
