@@ -42,10 +42,7 @@ pub(super) const CODEX_BACKEND_ID: &str = "codex_app_server";
 const CODEX_BACKEND_STATE_PREFIX: &str = "codex_thread:";
 
 pub(super) fn is_codex_provider(provider: &str) -> bool {
-    matches!(
-        provider.to_ascii_lowercase().as_str(),
-        "codex" | "codex_app_server" | "codex-app-server"
-    )
+    provider.eq_ignore_ascii_case("codex")
 }
 
 pub(super) fn is_codex_backend_id(backend_id: &str) -> bool {
@@ -82,7 +79,7 @@ where
         .to_ascii_lowercase()
         .as_str()
     {
-        "codex" | "codex_app_server" | "codex-app-server" => Arc::new(CodexAppServerBackend),
+        "codex" => Arc::new(CodexAppServerBackend),
         "anthropic" => Arc::new(AnthropicMessagesBackend),
         "gemini" | "google" | "google_gemini" => Arc::new(GeminiGenerateContentBackend),
         "openai_compatible" | "openrouter" | "together" | "fireworks" | "litellm" | "vllm"

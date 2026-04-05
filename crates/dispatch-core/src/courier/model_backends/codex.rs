@@ -1,8 +1,22 @@
 use super::*;
 use std::{
+    fs::File,
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+#[cfg(not(unix))]
+use std::process::{ChildStdin, ChildStdout};
+
+#[cfg(unix)]
+use nix::{
+    pty::openpty,
+    sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr},
+    unistd::dup,
 };
 
 #[derive(Default)]
@@ -39,12 +53,13 @@ impl ChatModelBackend for CodexAppServerBackend {
                 reason: "missing CODEX_BINARY or `codex` executable".to_string(),
             });
         };
+        let deadline = request_timeout_deadline(request);
 
-        process.initialize()?;
-        let thread_id = process.open_thread(request)?;
+        process.initialize(deadline)?;
+        let thread_id = process.open_thread(request, deadline)?;
         let prompt = codex_prompt_text(request);
-        let turn_id = process.start_turn(&thread_id, &request.model, &prompt)?;
-        let text = process.collect_turn_output(&turn_id, on_event)?;
+        let turn_id = process.start_turn(&thread_id, &request.model, &prompt, deadline)?;
+        let text = process.collect_turn_output(&turn_id, on_event, deadline)?;
 
         Ok(ModelGeneration::Reply(ModelReply {
             text: Some(text),
@@ -118,10 +133,10 @@ fn codex_prompt_text(request: &ModelRequest) -> String {
     };
 
     if request.previous_response_id.is_some() {
+        // The tool note is only needed once, on the first turn, to set Codex's
+        // expectations. On subsequent turns the Codex thread already has context
+        // and repeating the note adds noise without value.
         let mut parts = Vec::new();
-        if let Some(note) = tool_note {
-            parts.push(note);
-        }
         if let Some(text) = latest_user {
             parts.push(text);
         } else if !request.messages.is_empty() {
@@ -129,7 +144,11 @@ fn codex_prompt_text(request: &ModelRequest) -> String {
         } else if !request.instructions.trim().is_empty() {
             parts.push(request.instructions.clone());
         }
-        return parts.join("\n\n");
+        return parts
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
     }
 
     let mut sections = Vec::new();
@@ -167,9 +186,21 @@ fn render_conversation_transcript(messages: &[ConversationMessage]) -> String {
 
 struct CodexProcess {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    io: CodexIo,
     next_request_id: i64,
+}
+
+enum CodexIo {
+    #[cfg(not(unix))]
+    Pipes {
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    },
+    #[cfg(unix)]
+    Pty {
+        stdin: File,
+        stdout: BufReader<File>,
+    },
 }
 
 impl CodexProcess {
@@ -178,9 +209,6 @@ impl CodexProcess {
         let mut command = Command::new(&binary);
         command
             .arg("app-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .current_dir(Path::new(working_directory));
         if let Ok(home) = std::env::var("CODEX_HOME") {
             let trimmed = home.trim();
@@ -189,6 +217,90 @@ impl CodexProcess {
             }
         }
 
+        #[cfg(unix)]
+        {
+            Self::spawn_with_pty(command)
+        }
+
+        #[cfg(not(unix))]
+        {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            Self::spawn_with_pipes(command)
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_with_pty(mut command: Command) -> Result<Option<Self>, CourierError> {
+        let pty = openpty(None, None).map_err(|error| {
+            CourierError::ModelBackendRequest(format!(
+                "failed to allocate PTY for codex app-server: {error}"
+            ))
+        })?;
+        let mut termios = tcgetattr(&pty.slave).map_err(|error| {
+            CourierError::ModelBackendRequest(format!(
+                "failed to read PTY settings for codex app-server: {error}"
+            ))
+        })?;
+        cfmakeraw(&mut termios);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).map_err(|error| {
+            CourierError::ModelBackendRequest(format!(
+                "failed to configure PTY for codex app-server: {error}"
+            ))
+        })?;
+
+        let stdin = File::from(dup(&pty.master).map_err(|error| {
+            CourierError::ModelBackendRequest(format!(
+                "failed to clone codex app-server PTY master for input: {error}"
+            ))
+        })?);
+        let stdout = BufReader::new(File::from(dup(&pty.master).map_err(|error| {
+            CourierError::ModelBackendRequest(format!(
+                "failed to clone codex app-server PTY master for output: {error}"
+            ))
+        })?));
+
+        command
+            .stdin(Stdio::from(File::from(dup(&pty.slave).map_err(
+                |error| {
+                    CourierError::ModelBackendRequest(format!(
+                        "failed to clone codex app-server PTY slave for stdin: {error}"
+                    ))
+                },
+            )?)))
+            .stdout(Stdio::from(File::from(dup(&pty.slave).map_err(
+                |error| {
+                    CourierError::ModelBackendRequest(format!(
+                        "failed to clone codex app-server PTY slave for stdout: {error}"
+                    ))
+                },
+            )?)))
+            .stderr(Stdio::piped());
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CourierError::ModelBackendRequest(format!(
+                    "failed to start codex app-server: {error}"
+                )));
+            }
+        };
+
+        Ok(Some(Self {
+            child,
+            io: CodexIo::Pty { stdin, stdout },
+            next_request_id: 1,
+        }))
+    }
+
+    #[cfg(not(unix))]
+    fn spawn_with_pipes(mut command: Command) -> Result<Option<Self>, CourierError> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -206,13 +318,15 @@ impl CodexProcess {
         })?;
         Ok(Some(Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            io: CodexIo::Pipes {
+                stdin,
+                stdout: BufReader::new(stdout),
+            },
             next_request_id: 1,
         }))
     }
 
-    fn initialize(&mut self) -> Result<(), CourierError> {
+    fn initialize(&mut self, deadline: Option<Instant>) -> Result<(), CourierError> {
         self.request(
             "initialize",
             serde_json::json!({
@@ -225,38 +339,53 @@ impl CodexProcess {
                     "experimentalApi": true
                 }
             }),
+            deadline,
         )?;
         self.notify("initialized", serde_json::json!({}))?;
         Ok(())
     }
 
-    fn open_thread(&mut self, request: &ModelRequest) -> Result<String, CourierError> {
-        if let Some(thread_id) = request.previous_response_id.as_deref()
-            && let Ok(value) = self.request(
-                "thread/resume",
-                serde_json::json!({
-                    "threadId": thread_id,
-                    "cwd": request.working_directory,
-                    "approvalPolicy": "on-request",
-                    "sandbox": "workspace-write",
-                    "experimentalRawEvents": false,
-                    "model": request.model,
-                }),
-            )
-            && let Some(thread_id) = extract_thread_id(&value)
-        {
-            return Ok(thread_id);
+    fn open_thread(
+        &mut self,
+        request: &ModelRequest,
+        deadline: Option<Instant>,
+    ) -> Result<String, CourierError> {
+        if let Some(thread_id) = request.previous_response_id.as_deref() {
+            let value = self
+                .request(
+                    "thread/resume",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "cwd": request.working_directory,
+                        "approvalPolicy": "on-request",
+                        "sandbox": "workspace-write",
+                        "experimentalRawEvents": false,
+                        "model": request.model,
+                    }),
+                    deadline,
+                )
+                .map_err(|error| {
+                    CourierError::ModelBackendRequest(format!(
+                        "failed to resume codex thread `{thread_id}`: {error}"
+                    ))
+                })?;
+            return extract_thread_id(&value).ok_or_else(|| {
+                CourierError::ModelBackendResponse(format!(
+                    "codex thread/resume response for `{thread_id}` did not include a thread id"
+                ))
+            });
         }
 
         let value = self.request(
             "thread/start",
             serde_json::json!({
-                "cwd": request.working_directory,
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write",
+            "cwd": request.working_directory,
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
                 "experimentalRawEvents": false,
                 "model": request.model,
             }),
+            deadline,
         )?;
         extract_thread_id(&value).ok_or_else(|| {
             CourierError::ModelBackendResponse(
@@ -270,6 +399,7 @@ impl CodexProcess {
         thread_id: &str,
         model: &str,
         prompt: &str,
+        deadline: Option<Instant>,
     ) -> Result<String, CourierError> {
         let value = self.request(
             "turn/start",
@@ -279,6 +409,7 @@ impl CodexProcess {
                 "model": model,
                 "effort": codex_reasoning_effort(),
             }),
+            deadline,
         )?;
         value
             .get("turn")
@@ -296,10 +427,11 @@ impl CodexProcess {
         &mut self,
         turn_id: &str,
         on_event: &mut dyn FnMut(ModelStreamEvent),
+        deadline: Option<Instant>,
     ) -> Result<String, CourierError> {
         let mut reply = String::new();
         loop {
-            let value = self.read_message()?;
+            let value = self.read_message(deadline)?;
             if is_response(&value) {
                 continue;
             }
@@ -365,6 +497,7 @@ impl CodexProcess {
         &mut self,
         method: &str,
         params: serde_json::Value,
+        deadline: Option<Instant>,
     ) -> Result<serde_json::Value, CourierError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -376,7 +509,7 @@ impl CodexProcess {
         }))?;
 
         loop {
-            let value = self.read_message()?;
+            let value = self.read_message(deadline)?;
             if is_response_for(&value, request_id) {
                 if let Some(message) = value
                     .get("error")
@@ -412,23 +545,16 @@ impl CodexProcess {
             .get("method")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let params = value
-            .get("params")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-
         let result = match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 serde_json::json!({ "decision": "decline" })
             }
             "item/permissions/requestApproval" => {
-                let permissions = params
-                    .get("permissions")
-                    .and_then(serde_json::Value::as_object)
-                    .map(|_| serde_json::json!({}))
-                    .unwrap_or_else(|| serde_json::json!({}));
+                // Grant zero permissions for the current turn.
+                // The protocol accepts {"permissions": {}, "scope": "turn"} as
+                // the deny/no-grant response.
                 serde_json::json!({
-                    "permissions": permissions,
+                    "permissions": {},
                     "scope": "turn"
                 })
             }
@@ -436,12 +562,13 @@ impl CodexProcess {
                 serde_json::json!({ "decision": "denied" })
             }
             _ => {
+                let message = format!("Unsupported Codex app-server request: {method}");
                 return self.write_message(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {
                         "code": -32601,
-                        "message": format!("Unsupported Codex app-server request: {method}")
+                        "message": message
                     }
                 }));
             }
@@ -457,23 +584,55 @@ impl CodexProcess {
     fn write_message(&mut self, value: serde_json::Value) -> Result<(), CourierError> {
         let encoded = serde_json::to_vec(&value)
             .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
-        self.stdin
-            .write_all(&encoded)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-        self.stdin
-            .flush()
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))
+        match &mut self.io {
+            #[cfg(not(unix))]
+            CodexIo::Pipes { stdin, .. } => {
+                stdin
+                    .write_all(&encoded)
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+                stdin
+                    .write_all(b"\n")
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+                stdin
+                    .flush()
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))
+            }
+            #[cfg(unix)]
+            CodexIo::Pty { stdin, .. } => {
+                stdin
+                    .write_all(&encoded)
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+                stdin
+                    .write_all(b"\n")
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+                stdin
+                    .flush()
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))
+            }
+        }
     }
 
-    fn read_message(&mut self) -> Result<serde_json::Value, CourierError> {
-        let mut line = String::new();
-        let bytes = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+    fn read_message(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<serde_json::Value, CourierError> {
+        let bytes_and_line = match &mut self.io {
+            #[cfg(not(unix))]
+            CodexIo::Pipes { stdout, .. } => {
+                read_line_with_timeout(stdout, &mut self.child, deadline)?
+            }
+            #[cfg(unix)]
+            CodexIo::Pty { stdout, .. } => {
+                read_line_with_timeout(stdout, &mut self.child, deadline)?
+            }
+        };
+        let Some((bytes, line)) = bytes_and_line else {
+            return Err(CourierError::ModelBackendRequest(
+                read_stderr(&mut self.child)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "codex app-server closed unexpectedly".to_string()),
+            ));
+        };
         if bytes == 0 {
             return Err(CourierError::ModelBackendRequest(
                 read_stderr(&mut self.child)
@@ -486,7 +645,70 @@ impl CodexProcess {
     }
 }
 
+fn request_timeout_deadline(request: &ModelRequest) -> Option<Instant> {
+    request
+        .llm_timeout_ms
+        .map(Duration::from_millis)
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+}
+
+fn remaining_timeout(deadline: Option<Instant>) -> Result<Option<Duration>, CourierError> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+    deadline
+        .checked_duration_since(Instant::now())
+        .map(Some)
+        .ok_or_else(codex_timeout_error)
+}
+
+fn codex_timeout_error() -> CourierError {
+    CourierError::ModelBackendRequest("codex app-server request timed out".to_string())
+}
+
+fn read_line_with_timeout<R: BufRead + Send>(
+    reader: &mut R,
+    child: &mut Child,
+    deadline: Option<Instant>,
+) -> Result<Option<(usize, String)>, CourierError> {
+    let Some(timeout) = remaining_timeout(deadline)? else {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+        return Ok(Some((bytes, line)));
+    };
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut line = String::new();
+            let result = reader
+                .read_line(&mut line)
+                .map(|bytes| (bytes, line))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(timeout) {
+            Ok(Ok((bytes, line))) => Ok(Some((bytes, line))),
+            Ok(Err(error)) => Err(CourierError::ModelBackendRequest(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                Err(codex_timeout_error())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(CourierError::ModelBackendRequest(
+                "codex app-server reader disconnected unexpectedly".to_string(),
+            )),
+        }
+    })
+}
+
 fn read_stderr(child: &mut Child) -> Option<String> {
+    // Wait for the process to exit before reading stderr.
+    // Without this, read_to_string on a pipe can block indefinitely if the
+    // child process has closed stdout but not yet closed stderr.
+    let _ = child.wait();
     let mut stderr = String::new();
     let stderr_pipe = child.stderr.as_mut()?;
     let _ = std::io::Read::read_to_string(stderr_pipe, &mut stderr);

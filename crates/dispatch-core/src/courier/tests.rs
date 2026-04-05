@@ -90,6 +90,26 @@ fn write_executable_script(path: &std::path::Path, content: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+struct CodexBackendTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for CodexBackendTestGuard {
+    fn drop(&mut self) {
+        clear_test_codex_binary_override();
+    }
+}
+
+fn lock_codex_backend_test() -> CodexBackendTestGuard {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    CodexBackendTestGuard {
+        _guard: LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("codex backend test lock poisoned"),
+    }
+}
+
 fn start_test_a2a_server_with_options(options: TestA2aServerOptions) -> TestA2aServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

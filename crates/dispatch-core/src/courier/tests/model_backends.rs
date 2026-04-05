@@ -350,6 +350,7 @@ fn gemini_messages_include_function_call_and_response_parts() {
 #[test]
 #[cfg(unix)]
 fn codex_backend_streams_reply_and_resumes_previous_thread() {
+    let _guard = lock_codex_backend_test();
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("codex.log");
     let script_path = dir.path().join("codex-app-server");
@@ -426,5 +427,86 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("\"method\":\"thread/start\""));
     assert!(log.contains("\"method\":\"thread/resume\""));
-    clear_test_codex_binary_override();
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_resume_failure_returns_error() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/resume\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32001,\"message\":\"thread expired\"}}' ;;\nesac\ndone\n",
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "follow up".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: Some("thread-old".to_string()),
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to resume codex thread `thread-old`")
+    );
+    assert!(error.to_string().contains("thread expired"));
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_respects_llm_timeout() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(&script_path, "#!/bin/sh\nsleep 2\n");
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                llm_timeout_ms: Some(50),
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("timed out"));
 }

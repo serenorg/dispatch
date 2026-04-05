@@ -13,6 +13,7 @@ Current published schema:
 Dispatch keeps one tracked copy of the current parcel schema in the repo:
 The schema file is the single source of truth.
 The schema file is the single source of truth.
+The schema file is the single source of truth.
 
 - `schemas/parcel.v1.json` is the canonical schema checked into the repo
 
