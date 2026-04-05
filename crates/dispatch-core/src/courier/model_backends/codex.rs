@@ -56,12 +56,13 @@ impl ChatModelBackend for CodexAppServerBackend {
         let deadline = request_timeout_deadline(request);
 
         process.initialize(deadline)?;
+        let reasoning_effort = process.resolve_reasoning_effort(request, deadline)?;
         let thread = process.open_thread(request, deadline)?;
         let prompt = codex_prompt_text(request);
         let turn_id = process.start_turn(
-            request,
             &thread.thread_id,
             &request.model,
+            reasoning_effort.as_deref(),
             &prompt,
             deadline,
         )?;
@@ -119,18 +120,17 @@ fn codex_binary_path() -> String {
     std::env::var("CODEX_BINARY").unwrap_or_else(|_| "codex".to_string())
 }
 
-fn model_reasoning_effort(request: &ModelRequest) -> String {
+fn requested_model_reasoning_effort(request: &ModelRequest) -> Option<String> {
     model_option_value(request, "reasoning-effort")
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .map(|value| value.to_ascii_lowercase())
         .or_else(|| {
             std::env::var("DISPATCH_REASONING_EFFORT")
                 .ok()
-                .map(|value| value.trim().to_string())
+                .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or_else(|| "medium".to_string())
 }
 
 fn codex_history_persistence_enabled(request: &ModelRequest) -> bool {
@@ -240,6 +240,13 @@ struct CodexProcess {
 struct CodexThreadState {
     thread_id: String,
     rollout_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexModelReasoningProfile {
+    display_name: Option<String>,
+    supported_efforts: Vec<String>,
+    default_effort: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -475,24 +482,99 @@ impl CodexProcess {
         })
     }
 
-    fn start_turn(
+    fn resolve_reasoning_effort(
         &mut self,
         request: &ModelRequest,
+        deadline: Option<Instant>,
+    ) -> Result<Option<String>, CourierError> {
+        let Some(effort) = requested_model_reasoning_effort(request) else {
+            return Ok(None);
+        };
+        let Some(profile) = self.find_model_reasoning_profile(&request.model, deadline)? else {
+            return Err(CourierError::ModelBackendRequest(format!(
+                "codex model/list did not include model `{}` needed to validate reasoning effort `{}`",
+                request.model, effort
+            )));
+        };
+        if profile
+            .supported_efforts
+            .iter()
+            .any(|value| value == &effort)
+        {
+            return Ok(Some(effort));
+        }
+        let supported = if profile.supported_efforts.is_empty() {
+            "none".to_string()
+        } else {
+            profile.supported_efforts.join(", ")
+        };
+        let default_effort = profile.default_effort.as_deref().unwrap_or("none");
+        Err(CourierError::ModelBackendRequest(format!(
+            "codex model `{}` does not support reasoning effort `{}`; supported values: {}; default: {}",
+            profile.display_name.as_deref().unwrap_or(&request.model),
+            effort,
+            supported,
+            default_effort
+        )))
+    }
+
+    fn find_model_reasoning_profile(
+        &mut self,
+        requested_model: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<CodexModelReasoningProfile>, CourierError> {
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let mut params = serde_json::json!({
+                "includeHidden": true,
+            });
+            if let Some(value) = &cursor {
+                params["cursor"] = serde_json::Value::String(value.clone());
+            }
+            let value = self.request("model/list", params, deadline)?;
+            if let Some(found) = value
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|models| {
+                    models
+                        .iter()
+                        .find(|model| codex_model_matches(model, requested_model))
+                        .map(parse_codex_model_reasoning_profile)
+                })
+                .transpose()?
+            {
+                return Ok(Some(found));
+            }
+            cursor = value
+                .get("nextCursor")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            if cursor.is_none() {
+                return Ok(None);
+            }
+        }
+        Err(CourierError::ModelBackendResponse(
+            "codex model/list pagination exceeded 20 pages".to_string(),
+        ))
+    }
+
+    fn start_turn(
+        &mut self,
         thread_id: &str,
         model: &str,
+        reasoning_effort: Option<&str>,
         prompt: &str,
         deadline: Option<Instant>,
     ) -> Result<String, CourierError> {
-        let value = self.request(
-            "turn/start",
-            serde_json::json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": prompt }],
-                "model": model,
-                "effort": model_reasoning_effort(request),
-            }),
-            deadline,
-        )?;
+        let mut params = serde_json::json!({
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": prompt }],
+            "model": model,
+        });
+        if let Some(value) = reasoning_effort {
+            params["effort"] = serde_json::Value::String(value.to_string());
+        }
+        let value = self.request("turn/start", params, deadline)?;
         value
             .get("turn")
             .and_then(|turn| turn.get("id"))
@@ -841,6 +923,57 @@ fn extract_thread_state(value: &serde_json::Value) -> Option<CodexThreadState> {
     Some(CodexThreadState {
         thread_id,
         rollout_path,
+    })
+}
+
+fn codex_model_matches(model: &serde_json::Value, requested_model: &str) -> bool {
+    model
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value == requested_model)
+        || model
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == requested_model)
+}
+
+fn parse_codex_model_reasoning_profile(
+    model: &serde_json::Value,
+) -> Result<CodexModelReasoningProfile, CourierError> {
+    let supported_efforts = model
+        .get("supportedReasoningEfforts")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .get("reasoningEffort")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|value| value.to_ascii_lowercase())
+                        .ok_or_else(|| {
+                            CourierError::ModelBackendResponse(
+                                "codex model/list reasoning effort entry omitted reasoningEffort"
+                                    .to_string(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let default_effort = model
+        .get("defaultReasoningEffort")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    let display_name = model
+        .get("displayName")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    Ok(CodexModelReasoningProfile {
+        display_name,
+        supported_efforts,
+        default_effort,
     })
 }
 

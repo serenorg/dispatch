@@ -591,7 +591,7 @@ fn codex_backend_uses_reasoning_effort_model_option() {
     write_executable_script(
         &script_path,
         &format!(
-            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"model/list\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"data\":[{{\"id\":\"gpt-5.4\",\"model\":\"gpt-5.4\",\"displayName\":\"GPT-5.4\",\"description\":\"\",\"supportedReasoningEfforts\":[{{\"reasoningEffort\":\"low\",\"description\":\"\"}},{{\"reasoningEffort\":\"medium\",\"description\":\"\"}},{{\"reasoningEffort\":\"high\",\"description\":\"\"}}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\"],\"supportsPersonality\":false,\"isDefault\":true}}]}}}}' ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
             log_path.display()
         ),
     );
@@ -651,7 +651,7 @@ fn codex_backend_env_override_sets_reasoning_effort() {
     write_executable_script(
         &script_path,
         &format!(
-            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"model/list\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"data\":[{{\"id\":\"gpt-5.4\",\"model\":\"gpt-5.4\",\"displayName\":\"GPT-5.4\",\"description\":\"\",\"supportedReasoningEfforts\":[{{\"reasoningEffort\":\"low\",\"description\":\"\"}},{{\"reasoningEffort\":\"medium\",\"description\":\"\"}},{{\"reasoningEffort\":\"high\",\"description\":\"\"}}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\"],\"supportsPersonality\":false,\"isDefault\":true}}]}}}}' ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
             log_path.display()
         ),
     );
@@ -719,7 +719,7 @@ fn codex_backend_model_option_takes_precedence_over_reasoning_effort_env() {
     write_executable_script(
         &script_path,
         &format!(
-            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"model/list\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"data\":[{{\"id\":\"gpt-5.4\",\"model\":\"gpt-5.4\",\"displayName\":\"GPT-5.4\",\"description\":\"\",\"supportedReasoningEfforts\":[{{\"reasoningEffort\":\"low\",\"description\":\"\"}},{{\"reasoningEffort\":\"medium\",\"description\":\"\"}},{{\"reasoningEffort\":\"high\",\"description\":\"\"}}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\"],\"supportsPersonality\":false,\"isDefault\":true}}]}}}}' ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
             log_path.display()
         ),
     );
@@ -771,6 +771,141 @@ fn codex_backend_model_option_takes_precedence_over_reasoning_effort_env() {
     assert!(
         turn_start_line.contains("\"effort\":\"high\""),
         "parcel model option should override env var: {turn_start_line}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_omits_reasoning_effort_when_unset() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
+    unsafe {
+        std::env::remove_var("DISPATCH_REASONING_EFFORT");
+    }
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let _ = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_REASONING_EFFORT");
+        },
+    }
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !log.contains("\"method\":\"model/list\""),
+        "model/list should not be called when no reasoning effort override is set: {log}"
+    );
+    let turn_start_line = log
+        .lines()
+        .find(|line| line.contains("\"method\":\"turn/start\""))
+        .expect("turn/start call should appear in log");
+    assert!(
+        !turn_start_line.contains("\"effort\":"),
+        "turn/start should omit effort when no override is set: {turn_start_line}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_rejects_unsupported_reasoning_effort() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"model/list\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"data\":[{{\"id\":\"gpt-5.4\",\"model\":\"gpt-5.4\",\"displayName\":\"GPT-5.4\",\"description\":\"\",\"supportedReasoningEfforts\":[{{\"reasoningEffort\":\"low\",\"description\":\"\"}},{{\"reasoningEffort\":\"medium\",\"description\":\"\"}}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\"],\"supportsPersonality\":false,\"isDefault\":true}}]}}}}' ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                model_options: [("reasoning-effort".to_string(), "high".to_string())]
+                    .into_iter()
+                    .collect(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("does not support reasoning effort `high`"),
+        "unexpected unsupported-effort error: {message}"
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let model_list_line = log
+        .lines()
+        .find(|line| line.contains("\"method\":\"model/list\""))
+        .expect("model/list should appear in log");
+    assert!(
+        model_list_line.contains("\"includeHidden\":true"),
+        "model/list should request hidden models during effort validation: {model_list_line}"
+    );
+    assert!(
+        !log.contains("\"method\":\"thread/start\""),
+        "thread/start should not run after reasoning effort validation fails: {log}"
     );
 }
 
