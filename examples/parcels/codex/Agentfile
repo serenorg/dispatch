@@ -7,7 +7,7 @@ IDENTITY IDENTITY.md
 SOUL SOUL.md
 USER USER.md
 
-MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY true
+MODEL gpt-5.4 PROVIDER codex --persist-thread=true
 
 MOUNT SESSION sqlite
 MOUNT MEMORY none

@@ -64,7 +64,7 @@ pub(super) fn build_model_requests(
             ModelRequest {
                 model: model.id,
                 provider: model.provider.clone(),
-                persist_history: model.persist_history,
+                model_options: model.options.clone(),
                 llm_timeout_ms,
                 context_token_limit: configured_context_token_limit(&image.config.limits),
                 tool_call_limit: configured_tool_call_limit(&image.config.limits),
@@ -98,7 +98,7 @@ fn configured_model_references(policy: &crate::manifest::ModelPolicy) -> Vec<Mod
     models.push(ModelReference {
         id: model,
         provider: std::env::var("LLM_BACKEND").ok(),
-        persist_history: None,
+        options: Default::default(),
     });
     models
 }
@@ -119,7 +119,7 @@ pub(super) fn build_wasm_model_requests(
                 vec![ModelReference {
                     id: model,
                     provider: None,
-                    persist_history: None,
+                    options: Default::default(),
                 }]
             }
         }
@@ -139,7 +139,7 @@ pub(super) fn build_wasm_model_requests(
         .map(|model| ModelRequest {
             model: model.id,
             provider: model.provider.clone(),
-            persist_history: model.persist_history,
+            model_options: model.options.clone(),
             llm_timeout_ms,
             context_token_limit: configured_context_token_limit(&parcel.config.limits),
             tool_call_limit: configured_tool_call_limit(&parcel.config.limits),

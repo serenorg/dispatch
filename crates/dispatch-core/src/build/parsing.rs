@@ -10,6 +10,7 @@ use crate::{
     },
     validate::{Level, validate_agentfile},
 };
+use std::collections::BTreeMap;
 use std::{fs, path::Path};
 
 pub(super) fn validate_for_build(parsed: &ParsedAgentfile) -> Result<(), BuildError> {
@@ -148,37 +149,48 @@ pub(super) fn parse_model_reference(
         return Ok(None);
     };
     let mut provider = None;
-    let mut persist_history = None;
+    let mut options = BTreeMap::new();
 
     let mut index = 1;
     while index < tokens.len() {
-        match tokens[index].as_str() {
+        let token = &tokens[index];
+        match token.as_str() {
             "PROVIDER" if index + 1 < tokens.len() => {
                 provider = Some(tokens[index + 1].clone());
                 index += 2;
             }
-            "PERSIST_HISTORY" if index + 1 < tokens.len() => {
-                persist_history = Some(parse_bool_token(
-                    &tokens[index + 1],
-                    line,
-                    "PERSIST_HISTORY",
-                )?);
-                index += 2;
-            }
-            "PROVIDER" | "PERSIST_HISTORY" => {
+            "PROVIDER" => {
                 return Err(BuildError::Validation(format!(
-                    "line {line}: `{}` requires a value",
-                    tokens[index]
+                    "line {line}: `PROVIDER` requires a value"
                 )));
             }
-            _ => index += 1,
+            legacy if legacy.eq_ignore_ascii_case("PERSIST_HISTORY") => {
+                return Err(BuildError::Validation(format!(
+                    "line {line}: `PERSIST_HISTORY` is no longer supported; use `--persist-thread=<true|false>`"
+                )));
+            }
+            token if token.starts_with("--") => {
+                let (name, value) = parse_model_option_flag(token, line)?;
+                validate_model_option(&name, &value, line)?;
+                if options.insert(name.clone(), value).is_some() {
+                    return Err(BuildError::Validation(format!(
+                        "line {line}: duplicate model option `--{name}`"
+                    )));
+                }
+                index += 1;
+            }
+            _ => {
+                return Err(BuildError::Validation(format!(
+                    "line {line}: unexpected model token `{token}`; expected `PROVIDER <backend>` or `--flag=value`"
+                )));
+            }
         }
     }
 
     Ok(Some(ModelReference {
         id,
         provider,
-        persist_history,
+        options,
     }))
 }
 
@@ -291,6 +303,36 @@ fn parse_bool_token(value: &str, line: usize, field: &str) -> Result<bool, Build
         "false" | "0" | "no" | "off" => Ok(false),
         _ => Err(BuildError::Validation(format!(
             "line {line}: `{field}` must be one of `true` or `false`, got `{value}`"
+        ))),
+    }
+}
+
+fn parse_model_option_flag(token: &str, line: usize) -> Result<(String, String), BuildError> {
+    let Some(flag) = token.strip_prefix("--") else {
+        unreachable!("model option flags must start with `--`");
+    };
+    let Some((name, value)) = flag.split_once('=') else {
+        return Err(BuildError::Validation(format!(
+            "line {line}: model flag `{token}` must use `--name=value` syntax"
+        )));
+    };
+    if name.is_empty() || value.is_empty() {
+        return Err(BuildError::Validation(format!(
+            "line {line}: model flag `{token}` must include both a non-empty name and value"
+        )));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
+fn validate_model_option(name: &str, value: &str, line: usize) -> Result<(), BuildError> {
+    match name {
+        "persist-thread" => {
+            let _ = parse_bool_token(value, line, "--persist-thread")?;
+            Ok(())
+        }
+        "reasoning-effort" => Ok(()),
+        _ => Err(BuildError::Validation(format!(
+            "line {line}: unsupported model flag `--{name}`"
         ))),
     }
 }

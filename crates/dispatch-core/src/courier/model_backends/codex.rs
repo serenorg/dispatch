@@ -58,7 +58,13 @@ impl ChatModelBackend for CodexAppServerBackend {
         process.initialize(deadline)?;
         let thread = process.open_thread(request, deadline)?;
         let prompt = codex_prompt_text(request);
-        let turn_id = process.start_turn(&thread.thread_id, &request.model, &prompt, deadline)?;
+        let turn_id = process.start_turn(
+            request,
+            &thread.thread_id,
+            &request.model,
+            &prompt,
+            deadline,
+        )?;
         let text = process.collect_turn_output(&turn_id, on_event, deadline)?;
         let response_id = if codex_history_persistence_enabled(request) {
             Some(thread.encode())
@@ -113,31 +119,46 @@ fn codex_binary_path() -> String {
     std::env::var("CODEX_BINARY").unwrap_or_else(|_| "codex".to_string())
 }
 
-fn codex_reasoning_effort() -> String {
-    std::env::var("CODEX_REASONING_EFFORT")
-        .ok()
-        .map(|value| value.trim().to_string())
+fn model_reasoning_effort(request: &ModelRequest) -> String {
+    model_option_value(request, "reasoning-effort")
+        .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            std::env::var("DISPATCH_REASONING_EFFORT")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "medium".to_string())
 }
 
 fn codex_history_persistence_enabled(request: &ModelRequest) -> bool {
-    env_flag_override("DISPATCH_CODEX_PERSIST_HISTORY")
-        .or(request.persist_history)
+    env_flag_override("DISPATCH_PERSIST_THREAD")
+        .or_else(|| model_option_bool(request, "persist-thread"))
         .unwrap_or(true)
+}
+
+fn model_option_bool(request: &ModelRequest, key: &str) -> Option<bool> {
+    model_option_value(request, key).and_then(parse_flag_bool)
+}
+
+fn model_option_value<'a>(request: &'a ModelRequest, key: &str) -> Option<&'a str> {
+    request.model_options.get(key).map(String::as_str)
 }
 
 fn env_flag_override(name: &str) -> Option<bool> {
     std::env::var(name)
         .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .map(|value| match value.as_str() {
-            "" => None,
-            "0" | "false" | "no" | "off" => Some(false),
-            "1" | "true" | "yes" | "on" => Some(true),
-            _ => None,
-        })
-        .unwrap_or(None)
+        .and_then(|value| parse_flag_bool(&value))
+}
+
+fn parse_flag_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "on" => Some(true),
+        _ => None,
+    }
 }
 
 fn codex_prompt_text(request: &ModelRequest) -> String {
@@ -456,6 +477,7 @@ impl CodexProcess {
 
     fn start_turn(
         &mut self,
+        request: &ModelRequest,
         thread_id: &str,
         model: &str,
         prompt: &str,
@@ -467,7 +489,7 @@ impl CodexProcess {
                 "threadId": thread_id,
                 "input": [{ "type": "text", "text": prompt }],
                 "model": model,
-                "effort": codex_reasoning_effort(),
+                "effort": model_reasoning_effort(request),
             }),
             deadline,
         )?;

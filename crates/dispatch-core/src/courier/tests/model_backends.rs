@@ -210,7 +210,7 @@ fn anthropic_max_tokens_uses_context_token_limit_when_present() {
     let request = ModelRequest {
         model: "claude-sonnet-4".to_string(),
         provider: Some("anthropic".to_string()),
-        persist_history: None,
+        model_options: Default::default(),
         llm_timeout_ms: None,
         context_token_limit: Some(16000),
         tool_call_limit: None,
@@ -232,7 +232,7 @@ fn openai_chat_completions_messages_include_structured_tool_followup() {
     let request = ModelRequest {
         model: "gpt-5-mini".to_string(),
         provider: Some("openai_compatible".to_string()),
-        persist_history: None,
+        model_options: Default::default(),
         llm_timeout_ms: None,
         context_token_limit: None,
         tool_call_limit: None,
@@ -273,7 +273,7 @@ fn anthropic_messages_include_tool_use_and_tool_result_blocks() {
     let request = ModelRequest {
         model: "claude-sonnet-4".to_string(),
         provider: Some("anthropic".to_string()),
-        persist_history: None,
+        model_options: Default::default(),
         llm_timeout_ms: None,
         context_token_limit: None,
         tool_call_limit: None,
@@ -314,7 +314,7 @@ fn gemini_messages_include_function_call_and_response_parts() {
     let request = ModelRequest {
         model: "gemini-2.5-pro".to_string(),
         provider: Some("gemini".to_string()),
-        persist_history: None,
+        model_options: Default::default(),
         llm_timeout_ms: None,
         context_token_limit: None,
         tool_call_limit: None,
@@ -374,7 +374,7 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: None,
+                model_options: Default::default(),
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -409,7 +409,7 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: None,
+                model_options: Default::default(),
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -463,7 +463,9 @@ fn codex_backend_can_disable_persistent_history_per_request() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: Some(false),
+                model_options: [("persist-thread".to_string(), "false".to_string())]
+                    .into_iter()
+                    .collect(),
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -499,9 +501,9 @@ fn codex_backend_can_disable_persistent_history_per_request() {
 #[cfg(unix)]
 fn codex_backend_env_override_disables_persistent_history() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_CODEX_PERSIST_HISTORY");
+    let previous = std::env::var_os("DISPATCH_PERSIST_THREAD");
     unsafe {
-        std::env::set_var("DISPATCH_CODEX_PERSIST_HISTORY", "0");
+        std::env::set_var("DISPATCH_PERSIST_THREAD", "0");
     }
 
     let dir = tempdir().unwrap();
@@ -521,7 +523,9 @@ fn codex_backend_env_override_disables_persistent_history() {
         &ModelRequest {
             model: "gpt-5.4".to_string(),
             provider: Some("codex".to_string()),
-            persist_history: Some(true),
+            model_options: [("persist-thread".to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
             llm_timeout_ms: None,
             context_token_limit: None,
             tool_call_limit: None,
@@ -542,10 +546,10 @@ fn codex_backend_env_override_disables_persistent_history() {
 
     match previous {
         Some(value) => unsafe {
-            std::env::set_var("DISPATCH_CODEX_PERSIST_HISTORY", value);
+            std::env::set_var("DISPATCH_PERSIST_THREAD", value);
         },
         None => unsafe {
-            std::env::remove_var("DISPATCH_CODEX_PERSIST_HISTORY");
+            std::env::remove_var("DISPATCH_PERSIST_THREAD");
         },
     }
 
@@ -558,6 +562,61 @@ fn codex_backend_env_override_disables_persistent_history() {
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("\"ephemeral\":true"));
     assert!(!log.contains("\"persistExtendedHistory\":true"));
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_uses_reasoning_effort_model_option() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let _ = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                model_options: [("reasoning-effort".to_string(), "high".to_string())]
+                    .into_iter()
+                    .collect(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let turn_start_line = log
+        .lines()
+        .find(|line| line.contains("\"method\":\"turn/start\""))
+        .expect("turn/start call should appear in log");
+    assert!(
+        turn_start_line.contains("\"effort\":\"high\""),
+        "reasoning effort missing from turn/start params: {turn_start_line}"
+    );
 }
 
 #[test]
@@ -578,7 +637,7 @@ fn codex_backend_resume_failure_returns_error() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: None,
+                model_options: Default::default(),
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -621,7 +680,7 @@ fn codex_backend_respects_llm_timeout() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: None,
+                model_options: Default::default(),
                 llm_timeout_ms: Some(50),
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -734,7 +793,7 @@ fn codex_backend_forwards_rollout_path_to_thread_resume() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: None,
+                model_options: Default::default(),
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -770,7 +829,7 @@ fn codex_backend_forwards_rollout_path_to_thread_resume() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
-                persist_history: None,
+                model_options: Default::default(),
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,

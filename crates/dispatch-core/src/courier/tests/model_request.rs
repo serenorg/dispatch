@@ -37,7 +37,7 @@ fn build_model_request_carries_model_persist_history_setting() {
     let test_image = build_test_image(
         "\
 FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
+MODEL gpt-5.4 PROVIDER codex --persist-thread=false
 ENTRYPOINT chat
 ",
         &[],
@@ -55,7 +55,13 @@ ENTRYPOINT chat
     .expect("expected model request");
 
     assert_eq!(request.provider.as_deref(), Some("codex"));
-    assert_eq!(request.persist_history, Some(false));
+    assert_eq!(
+        request
+            .model_options
+            .get("persist-thread")
+            .map(String::as_str),
+        Some("false")
+    );
 }
 
 #[test]

@@ -810,11 +810,11 @@
             "null"
           ]
         },
-        "persist_history": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+        "options": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       }
     },

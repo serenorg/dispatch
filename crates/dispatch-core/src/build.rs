@@ -2267,8 +2267,8 @@ ENTRYPOINT chat
             dir.path().join("Agentfile"),
             "\
 FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
-FALLBACK gpt-5.4-mini PROVIDER codex PERSIST_HISTORY true
+MODEL gpt-5.4 PROVIDER codex --persist-thread=false --reasoning-effort=high
+FALLBACK gpt-5.4-mini PROVIDER codex --persist-thread=true
 ENTRYPOINT chat
 ",
         )
@@ -2285,8 +2285,22 @@ ENTRYPOINT chat
         let parcel: ParcelManifest =
             serde_json::from_slice(&fs::read(&built.manifest_path).unwrap()).unwrap();
 
-        assert_eq!(parcel.models.primary.unwrap().persist_history, Some(false));
-        assert_eq!(parcel.models.fallbacks[0].persist_history, Some(true));
+        let primary = parcel.models.primary.unwrap();
+        assert_eq!(
+            primary.options.get("persist-thread").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            primary.options.get("reasoning-effort").map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            parcel.models.fallbacks[0]
+                .options
+                .get("persist-thread")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -2296,7 +2310,7 @@ ENTRYPOINT chat
             dir.path().join("Agentfile"),
             "\
 FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY maybe
+MODEL gpt-5.4 PROVIDER codex --persist-thread=maybe
 ENTRYPOINT chat
 ",
         )
@@ -2313,7 +2327,35 @@ ENTRYPOINT chat
         assert!(
             error
                 .to_string()
-                .contains("`PERSIST_HISTORY` must be one of `true` or `false`")
+                .contains("`--persist-thread` must be one of `true` or `false`")
+        );
+    }
+
+    #[test]
+    fn build_rejects_legacy_model_persist_history_syntax() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("`PERSIST_HISTORY` is no longer supported")
         );
     }
 
