@@ -132,7 +132,8 @@ CLI implementations may expose explicit courier selection so the same built parc
 - `#` starts a comment
 - instruction names are uppercase
 - arguments are space-separated
-- quoted strings are allowed
+- double-quoted strings are allowed for grouping whitespace within one scalar
+- the current parser does not decode backslash escapes or embedded `\"`; use heredocs for multiline content
 - multi-line bodies use heredoc blocks
 
 Example:
@@ -704,7 +705,9 @@ dispatch parcel eval <parcel-or-source> --tool-approval never
 
 #### `TEST`
 
-Reserved for local build verification commands.
+Reserved for future local build verification commands. The current reference implementation accepts
+`TEST` for forward compatibility but ignores it during parcel build and omits it from the parcel
+manifest.
 
 ```dockerfile
 TEST tool:fetch_price
@@ -720,7 +723,6 @@ Defines how the agent is invoked.
 ENTRYPOINT chat
 ENTRYPOINT heartbeat
 ENTRYPOINT job
-ENTRYPOINT http
 ```
 
 ## Resolution Order
@@ -752,7 +754,7 @@ In the reference implementation, the prompt-bearing instruction kinds are:
 - a declared local tool does not exist
 - a built-in tool is unknown
 - a required secret is malformed at deploy time
-- `HEARTBEAT` exists without a schedulable entry mode
+- `HEARTBEAT` files are currently packaged independently of the parcel entrypoint; couriers still reject `heartbeat` operations when the parcel entrypoint is not `heartbeat`
 - incompatible mounts are declared
 - unsupported instructions are used by the selected `FROM`
 

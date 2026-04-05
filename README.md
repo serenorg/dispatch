@@ -1,6 +1,6 @@
 # Dispatch
 
-Dispatch is an open packaging, courier, and signing standard for agents.
+Dispatch packages agents into verifiable parcels and runs them through pluggable couriers.
 
 The core idea: an agent should be a self-describing, verifiable artifact - separate from the infrastructure that runs it. Build it once. Run it anywhere a courier exists.
 
@@ -8,7 +8,7 @@ The core idea: an agent should be a self-describing, verifiable artifact - separ
 Agentfile  ->  dispatch parcel build  ->  parcel (artifact)  ->  dispatch run  ->  courier
 ```
 
-The **WASM courier** is the most differentiated part. A guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) runs in any WASM host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
+Available couriers today include native, Docker, WASM, and external JSONL plugins. The WASM path runs a guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) in any host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
 
 ## Why Dispatch
 
