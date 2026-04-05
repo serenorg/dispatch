@@ -210,6 +210,10 @@ impl CodexProcess {
         command
             .arg("app-server")
             .current_dir(Path::new(working_directory));
+        // Intentionally inherit the parent environment so local Codex auth and
+        // config continue to work. This backend still denies ambient app-server
+        // permission requests by default; inherited env does not widen the
+        // declared parcel tool surface.
         if let Ok(home) = std::env::var("CODEX_HOME") {
             let trimmed = home.trim();
             if !trimmed.is_empty() {

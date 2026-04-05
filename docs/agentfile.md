@@ -394,7 +394,7 @@ Reference implementation providers currently include:
 - `openai_compatible`
 - `codex`
 
-`PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. The reference implementation resumes Codex thread state across turns, but it denies ambient app-server permission requests by default so undeclared Codex command/file/MCP actions are not exposed through the courier implicitly.
+`PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. The reference implementation resumes Codex thread state across turns, but it denies ambient app-server permission requests by default so undeclared Codex command/file/MCP actions are not exposed through the courier implicitly. The Codex backend intentionally inherits the parent process environment so local Codex auth and config continue to work. Unix targets use a PTY-backed Codex transport; other targets currently fall back to standard process pipes.
 
 #### `FALLBACK`
 
