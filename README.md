@@ -338,7 +338,7 @@ expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
 expects_text_exact = "plugin reply"
 ```
 
-`dispatch parcel eval` runs those packaged cases against a live courier and reports pass/fail per case.
+`dispatch parcel eval` runs packaged `EVAL` cases and `TEST` tool smoke checks against a live courier and reports pass/fail per case.
 Tool result assertions can be either a plain value or a tool-scoped object, so multi-tool evals can target one tool explicitly.
 `expects_no_tool = true` can be used for cases that should complete without invoking any tool.
 `expects_tool_stdout_matches_schema` validates JSON stdout from a tool against a packaged JSON schema file, and `expects_a2a_endpoint` asserts that an A2A tool alias resolved to the expected declared endpoint.

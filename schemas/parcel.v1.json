@@ -16,6 +16,7 @@
     "secrets",
     "mounts",
     "tools",
+    "tests",
     "models",
     "limits",
     "timeouts",
@@ -116,6 +117,12 @@
         "$ref": "#/$defs/tool"
       }
     },
+    "tests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/test"
+      }
+    },
     "models": {
       "$ref": "#/$defs/models"
     },
@@ -182,6 +189,29 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "test": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/toolTest"
+        }
+      ]
+    },
+    "toolTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "tool"
+      ],
+      "properties": {
+        "kind": {
+          "const": "tool"
+        },
+        "tool": {
+          "type": "string"
         }
       }
     },

@@ -139,6 +139,7 @@ fn validate_agentfile_base(agentfile: &ParsedAgentfile) -> ValidationReport {
             "IDENTITY" | "SOUL" | "SKILL" | "AGENTS" | "USER" | "TOOLS" | "EVAL" => {
                 require_exact_args(instruction, 1, &mut diagnostics)
             }
+            "TEST" => require_exact_args(instruction, 1, &mut diagnostics),
             "MEMORY" => require_min_args(instruction, 2, &mut diagnostics),
             "HEARTBEAT" | "TOOL" | "MOUNT" | "TIMEOUT" | "LIMIT" | "COMPACTION" | "ENV"
             | "SECRET" | "NETWORK" | "LABEL" | "COPY" | "ADD" | "ROUTING" | "PROMPT" => {

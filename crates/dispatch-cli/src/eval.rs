@@ -3,8 +3,9 @@ use dispatch_core::eval::{ToolA2aEndpointExpectation, ToolSchemaExpectation};
 use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest,
     DockerCourier, EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier, ResolvedCourier,
-    ToolConfig, ToolExitExpectation, ToolRunResult, ToolTextExpectation, WasmCourier,
-    build_agentfile, load_parcel, load_parcel_evals, resolve_courier,
+    TestSpec, ToolConfig, ToolExitExpectation, ToolInvocation, ToolRunResult, ToolTextExpectation,
+    WasmCourier, build_agentfile, load_parcel, load_parcel_evals, load_parcel_tests,
+    resolve_courier,
 };
 use futures::executor::block_on;
 use jsonschema::Validator;
@@ -129,14 +130,20 @@ fn eval_with_courier<R: CourierBackend>(
     emit_json: bool,
 ) -> Result<()> {
     let evals = load_parcel_evals(parcel).context("failed to load parcel evals")?;
-    if evals.is_empty() {
-        bail!("parcel does not declare any EVAL files");
+    let tests = load_parcel_tests(parcel);
+    if evals.is_empty() && tests.is_empty() {
+        bail!("parcel does not declare any EVAL files or TEST cases");
     }
 
-    let results = evals
+    let mut results = evals
         .iter()
         .map(|(packaged_path, spec)| run_eval_case(&courier, parcel, packaged_path, spec))
         .collect::<Vec<_>>();
+    results.extend(
+        tests
+            .iter()
+            .map(|spec| run_tool_test_case(&courier, parcel, spec)),
+    );
     let report = EvalReport {
         parcel_digest: parcel.config.digest.clone(),
         courier: courier_name.to_string(),
@@ -255,6 +262,117 @@ fn run_eval_case<R: CourierBackend>(
 
     apply_eval_expectations(&mut result, parcel, packaged_path, spec, &text_observations);
     result
+}
+
+fn run_tool_test_case<R: CourierBackend>(
+    courier: &R,
+    parcel: &LoadedParcel,
+    spec: &TestSpec,
+) -> EvalCaseResult {
+    let (name, expected_tool) = match spec {
+        TestSpec::Tool { tool } => (format!("tool:{tool}"), tool.as_str()),
+    };
+    let mut result = EvalCaseResult {
+        name,
+        packaged_path: parcel.config.source_agentfile.clone(),
+        entrypoint: "tool".to_string(),
+        passed: false,
+        tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+        assistant_messages: Vec::new(),
+        failures: Vec::new(),
+        error: None,
+    };
+
+    let session = match block_on(courier.open_session(parcel)) {
+        Ok(session) => session,
+        Err(error) => {
+            result.error = Some(error.to_string());
+            apply_tool_test_expectations(&mut result, expected_tool);
+            return result;
+        }
+    };
+    if session.parcel_digest != parcel.config.digest {
+        result.error = Some(format!(
+            "courier returned session for parcel {} while evaluating {}",
+            session.parcel_digest, parcel.config.digest
+        ));
+        apply_tool_test_expectations(&mut result, expected_tool);
+        return result;
+    }
+
+    let response = match block_on(courier.run(
+        parcel,
+        CourierRequest {
+            session,
+            operation: CourierOperation::InvokeTool {
+                invocation: ToolInvocation {
+                    name: expected_tool.to_string(),
+                    input: None,
+                },
+            },
+        },
+    )) {
+        Ok(response) => response,
+        Err(error) => {
+            result.error = Some(error.to_string());
+            apply_tool_test_expectations(&mut result, expected_tool);
+            return result;
+        }
+    };
+    for event in &response.events {
+        match event {
+            CourierEvent::ToolCallStarted { invocation, .. } => {
+                result.tool_calls.push(invocation.name.clone());
+            }
+            CourierEvent::ToolCallFinished {
+                result: tool_result,
+            } => {
+                result.tool_results.push(tool_result.clone());
+            }
+            _ => {}
+        }
+    }
+    if response.session.parcel_digest != parcel.config.digest {
+        result.error = Some(format!(
+            "courier returned response session for parcel {} while evaluating {}",
+            response.session.parcel_digest, parcel.config.digest
+        ));
+    }
+
+    apply_tool_test_expectations(&mut result, expected_tool);
+    result
+}
+
+fn apply_tool_test_expectations(result: &mut EvalCaseResult, expected_tool: &str) {
+    let matching_results = result
+        .tool_results
+        .iter()
+        .filter(|tool_result| tool_result.tool == expected_tool)
+        .collect::<Vec<_>>();
+    let invoked =
+        result.tool_calls.iter().any(|tool| tool == expected_tool) || !matching_results.is_empty();
+    if !invoked {
+        result.failures.push(format!(
+            "expected tool `{expected_tool}` to be invoked but saw [{}]",
+            result.tool_calls.join(", ")
+        ));
+    }
+    if matching_results.is_empty() {
+        result.failures.push(format!(
+            "expected tool `{expected_tool}` to produce a result"
+        ));
+    }
+    for tool_result in matching_results {
+        if tool_result.exit_code != 0 {
+            result.failures.push(format!(
+                "expected tool `{expected_tool}` to exit with code 0 but saw {}",
+                tool_result.exit_code
+            ));
+        }
+    }
+
+    result.passed = result.error.is_none() && result.failures.is_empty();
 }
 
 fn apply_eval_expectations(
@@ -723,5 +841,75 @@ mod tests {
             vec!["expected A2A tool `broker` to call endpoint `https://other.example.com`"]
         );
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn run_tool_test_case_passes_for_successful_tool_smoke_test() {
+        let (_dir, parcel) = build_eval_parcel(
+            concat!(
+                "FROM dispatch/native:latest\n",
+                "TOOL LOCAL scripts/demo.sh AS demo USING sh\n",
+                "TEST tool:demo\n",
+                "ENTRYPOINT chat\n",
+            ),
+            &[("scripts/demo.sh", "echo ok\n")],
+        );
+
+        let result = run_tool_test_case(
+            &NativeCourier::default(),
+            &parcel,
+            &TestSpec::Tool {
+                tool: "demo".to_string(),
+            },
+        );
+
+        assert!(result.passed, "{result:?}");
+        assert_eq!(result.tool_calls, vec!["demo".to_string()]);
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].exit_code, 0);
+    }
+
+    #[test]
+    fn run_tool_test_case_fails_when_tool_returns_nonzero_exit() {
+        let (_dir, parcel) = build_eval_parcel(
+            concat!(
+                "FROM dispatch/native:latest\n",
+                "TOOL LOCAL scripts/demo.sh AS demo USING sh\n",
+                "TEST tool:demo\n",
+                "ENTRYPOINT chat\n",
+            ),
+            &[("scripts/demo.sh", "exit 7\n")],
+        );
+
+        let result = run_tool_test_case(
+            &NativeCourier::default(),
+            &parcel,
+            &TestSpec::Tool {
+                tool: "demo".to_string(),
+            },
+        );
+
+        assert!(!result.passed);
+        assert_eq!(
+            result.failures,
+            vec!["expected tool `demo` to exit with code 0 but saw 7".to_string()]
+        );
+    }
+
+    #[test]
+    fn eval_with_courier_accepts_test_only_parcels() {
+        let (_dir, parcel) = build_eval_parcel(
+            concat!(
+                "FROM dispatch/native:latest\n",
+                "TOOL LOCAL scripts/demo.sh AS demo USING sh\n",
+                "TEST tool:demo\n",
+                "ENTRYPOINT chat\n",
+            ),
+            &[("scripts/demo.sh", "echo ok\n")],
+        );
+
+        let outcome = eval_with_courier(NativeCourier::default(), &parcel, "native", true);
+
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 }

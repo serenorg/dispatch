@@ -5,7 +5,7 @@ use crate::{
         CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar, FrameworkProvenance,
         InstructionConfig, InstructionKind, LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy,
         ModelReference, MountConfig, MountKind, NetworkRule, PARCEL_FORMAT_VERSION,
-        PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec, TimeoutSpec,
+        PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec, TestSpec, TimeoutSpec,
         ToolApprovalPolicy, ToolConfig, ToolInputSchemaRef, ToolRiskLevel, Visibility,
         WasmComponentConfig,
     },
@@ -138,6 +138,7 @@ struct ProvisionalParcelManifest {
     visibility: Option<Visibility>,
     mounts: Vec<MountConfig>,
     tools: Vec<ToolConfig>,
+    tests: Vec<TestSpec>,
     models: ModelPolicy,
     compaction: Option<CompactionConfig>,
     limits: Vec<LimitSpec>,
@@ -161,6 +162,7 @@ struct ResolvedAgentSpec {
     visibility: Option<Visibility>,
     mounts: Vec<MountConfig>,
     tools: Vec<ToolConfig>,
+    tests: Vec<TestSpec>,
     models: ModelPolicy,
     compaction: Option<CompactionConfig>,
     limits: Vec<LimitSpec>,
@@ -387,6 +389,12 @@ pub fn build_agentfile(
                     files.extend(file_record.expand());
                 }
             }
+            "TEST" => {
+                resolved.tests.push(parse_test_spec(
+                    &instruction.args,
+                    instruction.span.line_start,
+                )?);
+            }
             "COPY" | "ADD" => {
                 let source_path = scalar_at(&instruction.args, 0);
                 let resolved_path = resolve_path(&context_dir, &source_path)?;
@@ -402,6 +410,8 @@ pub fn build_agentfile(
         &resolved.skill_tool_aliases,
         &resolved.tools,
     ));
+    validate_test_specs(&resolved.tests, &resolved.tools)?;
+    validate_heartbeat_entrypoint(resolved.entrypoint.as_deref(), &resolved.instructions)?;
 
     files.sort_by(|left, right| left.packaged_as.cmp(&right.packaged_as));
     for pair in files.windows(2) {
@@ -451,6 +461,7 @@ pub fn build_agentfile(
         visibility: resolved.visibility,
         mounts: resolved.mounts,
         tools: resolved.tools,
+        tests: resolved.tests,
         models: resolved.models,
         compaction: resolved.compaction,
         limits: resolved.limits,
@@ -503,6 +514,7 @@ pub fn build_agentfile(
         visibility: provisional.visibility,
         mounts: provisional.mounts,
         tools: provisional.tools,
+        tests: provisional.tests,
         models: provisional.models,
         compaction: provisional.compaction,
         limits: provisional.limits,
@@ -656,6 +668,7 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
         visibility: parcel.visibility,
         mounts: parcel.mounts.clone(),
         tools: parcel.tools.clone(),
+        tests: parcel.tests.clone(),
         models: parcel.models.clone(),
         compaction: parcel.compaction.clone(),
         limits: parcel.limits.clone(),
@@ -1161,6 +1174,58 @@ fn validate_entrypoint_value(value: &str, context: &str) -> Result<String, Build
             "{context} must be one of `chat`, `job`, or `heartbeat`, got `{value}`"
         ))),
     }
+}
+
+fn parse_test_spec(args: &[Value], line: usize) -> Result<TestSpec, BuildError> {
+    let target = scalar_at(args, 0);
+    let Some(tool) = target.strip_prefix("tool:") else {
+        return Err(BuildError::Validation(format!(
+            "line {line}: `TEST` currently only supports `tool:<alias>` targets"
+        )));
+    };
+    if tool.is_empty() {
+        return Err(BuildError::Validation(format!(
+            "line {line}: `TEST tool:<alias>` requires a non-empty tool alias"
+        )));
+    }
+    Ok(TestSpec::Tool {
+        tool: tool.to_string(),
+    })
+}
+
+fn validate_test_specs(tests: &[TestSpec], tools: &[ToolConfig]) -> Result<(), BuildError> {
+    for test in tests {
+        match test {
+            TestSpec::Tool { tool } => {
+                let declared = tools.iter().any(|candidate| match candidate {
+                    ToolConfig::Local(local) => local.alias == *tool,
+                    ToolConfig::A2a(a2a) => a2a.alias == *tool,
+                    ToolConfig::Builtin(_) | ToolConfig::Mcp(_) => false,
+                });
+                if !declared {
+                    return Err(BuildError::Validation(format!(
+                        "`TEST tool:{tool}` references an unknown local or A2A tool alias"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_heartbeat_entrypoint(
+    entrypoint: Option<&str>,
+    instructions: &[InstructionConfig],
+) -> Result<(), BuildError> {
+    let has_heartbeat = instructions
+        .iter()
+        .any(|instruction| instruction.kind == InstructionKind::Heartbeat);
+    if has_heartbeat && entrypoint != Some("heartbeat") {
+        return Err(BuildError::Validation(
+            "`HEARTBEAT` requires `ENTRYPOINT heartbeat`".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_visibility(value: &str) -> Option<Visibility> {
@@ -1834,6 +1899,7 @@ ENTRYPOINT chat
             parcel.models.fallbacks[0].provider.as_deref(),
             Some("openai")
         );
+        assert!(parcel.tests.is_empty());
         assert_eq!(parcel.env[0].name, "TZ");
         assert_eq!(parcel.secrets[0].name, "OPENAI_API_KEY");
         assert_eq!(parcel.labels["org.example.team"], "platform");
@@ -2560,6 +2626,99 @@ ENTRYPOINT heartbeat
         assert_eq!(parcel.network[0].target, "api.example.com");
         assert_eq!(parcel.network[0].qualifiers, vec!["via-egress"]);
         assert_eq!(parcel.labels["org.example.display"], "Market Monitor");
+    }
+
+    #[test]
+    fn build_rejects_heartbeat_without_heartbeat_entrypoint() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+HEARTBEAT EVERY 30s FILE HEARTBEAT.md
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+        fs::write(dir.path().join("HEARTBEAT.md"), "poll").unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "validation failed:\n`HEARTBEAT` requires `ENTRYPOINT heartbeat`"
+        );
+    }
+
+    #[test]
+    fn build_packages_tool_tests_into_manifest() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL LOCAL scripts/demo.sh AS demo
+TEST tool:demo
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+        fs::write(dir.path().join("scripts/demo.sh"), "#!/bin/sh\necho ok\n").unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        assert_eq!(
+            parcel.tests,
+            vec![TestSpec::Tool {
+                tool: "demo".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn build_rejects_tool_tests_for_unknown_aliases() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+TOOL LOCAL scripts/demo.sh AS demo
+TEST tool:missing
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+        fs::write(dir.path().join("scripts/demo.sh"), "#!/bin/sh\necho ok\n").unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "validation failed:\n`TEST tool:missing` references an unknown local or A2A tool alias"
+        );
     }
 
     #[test]

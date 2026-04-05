@@ -340,7 +340,8 @@ TOOLS TOOLS.md
 
 #### `HEARTBEAT`
 
-Declares scheduled or recurring execution semantics.
+Declares scheduled or recurring execution semantics. `HEARTBEAT` requires
+`ENTRYPOINT heartbeat`.
 
 ```dockerfile
 HEARTBEAT EVERY 30s FILE HEARTBEAT.md
@@ -695,7 +696,7 @@ expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
 
 Schema assertions resolve relative to the eval file's packaged directory and must point at JSON files already packaged into the parcel, for example via a declared tool schema.
 
-Run packaged evals with:
+Run packaged evals and tests with:
 
 ```bash
 dispatch parcel eval <parcel-or-source>
@@ -705,9 +706,10 @@ dispatch parcel eval <parcel-or-source> --tool-approval never
 
 #### `TEST`
 
-Reserved for future local build verification commands. The current reference implementation accepts
-`TEST` for forward compatibility but ignores it during parcel build and omits it from the parcel
-manifest.
+Packages a direct tool smoke test that `dispatch parcel eval` executes through the selected
+courier. The current reference implementation supports `TEST tool:<alias>` for local and A2A tool
+aliases, invokes the tool with no input, and expects it to return exit code `0`. Use `EVAL` for
+richer assertions or tool inputs.
 
 ```dockerfile
 TEST tool:fetch_price
@@ -753,8 +755,9 @@ In the reference implementation, the prompt-bearing instruction kinds are:
 - referenced files are missing
 - a declared local tool does not exist
 - a built-in tool is unknown
+- a `TEST tool:<alias>` references an unknown local or A2A tool alias
 - a required secret is malformed at deploy time
-- `HEARTBEAT` files are currently packaged independently of the parcel entrypoint; couriers still reject `heartbeat` operations when the parcel entrypoint is not `heartbeat`
+- `HEARTBEAT` is declared without `ENTRYPOINT heartbeat`
 - incompatible mounts are declared
 - unsupported instructions are used by the selected `FROM`
 

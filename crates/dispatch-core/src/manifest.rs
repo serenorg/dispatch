@@ -25,6 +25,7 @@ pub struct ParcelManifest {
     pub visibility: Option<Visibility>,
     pub mounts: Vec<MountConfig>,
     pub tools: Vec<ToolConfig>,
+    pub tests: Vec<TestSpec>,
     pub models: ModelPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
@@ -207,6 +208,12 @@ pub enum ToolConfig {
     Builtin(BuiltinToolConfig),
     Mcp(McpToolConfig),
     A2a(A2aToolConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TestSpec {
+    Tool { tool: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

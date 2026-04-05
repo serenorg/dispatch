@@ -35,14 +35,14 @@ pub use depot::{
 };
 pub use eval::{
     EvalDocument, EvalError, EvalSpec, ToolA2aEndpointExpectation, ToolExitExpectation,
-    ToolSchemaExpectation, ToolTextExpectation, load_parcel_evals,
+    ToolSchemaExpectation, ToolTextExpectation, load_parcel_evals, load_parcel_tests,
 };
 pub use manifest::{
     A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, A2aToolConfig, BuiltinToolConfig, CommandSpec,
     CompactionConfig, CourierTarget, DISPATCH_WASM_ABI, EnvVar, InstructionConfig, InstructionKind,
     LimitSpec, LocalToolConfig, McpToolConfig, ModelPolicy, ModelReference, MountConfig, MountKind,
     NetworkRule, PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest,
-    SecretSpec, TimeoutSpec, ToolApprovalPolicy, ToolConfig, ToolRiskLevel, Visibility,
+    SecretSpec, TestSpec, TimeoutSpec, ToolApprovalPolicy, ToolConfig, ToolRiskLevel, Visibility,
     WasmComponentConfig,
 };
 pub use parse::{ParseError, parse_agentfile};

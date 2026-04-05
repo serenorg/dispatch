@@ -1,4 +1,4 @@
-use crate::{InstructionKind, LoadedParcel};
+use crate::{InstructionKind, LoadedParcel, TestSpec};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use thiserror::Error;
@@ -117,6 +117,10 @@ pub fn load_parcel_evals(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)
         }
     }
     Ok(evals)
+}
+
+pub fn load_parcel_tests(parcel: &LoadedParcel) -> Vec<TestSpec> {
+    parcel.config.tests.clone()
 }
 
 #[cfg(test)]
@@ -281,6 +285,36 @@ mod tests {
                 tool: "broker".to_string(),
                 url: "https://broker.example.com".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn load_parcel_tests_returns_packaged_tool_tests() {
+        let dir = tempdir().unwrap();
+        let context_dir = dir.path().join("image");
+        fs::create_dir_all(context_dir.join("scripts")).unwrap();
+        fs::write(
+            context_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nTOOL LOCAL scripts/demo.sh AS demo\nTEST tool:demo\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+        fs::write(context_dir.join("scripts/demo.sh"), "#!/bin/sh\necho ok\n").unwrap();
+
+        let built = build_agentfile(
+            &context_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: context_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+        let parcel = load_parcel(&built.parcel_dir).unwrap();
+        let tests = load_parcel_tests(&parcel);
+
+        assert_eq!(
+            tests,
+            vec![TestSpec::Tool {
+                tool: "demo".to_string(),
+            }]
         );
     }
 }
