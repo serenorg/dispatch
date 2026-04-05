@@ -1,8 +1,9 @@
+use super::model_request::load_tool_schema;
 use super::{
     Arc, BoundedLruCache, ChatModelBackend, Component, ConversationMessage, CourierError,
     CourierEvent, CourierOperation, CourierSession, Engine, HasSelf, Linker, LoadedParcel,
     LocalToolSpec, Mutex, Path, PathBuf, ResourceTable, Store, WasiCtx, WasmHost, WasmHostState,
-    list_local_tools, load_tool_schema, resolve_prompt_text, run_timeout_deadline, wasm_bindings,
+    list_local_tools, resolve_prompt_text, run_timeout_deadline, wasm_bindings,
 };
 use dispatch_wasm_abi::ABI as DISPATCH_WASM_COMPONENT_ABI;
 use wasmtime_wasi::p2;
