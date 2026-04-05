@@ -193,7 +193,9 @@ Semantics:
 - optional
 - normalized into top-level `framework` metadata in `manifest.json`
 - describes how the parcel was authored or compiled
+- is informational provenance, not a trust primitive
 - does not affect courier compatibility or backend selection
+- signing and trust guidance are documented in [`trust-and-depots.md`](trust-and-depots.md)
 
 #### `COMPONENT`
 

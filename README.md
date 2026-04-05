@@ -465,6 +465,7 @@ State management:
 - `dispatch depot push ... --json` / `dispatch depot pull ... --json` - emit machine-readable depot results
 - `dispatch depot pull <reference> --public-key <path>` - require detached signature verification during fetch
 - `dispatch depot pull <reference> --trust-policy <path>` - apply pull-time trust rules during fetch
+- trust, provenance, and depot operator guidance live in [`docs/trust-and-depots.md`](docs/trust-and-depots.md)
 - v1 depot references include:
 - `file:///absolute/path/to/depot::org/parcel:v1`
 - `https://depot.example.com::org/parcel:v1`
@@ -481,6 +482,7 @@ State management:
   - `public_keys` from matching rules are merged and deduplicated
 - `--public-key` composes with `--trust-policy`; explicit keys are added to any matching policy keys
 - trust-policy verification happens before a pulled parcel is committed into the local parcel store
+- `FRAMEWORK` metadata is informational provenance, not a trust root; use signatures and trust policy for publisher authorization
 
 ## Design Principles
 
