@@ -76,6 +76,7 @@ Trust policy rules match on depot references and repository prefixes, then compo
 
 - `require_signatures` becomes true if any matching rule requires signatures
 - `public_keys` from all matching rules are merged and deduplicated
+- signature verification succeeds if any one of the merged keys verifies the parcel; matching rules do not require all merged keys to verify
 
 Recommended patterns:
 
@@ -144,6 +145,7 @@ Dispatch does not yet provide:
 - transparency logs
 - reproducible-build attestations
 - a full PKI or certificate-based publisher identity system
+- a revocation or replay-prevention mechanism that can invalidate a signed parcel already pulled into a local cache
 
 Those may be added later, but the current safe baseline is:
 

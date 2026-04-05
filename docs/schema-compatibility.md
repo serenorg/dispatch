@@ -12,11 +12,8 @@ Current published schema:
 
 Dispatch keeps one tracked copy of the current parcel schema in the repo:
 The schema file is the single source of truth.
-The schema file is the single source of truth.
-The schema file is the single source of truth.
 
 - `schemas/parcel.v1.json` is the canonical schema checked into the repo
-
 
 ## Compatibility Rules
 
@@ -59,6 +56,7 @@ Practical implications:
 - the CLI and reference couriers may add features around the parcel format in `v0.x`
 - manifest-shape changes must still go through a new schema URL and `format_version`
 - third-party couriers should pin the Dispatch release range and schema versions they have validated, instead of assuming forward compatibility
+- the lifetime of old `format_version` support inside the reference implementation is not yet a stability promise for `v0.x`, even though published schema files remain available by URL
 
 ## Release Process
 

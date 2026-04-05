@@ -29,6 +29,7 @@ Required responsibilities:
 Minimum expectations:
 
 - it must reject parcels whose `courier.reference` is incompatible with the courier implementation
+- it must reject parcels whose `$schema` URL or `format_version` it does not support
 - it must not mutate the parcel or session state
 - it should fail before execution, not halfway through a turn
 
@@ -150,6 +151,40 @@ Useful forms:
 
 - `dispatch courier conformance <name>` - human-readable pass/fail output
 - `dispatch courier conformance <name> --json` - machine-readable report for CI artifacts
+
+Current JSON report shape:
+
+```json
+{
+  "courier": "native",
+  "courier_id": "dispatch-native",
+  "kind": "native",
+  "checks": [
+    {
+      "name": "validate-compatible",
+      "passed": true,
+      "skipped": false,
+      "detail": "dispatch/native:latest"
+    }
+  ]
+}
+```
+
+Field meanings:
+
+- `courier` - the operator-facing courier name passed to the command
+- `courier_id` - the courier implementation id returned by inspection
+- `kind` - the courier kind enum, such as `native`, `docker`, `wasm`, or `plugin`
+- `checks[].name` - stable check identifier for one contract assertion
+- `checks[].passed` - whether the check passed
+- `checks[].skipped` - whether the check was intentionally skipped because the courier kind does not support that fixture
+- `checks[].detail` - short human-readable context for the check result
+
+Stability guidance:
+
+- top-level field names and check object field names are intended to stay stable across patch releases within the same Dispatch minor release line
+- new checks may be added in later Dispatch releases, so CI consumers should tolerate additional `checks[]` entries
+- compare reports by `checks[].name`, not by array position
 
 Recommended CI pattern for external couriers:
 
