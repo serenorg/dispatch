@@ -29,7 +29,6 @@ use wasmtime::{
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-#[path = "courier_a2a.rs"]
 mod a2a;
 mod builtin_tools;
 mod checkpoint_store;
