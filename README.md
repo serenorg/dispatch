@@ -283,6 +283,12 @@ cargo run -p dispatch -- run examples/parcels/wasm-reference/.dispatch/parcels/<
 # Run a heartbeat
 cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
 
+# Test the Codex backend (requires `codex app-server` access)
+cargo run -p dispatch -- parcel lint examples/parcels/codex
+cargo run -p dispatch -- parcel build examples/parcels/codex
+cargo run -p dispatch -- run examples/parcels/codex/.dispatch/parcels/<digest> --chat "Say hello in one sentence."
+cargo run -p dispatch -- run examples/parcels/codex/.dispatch/parcels/<digest> --interactive
+
 # List and invoke tools
 cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
 cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
