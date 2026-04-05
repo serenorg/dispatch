@@ -1,3 +1,4 @@
+use super::super::wasm_support::BoundedLruCache;
 use super::*;
 
 static REFERENCE_GUEST: &[u8] = include_bytes!(concat!(
@@ -353,4 +354,54 @@ ENTRYPOINT chat
         second_response.events.first(),
         Some(CourierEvent::Message { content, .. }) if content == "profile:name = Christian"
     ));
+}
+
+#[test]
+fn wasm_courier_reference_guest_rejects_memory_ops_without_memory_mount() {
+    let test_image = build_test_image_with_binary_files(
+        "\
+FROM dispatch/wasm:latest
+COMPONENT components/reference.wasm
+MOUNT MEMORY none
+ENTRYPOINT chat
+",
+        &[],
+        &[("components/reference.wasm", REFERENCE_GUEST)],
+    );
+    let courier = WasmCourier::new().unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+    let error = futures::executor::block_on(courier.run(
+        &test_image.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat {
+                input: "remember profile:name Christian".to_string(),
+            },
+        },
+    ))
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CourierError::WasmGuest { message, .. }
+            if message.contains("memory put failed")
+                && message.contains("does not declare a usable memory mount")
+    ));
+}
+
+#[test]
+fn bounded_lru_cache_evicts_least_recently_used_entries() {
+    let mut cache = BoundedLruCache::new(2);
+    cache.insert("a".to_string(), "one".to_string());
+    cache.insert("b".to_string(), "two".to_string());
+
+    assert_eq!(cache.get("a").as_deref(), Some("one"));
+
+    cache.insert("c".to_string(), "three".to_string());
+
+    assert_eq!(cache.get("a").as_deref(), Some("one"));
+    assert_eq!(cache.get("b"), None);
+    assert_eq!(cache.get("c").as_deref(), Some("three"));
+    assert_eq!(cache.keys(), vec!["a".to_string(), "c".to_string()]);
 }

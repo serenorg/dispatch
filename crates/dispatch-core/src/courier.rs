@@ -23,11 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use wasmtime::{
-    Config, Engine, Store,
-    component::{Component, HasSelf, Linker, ResourceTable},
-};
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime::{Config, Engine, component::Component};
 
 mod a2a;
 mod builtin_tools;
@@ -55,8 +51,8 @@ use self::model_request::{
     configured_tool_call_limit, configured_tool_output_limit,
 };
 use self::model_request::{
-    build_model_requests, build_wasm_model_requests, configured_tool_round_limit,
-    normalize_local_tool_input, select_chat_backend, truncate_tool_output,
+    build_model_requests, configured_tool_round_limit, normalize_local_tool_input,
+    select_chat_backend, truncate_tool_output,
 };
 use self::mounts::{ensure_mounts_supported, resolve_builtin_mounts};
 #[cfg(test)]
@@ -85,9 +81,9 @@ use self::validation::{
     validate_courier_reference,
 };
 use self::wasm_support::{
-    apply_wasm_turn_to_session, instantiate_wasm_guest, load_wasm_component,
-    resolve_wasm_component_path, validate_wasm_component_metadata, wasm_events_to_courier_events,
-    wasm_guest_session, wasm_operation,
+    BoundedLruCache, apply_wasm_turn_to_session, instantiate_wasm_guest, load_wasm_component,
+    resolve_wasm_component_path, validate_wasm_component_metadata, wasm_component_cache_limit,
+    wasm_events_to_courier_events, wasm_guest_session, wasm_operation,
 };
 use self::{
     model_backends::*,
@@ -743,19 +739,6 @@ struct ChatTurnResult {
     streamed_reply: bool,
 }
 
-struct WasmHostState {
-    host: WasmHost,
-    wasi_ctx: WasiCtx,
-    resource_table: ResourceTable,
-}
-
-struct WasmHost {
-    parcel: LoadedParcel,
-    session: CourierSession,
-    chat_backend_override: Option<Arc<dyn ChatModelBackend>>,
-    run_deadline: Option<Instant>,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum NativeTurnMode {
     Chat,
@@ -932,19 +915,6 @@ struct PersistentPluginProcess {
     responses: mpsc::Receiver<Result<PluginResponse, CourierError>>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedValue<T> {
-    value: T,
-    last_used: u64,
-}
-
-#[derive(Debug, Clone)]
-struct BoundedLruCache<T> {
-    max_entries: usize,
-    tick: u64,
-    entries: BTreeMap<String, CachedValue<T>>,
-}
-
 #[derive(Clone)]
 pub struct DockerCourier {
     docker_bin: PathBuf,
@@ -1043,215 +1013,6 @@ impl Drop for JsonlCourierPluginState {
     }
 }
 
-impl wasm_bindings::dispatch::courier::host::Host for WasmHost {
-    fn model_complete(
-        &mut self,
-        request: wasm_bindings::dispatch::courier::host::ModelRequest,
-    ) -> Result<wasm_bindings::dispatch::courier::host::ModelResponse, String> {
-        let messages = request
-            .messages
-            .into_iter()
-            .map(|message| ConversationMessage {
-                role: message.role,
-                content: message.content,
-            })
-            .collect::<Vec<_>>();
-        let tools = request
-            .tools
-            .into_iter()
-            .map(|tool| {
-                let format = match tool.kind {
-                    wasm_bindings::dispatch::courier::host::ModelToolKind::Custom => {
-                        Ok::<ModelToolFormat, String>(ModelToolFormat::Text)
-                    }
-                    wasm_bindings::dispatch::courier::host::ModelToolKind::Function => {
-                        match tool.input_schema_json {
-                            Some(schema_json) => {
-                                let schema: serde_json::Value = serde_json::from_str(&schema_json)
-                                    .map_err(|error| {
-                                        format!("invalid model tool schema JSON: {error}")
-                                    })?;
-                                Ok::<ModelToolFormat, String>(ModelToolFormat::JsonSchema {
-                                    schema,
-                                })
-                            }
-                            None => Ok::<ModelToolFormat, String>(ModelToolFormat::Text),
-                        }
-                    }
-                }?;
-                Ok(ModelToolDefinition {
-                    name: tool.name,
-                    description: tool.description,
-                    format,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let tool_outputs = request
-            .tool_outputs
-            .into_iter()
-            .map(|output| ModelToolOutput {
-                call_id: output.call_id,
-                name: String::new(),
-                output: output.output,
-                kind: match output.kind {
-                    wasm_bindings::dispatch::courier::host::ModelToolKind::Custom => {
-                        ModelToolKind::Custom
-                    }
-                    wasm_bindings::dispatch::courier::host::ModelToolKind::Function => {
-                        ModelToolKind::Function
-                    }
-                },
-            })
-            .collect::<Vec<_>>();
-        let requests = build_wasm_model_requests(
-            &self.parcel,
-            WasmModelRequestInput {
-                requested_model: request.model,
-                instructions: request.instructions,
-                messages,
-                tools,
-                tool_outputs,
-                previous_response_id: request.previous_response_id,
-                run_deadline: self.run_deadline,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        let mut last_error = None;
-        for model_request in requests {
-            let backend = select_chat_backend(self.chat_backend_override.as_ref(), &model_request);
-            match backend.generate(&model_request) {
-                Ok(ModelGeneration::Reply(reply)) => {
-                    return Ok(wasm_bindings::dispatch::courier::host::ModelResponse {
-                        backend: reply.backend,
-                        text: reply.text,
-                        response_id: reply.response_id,
-                        tool_calls: reply
-                            .tool_calls
-                            .into_iter()
-                            .map(
-                                |call| wasm_bindings::dispatch::courier::host::ModelToolCall {
-                                    call_id: call.call_id,
-                                    name: call.name,
-                                    input: call.input,
-                                    kind: match call.kind {
-                                        ModelToolKind::Custom => {
-                                            wasm_bindings::dispatch::courier::host::ModelToolKind::Custom
-                                        }
-                                        ModelToolKind::Function => {
-                                            wasm_bindings::dispatch::courier::host::ModelToolKind::Function
-                                        }
-                                    },
-                                },
-                            )
-                            .collect(),
-                    });
-                }
-                Ok(ModelGeneration::NotConfigured { backend, reason }) => {
-                    last_error = Some(format!("{backend} backend not configured: {reason}"));
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                }
-            }
-        }
-        let message =
-            last_error.unwrap_or_else(|| "no model configured for wasm guest request".to_string());
-        Err(message)
-    }
-
-    fn invoke_tool(
-        &mut self,
-        invocation: wasm_bindings::dispatch::courier::host::ToolInvocation,
-    ) -> Result<wasm_bindings::dispatch::courier::host::ToolResult, String> {
-        let tool = resolve_local_tool(&self.parcel, &invocation.name)
-            .map_err(|error| error.to_string())?;
-        if let Some(request) = build_local_tool_approval_request(&tool, invocation.input.as_deref())
-            && !check_tool_approval(&request).map_err(|error| error.to_string())?
-        {
-            return Err(CourierError::ApprovalDenied { tool: request.tool }.to_string());
-        }
-        let result = execute_local_tool_with_env(
-            &self.parcel,
-            &tool,
-            invocation.input.as_deref(),
-            self.run_deadline,
-            process_env_lookup,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(wasm_bindings::dispatch::courier::host::ToolResult {
-            tool: result.tool,
-            command: result.command,
-            args: result.args,
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        })
-    }
-
-    fn memory_get(
-        &mut self,
-        namespace: String,
-        key: String,
-    ) -> Result<Option<wasm_bindings::dispatch::courier::host::MemoryEntry>, String> {
-        memory_get(&self.session, &namespace, &key)
-            .map(|entry| {
-                entry.map(
-                    |entry| wasm_bindings::dispatch::courier::host::MemoryEntry {
-                        namespace: entry.namespace,
-                        key: entry.key,
-                        value: entry.value,
-                        updated_at: entry.updated_at,
-                    },
-                )
-            })
-            .map_err(|error| error.to_string())
-    }
-
-    fn memory_put(
-        &mut self,
-        namespace: String,
-        key: String,
-        value: String,
-    ) -> Result<bool, String> {
-        memory_put(&self.session, &namespace, &key, &value).map_err(|error| error.to_string())
-    }
-
-    fn memory_delete(&mut self, namespace: String, key: String) -> Result<bool, String> {
-        memory_delete(&self.session, &namespace, &key).map_err(|error| error.to_string())
-    }
-
-    fn memory_list(
-        &mut self,
-        namespace: String,
-        prefix: Option<String>,
-    ) -> Result<Vec<wasm_bindings::dispatch::courier::host::MemoryEntry>, String> {
-        memory_list(&self.session, &namespace, prefix.as_deref())
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(
-                        |entry| wasm_bindings::dispatch::courier::host::MemoryEntry {
-                            namespace: entry.namespace,
-                            key: entry.key,
-                            value: entry.value,
-                            updated_at: entry.updated_at,
-                        },
-                    )
-                    .collect()
-            })
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl WasiView for WasmHostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi_ctx,
-            table: &mut self.resource_table,
-        }
-    }
-}
-
 impl NativeCourier {
     pub fn with_chat_backend(chat_backend: Arc<dyn ChatModelBackend>) -> Self {
         Self {
@@ -1273,62 +1034,6 @@ impl WasmCourier {
             ))),
         }
     }
-}
-
-impl<T: Clone> BoundedLruCache<T> {
-    fn new(max_entries: usize) -> Self {
-        Self {
-            max_entries,
-            tick: 0,
-            entries: BTreeMap::new(),
-        }
-    }
-
-    fn get(&mut self, key: &str) -> Option<T> {
-        let entry = self.entries.get(key).cloned()?;
-        self.tick = self.tick.saturating_add(1);
-        if let Some(current) = self.entries.get_mut(key) {
-            current.last_used = self.tick;
-        }
-        Some(entry.value)
-    }
-
-    fn insert(&mut self, key: String, value: T) {
-        if self.max_entries == 0 {
-            return;
-        }
-        self.tick = self.tick.saturating_add(1);
-        self.entries.insert(
-            key,
-            CachedValue {
-                value,
-                last_used: self.tick,
-            },
-        );
-        while self.entries.len() > self.max_entries {
-            let Some(evicted_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.entries.remove(&evicted_key);
-        }
-    }
-
-    #[cfg(test)]
-    fn keys(&self) -> Vec<String> {
-        self.entries.keys().cloned().collect()
-    }
-}
-
-fn wasm_component_cache_limit() -> usize {
-    std::env::var("DISPATCH_WASM_COMPONENT_CACHE_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(16)
 }
 
 impl DockerCourier {
