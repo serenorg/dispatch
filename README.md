@@ -314,6 +314,7 @@ A built parcel contains:
 - `signatures/<key_id>.json` - detached Ed25519 signatures (optional)
 
 The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
+Schema publication and compatibility policy live in [`docs/schema-compatibility.md`](docs/schema-compatibility.md).
 
 Packaged eval files live under `context/` with the other authored inputs. A minimal eval file looks like:
 
@@ -350,6 +351,7 @@ Parcel format compatibility:
 - `load_parcel` validates `manifest.json` against the bundled Dispatch JSON Schema before parsing
 - the reference implementation supports exactly `format_version: 1`
 - couriers must reject parcels whose `$schema` or `format_version` they do not support
+- published schema URLs are immutable; new manifest-shape changes require a new schema URL and `format_version`
 
 `verify` behavior:
 

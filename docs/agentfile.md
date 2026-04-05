@@ -52,6 +52,7 @@ Format compatibility:
 - couriers must validate parcels against the schema they claim to support before execution
 - couriers must reject parcels with unsupported schema URLs or format versions
 - the Dispatch reference implementation currently supports `format_version: 1`
+- schema publication and versioning policy are documented in [`schema-compatibility.md`](schema-compatibility.md)
 
 ### Parcel vs Mounts
 
