@@ -2214,6 +2214,37 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn build_accepts_tool_round_limit() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+LIMIT TOOL_ROUNDS 4
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        assert!(
+            parcel
+                .limits
+                .iter()
+                .any(|limit| limit.scope == "TOOL_ROUNDS" && limit.value == "4")
+        );
+    }
+
+    #[test]
     fn build_rejects_invalid_timeout_duration() {
         let dir = tempdir().unwrap();
         fs::write(

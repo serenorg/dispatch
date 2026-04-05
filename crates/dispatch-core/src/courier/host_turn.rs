@@ -2,10 +2,10 @@ use super::{
     ChatTurnResult, CourierError, CourierEvent, CourierSession, HostTurnContext, InstructionKind,
     LoadedParcel, ModelGeneration, ModelStreamEvent, ModelToolOutput, NativeTurnMode,
     ToolInvocation, build_builtin_tool_approval_request, build_local_tool_approval_request,
-    build_model_requests, check_tool_approval, denied_tool_run_result, effective_llm_timeout_ms,
-    execute_builtin_tool, execute_host_local_tool, handle_native_memory_command, list_local_tools,
-    list_native_builtin_tools, normalize_local_tool_input, resolve_prompt_text,
-    select_chat_backend, truncate_tool_output,
+    build_model_requests, check_tool_approval, configured_tool_round_limit, denied_tool_run_result,
+    effective_llm_timeout_ms, execute_builtin_tool, execute_host_local_tool,
+    handle_native_memory_command, list_local_tools, list_native_builtin_tools,
+    normalize_local_tool_input, resolve_prompt_text, select_chat_backend, truncate_tool_output,
 };
 
 pub(super) fn execute_host_turn(
@@ -79,19 +79,21 @@ pub(super) fn execute_host_turn(
                 });
             }
         }
-        const MAX_TOOL_ROUNDS: u32 = 8;
+        const DEFAULT_MAX_TOOL_ROUNDS: u32 = 8;
+        let max_tool_rounds =
+            configured_tool_round_limit(&image.config.limits).unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
         let mut rounds = 0u32;
         let mut executed_tool_calls = 0u32;
         let mut backend = select_chat_backend(context.chat_backend_override, &request);
         let mut candidate_locked = false;
         let mut streamed_reply = false;
         loop {
-            if rounds >= MAX_TOOL_ROUNDS {
+            if rounds >= max_tool_rounds {
                 events.push(CourierEvent::BackendFallback {
                     backend: backend.id().to_string(),
                     error: format!(
                         "tool call loop reached {} rounds without a final reply; falling back to local reference reply",
-                        MAX_TOOL_ROUNDS
+                        max_tool_rounds
                     ),
                 });
                 break;

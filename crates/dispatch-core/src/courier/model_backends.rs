@@ -16,6 +16,13 @@ fn request_timeout(request: &ModelRequest) -> Option<Duration> {
     request.llm_timeout_ms.map(Duration::from_millis)
 }
 
+fn generate_with_noop_events(
+    backend: &dyn ChatModelBackend,
+    request: &ModelRequest,
+) -> Result<ModelGeneration, CourierError> {
+    backend.generate_with_events(request, &mut |_| {})
+}
+
 pub(super) fn default_chat_backend_for_provider(
     provider: Option<&str>,
 ) -> Arc<dyn ChatModelBackend> {
@@ -54,42 +61,7 @@ impl ChatModelBackend for OpenAiResponsesBackend {
     }
 
     fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError> {
-        let api_key = match model_api_key("LLM_API_KEY", "OPENAI_API_KEY") {
-            Some(value) => value,
-            None => {
-                return Ok(ModelGeneration::NotConfigured {
-                    backend: self.id().to_string(),
-                    reason: "missing LLM_API_KEY or OPENAI_API_KEY".to_string(),
-                });
-            }
-        };
-
-        let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
-        let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
-        let payload = openai_responses_payload(request, false);
-
-        let response = ureq::post(&url)
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(request_timeout(request))
-            .build()
-            .header("authorization", &format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body = read_model_json_response(response, self.id())?;
-        let (text, tool_calls) = extract_openai_output(&body)?;
-
-        Ok(ModelGeneration::Reply(ModelReply {
-            text,
-            backend: self.id().to_string(),
-            response_id: body
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
-            tool_calls,
-        }))
+        generate_with_noop_events(self, request)
     }
 
     fn generate_with_events(
@@ -131,41 +103,7 @@ impl ChatModelBackend for OpenAiChatCompletionsBackend {
     }
 
     fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError> {
-        let api_key = match model_api_key("LLM_API_KEY", "OPENAI_API_KEY") {
-            Some(value) => value,
-            None => {
-                return Ok(ModelGeneration::NotConfigured {
-                    backend: self.id().to_string(),
-                    reason: "missing LLM_API_KEY or OPENAI_API_KEY".to_string(),
-                });
-            }
-        };
-
-        let base_url = model_base_url("LLM_BASE_URL", "OPENAI_BASE_URL", "https://api.openai.com");
-        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "model": request.model,
-            "messages": openai_chat_completions_messages(request),
-            "tools": request
-                .tools
-                .iter()
-                .map(openai_chat_completions_tool_definition)
-                .collect::<Vec<_>>(),
-            "tool_choice": "auto",
-        });
-
-        let response = ureq::post(&url)
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(request_timeout(request))
-            .build()
-            .header("authorization", &format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body = read_model_json_response(response, self.id())?;
-        extract_openai_chat_completions_output(&body)
+        generate_with_noop_events(self, request)
     }
 
     fn generate_with_events(
@@ -217,47 +155,7 @@ impl ChatModelBackend for AnthropicMessagesBackend {
     }
 
     fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError> {
-        let api_key = match model_api_key("LLM_API_KEY", "ANTHROPIC_API_KEY") {
-            Some(value) => value,
-            None => {
-                return Ok(ModelGeneration::NotConfigured {
-                    backend: self.id().to_string(),
-                    reason: "missing LLM_API_KEY or ANTHROPIC_API_KEY".to_string(),
-                });
-            }
-        };
-
-        let base_url = model_base_url(
-            "LLM_BASE_URL",
-            "ANTHROPIC_BASE_URL",
-            "https://api.anthropic.com",
-        );
-        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-        let payload = serde_json::json!({
-            "model": request.model,
-            "max_tokens": anthropic_max_tokens(request),
-            "system": request.instructions,
-            "messages": anthropic_messages(request),
-            "tools": request
-                .tools
-                .iter()
-                .map(anthropic_tool_definition)
-                .collect::<Vec<_>>(),
-        });
-
-        let response = ureq::post(&url)
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(request_timeout(request))
-            .build()
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body = read_model_json_response(response, self.id())?;
-        extract_anthropic_output(&body)
+        generate_with_noop_events(self, request)
     }
 
     fn generate_with_events(
@@ -321,58 +219,7 @@ impl ChatModelBackend for GeminiGenerateContentBackend {
     }
 
     fn generate(&self, request: &ModelRequest) -> Result<ModelGeneration, CourierError> {
-        let api_key = std::env::var("LLM_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-            .or_else(|| std::env::var("GOOGLE_API_KEY").ok());
-        let api_key = match api_key {
-            Some(value) => value,
-            None => {
-                return Ok(ModelGeneration::NotConfigured {
-                    backend: self.id().to_string(),
-                    reason: "missing LLM_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY".to_string(),
-                });
-            }
-        };
-
-        let base_url = std::env::var("LLM_BASE_URL")
-            .ok()
-            .or_else(|| std::env::var("GEMINI_BASE_URL").ok())
-            .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string());
-        let model = if request.model.starts_with("models/") {
-            request.model.clone()
-        } else {
-            format!("models/{}", request.model)
-        };
-        let url = format!("{}/{model}:generateContent", base_url.trim_end_matches('/'));
-        let mut payload = serde_json::json!({
-            "systemInstruction": {
-                "parts": [{ "text": request.instructions }]
-            },
-            "contents": gemini_messages(request),
-        });
-        if !request.tools.is_empty() {
-            payload["tools"] = serde_json::json!([{
-                "functionDeclarations": request
-                    .tools
-                    .iter()
-                    .map(gemini_tool_definition)
-                    .collect::<Vec<_>>()
-            }]);
-        }
-
-        let response = ureq::post(&url)
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(request_timeout(request))
-            .build()
-            .header("x-goog-api-key", &api_key)
-            .header("content-type", "application/json")
-            .send_json(payload)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-
-        let body = read_model_json_response(response, self.id())?;
-        extract_gemini_output(&body)
+        generate_with_noop_events(self, request)
     }
 
     fn generate_with_events(
@@ -1143,27 +990,6 @@ fn parse_sse_events<R: BufRead>(mut reader: R) -> Result<Vec<String>, CourierErr
     }
 
     Ok(events)
-}
-
-fn read_model_json_response(
-    mut response: ureq::http::Response<ureq::Body>,
-    backend: &str,
-) -> Result<serde_json::Value, CourierError> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.body_mut().read_to_string().unwrap_or_default();
-        let detail = format_provider_error_body(&body);
-        let message = if detail.is_empty() {
-            format!("{backend} HTTP {}", status.as_u16())
-        } else {
-            format!("{backend} HTTP {}: {detail}", status.as_u16())
-        };
-        return Err(CourierError::ModelBackendRequest(message));
-    }
-    response
-        .body_mut()
-        .read_json()
-        .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))
 }
 
 fn format_provider_error_body(body: &str) -> String {

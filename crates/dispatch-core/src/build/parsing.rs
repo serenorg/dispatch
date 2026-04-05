@@ -500,10 +500,10 @@ pub(super) fn parse_limit(args: &[Value]) -> Result<Option<LimitSpec>, BuildErro
     let scope = tokens[0].clone();
     if !matches!(
         scope.as_str(),
-        "ITERATIONS" | "TOOL_CALLS" | "TOOL_OUTPUT" | "CONTEXT_TOKENS"
+        "ITERATIONS" | "TOOL_CALLS" | "TOOL_OUTPUT" | "CONTEXT_TOKENS" | "TOOL_ROUNDS"
     ) {
         return Err(BuildError::Validation(format!(
-            "invalid limit scope `{scope}`; expected one of ITERATIONS, TOOL_CALLS, TOOL_OUTPUT, CONTEXT_TOKENS"
+            "invalid limit scope `{scope}`; expected one of ITERATIONS, TOOL_CALLS, TOOL_OUTPUT, CONTEXT_TOKENS, TOOL_ROUNDS"
         )));
     }
     Ok(Some(LimitSpec {

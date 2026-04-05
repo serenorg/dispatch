@@ -157,6 +157,16 @@ pub(super) fn configured_tool_output_limit(limits: &[crate::manifest::LimitSpec]
     configured_limit_u32(limits, "TOOL_OUTPUT").map(|value| value as usize)
 }
 
+#[cfg(test)]
+pub(super) fn configured_tool_round_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
+    configured_limit_u32(limits, "TOOL_ROUNDS")
+}
+
+#[cfg(not(test))]
+pub(super) fn configured_tool_round_limit(limits: &[crate::manifest::LimitSpec]) -> Option<u32> {
+    configured_limit_u32(limits, "TOOL_ROUNDS")
+}
+
 fn configured_limit_u32(limits: &[crate::manifest::LimitSpec], scope: &str) -> Option<u32> {
     limits
         .iter()

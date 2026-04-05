@@ -557,11 +557,13 @@ Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.
 ```dockerfile
 LIMIT ITERATIONS 20
 LIMIT TOOL_CALLS 12
+LIMIT TOOL_ROUNDS 8
 LIMIT TOOL_OUTPUT 10000
 LIMIT CONTEXT_TOKENS 16000
 ```
 
 Hosted model backends may use `LIMIT CONTEXT_TOKENS` when the provider supports an explicit token budget field. The reference implementation currently applies it to Anthropic `max_tokens`.
+The reference courier enforces `LIMIT TOOL_ROUNDS` as the maximum number of model/tool exchange rounds before it falls back to the local reference reply path.
 
 #### `COMPACTION`
 

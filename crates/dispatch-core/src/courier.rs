@@ -56,8 +56,8 @@ use self::model_request::{
     configured_tool_call_limit, configured_tool_output_limit,
 };
 use self::model_request::{
-    build_model_requests, build_wasm_model_requests, normalize_local_tool_input,
-    select_chat_backend, truncate_tool_output,
+    build_model_requests, build_wasm_model_requests, configured_tool_round_limit,
+    normalize_local_tool_input, select_chat_backend, truncate_tool_output,
 };
 use self::mounts::{ensure_mounts_supported, resolve_builtin_mounts};
 #[cfg(test)]

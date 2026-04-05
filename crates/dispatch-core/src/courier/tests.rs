@@ -3442,10 +3442,21 @@ fn configured_tool_limits_use_last_valid_values() {
             value: "1024".to_string(),
             qualifiers: Vec::new(),
         },
+        crate::manifest::LimitSpec {
+            scope: "TOOL_ROUNDS".to_string(),
+            value: "0".to_string(),
+            qualifiers: Vec::new(),
+        },
+        crate::manifest::LimitSpec {
+            scope: "TOOL_ROUNDS".to_string(),
+            value: "6".to_string(),
+            qualifiers: Vec::new(),
+        },
     ];
 
     assert_eq!(configured_tool_call_limit(&limits), Some(5));
     assert_eq!(configured_tool_output_limit(&limits), Some(1024));
+    assert_eq!(configured_tool_round_limit(&limits), Some(6));
 }
 
 #[test]
@@ -4112,6 +4123,60 @@ ENTRYPOINT chat
 
     let error = run_local_tool(&test_image.image, "demo", Some("hello")).unwrap_err();
     assert!(matches!(error, CourierError::ApprovalRequired { ref tool } if tool == "demo"));
+}
+
+#[test]
+fn native_courier_respects_configured_tool_round_limit() {
+    let test_image = build_test_image(
+        "\
+FROM dispatch/native:latest
+MODEL fake-model PROVIDER fake
+TOOL LOCAL tools/demo.sh AS demo
+LIMIT TOOL_ROUNDS 3
+ENTRYPOINT chat
+",
+        &[("tools/demo.sh", "printf ok")],
+    );
+
+    let backend = Arc::new(FakeChatBackend::with_replies(
+        (0..6)
+            .map(|index| {
+                Some(ModelReply {
+                    text: None,
+                    backend: "fake".to_string(),
+                    response_id: Some(format!("resp_{index}")),
+                    tool_calls: vec![ModelToolCall {
+                        call_id: format!("call_{index}"),
+                        name: "demo".to_string(),
+                        input: "{\"query\":\"ping\"}".to_string(),
+                        kind: ModelToolKind::Custom,
+                    }],
+                })
+            })
+            .collect(),
+    ));
+    let courier = NativeCourier::with_chat_backend(backend.clone());
+    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+    let response = futures::executor::block_on(courier.run(
+        &test_image.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat {
+                input: "loop forever".to_string(),
+            },
+        },
+    ))
+    .unwrap();
+
+    assert!(response.events.iter().any(|event| {
+        matches!(
+            event,
+            CourierEvent::BackendFallback { backend, error }
+                if backend == "fake" && error.contains("tool call loop reached 3 rounds")
+        )
+    }));
+    assert_eq!(backend.calls.lock().unwrap().len(), 3);
 }
 
 #[test]
