@@ -333,6 +333,8 @@ pub struct ModelPolicy {
 pub struct ModelReference {
     pub id: String,
     pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_history: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

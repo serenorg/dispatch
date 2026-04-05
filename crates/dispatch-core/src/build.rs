@@ -253,12 +253,16 @@ pub fn build_agentfile(
                 }
             }
             "MODEL" => {
-                if let Some(model) = parse_model_reference(&instruction.args) {
+                if let Some(model) =
+                    parse_model_reference(&instruction.args, instruction.span.line_start)?
+                {
                     resolved.models.primary = Some(model);
                 }
             }
             "FALLBACK" => {
-                if let Some(model) = parse_model_reference(&instruction.args) {
+                if let Some(model) =
+                    parse_model_reference(&instruction.args, instruction.span.line_start)?
+                {
                     resolved.models.fallbacks.push(model);
                 }
             }
@@ -2254,6 +2258,63 @@ ENTRYPOINT chat
         assert_eq!(report.verified_files, 1);
         assert!(report.missing_files.is_empty());
         assert!(report.modified_files.is_empty());
+    }
+
+    #[test]
+    fn build_records_model_persist_history_setting() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
+FALLBACK gpt-5.4-mini PROVIDER codex PERSIST_HISTORY true
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(&built.manifest_path).unwrap()).unwrap();
+
+        assert_eq!(parcel.models.primary.unwrap().persist_history, Some(false));
+        assert_eq!(parcel.models.fallbacks[0].persist_history, Some(true));
+    }
+
+    #[test]
+    fn build_rejects_invalid_model_persist_history_setting() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY maybe
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("`PERSIST_HISTORY` must be one of `true` or `false`")
+        );
     }
 
     #[test]

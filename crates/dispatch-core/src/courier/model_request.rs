@@ -48,20 +48,39 @@ pub(super) fn build_model_requests(
 
     Ok(model_refs
         .into_iter()
-        .map(|model| ModelRequest {
-            model: model.id,
-            provider: model.provider.clone(),
-            llm_timeout_ms,
-            context_token_limit: configured_context_token_limit(&image.config.limits),
-            tool_call_limit: configured_tool_call_limit(&image.config.limits),
-            tool_output_limit: configured_tool_output_limit(&image.config.limits),
-            working_directory: working_directory.clone(),
-            instructions: instructions.clone(),
-            messages: messages.to_vec(),
-            tools: tools.clone(),
-            pending_tool_calls: Vec::new(),
-            tool_outputs: Vec::new(),
-            previous_response_id: backend_state.map(ToString::to_string),
+        .map(|model| {
+            // Only pass backend_state as previous_response_id to Codex providers.
+            // Non-Codex backends (OpenAI, Anthropic, …) use previous_response_id
+            // for their own response-continuation semantics and would reject a
+            // Codex thread-state blob.
+            let is_codex = model
+                .provider
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case("codex"))
+                .or_else(|| {
+                    process_env_lookup("LLM_BACKEND").map(|p| p.eq_ignore_ascii_case("codex"))
+                })
+                .unwrap_or(false);
+            ModelRequest {
+                model: model.id,
+                provider: model.provider.clone(),
+                persist_history: model.persist_history,
+                llm_timeout_ms,
+                context_token_limit: configured_context_token_limit(&image.config.limits),
+                tool_call_limit: configured_tool_call_limit(&image.config.limits),
+                tool_output_limit: configured_tool_output_limit(&image.config.limits),
+                working_directory: working_directory.clone(),
+                instructions: instructions.clone(),
+                messages: messages.to_vec(),
+                tools: tools.clone(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: if is_codex {
+                    backend_state.map(ToString::to_string)
+                } else {
+                    None
+                },
+            }
         })
         .collect())
 }
@@ -79,6 +98,7 @@ fn configured_model_references(policy: &crate::manifest::ModelPolicy) -> Vec<Mod
     models.push(ModelReference {
         id: model,
         provider: std::env::var("LLM_BACKEND").ok(),
+        persist_history: None,
     });
     models
 }
@@ -99,6 +119,7 @@ pub(super) fn build_wasm_model_requests(
                 vec![ModelReference {
                     id: model,
                     provider: None,
+                    persist_history: None,
                 }]
             }
         }
@@ -118,6 +139,7 @@ pub(super) fn build_wasm_model_requests(
         .map(|model| ModelRequest {
             model: model.id,
             provider: model.provider.clone(),
+            persist_history: model.persist_history,
             llm_timeout_ms,
             context_token_limit: configured_context_token_limit(&parcel.config.limits),
             tool_call_limit: configured_tool_call_limit(&parcel.config.limits),

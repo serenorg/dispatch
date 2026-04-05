@@ -210,6 +210,7 @@ fn anthropic_max_tokens_uses_context_token_limit_when_present() {
     let request = ModelRequest {
         model: "claude-sonnet-4".to_string(),
         provider: Some("anthropic".to_string()),
+        persist_history: None,
         llm_timeout_ms: None,
         context_token_limit: Some(16000),
         tool_call_limit: None,
@@ -231,6 +232,7 @@ fn openai_chat_completions_messages_include_structured_tool_followup() {
     let request = ModelRequest {
         model: "gpt-5-mini".to_string(),
         provider: Some("openai_compatible".to_string()),
+        persist_history: None,
         llm_timeout_ms: None,
         context_token_limit: None,
         tool_call_limit: None,
@@ -271,6 +273,7 @@ fn anthropic_messages_include_tool_use_and_tool_result_blocks() {
     let request = ModelRequest {
         model: "claude-sonnet-4".to_string(),
         provider: Some("anthropic".to_string()),
+        persist_history: None,
         llm_timeout_ms: None,
         context_token_limit: None,
         tool_call_limit: None,
@@ -311,6 +314,7 @@ fn gemini_messages_include_function_call_and_response_parts() {
     let request = ModelRequest {
         model: "gemini-2.5-pro".to_string(),
         provider: Some("gemini".to_string()),
+        persist_history: None,
         llm_timeout_ms: None,
         context_token_limit: None,
         tool_call_limit: None,
@@ -370,6 +374,7 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
+                persist_history: None,
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -404,6 +409,7 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
+                persist_history: None,
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -437,6 +443,125 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
 
 #[test]
 #[cfg(unix)]
+fn codex_backend_can_disable_persistent_history_per_request() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-ephemeral\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"hello\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let reply = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                persist_history: Some(false),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: Some("thread-old".to_string()),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let reply = match reply {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected codex reply, got {other:?}"),
+    };
+
+    assert!(reply.response_id.is_none());
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("\"method\":\"thread/start\""));
+    assert!(!log.contains("\"method\":\"thread/resume\""));
+    assert!(log.contains("\"ephemeral\":true"));
+    assert!(!log.contains("\"persistExtendedHistory\":true"));
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_env_override_disables_persistent_history() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("DISPATCH_CODEX_PERSIST_HISTORY");
+    unsafe {
+        std::env::set_var("DISPATCH_CODEX_PERSIST_HISTORY", "0");
+    }
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-ephemeral\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"hello\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "gpt-5.4".to_string(),
+            provider: Some("codex".to_string()),
+            persist_history: Some(true),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: Some(dir.path().display().to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_CODEX_PERSIST_HISTORY", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_CODEX_PERSIST_HISTORY");
+        },
+    }
+
+    let reply = match result.unwrap() {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected codex reply, got {other:?}"),
+    };
+    assert!(reply.response_id.is_none());
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("\"ephemeral\":true"));
+    assert!(!log.contains("\"persistExtendedHistory\":true"));
+}
+
+#[test]
+#[cfg(unix)]
 fn codex_backend_resume_failure_returns_error() {
     let _guard = lock_codex_backend_test();
     let dir = tempdir().unwrap();
@@ -453,6 +578,7 @@ fn codex_backend_resume_failure_returns_error() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
+                persist_history: None,
                 llm_timeout_ms: None,
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -495,6 +621,7 @@ fn codex_backend_respects_llm_timeout() {
             &ModelRequest {
                 model: "gpt-5.4".to_string(),
                 provider: Some("codex".to_string()),
+                persist_history: None,
                 llm_timeout_ms: Some(50),
                 context_token_limit: None,
                 tool_call_limit: None,
@@ -545,7 +672,7 @@ fn codex_backend_preserves_existing_codex_home() {
         &ModelRequest {
             model: "gpt-5.4".to_string(),
             provider: Some("codex".to_string()),
-            model_options: Default::default(),
+            persist_history: None,
             llm_timeout_ms: None,
             context_token_limit: None,
             tool_call_limit: None,
@@ -577,4 +704,99 @@ fn codex_backend_preserves_existing_codex_home() {
 
     let logged_home = fs::read_to_string(&env_log_path).unwrap();
     assert_eq!(logged_home.trim(), expected_home.display().to_string());
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_forwards_rollout_path_to_thread_resume() {
+    // When a previous turn returned a rollout_path in the thread state, the next
+    // thread/resume call must include "path" in its params so the Codex server can
+    // load history from the rollout file rather than relying on thread ID alone.
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    // thread/start returns a thread with both id and path.
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-with-path\",\"path\":\"/tmp/rollout.json\"}}}}}}' ;;\n*'\"method\":\"thread/resume\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-resumed\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+
+    // First turn: start a thread - response includes a rollout path.
+    let first = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                persist_history: None,
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: String::new(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let first_state = match first {
+        ModelGeneration::Reply(ref reply) => reply
+            .response_id
+            .clone()
+            .expect("first turn should have a response_id"),
+        other => panic!("expected Reply, got {other:?}"),
+    };
+    assert!(
+        first_state.contains("/tmp/rollout.json"),
+        "state: {first_state}"
+    );
+
+    let _ = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                persist_history: None,
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: String::new(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "follow up".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: Some(first_state),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let resume_line = log
+        .lines()
+        .find(|line| line.contains("\"method\":\"thread/resume\""))
+        .expect("thread/resume call should appear in log");
+    assert!(
+        resume_line.contains("/tmp/rollout.json"),
+        "rollout path missing from thread/resume params: {resume_line}"
+    );
 }

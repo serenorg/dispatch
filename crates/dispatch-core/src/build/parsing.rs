@@ -139,10 +139,16 @@ pub(super) fn parse_framework(args: &[Value]) -> Option<FrameworkProvenance> {
     })
 }
 
-pub(super) fn parse_model_reference(args: &[Value]) -> Option<ModelReference> {
+pub(super) fn parse_model_reference(
+    args: &[Value],
+    line: usize,
+) -> Result<Option<ModelReference>, BuildError> {
     let tokens = scalars(args);
-    let id = tokens.first()?.clone();
+    let Some(id) = tokens.first().cloned() else {
+        return Ok(None);
+    };
     let mut provider = None;
+    let mut persist_history = None;
 
     let mut index = 1;
     while index < tokens.len() {
@@ -151,11 +157,29 @@ pub(super) fn parse_model_reference(args: &[Value]) -> Option<ModelReference> {
                 provider = Some(tokens[index + 1].clone());
                 index += 2;
             }
+            "PERSIST_HISTORY" if index + 1 < tokens.len() => {
+                persist_history = Some(parse_bool_token(
+                    &tokens[index + 1],
+                    line,
+                    "PERSIST_HISTORY",
+                )?);
+                index += 2;
+            }
+            "PROVIDER" | "PERSIST_HISTORY" => {
+                return Err(BuildError::Validation(format!(
+                    "line {line}: `{}` requires a value",
+                    tokens[index]
+                )));
+            }
             _ => index += 1,
         }
     }
 
-    Some(ModelReference { id, provider })
+    Ok(Some(ModelReference {
+        id,
+        provider,
+        persist_history,
+    }))
 }
 
 pub(super) fn parse_env_var(args: &[Value]) -> Option<EnvVar> {
@@ -259,6 +283,16 @@ fn parse_local_tool(tokens: &[String]) -> Result<Option<LocalToolConfig>, BuildE
         input_schema,
         skill_source: None,
     }))
+}
+
+fn parse_bool_token(value: &str, line: usize, field: &str) -> Result<bool, BuildError> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(BuildError::Validation(format!(
+            "line {line}: `{field}` must be one of `true` or `false`, got `{value}`"
+        ))),
+    }
 }
 
 fn parse_a2a_tool(tokens: &[String]) -> Result<Option<A2aToolConfig>, BuildError> {

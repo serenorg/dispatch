@@ -809,6 +809,12 @@
             "string",
             "null"
           ]
+        },
+        "persist_history": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },

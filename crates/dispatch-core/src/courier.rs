@@ -825,6 +825,7 @@ pub trait ChatModelBackend: Send + Sync {
 pub struct ModelRequest {
     pub model: String,
     pub provider: Option<String>,
+    pub persist_history: Option<bool>,
     pub llm_timeout_ms: Option<u64>,
     pub context_token_limit: Option<u32>,
     pub tool_call_limit: Option<u32>,

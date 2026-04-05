@@ -33,6 +33,73 @@ ENTRYPOINT chat
 }
 
 #[test]
+fn build_model_request_carries_model_persist_history_setting() {
+    let test_image = build_test_image(
+        "\
+FROM dispatch/native:latest
+MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
+ENTRYPOINT chat
+",
+        &[],
+    );
+
+    let request = build_model_request(
+        &test_image.image,
+        &[ConversationMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }],
+        &[],
+    )
+    .unwrap()
+    .expect("expected model request");
+
+    assert_eq!(request.provider.as_deref(), Some("codex"));
+    assert_eq!(request.persist_history, Some(false));
+}
+
+#[test]
+fn build_model_requests_only_passes_backend_state_to_codex_provider() {
+    // When a parcel has a Codex primary and a non-Codex fallback, backend_state
+    // (a Codex thread-state blob) must NOT be forwarded to the non-Codex fallback
+    // request: other backends treat previous_response_id as their own opaque
+    // continuation token and would send the Codex JSON blob to a provider API,
+    // causing an API error.
+    let test_image = build_test_image(
+        "\
+FROM dispatch/native:latest
+MODEL gpt-5.4 PROVIDER codex
+FALLBACK gpt-5.4-mini PROVIDER openai
+ENTRYPOINT chat
+",
+        &[],
+    );
+
+    let codex_thread_state = r#"{"thread_id":"thr_abc","rollout_path":null}"#;
+    let requests = build_model_requests(
+        &test_image.image,
+        &[ConversationMessage {
+            role: "user".to_string(),
+            content: "follow up".to_string(),
+        }],
+        &[],
+        None,
+        Some(codex_thread_state),
+    )
+    .unwrap();
+
+    assert_eq!(requests.len(), 2);
+    // Codex primary gets the thread state.
+    assert_eq!(
+        requests[0].previous_response_id.as_deref(),
+        Some(codex_thread_state),
+    );
+    // OpenAI fallback must not receive the Codex blob.
+    assert_eq!(requests[1].provider.as_deref(), Some("openai"));
+    assert!(requests[1].previous_response_id.is_none());
+}
+
+#[test]
 fn build_model_request_uses_declared_tool_description() {
     let test_image = build_test_image(
         "\

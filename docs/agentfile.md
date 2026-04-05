@@ -384,6 +384,7 @@ EOF
 MODEL gpt-5.4-mini
 MODEL claude-sonnet-4-6 PROVIDER anthropic
 MODEL gpt-5.4 PROVIDER codex
+MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
 ```
 
 Reference implementation providers currently include:
@@ -394,7 +395,7 @@ Reference implementation providers currently include:
 - `openai_compatible`
 - `codex`
 
-`PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. The reference implementation resumes Codex thread state across turns, but it denies ambient app-server permission requests by default so undeclared Codex command/file/MCP actions are not exposed through the courier implicitly. The Codex backend intentionally inherits the parent process environment so local Codex auth and config continue to work, and it leaves `CODEX_HOME` alone unless the caller already set it. Unix targets use a PTY-backed Codex transport; other targets currently fall back to standard process pipes.
+`PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. `PERSIST_HISTORY true|false` is an optional parcel-level Codex setting that controls whether Dispatch asks Codex to persist rollout history and resume the Codex thread on later turns. The default is `true`. When persistence is disabled, Dispatch requests ephemeral Codex threads and follow-up context comes from Dispatch session history instead of Codex rollout files. `DISPATCH_CODEX_PERSIST_HISTORY` remains an operator override and takes precedence over the parcel setting. The reference implementation denies ambient app-server permission requests by default so undeclared Codex command/file/MCP actions are not exposed through the courier implicitly. The Codex backend intentionally inherits the parent process environment so local Codex auth and config continue to work, and it leaves `CODEX_HOME` alone unless the caller already set it. Unix targets use a PTY-backed Codex transport; other targets currently fall back to standard process pipes.
 
 #### `FALLBACK`
 

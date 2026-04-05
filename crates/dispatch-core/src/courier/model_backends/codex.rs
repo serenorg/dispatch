@@ -47,7 +47,7 @@ impl ChatModelBackend for CodexAppServerBackend {
             });
         };
 
-        let Some(mut process) = CodexProcess::spawn(working_directory)? else {
+        let Some(mut process) = CodexProcess::spawn(working_directory, request)? else {
             return Ok(ModelGeneration::NotConfigured {
                 backend: self.id().to_string(),
                 reason: "missing CODEX_BINARY or `codex` executable".to_string(),
@@ -60,7 +60,7 @@ impl ChatModelBackend for CodexAppServerBackend {
         let prompt = codex_prompt_text(request);
         let turn_id = process.start_turn(&thread.thread_id, &request.model, &prompt, deadline)?;
         let text = process.collect_turn_output(&turn_id, on_event, deadline)?;
-        let response_id = if codex_history_persistence_enabled() {
+        let response_id = if codex_history_persistence_enabled(request) {
             Some(thread.encode())
         } else {
             None
@@ -121,21 +121,23 @@ fn codex_reasoning_effort() -> String {
         .unwrap_or_else(|| "medium".to_string())
 }
 
-fn codex_history_persistence_enabled() -> bool {
-    env_flag_enabled("DISPATCH_CODEX_PERSIST_HISTORY", true)
+fn codex_history_persistence_enabled(request: &ModelRequest) -> bool {
+    env_flag_override("DISPATCH_CODEX_PERSIST_HISTORY")
+        .or(request.persist_history)
+        .unwrap_or(true)
 }
 
-fn env_flag_enabled(name: &str, default: bool) -> bool {
+fn env_flag_override(name: &str) -> Option<bool> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .map(|value| match value.as_str() {
-            "" => default,
-            "0" | "false" | "no" | "off" => false,
-            "1" | "true" | "yes" | "on" => true,
-            _ => default,
+            "" => None,
+            "0" | "false" | "no" | "off" => Some(false),
+            "1" | "true" | "yes" | "on" => Some(true),
+            _ => None,
         })
-        .unwrap_or(default)
+        .unwrap_or(None)
 }
 
 fn codex_prompt_text(request: &ModelRequest) -> String {
@@ -267,7 +269,10 @@ enum CodexIo {
 }
 
 impl CodexProcess {
-    fn spawn(working_directory: &str) -> Result<Option<Self>, CourierError> {
+    fn spawn(
+        working_directory: &str,
+        request: &ModelRequest,
+    ) -> Result<Option<Self>, CourierError> {
         let binary = codex_binary_path();
         let mut command = Command::new(&binary);
         command
@@ -413,7 +418,7 @@ impl CodexProcess {
         request: &ModelRequest,
         deadline: Option<Instant>,
     ) -> Result<CodexThreadState, CourierError> {
-        let persistence_enabled = codex_history_persistence_enabled();
+        let persistence_enabled = codex_history_persistence_enabled(request);
         if persistence_enabled
             && let Some(state) = CodexThreadState::decode(request.previous_response_id.as_deref())
         {
@@ -836,14 +841,20 @@ fn codex_thread_resume_params(
     state: &CodexThreadState,
     request: &ModelRequest,
 ) -> serde_json::Value {
-    serde_json::json!({
+    // Prefer resuming by rollout path when available - it is more reliable than
+    // thread ID alone. ThreadResumeParams precedence: history > path > threadId.
+    let mut params = serde_json::json!({
         "threadId": state.thread_id,
         "cwd": request.working_directory,
         "approvalPolicy": "on-request",
         "sandbox": "workspace-write",
         "persistExtendedHistory": true,
         "model": request.model,
-    })
+    });
+    if let Some(path) = &state.rollout_path {
+        params["path"] = serde_json::Value::String(path.clone());
+    }
+    params
 }
 
 fn is_server_request(value: &serde_json::Value) -> bool {
