@@ -2261,7 +2261,7 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn build_records_model_persist_history_setting() {
+    fn build_records_model_persist_thread_setting() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("Agentfile"),
@@ -2304,7 +2304,7 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn build_rejects_invalid_model_persist_history_setting() {
+    fn build_rejects_invalid_model_persist_thread_setting() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("Agentfile"),

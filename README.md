@@ -385,7 +385,7 @@ Supported backends:
 | `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
 | `gemini` | Gemini generateContent | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 | `openai_compatible` | Chat Completions | `LLM_API_KEY` + `LLM_BASE_URL` |
-| `codex` | Local `codex app-server` JSON-RPC transport | optional `CODEX_BINARY`, `CODEX_HOME`, `DISPATCH_REASONING_EFFORT`, `DISPATCH_PERSIST_THREAD` |
+| `codex` | Local `codex app-server` JSON-RPC transport | optional `CODEX_BINARY`, `CODEX_HOME`, `DISPATCH_PERSIST_THREAD`, `DISPATCH_REASONING_EFFORT` (value passed through to Codex; typically `low`, `medium`, or `high`) |
 
 `LLM_API_KEY` and `LLM_BASE_URL` take precedence over provider-specific vars. Provider-specific vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) are checked as fallbacks when the `LLM_*` vars are not set.
 

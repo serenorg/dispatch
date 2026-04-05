@@ -446,7 +446,7 @@ impl CodexProcess {
             let value = self
                 .request(
                     "thread/resume",
-                    codex_thread_resume_params(&state, request),
+                    codex_thread_resume_params(&state, request, persistence_enabled),
                     deadline,
                 )
                 .map_err(|error| {
@@ -862,6 +862,7 @@ fn codex_thread_start_params(
 fn codex_thread_resume_params(
     state: &CodexThreadState,
     request: &ModelRequest,
+    persistence_enabled: bool,
 ) -> serde_json::Value {
     // Prefer resuming by rollout path when available - it is more reliable than
     // thread ID alone. ThreadResumeParams precedence: history > path > threadId.
@@ -870,7 +871,7 @@ fn codex_thread_resume_params(
         "cwd": request.working_directory,
         "approvalPolicy": "on-request",
         "sandbox": "workspace-write",
-        "persistExtendedHistory": true,
+        "persistExtendedHistory": persistence_enabled,
         "model": request.model,
     });
     if let Some(path) = &state.rollout_path {

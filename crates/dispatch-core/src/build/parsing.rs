@@ -170,9 +170,9 @@ pub(super) fn parse_model_reference(
                 )));
             }
             token if token.starts_with("--") => {
-                let (name, value) = parse_model_option_flag(token, line)?;
-                validate_model_option(&name, &value, line)?;
-                if options.insert(name.clone(), value).is_some() {
+                let (name, raw_value) = parse_model_option_flag(token, line)?;
+                let canonical_value = validate_model_option(&name, &raw_value, line)?;
+                if options.insert(name.clone(), canonical_value).is_some() {
                     return Err(BuildError::Validation(format!(
                         "line {line}: duplicate model option `--{name}`"
                     )));
@@ -324,13 +324,13 @@ fn parse_model_option_flag(token: &str, line: usize) -> Result<(String, String),
     Ok((name.to_string(), value.to_string()))
 }
 
-fn validate_model_option(name: &str, value: &str, line: usize) -> Result<(), BuildError> {
+fn validate_model_option(name: &str, value: &str, line: usize) -> Result<String, BuildError> {
     match name {
         "persist-thread" => {
-            let _ = parse_bool_token(value, line, "--persist-thread")?;
-            Ok(())
+            let canonical = parse_bool_token(value, line, "--persist-thread")?;
+            Ok(if canonical { "true" } else { "false" }.to_string())
         }
-        "reasoning-effort" => Ok(()),
+        "reasoning-effort" => Ok(value.to_string()),
         _ => Err(BuildError::Validation(format!(
             "line {line}: unsupported model flag `--{name}`"
         ))),

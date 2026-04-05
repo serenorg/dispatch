@@ -33,7 +33,7 @@ ENTRYPOINT chat
 }
 
 #[test]
-fn build_model_request_carries_model_persist_history_setting() {
+fn build_model_request_carries_model_persist_thread_setting() {
     let test_image = build_test_image(
         "\
 FROM dispatch/native:latest

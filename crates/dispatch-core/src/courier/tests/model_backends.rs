@@ -438,7 +438,24 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("\"method\":\"thread/start\""));
     assert!(log.contains("\"method\":\"thread/resume\""));
-    assert!(log.contains("\"persistExtendedHistory\":true"));
+
+    let start_line = log
+        .lines()
+        .find(|l| l.contains("\"method\":\"thread/start\""))
+        .expect("thread/start should appear in log");
+    assert!(
+        start_line.contains("\"persistExtendedHistory\":true"),
+        "thread/start should carry persistExtendedHistory:true: {start_line}"
+    );
+
+    let resume_line = log
+        .lines()
+        .find(|l| l.contains("\"method\":\"thread/resume\""))
+        .expect("thread/resume should appear in log");
+    assert!(
+        resume_line.contains("\"persistExtendedHistory\":true"),
+        "thread/resume should carry persistExtendedHistory:true: {resume_line}"
+    );
 }
 
 #[test]
@@ -616,6 +633,144 @@ fn codex_backend_uses_reasoning_effort_model_option() {
     assert!(
         turn_start_line.contains("\"effort\":\"high\""),
         "reasoning effort missing from turn/start params: {turn_start_line}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_env_override_sets_reasoning_effort() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
+    unsafe {
+        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
+    }
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "gpt-5.4".to_string(),
+            provider: Some("codex".to_string()),
+            // No --reasoning-effort in model_options; env var should supply it.
+            model_options: Default::default(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: Some(dir.path().display().to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_REASONING_EFFORT");
+        },
+    }
+
+    result.unwrap();
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let turn_start_line = log
+        .lines()
+        .find(|line| line.contains("\"method\":\"turn/start\""))
+        .expect("turn/start call should appear in log");
+    assert!(
+        turn_start_line.contains("\"effort\":\"low\""),
+        "env-supplied reasoning effort missing from turn/start params: {turn_start_line}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_model_option_takes_precedence_over_reasoning_effort_env() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
+    unsafe {
+        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
+    }
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "gpt-5.4".to_string(),
+            provider: Some("codex".to_string()),
+            // Parcel option is "high"; env var is "low" - parcel wins.
+            model_options: [("reasoning-effort".to_string(), "high".to_string())]
+                .into_iter()
+                .collect(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: Some(dir.path().display().to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_REASONING_EFFORT");
+        },
+    }
+
+    result.unwrap();
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let turn_start_line = log
+        .lines()
+        .find(|line| line.contains("\"method\":\"turn/start\""))
+        .expect("turn/start call should appear in log");
+    assert!(
+        turn_start_line.contains("\"effort\":\"high\""),
+        "parcel model option should override env var: {turn_start_line}"
     );
 }
 
