@@ -756,7 +756,7 @@ In the reference implementation, the prompt-bearing instruction kinds are:
 - a declared local tool does not exist
 - a built-in tool is unknown
 - a `TEST tool:<alias>` references an unknown local or A2A tool alias
-- a required secret is malformed at deploy time
+- a required secret is absent from the execution environment at runtime
 - `HEARTBEAT` is declared without `ENTRYPOINT heartbeat`
 - incompatible mounts are declared
 - unsupported instructions are used by the selected `FROM`

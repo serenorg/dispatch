@@ -200,7 +200,8 @@ Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out o
 
 ## WASM Courier
 
-The WASM courier is where Dispatch's portability story is most concrete.
+Dispatch includes a WASM courier for parcels that package a guest component targeting the Dispatch
+WIT ABI.
 
 A `dispatch/wasm` parcel contains a WASM component compiled against the Dispatch WIT ABI:
 
