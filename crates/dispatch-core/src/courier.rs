@@ -40,6 +40,7 @@ mod parcel;
 mod plugin_process;
 mod session_store;
 mod tool_exec;
+mod validation;
 mod wasm_support;
 
 #[cfg(test)]
@@ -67,6 +68,10 @@ use self::tool_exec::{
     effective_llm_timeout_ms, ensure_run_timeout_budget, execute_host_local_tool,
     execute_local_tool_in_docker, execute_local_tool_with_env, operation_counts_toward_run_budget,
     remaining_run_budget_with_literal, run_timeout_deadline,
+};
+use self::validation::{
+    ensure_operation_matches_entrypoint, ensure_session_matches_parcel, resolve_manifest_path,
+    validate_courier_reference,
 };
 use self::wasm_support::{
     apply_wasm_turn_to_session, instantiate_wasm_guest, load_wasm_component,
@@ -2680,121 +2685,6 @@ fn validate_native_parcel(image: &LoadedParcel) -> Result<(), CourierError> {
         CourierKind::Native,
         image.config.courier.reference(),
     )
-}
-
-fn validate_courier_reference(
-    courier_name: &str,
-    kind: CourierKind,
-    reference: &str,
-) -> Result<(), CourierError> {
-    if courier_reference_matches(kind, reference) {
-        return Ok(());
-    }
-
-    Err(CourierError::IncompatibleCourier {
-        courier: courier_name.to_string(),
-        parcel_courier: reference.to_string(),
-        supported: supported_courier_references(kind).join(", "),
-    })
-}
-
-fn courier_reference_matches(kind: CourierKind, reference: &str) -> bool {
-    match kind {
-        CourierKind::Native => {
-            reference == "native"
-                || reference == "dispatch/native"
-                || reference.starts_with("dispatch/native:")
-                || reference.starts_with("dispatch/native@")
-        }
-        CourierKind::Docker => {
-            reference == "docker"
-                || reference == "dispatch/docker"
-                || reference.starts_with("dispatch/docker:")
-                || reference.starts_with("dispatch/docker@")
-        }
-        CourierKind::Wasm => {
-            reference == "wasm"
-                || reference == "dispatch/wasm"
-                || reference.starts_with("dispatch/wasm:")
-                || reference.starts_with("dispatch/wasm@")
-        }
-        CourierKind::Custom => {
-            reference == "custom"
-                || reference == "dispatch/custom"
-                || reference.starts_with("dispatch/custom:")
-                || reference.starts_with("dispatch/custom@")
-        }
-    }
-}
-
-fn supported_courier_references(kind: CourierKind) -> &'static [&'static str] {
-    match kind {
-        CourierKind::Native => &["dispatch/native", "dispatch/native:<tag>", "native"],
-        CourierKind::Docker => &["dispatch/docker", "dispatch/docker:<tag>", "docker"],
-        CourierKind::Wasm => &["dispatch/wasm", "dispatch/wasm:<tag>", "wasm"],
-        CourierKind::Custom => &["dispatch/custom", "dispatch/custom:<tag>", "custom"],
-    }
-}
-
-fn ensure_session_matches_parcel(
-    image: &LoadedParcel,
-    session: &CourierSession,
-) -> Result<(), CourierError> {
-    if session.parcel_digest != image.config.digest {
-        return Err(CourierError::SessionParcelMismatch {
-            session_parcel_digest: session.parcel_digest.clone(),
-            parcel_digest: image.config.digest.clone(),
-        });
-    }
-
-    Ok(())
-}
-
-fn ensure_operation_matches_entrypoint(
-    session: &CourierSession,
-    operation: &CourierOperation,
-) -> Result<(), CourierError> {
-    let Some(entrypoint) = session.entrypoint.as_deref() else {
-        return Ok(());
-    };
-
-    let Some(operation_name) = operation_entrypoint_name(operation) else {
-        return Ok(());
-    };
-
-    if entrypoint == operation_name {
-        return Ok(());
-    }
-
-    Err(CourierError::EntrypointMismatch {
-        entrypoint: entrypoint.to_string(),
-        operation: operation_name.to_string(),
-    })
-}
-
-fn operation_entrypoint_name(operation: &CourierOperation) -> Option<&'static str> {
-    match operation {
-        CourierOperation::Chat { .. } => Some("chat"),
-        CourierOperation::Job { .. } => Some("job"),
-        CourierOperation::Heartbeat { .. } => Some("heartbeat"),
-        CourierOperation::ResolvePrompt
-        | CourierOperation::ListLocalTools
-        | CourierOperation::InvokeTool { .. } => None,
-    }
-}
-
-fn resolve_manifest_path(path: &Path) -> Result<PathBuf, CourierError> {
-    if !path.exists() {
-        return Err(CourierError::MissingParcelPath {
-            path: path.display().to_string(),
-        });
-    }
-
-    if path.is_dir() {
-        Ok(path.join("manifest.json"))
-    } else {
-        Ok(path.to_path_buf())
-    }
 }
 
 fn instruction_heading(kind: InstructionKind) -> &'static str {
