@@ -8,6 +8,8 @@ Dispatch is defined by three layers:
 
 If you are implementing a Dispatch-compatible courier, the courier contract matters more than the CLI. Compatibility means your courier can load a Dispatch parcel, validate whether it can execute it, and honor the expected session and operation semantics.
 
+This guide is the contract-facing companion to [`schema-compatibility.md`](schema-compatibility.md). External couriers should treat both documents as release inputs: one defines which parcel manifests are valid to load, the other defines what it means to execute them compatibly.
+
 ## Courier Contract
 
 The reference contract lives in [`CourierBackend`](../crates/dispatch-core/src/courier.rs).
@@ -31,6 +33,14 @@ Minimum expectations:
 - it should fail before execution, not halfway through a turn
 
 The Dispatch CLI calls `validate_parcel()` before opening a session.
+
+Couriers should also make their compatibility scope explicit:
+
+- list the schema URLs and `format_version` values they support
+- list the `courier.reference` families they support
+- reject parcels outside that supported matrix before execution starts
+
+If your courier only supports a subset of Dispatch parcels, that is acceptable as long as the rejection is explicit and deterministic.
 
 ## Session Rules
 
@@ -136,6 +146,37 @@ The Dispatch CLI also exposes a generated harness:
 
 That command builds temporary fixture parcels, runs the shared contract checks against the selected built-in or installed courier, and reports pass/fail per check. Use it as the quickest operator-facing validation pass before you wire courier-specific tests into your own CI.
 
+Useful forms:
+
+- `dispatch courier conformance <name>` - human-readable pass/fail output
+- `dispatch courier conformance <name> --json` - machine-readable report for CI artifacts
+
+Recommended CI pattern for external couriers:
+
+1. Build or install the courier exactly as operators will invoke it.
+2. Run `dispatch courier inspect <name>` and fail if inspection itself errors.
+3. Run `dispatch courier conformance <name> --json`.
+4. Treat any non-zero exit code as a release blocker.
+5. Archive the JSON report so regressions can be compared across releases.
+
+Suggested release checklist for a courier claiming Dispatch compatibility:
+
+- pass the shared conformance suite for every supported backend mode
+- document the supported schema URLs and `format_version` values
+- document any unsupported operations or mount types
+- document any extra runtime requirements such as Docker, WASM host support, or network access
+- add courier-specific tests for isolation, persistence, auth, and performance characteristics not covered by the shared suite
+
+The shared conformance suite is intentionally a floor, not a ceiling.
+
+What the shared suite does not prove:
+
+- sandbox strength or isolation guarantees
+- performance, timeout, or scaling behavior under load
+- provider-specific hosted-model correctness
+- organization-specific trust policy or secret handling requirements
+- every courier-specific feature you may add beyond the Dispatch core contract
+
 ## Practical Guidance
 
 - keep the parcel format portable and courier-agnostic
@@ -143,6 +184,24 @@ That command builds temporary fixture parcels, runs the shared contract checks a
 - avoid depending on CLI-only behavior for correctness
 - prefer explicit unsupported-operation errors over silent no-ops
 - keep inspection and validation cheap and deterministic
+- pin the Dispatch release range and schema versions you have validated instead of assuming forward compatibility
+
+## Compatibility Claims
+
+Use precise language when you document or market an external courier.
+
+Good compatibility claims look like:
+
+- "supports Dispatch parcel schema `https://schema.dispatch.run/parcel.v1.json`"
+- "passes `dispatch courier conformance` against Dispatch v0.x.y"
+- "supports `dispatch/native` parcels for `chat`, `job`, and `heartbeat`, but not `dispatch/wasm`"
+
+Avoid vague claims like "supports Dispatch" unless you also say:
+
+- which schema versions you load
+- which courier families you execute
+- which operations you support
+- which conformance suite version or Dispatch release you tested against
 
 Dispatch does not require Docker, WASM, or any other execution engine. Those are implementation choices behind the courier boundary.
 
