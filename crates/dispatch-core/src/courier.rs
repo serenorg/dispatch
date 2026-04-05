@@ -46,6 +46,8 @@ use self::builtin_tools::{execute_builtin_tool, handle_native_memory_command};
 use self::host_turn::{execute_host_turn, format_heartbeat_payload, format_job_payload};
 use self::memory_store::{memory_delete, memory_get, memory_list, memory_put};
 #[cfg(test)]
+use self::model_backends::{CodexAppServerBackend, clear_test_codex_binary_override};
+#[cfg(test)]
 use self::model_request::{
     build_model_request, configured_context_token_limit, configured_model_id_with,
     configured_tool_call_limit, configured_tool_output_limit,
@@ -737,6 +739,7 @@ struct ChatTurnResult {
     reply: String,
     events: Vec<CourierEvent>,
     streamed_reply: bool,
+    backend_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -826,6 +829,7 @@ pub struct ModelRequest {
     pub context_token_limit: Option<u32>,
     pub tool_call_limit: Option<u32>,
     pub tool_output_limit: Option<usize>,
+    pub working_directory: Option<String>,
     pub instructions: String,
     pub messages: Vec<ConversationMessage>,
     pub tools: Vec<ModelToolDefinition>,
@@ -1286,6 +1290,7 @@ impl CourierBackend for NativeCourier {
                         role: "assistant".to_string(),
                         content: chat_turn.reply.clone(),
                     });
+                    session.backend_state = chat_turn.backend_state.clone();
                     if !chat_turn.streamed_reply {
                         chat_turn.events.push(CourierEvent::Message {
                             role: "assistant".to_string(),
@@ -1528,6 +1533,7 @@ impl CourierBackend for DockerCourier {
                         role: "assistant".to_string(),
                         content: chat_turn.reply.clone(),
                     });
+                    session.backend_state = chat_turn.backend_state.clone();
                     if !chat_turn.streamed_reply {
                         chat_turn.events.push(CourierEvent::Message {
                             role: "assistant".to_string(),
@@ -2379,6 +2385,7 @@ fn run_host_task_operation(
         role: "assistant".to_string(),
         content: turn.reply.clone(),
     });
+    session.backend_state = turn.backend_state.clone();
     if !turn.streamed_reply {
         turn.events.push(CourierEvent::Message {
             role: "assistant".to_string(),

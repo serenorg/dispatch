@@ -2,8 +2,9 @@ use super::{
     Arc, BuiltinToolSpec, ChatModelBackend, ConversationMessage, CourierError, Cow, Instant,
     LoadedParcel, LocalToolSpec, LocalToolTarget, ModelReference, ModelRequest,
     ModelToolDefinition, ModelToolFormat, Sha256, WasmModelRequestInput,
-    builtin_memory_tool_description, default_chat_backend_for_provider, effective_llm_timeout_ms,
-    encode_hex, list_native_builtin_tools, process_env_lookup, resolve_prompt_text,
+    builtin_memory_tool_description, codex_thread_id_from_backend_state,
+    default_chat_backend_for_provider, effective_llm_timeout_ms, encode_hex, is_codex_provider,
+    list_native_builtin_tools, process_env_lookup, resolve_prompt_text,
 };
 use sha2::Digest;
 use std::fs;
@@ -14,9 +15,11 @@ pub(super) fn build_model_request(
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
 ) -> Result<Option<ModelRequest>, CourierError> {
-    Ok(build_model_requests(image, messages, local_tools, None)?
-        .into_iter()
-        .next())
+    Ok(
+        build_model_requests(image, messages, local_tools, None, None)?
+            .into_iter()
+            .next(),
+    )
 }
 
 pub(super) fn build_model_requests(
@@ -24,6 +27,7 @@ pub(super) fn build_model_requests(
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
     run_deadline: Option<Instant>,
+    backend_state: Option<&str>,
 ) -> Result<Vec<ModelRequest>, CourierError> {
     let model_refs = configured_model_references(&image.config.models);
     if model_refs.is_empty() {
@@ -41,22 +45,27 @@ pub(super) fn build_model_requests(
     );
     let instructions = resolve_prompt_text(image)?;
     let llm_timeout_ms = effective_llm_timeout_ms(&image.config.timeouts, run_deadline)?;
+    let working_directory = model_working_directory(image);
 
     Ok(model_refs
         .into_iter()
         .map(|model| ModelRequest {
             model: model.id,
-            provider: model.provider,
+            provider: model.provider.clone(),
             llm_timeout_ms,
             context_token_limit: configured_context_token_limit(&image.config.limits),
             tool_call_limit: configured_tool_call_limit(&image.config.limits),
             tool_output_limit: configured_tool_output_limit(&image.config.limits),
+            working_directory: working_directory.clone(),
             instructions: instructions.clone(),
             messages: messages.to_vec(),
             tools: tools.clone(),
             pending_tool_calls: Vec::new(),
             tool_outputs: Vec::new(),
-            previous_response_id: None,
+            previous_response_id: configured_previous_response_id(
+                model.provider.as_deref(),
+                backend_state,
+            ),
         })
         .collect())
 }
@@ -112,11 +121,12 @@ pub(super) fn build_wasm_model_requests(
         .into_iter()
         .map(|model| ModelRequest {
             model: model.id,
-            provider: model.provider,
+            provider: model.provider.clone(),
             llm_timeout_ms,
             context_token_limit: configured_context_token_limit(&parcel.config.limits),
             tool_call_limit: configured_tool_call_limit(&parcel.config.limits),
             tool_output_limit: configured_tool_output_limit(&parcel.config.limits),
+            working_directory: model_working_directory(parcel),
             instructions: input.instructions.clone(),
             messages: input.messages.clone(),
             tools: input.tools.clone(),
@@ -125,6 +135,28 @@ pub(super) fn build_wasm_model_requests(
             previous_response_id: input.previous_response_id.clone(),
         })
         .collect())
+}
+
+fn model_working_directory(parcel: &LoadedParcel) -> Option<String> {
+    let context_dir = parcel.parcel_dir.join("context");
+    if context_dir.is_dir() {
+        return Some(context_dir.display().to_string());
+    }
+    Some(parcel.parcel_dir.display().to_string())
+}
+
+fn configured_previous_response_id(
+    provider: Option<&str>,
+    backend_state: Option<&str>,
+) -> Option<String> {
+    let provider = provider
+        .map(ToString::to_string)
+        .or_else(|| process_env_lookup("LLM_BACKEND"))
+        .unwrap_or_else(|| "openai".to_string());
+    if !is_codex_provider(&provider) {
+        return None;
+    }
+    backend_state.and_then(codex_thread_id_from_backend_state)
 }
 
 #[cfg(test)]

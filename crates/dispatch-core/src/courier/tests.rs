@@ -84,6 +84,12 @@ fn start_test_a2a_server() -> TestA2aServer {
     start_test_a2a_server_with_options(TestA2aServerOptions::default())
 }
 
+#[cfg(unix)]
+fn write_executable_script(path: &std::path::Path, content: &str) {
+    fs::write(path, content).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn start_test_a2a_server_with_options(options: TestA2aServerOptions) -> TestA2aServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

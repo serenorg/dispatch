@@ -2,10 +2,11 @@ use super::{
     ChatTurnResult, CourierError, CourierEvent, CourierSession, HostTurnContext, InstructionKind,
     LoadedParcel, ModelGeneration, ModelStreamEvent, ModelToolOutput, NativeTurnMode,
     ToolInvocation, build_builtin_tool_approval_request, build_local_tool_approval_request,
-    build_model_requests, check_tool_approval, configured_tool_round_limit, denied_tool_run_result,
-    effective_llm_timeout_ms, execute_builtin_tool, execute_host_local_tool,
-    handle_native_memory_command, list_local_tools, list_native_builtin_tools,
-    normalize_local_tool_input, resolve_prompt_text, select_chat_backend, truncate_tool_output,
+    build_model_requests, check_tool_approval, codex_backend_state, configured_tool_round_limit,
+    denied_tool_run_result, effective_llm_timeout_ms, execute_builtin_tool,
+    execute_host_local_tool, handle_native_memory_command, is_codex_backend_id, list_local_tools,
+    list_native_builtin_tools, normalize_local_tool_input, resolve_prompt_text,
+    select_chat_backend, truncate_tool_output,
 };
 
 pub(super) fn execute_host_turn(
@@ -25,6 +26,7 @@ pub(super) fn execute_host_turn(
             reply: resolve_prompt_text(image)?,
             events: Vec::new(),
             streamed_reply: false,
+            backend_state: session.backend_state.clone(),
         });
     }
 
@@ -34,6 +36,7 @@ pub(super) fn execute_host_turn(
                 reply: "No local tools are declared for this image.".to_string(),
                 events: Vec::new(),
                 streamed_reply: false,
+                backend_state: session.backend_state.clone(),
             });
         }
 
@@ -46,6 +49,7 @@ pub(super) fn execute_host_turn(
             reply: format!("Declared local tools: {names}"),
             events: Vec::new(),
             streamed_reply: false,
+            backend_state: session.backend_state.clone(),
         });
     }
 
@@ -57,6 +61,7 @@ pub(super) fn execute_host_turn(
             ),
             events: Vec::new(),
             streamed_reply: false,
+            backend_state: session.backend_state.clone(),
         });
     }
 
@@ -65,11 +70,17 @@ pub(super) fn execute_host_turn(
             reply: handle_native_memory_command(session, trimmed)?,
             events: Vec::new(),
             streamed_reply: false,
+            backend_state: session.backend_state.clone(),
         });
     }
 
-    let requests =
-        build_model_requests(image, &session.history, &local_tools, context.run_deadline)?;
+    let requests = build_model_requests(
+        image,
+        &session.history,
+        &local_tools,
+        context.run_deadline,
+        session.backend_state.as_deref(),
+    )?;
     if let Some(mut request) = requests.first().cloned() {
         let mut remaining_requests = requests.into_iter().skip(1).collect::<Vec<_>>();
         for secret in &image.config.secrets {
@@ -289,6 +300,11 @@ pub(super) fn execute_host_turn(
                     reply: text,
                     events,
                     streamed_reply,
+                    backend_state: if is_codex_backend_id(backend.id()) {
+                        reply.response_id.as_deref().map(codex_backend_state)
+                    } else {
+                        None
+                    },
                 });
             }
             break;
@@ -330,6 +346,7 @@ pub(super) fn execute_host_turn(
         ),
         events,
         streamed_reply: false,
+        backend_state: None,
     })
 }
 

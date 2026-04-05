@@ -54,6 +54,17 @@ fn default_chat_backend_selects_gemini_from_env() {
 }
 
 #[test]
+fn default_chat_backend_selects_codex_from_env() {
+    let backend = default_chat_backend_for_provider_with(None, |name| match name {
+        "LLM_BACKEND" => Some("codex".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(backend.id(), CODEX_BACKEND_ID);
+    assert!(backend.supports_previous_response_id());
+}
+
+#[test]
 fn default_chat_backend_prefers_model_provider_over_env() {
     let backend = default_chat_backend_for_provider_with(Some("anthropic"), |name| match name {
         "LLM_BACKEND" => Some("openai".to_string()),
@@ -203,6 +214,7 @@ fn anthropic_max_tokens_uses_context_token_limit_when_present() {
         context_token_limit: Some(16000),
         tool_call_limit: None,
         tool_output_limit: None,
+        working_directory: None,
         instructions: String::new(),
         messages: Vec::new(),
         tools: Vec::new(),
@@ -223,6 +235,7 @@ fn openai_chat_completions_messages_include_structured_tool_followup() {
         context_token_limit: None,
         tool_call_limit: None,
         tool_output_limit: None,
+        working_directory: None,
         instructions: "Be helpful.".to_string(),
         messages: vec![ConversationMessage {
             role: "user".to_string(),
@@ -262,6 +275,7 @@ fn anthropic_messages_include_tool_use_and_tool_result_blocks() {
         context_token_limit: None,
         tool_call_limit: None,
         tool_output_limit: None,
+        working_directory: None,
         instructions: String::new(),
         messages: vec![ConversationMessage {
             role: "user".to_string(),
@@ -301,6 +315,7 @@ fn gemini_messages_include_function_call_and_response_parts() {
         context_token_limit: None,
         tool_call_limit: None,
         tool_output_limit: None,
+        working_directory: None,
         instructions: String::new(),
         messages: vec![ConversationMessage {
             role: "user".to_string(),
@@ -330,4 +345,86 @@ fn gemini_messages_include_function_call_and_response_parts() {
         messages[2]["parts"][0]["functionResponse"]["name"],
         "lookup"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_streams_reply_and_resumes_previous_thread() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("codex.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nLOG='{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> \"$LOG\"\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"thread/resume\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-resumed\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"hello \"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"world\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+
+    let first = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let first = match first {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected codex reply, got {other:?}"),
+    };
+    assert_eq!(first.text.as_deref(), Some("hello world"));
+    assert_eq!(first.response_id.as_deref(), Some("thread-new"));
+
+    let second = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "gpt-5.4".to_string(),
+                provider: Some("codex".to_string()),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "follow up".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: Some("thread-new".to_string()),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let second = match second {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected codex reply, got {other:?}"),
+    };
+    assert_eq!(second.response_id.as_deref(), Some("thread-resumed"));
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("\"method\":\"thread/start\""));
+    assert!(log.contains("\"method\":\"thread/resume\""));
+    clear_test_codex_binary_override();
 }

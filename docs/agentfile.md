@@ -108,7 +108,7 @@ Resolved prompt/tool invariant:
 - tool exposure is driven by declared tool entries in the parcel manifest
 - prompt text must not be treated as authority to expose undeclared tools
 
-The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a hosted model backend, expose declared local tools plus the supported built-in memory tools to that backend, execute returned tool calls locally, and resume the model turn with tool outputs. `MODEL <id> PROVIDER <backend>` selects a parcel-level backend explicitly; otherwise the courier falls back to `LLM_BACKEND`. If no parcel model is declared, Dispatch falls back to `LLM_MODEL`. `FALLBACK` models are tried in declaration order when the hosted-model request fails before producing a reply. The same primary-plus-fallback model policy is also used by the WASM host when a guest calls `model-complete`. Without a usable hosted-model configuration it falls back to a local reference reply path.
+The current native courier implements prompt resolution, local tool execution, and reference `chat`, `job`, and `heartbeat` entrypoints that preserve session history and emit ordered courier events. When a primary model is declared and provider credentials are available, the native courier may delegate turns to a model backend, expose declared local tools plus the supported built-in memory tools to that backend when the backend supports Dispatch tool calls, execute returned tool calls locally, and resume the model turn with tool outputs. `MODEL <id> PROVIDER <backend>` selects a parcel-level backend explicitly; otherwise the courier falls back to `LLM_BACKEND`. If no parcel model is declared, Dispatch falls back to `LLM_MODEL`. `FALLBACK` models are tried in declaration order when the model request fails before producing a reply. The same primary-plus-fallback model policy is also used by the WASM host when a guest calls `model-complete`. Without a usable model configuration it falls back to a local reference reply path.
 
 ### Pluggable Courier Model
 
@@ -383,7 +383,18 @@ EOF
 ```dockerfile
 MODEL gpt-5.4-mini
 MODEL claude-sonnet-4-6 PROVIDER anthropic
+MODEL gpt-5.4 PROVIDER codex
 ```
+
+Reference implementation providers currently include:
+
+- `openai`
+- `anthropic`
+- `gemini`
+- `openai_compatible`
+- `codex`
+
+`PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. The reference implementation resumes Codex thread state across turns, but it denies ambient app-server permission requests by default so undeclared Codex command/file/MCP actions are not exposed through the courier implicitly.
 
 #### `FALLBACK`
 

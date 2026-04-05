@@ -2,6 +2,7 @@ use super::*;
 use std::{io::BufRead, time::Duration};
 
 mod anthropic;
+mod codex;
 mod gemini;
 mod openai;
 
@@ -10,6 +11,9 @@ use anthropic::AnthropicMessagesBackend;
 pub(super) use anthropic::parse_anthropic_streaming_events;
 #[cfg(test)]
 pub(super) use anthropic::{anthropic_max_tokens, anthropic_messages, extract_anthropic_output};
+pub(crate) use codex::CodexAppServerBackend;
+#[cfg(test)]
+pub(crate) use codex::clear_test_codex_binary_override;
 use gemini::GeminiGenerateContentBackend;
 #[cfg(test)]
 pub(super) use gemini::parse_gemini_streaming_events;
@@ -34,6 +38,30 @@ fn generate_with_noop_events(
     backend.generate_with_events(request, &mut |_| {})
 }
 
+pub(super) const CODEX_BACKEND_ID: &str = "codex_app_server";
+const CODEX_BACKEND_STATE_PREFIX: &str = "codex_thread:";
+
+pub(super) fn is_codex_provider(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "codex" | "codex_app_server" | "codex-app-server"
+    )
+}
+
+pub(super) fn is_codex_backend_id(backend_id: &str) -> bool {
+    backend_id == CODEX_BACKEND_ID
+}
+
+pub(super) fn codex_backend_state(thread_id: &str) -> String {
+    format!("{CODEX_BACKEND_STATE_PREFIX}{thread_id}")
+}
+
+pub(super) fn codex_thread_id_from_backend_state(state: &str) -> Option<String> {
+    state
+        .strip_prefix(CODEX_BACKEND_STATE_PREFIX)
+        .map(ToString::to_string)
+}
+
 pub(super) fn default_chat_backend_for_provider(
     provider: Option<&str>,
 ) -> Arc<dyn ChatModelBackend> {
@@ -54,6 +82,7 @@ where
         .to_ascii_lowercase()
         .as_str()
     {
+        "codex" | "codex_app_server" | "codex-app-server" => Arc::new(CodexAppServerBackend),
         "anthropic" => Arc::new(AnthropicMessagesBackend),
         "gemini" | "google" | "google_gemini" => Arc::new(GeminiGenerateContentBackend),
         "openai_compatible" | "openrouter" | "together" | "fireworks" | "litellm" | "vllm"
