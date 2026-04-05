@@ -56,15 +56,21 @@ impl ChatModelBackend for CodexAppServerBackend {
         let deadline = request_timeout_deadline(request);
 
         process.initialize(deadline)?;
-        let thread_id = process.open_thread(request, deadline)?;
+        let thread = process.open_thread(request, deadline)?;
         let prompt = codex_prompt_text(request);
-        let turn_id = process.start_turn(&thread_id, &request.model, &prompt, deadline)?;
+        let turn_id = process.start_turn(&thread.thread_id, &request.model, &prompt, deadline)?;
         let text = process.collect_turn_output(&turn_id, on_event, deadline)?;
+        let response_id = if codex_history_persistence_enabled() {
+            Some(thread.encode())
+        } else {
+            None
+        };
+        process.shutdown(deadline);
 
         Ok(ModelGeneration::Reply(ModelReply {
             text: Some(text),
             backend: self.id().to_string(),
-            response_id: Some(thread_id),
+            response_id,
             tool_calls: Vec::new(),
         }))
     }
@@ -113,6 +119,23 @@ fn codex_reasoning_effort() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "medium".to_string())
+}
+
+fn codex_history_persistence_enabled() -> bool {
+    env_flag_enabled("DISPATCH_CODEX_PERSIST_HISTORY", true)
+}
+
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| match value.as_str() {
+            "" => default,
+            "0" | "false" | "no" | "off" => false,
+            "1" | "true" | "yes" | "on" => true,
+            _ => default,
+        })
+        .unwrap_or(default)
 }
 
 fn codex_prompt_text(request: &ModelRequest) -> String {
@@ -190,6 +213,46 @@ struct CodexProcess {
     next_request_id: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexThreadState {
+    thread_id: String,
+    rollout_path: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CodexThreadStateWire {
+    thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout_path: Option<String>,
+}
+
+impl CodexThreadState {
+    fn encode(&self) -> String {
+        serde_json::to_string(&CodexThreadStateWire {
+            thread_id: self.thread_id.clone(),
+            rollout_path: self.rollout_path.clone(),
+        })
+        .unwrap_or_else(|_| self.thread_id.clone())
+    }
+
+    fn decode(raw: Option<&str>) -> Option<Self> {
+        let raw = raw?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Ok(value) = serde_json::from_str::<CodexThreadStateWire>(raw) {
+            return Some(Self {
+                thread_id: value.thread_id,
+                rollout_path: value.rollout_path,
+            });
+        }
+        Some(Self {
+            thread_id: raw.to_string(),
+            rollout_path: None,
+        })
+    }
+}
+
 enum CodexIo {
     #[cfg(not(unix))]
     Pipes {
@@ -210,10 +273,6 @@ impl CodexProcess {
         command
             .arg("app-server")
             .current_dir(Path::new(working_directory));
-        // Intentionally inherit the parent environment so local Codex auth and
-        // config continue to work. This backend still denies ambient app-server
-        // permission requests by default; inherited env does not widen the
-        // declared parcel tool surface.
         if let Ok(home) = std::env::var("CODEX_HOME") {
             let trimmed = home.trim();
             if !trimmed.is_empty() {
@@ -353,45 +412,37 @@ impl CodexProcess {
         &mut self,
         request: &ModelRequest,
         deadline: Option<Instant>,
-    ) -> Result<String, CourierError> {
-        if let Some(thread_id) = request.previous_response_id.as_deref() {
+    ) -> Result<CodexThreadState, CourierError> {
+        let persistence_enabled = codex_history_persistence_enabled();
+        if persistence_enabled
+            && let Some(state) = CodexThreadState::decode(request.previous_response_id.as_deref())
+        {
             let value = self
                 .request(
                     "thread/resume",
-                    serde_json::json!({
-                        "threadId": thread_id,
-                        "cwd": request.working_directory,
-                        "approvalPolicy": "on-request",
-                        "sandbox": "workspace-write",
-                        "experimentalRawEvents": false,
-                        "model": request.model,
-                    }),
+                    codex_thread_resume_params(&state, request),
                     deadline,
                 )
                 .map_err(|error| {
                     CourierError::ModelBackendRequest(format!(
-                        "failed to resume codex thread `{thread_id}`: {error}"
+                        "failed to resume codex thread `{}`: {error}",
+                        state.thread_id
                     ))
                 })?;
-            return extract_thread_id(&value).ok_or_else(|| {
+            return extract_thread_state(&value).ok_or_else(|| {
                 CourierError::ModelBackendResponse(format!(
-                    "codex thread/resume response for `{thread_id}` did not include a thread id"
+                    "codex thread/resume response for `{}` did not include a thread id",
+                    state.thread_id
                 ))
             });
         }
 
         let value = self.request(
             "thread/start",
-            serde_json::json!({
-            "cwd": request.working_directory,
-            "approvalPolicy": "on-request",
-            "sandbox": "workspace-write",
-                "experimentalRawEvents": false,
-                "model": request.model,
-            }),
+            codex_thread_start_params(request, persistence_enabled),
             deadline,
         )?;
-        extract_thread_id(&value).ok_or_else(|| {
+        extract_thread_state(&value).ok_or_else(|| {
             CourierError::ModelBackendResponse(
                 "codex thread/start response did not include a thread id".to_string(),
             )
@@ -647,6 +698,31 @@ impl CodexProcess {
         serde_json::from_str(line.trim_end())
             .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))
     }
+
+    fn shutdown(self, deadline: Option<Instant>) {
+        let CodexProcess { mut child, io, .. } = self;
+        drop(io);
+
+        let timeout = remaining_timeout(deadline)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Duration::from_millis(250))
+            .min(Duration::from_secs(2));
+        let wait_deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < wait_deadline => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn request_timeout_deadline(request: &ModelRequest) -> Option<Instant> {
@@ -726,6 +802,48 @@ fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .or_else(|| value.get("threadId").and_then(serde_json::Value::as_str))
         .map(ToString::to_string)
+}
+
+fn extract_thread_state(value: &serde_json::Value) -> Option<CodexThreadState> {
+    let thread_id = extract_thread_id(value)?;
+    let rollout_path = value
+        .get("thread")
+        .and_then(|thread| thread.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    Some(CodexThreadState {
+        thread_id,
+        rollout_path,
+    })
+}
+
+fn codex_thread_start_params(
+    request: &ModelRequest,
+    persistence_enabled: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "cwd": request.working_directory,
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+        "experimentalRawEvents": false,
+        "persistExtendedHistory": persistence_enabled,
+        "ephemeral": (!persistence_enabled),
+        "model": request.model,
+    })
+}
+
+fn codex_thread_resume_params(
+    state: &CodexThreadState,
+    request: &ModelRequest,
+) -> serde_json::Value {
+    serde_json::json!({
+        "threadId": state.thread_id,
+        "cwd": request.working_directory,
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+        "persistExtendedHistory": true,
+        "model": request.model,
+    })
 }
 
 fn is_server_request(value: &serde_json::Value) -> bool {

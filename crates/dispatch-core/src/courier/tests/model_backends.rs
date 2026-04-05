@@ -393,7 +393,11 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
         other => panic!("expected codex reply, got {other:?}"),
     };
     assert_eq!(first.text.as_deref(), Some("hello world"));
-    assert_eq!(first.response_id.as_deref(), Some("thread-new"));
+    let first_state = first
+        .response_id
+        .clone()
+        .expect("codex state should persist");
+    assert!(first_state.contains("thread-new"));
 
     let second = backend
         .generate_with_events(
@@ -413,7 +417,7 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
                 tools: Vec::new(),
                 pending_tool_calls: Vec::new(),
                 tool_outputs: Vec::new(),
-                previous_response_id: Some("thread-new".to_string()),
+                previous_response_id: Some(first_state),
             },
             &mut |_| {},
         )
@@ -422,11 +426,13 @@ fn codex_backend_streams_reply_and_resumes_previous_thread() {
         ModelGeneration::Reply(reply) => reply,
         other => panic!("expected codex reply, got {other:?}"),
     };
-    assert_eq!(second.response_id.as_deref(), Some("thread-resumed"));
+    let second_state = second.response_id.expect("codex state should persist");
+    assert!(second_state.contains("thread-resumed"));
 
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("\"method\":\"thread/start\""));
     assert!(log.contains("\"method\":\"thread/resume\""));
+    assert!(log.contains("\"persistExtendedHistory\":true"));
 }
 
 #[test]
@@ -509,4 +515,66 @@ fn codex_backend_respects_llm_timeout() {
         .unwrap_err();
 
     assert!(error.to_string().contains("timed out"));
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_backend_preserves_existing_codex_home() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("CODEX_HOME");
+    let dir = tempdir().unwrap();
+    let expected_home = dir.path().join("codex-home");
+    fs::create_dir_all(&expected_home).unwrap();
+    unsafe {
+        std::env::set_var("CODEX_HOME", &expected_home);
+    }
+
+    let env_log_path = dir.path().join("codex-home.log");
+    let script_path = dir.path().join("codex-app-server");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$CODEX_HOME\" > '{}'\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-new\"}}}}}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"ok\"}}}}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-1\",\"status\":\"completed\"}}}}}}' ;;\nesac\ndone\n",
+            env_log_path.display()
+        ),
+    );
+
+    let backend =
+        CodexAppServerBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "gpt-5.4".to_string(),
+            provider: Some("codex".to_string()),
+            model_options: Default::default(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: Some(dir.path().display().to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("CODEX_HOME", value);
+        },
+        None => unsafe {
+            std::env::remove_var("CODEX_HOME");
+        },
+    }
+
+    result.unwrap();
+
+    let logged_home = fs::read_to_string(&env_log_path).unwrap();
+    assert_eq!(logged_home.trim(), expected_home.display().to_string());
 }

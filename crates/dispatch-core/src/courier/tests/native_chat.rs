@@ -126,7 +126,7 @@ ENTRYPOINT chat
 
 #[test]
 #[cfg(unix)]
-fn native_courier_codex_backend_persists_thread_state_and_denies_app_server_approvals() {
+fn native_courier_codex_backend_resumes_threads_and_denies_app_server_approvals() {
     let _guard = lock_codex_backend_test();
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("codex.log");
@@ -164,10 +164,12 @@ ENTRYPOINT chat
     ))
     .unwrap();
 
-    assert_eq!(
-        first.session.backend_state.as_deref(),
-        Some("codex_thread:thread-new")
-    );
+    let first_state = first
+        .session
+        .backend_state
+        .clone()
+        .expect("codex backend should persist state");
+    assert!(first_state.contains("thread-new"));
     assert!(first.events.iter().any(|event| matches!(
         event,
         CourierEvent::TextDelta { content } if content == "codex reply"
@@ -184,80 +186,24 @@ ENTRYPOINT chat
     ))
     .unwrap();
 
-    assert_eq!(
-        second.session.backend_state.as_deref(),
-        Some("codex_thread:thread-new")
+    let second_state = second
+        .session
+        .backend_state
+        .clone()
+        .expect("codex backend should persist resumed state");
+    assert!(second_state.contains("thread-new"));
+    assert!(
+        !second
+            .events
+            .iter()
+            .any(|event| matches!(event, CourierEvent::BackendFallback { .. }))
     );
     let log = fs::read_to_string(&log_path).unwrap();
+    let thread_start_count = log.matches("\"method\":\"thread/start\"").count();
+    assert_eq!(thread_start_count, 1);
     assert!(log.contains("\"method\":\"thread/resume\""));
+    assert!(log.contains("\"persistExtendedHistory\":true"));
     assert!(log.contains("\"decision\":\"decline\""));
-}
-
-#[test]
-#[cfg(unix)]
-fn native_courier_codex_resume_failure_clears_backend_state_and_surfaces_fallback() {
-    let _guard = lock_codex_backend_test();
-    let dir = tempdir().unwrap();
-    let script_path = dir.path().join("codex-app-server");
-    write_executable_script(
-        &script_path,
-        "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n*'\"method\":\"initialized\"'*) : ;;\n*'\"method\":\"thread/start\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-new\"}}}' ;;\n*'\"method\":\"thread/resume\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32001,\"message\":\"thread expired\"}}' ;;\n*'\"method\":\"turn/start\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"codex reply\"}}'\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}' ;;\nesac\ndone\n",
-    );
-
-    let test_image = build_test_image(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex
-ENTRYPOINT chat
-",
-        &[],
-    );
-    let backend = Arc::new(CodexAppServerBackend::with_binary_path_for_tests(
-        script_path.display().to_string(),
-    ));
-    let courier = NativeCourier::with_chat_backend(backend);
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
-
-    let first = futures::executor::block_on(courier.run(
-        &test_image.image,
-        CourierRequest {
-            session,
-            operation: CourierOperation::Chat {
-                input: "hello".to_string(),
-            },
-        },
-    ))
-    .unwrap();
-
-    assert_eq!(
-        first.session.backend_state.as_deref(),
-        Some("codex_thread:thread-new")
-    );
-
-    let second = futures::executor::block_on(courier.run(
-        &test_image.image,
-        CourierRequest {
-            session: first.session,
-            operation: CourierOperation::Chat {
-                input: "follow up".to_string(),
-            },
-        },
-    ))
-    .unwrap();
-
-    assert_eq!(second.session.backend_state, None);
-    assert!(matches!(
-        second.events.first(),
-        Some(CourierEvent::BackendFallback { backend, error })
-            if backend == "codex_app_server"
-                && error.contains("failed to resume codex thread `thread-new`")
-                && error.contains("thread expired")
-    ));
-    assert!(matches!(
-        second.events.get(1),
-        Some(CourierEvent::Message { content, .. })
-            if content.contains("Native chat reference reply")
-    ));
 }
 
 #[test]

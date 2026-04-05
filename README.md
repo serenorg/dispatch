@@ -385,11 +385,11 @@ Supported backends:
 | `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
 | `gemini` | Gemini generateContent | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 | `openai_compatible` | Chat Completions | `LLM_API_KEY` + `LLM_BASE_URL` |
-| `codex` | Local `codex app-server` JSON-RPC transport | optional `CODEX_BINARY`, `CODEX_HOME`, `CODEX_REASONING_EFFORT` |
+| `codex` | Local `codex app-server` JSON-RPC transport | optional `CODEX_BINARY`, `CODEX_HOME`, `CODEX_REASONING_EFFORT`, `DISPATCH_CODEX_PERSIST_HISTORY` |
 
 `LLM_API_KEY` and `LLM_BASE_URL` take precedence over provider-specific vars. Provider-specific vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) are checked as fallbacks when the `LLM_*` vars are not set.
 
-`codex` uses the local `codex app-server` process instead of a hosted HTTP API. Dispatch starts a local app-server session in the parcel `context/` directory, persists the Codex thread id in `CourierSession.backend_state`, and resumes that thread on later turns. To preserve Dispatch's capability boundary, app-server permission requests are denied by default in this backend, so ambient Codex command/file/MCP actions are not available unless Dispatch grows an explicit tool bridge for them. This backend intentionally inherits the parent process environment so local Codex auth and config keep working. On Unix the reference implementation uses a PTY-backed transport for Codex; other targets currently fall back to plain process pipes.
+`codex` uses the local `codex app-server` process instead of a hosted HTTP API. Dispatch starts a fresh app-server process per model call, but by default it persists Codex thread state and resumes that thread on later turns when `--session-file` or interactive session state is present. Dispatch leaves Codex using its normal home/config/auth location unless the environment already overrides `CODEX_HOME`. Set `DISPATCH_CODEX_PERSIST_HISTORY=0` to opt out of Codex rollout persistence; in that mode Dispatch asks Codex for ephemeral threads so no Codex session files are saved, and follow-up context comes from Dispatch session history instead. To preserve Dispatch's capability boundary, app-server permission requests are denied by default in this backend, so ambient Codex command/file/MCP actions are not available unless Dispatch grows an explicit tool bridge for them. This backend intentionally preserves the user's existing Codex auth/config for both modes. On Unix the reference implementation uses a PTY-backed transport for Codex; other targets currently fall back to plain process pipes.
 
 `run` flags:
 

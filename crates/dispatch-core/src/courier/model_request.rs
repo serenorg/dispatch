@@ -2,9 +2,8 @@ use super::{
     Arc, BuiltinToolSpec, ChatModelBackend, ConversationMessage, CourierError, Cow, Instant,
     LoadedParcel, LocalToolSpec, LocalToolTarget, ModelReference, ModelRequest,
     ModelToolDefinition, ModelToolFormat, Sha256, WasmModelRequestInput,
-    builtin_memory_tool_description, codex_thread_id_from_backend_state,
-    default_chat_backend_for_provider, effective_llm_timeout_ms, encode_hex, is_codex_provider,
-    list_native_builtin_tools, process_env_lookup, resolve_prompt_text,
+    builtin_memory_tool_description, default_chat_backend_for_provider, effective_llm_timeout_ms,
+    encode_hex, list_native_builtin_tools, process_env_lookup, resolve_prompt_text,
 };
 use sha2::Digest;
 use std::fs;
@@ -62,10 +61,7 @@ pub(super) fn build_model_requests(
             tools: tools.clone(),
             pending_tool_calls: Vec::new(),
             tool_outputs: Vec::new(),
-            previous_response_id: configured_previous_response_id(
-                model.provider.as_deref(),
-                backend_state,
-            ),
+            previous_response_id: backend_state.map(ToString::to_string),
         })
         .collect())
 }
@@ -143,20 +139,6 @@ fn model_working_directory(parcel: &LoadedParcel) -> Option<String> {
         return Some(context_dir.display().to_string());
     }
     Some(parcel.parcel_dir.display().to_string())
-}
-
-fn configured_previous_response_id(
-    provider: Option<&str>,
-    backend_state: Option<&str>,
-) -> Option<String> {
-    let provider = provider
-        .map(ToString::to_string)
-        .or_else(|| process_env_lookup("LLM_BACKEND"))
-        .unwrap_or_else(|| "openai".to_string());
-    if !is_codex_provider(&provider) {
-        return None;
-    }
-    backend_state.and_then(codex_thread_id_from_backend_state)
 }
 
 #[cfg(test)]

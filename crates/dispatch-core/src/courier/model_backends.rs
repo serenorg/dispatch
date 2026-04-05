@@ -39,24 +39,9 @@ fn generate_with_noop_events(
 }
 
 pub(super) const CODEX_BACKEND_ID: &str = "codex_app_server";
-const CODEX_BACKEND_STATE_PREFIX: &str = "codex_thread:";
-
-pub(super) fn is_codex_provider(provider: &str) -> bool {
-    provider.eq_ignore_ascii_case("codex")
-}
 
 pub(super) fn is_codex_backend_id(backend_id: &str) -> bool {
     backend_id == CODEX_BACKEND_ID
-}
-
-pub(super) fn codex_backend_state(thread_id: &str) -> String {
-    format!("{CODEX_BACKEND_STATE_PREFIX}{thread_id}")
-}
-
-pub(super) fn codex_thread_id_from_backend_state(state: &str) -> Option<String> {
-    state
-        .strip_prefix(CODEX_BACKEND_STATE_PREFIX)
-        .map(ToString::to_string)
 }
 
 pub(super) fn default_chat_backend_for_provider(
