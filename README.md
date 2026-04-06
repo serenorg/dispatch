@@ -201,7 +201,6 @@ Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out o
 
 `allowed-tools` is currently preserved as informational metadata for interoperability and downstream policy engines. The reference courier does not enforce it yet, but `dispatch parcel lint` and `dispatch parcel build` warn when a skill's `allowed-tools` entries do not line up with synthesized or declared tool aliases.
 
-
 ## WASM Courier
 
 Dispatch includes a WASM courier for parcels that package a guest component targeting the Dispatch
@@ -328,7 +327,9 @@ cargo run -- serve examples/parcels/heartbeat-monitor --schedule "*/5 * * * * * 
 cargo run -- ps examples/parcels/heartbeat-monitor
 cargo run -- inspect-run <run-id> examples/parcels/heartbeat-monitor --json
 cargo run -- logs <run-id> examples/parcels/heartbeat-monitor --follow
+cargo run -- wait <run-id> examples/parcels/heartbeat-monitor
 cargo run -- stop <run-id> examples/parcels/heartbeat-monitor
+cargo run -- restart <run-id> examples/parcels/heartbeat-monitor
 cargo run -- rm <run-id> examples/parcels/heartbeat-monitor
 
 # Docker-style aliases for the same run-management surface
@@ -449,8 +450,9 @@ heartbeat services.
   run record under `.dispatch/runs/`
 - `dispatch serve` starts a long-lived `service` run that can wake from heartbeat
   intervals, persisted cron schedules, and local HTTP ingress
-- `dispatch ps`, `dispatch logs`, `dispatch stop`, `dispatch rm`, and
-  `dispatch prune`, and `dispatch inspect-run` manage those runs
+- `dispatch ps`, `dispatch logs`, `dispatch wait`, `dispatch stop`,
+  `dispatch restart`, `dispatch prune`, `dispatch rm`, and
+  `dispatch inspect-run` manage those runs
 - `dispatch container ...` exposes Docker-style aliases for the same run
   management commands
 

@@ -57,7 +57,9 @@ The current runtime command set is:
 - `dispatch serve <path> --listen <addr>`
 - `dispatch ps`
 - `dispatch logs <run>`
+- `dispatch wait <run>`
 - `dispatch stop <run>`
+- `dispatch restart <run>`
 - `dispatch prune`
 - `dispatch rm <run>`
 - `dispatch inspect-run <run>`
@@ -67,8 +69,10 @@ Docker-style aliases also make sense on top of the base commands:
 - `dispatch container ls`
 - `dispatch container ps`
 - `dispatch container logs <run>`
+- `dispatch container wait <run>`
 - `dispatch container inspect <run>`
 - `dispatch container stop <run>`
+- `dispatch container restart <run>`
 - `dispatch container prune`
 - `dispatch container rm <run>`
 
