@@ -40,6 +40,21 @@ enum Command {
         #[command(subcommand)]
         command: DepotCommand,
     },
+    /// Build an immutable agent parcel
+    Build(BuildArgs),
+    /// Inspect a built parcel
+    Inspect(InspectArgs),
+    /// Pull a parcel from a depot reference
+    Pull(PullArgs),
+    /// Push a built parcel to a depot reference
+    Push(PushArgs),
+    /// List locally built parcels
+    Images(ParcelListArgs),
+    /// Manage parcel artifacts using Docker-style image commands
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
     /// Execute part of a built parcel locally
     Run(RunArgs),
     /// Execute Agent Skills bundles and files
@@ -322,6 +337,21 @@ enum DepotCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ImageCommand {
+    /// Build an immutable agent parcel
+    Build(BuildArgs),
+    /// List locally built parcels
+    #[command(visible_alias = "ls")]
+    List(ParcelListArgs),
+    /// Inspect a built parcel
+    Inspect(InspectArgs),
+    /// Pull a parcel from a depot reference
+    Pull(PullArgs),
+    /// Push a built parcel to a depot reference
+    Push(PushArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum CourierCommand {
     /// List built-in and installed courier backends
     Ls {
@@ -512,6 +542,14 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Parcel { command } => parcel_command(command),
         Command::Depot { command } => depot_command(command),
+        Command::Build(args) => build(args.path, args.output_dir),
+        Command::Inspect(args) => {
+            inspect::inspect(args.path, args.courier, args.registry, args.json)
+        }
+        Command::Pull(args) => depot_command(DepotCommand::Pull(args)),
+        Command::Push(args) => depot_command(DepotCommand::Push(args)),
+        Command::Images(args) => parcel_ops::list(args.path, args.json),
+        Command::Image { command } => image_command(command),
         Command::Run(args) => run::run(args),
         Command::Skill { command } => match command {
             SkillCommand::Validate(args) => skill_run::validate_skill(*args),
@@ -580,6 +618,21 @@ fn depot_command(command: DepotCommand) -> Result<()> {
             trust_policy,
             json,
         }) => parcel_ops::pull(&reference, output_dir, public_keys, trust_policy, json),
+    }
+}
+
+fn image_command(command: ImageCommand) -> Result<()> {
+    match command {
+        ImageCommand::Build(BuildArgs { path, output_dir }) => build(path, output_dir),
+        ImageCommand::List(ParcelListArgs { path, json }) => parcel_ops::list(path, json),
+        ImageCommand::Inspect(InspectArgs {
+            path,
+            courier,
+            registry,
+            json,
+        }) => inspect::inspect(path, courier, registry, json),
+        ImageCommand::Pull(args) => depot_command(DepotCommand::Pull(args)),
+        ImageCommand::Push(args) => depot_command(DepotCommand::Push(args)),
     }
 }
 
@@ -764,8 +817,8 @@ fn state_command(command: StateCommand) -> Result<()> {
 mod tests {
     use super::{
         Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, DepotCommand, EvalArgs,
-        InspectArgs, KeygenArgs, ParcelCommand, PullArgs, PushArgs, SignArgs, SkillCommand,
-        SkillSynthesisOverrideArgs, StateCommand, ValidateSkillArgs, VerifyArgs,
+        ImageCommand, InspectArgs, KeygenArgs, ParcelCommand, PullArgs, PushArgs, SignArgs,
+        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, ValidateSkillArgs, VerifyArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -935,6 +988,91 @@ mod tests {
         };
         assert_eq!(args.path, Path::new("."));
         assert!(!args.json);
+    }
+
+    #[test]
+    fn cli_parses_top_level_images_command() {
+        let cli = Cli::try_parse_from(["dispatch", "images", "examples/demo", "--json"]).unwrap();
+
+        let Command::Images(args) = cli.command else {
+            panic!("expected images command");
+        };
+        assert_eq!(args.path, Path::new("examples/demo"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn cli_parses_image_ls_alias() {
+        let cli = Cli::try_parse_from(["dispatch", "image", "ls", "examples/demo"]).unwrap();
+
+        let Command::Image { command } = cli.command else {
+            panic!("expected image command");
+        };
+        let ImageCommand::List(args) = command else {
+            panic!("expected image list command");
+        };
+        assert_eq!(args.path, Path::new("examples/demo"));
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn cli_parses_top_level_build_alias() {
+        let cli = Cli::try_parse_from(["dispatch", "build", "examples/demo"]).unwrap();
+
+        let Command::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(args.path, Path::new("examples/demo"));
+        assert!(args.output_dir.is_none());
+    }
+
+    #[test]
+    fn cli_parses_top_level_inspect_alias() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "inspect",
+            "manifest.json",
+            "--courier",
+            "native",
+        ])
+        .unwrap();
+
+        let Command::Inspect(args) = cli.command else {
+            panic!("expected inspect command");
+        };
+        assert_eq!(args.path, Path::new("manifest.json"));
+        assert_eq!(args.courier.as_deref(), Some("native"));
+    }
+
+    #[test]
+    fn cli_parses_image_pull_and_push_aliases() {
+        let pull = Cli::try_parse_from([
+            "dispatch",
+            "image",
+            "pull",
+            "file:///tmp/depot::acme/demo:v1",
+        ])
+        .unwrap();
+        let Command::Image { command } = pull.command else {
+            panic!("expected image command");
+        };
+        let ImageCommand::Pull(args) = command else {
+            panic!("expected image pull command");
+        };
+        assert_eq!(args.reference, "file:///tmp/depot::acme/demo:v1");
+
+        let push = Cli::try_parse_from([
+            "dispatch",
+            "push",
+            "manifest.json",
+            "file:///tmp/depot::acme/demo:v1",
+        ])
+        .unwrap();
+        let Command::Push(args) = push.command else {
+            panic!("expected push command");
+        };
+        assert_eq!(args.path, Path::new("manifest.json"));
+        assert_eq!(args.reference, "file:///tmp/depot::acme/demo:v1");
     }
 
     #[test]
