@@ -53,6 +53,7 @@ The full runtime command set should converge on:
 - `dispatch run <path> --detach --heartbeat [payload]`
 - `dispatch serve <path>`
 - `dispatch serve <path> --schedule "<cron>"`
+- `dispatch serve <path> --listen <addr>`
 - `dispatch ps`
 - `dispatch logs <run>`
 - `dispatch stop <run>`
@@ -257,6 +258,38 @@ Schedules can originate from:
 The current implementation supports CLI flags and parcel-authored `SCHEDULE`
 directives. Runtime APIs remain a later follow-on.
 
+## Current Ingress Behavior
+
+The current implementation supports local HTTP ingress on service runs via:
+
+- `dispatch serve <path> --listen 127.0.0.1:0`
+
+Listener state is persisted directly in the run record:
+
+- `listen_addr`
+- `bound_addr`
+- `requests_handled`
+- `last_request_at`
+
+Inbound requests are translated into heartbeat payload envelopes rather than a
+new parcel entrypoint. The current envelope shape includes:
+
+- listener address
+- remote address
+- HTTP method
+- request target/path/query
+- lowercased request headers
+- text body
+
+Responses are intentionally simple:
+
+- `202 Accepted` when the heartbeat dispatch succeeds
+- `400 Bad Request` for malformed HTTP
+- `500 Internal Server Error` when the heartbeat execution fails
+
+This keeps the current runtime honest: ingress is a wake source for heartbeat
+services, not a separate HTTP application contract.
+
 ## Session Semantics
 
 Runs should be allowed to reference a courier session file, but the run is the
@@ -380,10 +413,9 @@ pattern directly.
 
 Cloudflare Agents store schedules in a SQLite table (`cf_agents_schedules`) with
 cron, delayed, and interval variants. An alarm fires when the next schedule is
-due, executes all due tasks, then recalculates the next alarm. This is the
-closest reference for Dispatch's schedule persistence model: store schedules in
-SQLite alongside run records, evaluate due items on a timer tick, and
-recalculate next-fire times after each execution.
+due, executes all due tasks, then recalculates the next alarm. This remains a
+useful reference for a future Dispatch scheduler, but the current implementation
+persists schedule state directly in the run record rather than SQLite.
 
 Also relevant: their state sync model (server-side `setState` with broadcast to
 connected clients) is a future pattern if Dispatch ever needs live run status

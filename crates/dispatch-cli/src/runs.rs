@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
+    collections::BTreeMap,
     env, fs,
-    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{self, BufReader, Read as _, Seek as _, SeekFrom, Write as _},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -43,6 +45,7 @@ pub(crate) enum RunOperation {
         payload: Option<String>,
         interval_ms: u64,
         schedules: Vec<RunSchedule>,
+        listeners: Vec<RunListener>,
     },
 }
 
@@ -61,6 +64,14 @@ pub(crate) struct RunSchedule {
     pub schedule_expr: String,
     pub next_fire_at_ms: u64,
     pub last_fired_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunListener {
+    pub listen_addr: String,
+    pub bound_addr: Option<String>,
+    pub requests_handled: u64,
+    pub last_request_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +128,9 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     for schedule in &args.schedules {
         validate_schedule_expr(schedule)?;
     }
+    for listen in &args.listens {
+        validate_listen_addr(listen)?;
+    }
     let parcel = crate::run::load_or_build_parcel_for_run(args.path.clone())?;
     validate_service_parcel(&parcel)?;
     for schedule in &parcel.config.schedules {
@@ -156,14 +170,16 @@ pub(crate) fn ps(args: crate::PsArgs) -> Result<()> {
         let name = run.parcel_name.as_deref().unwrap_or("<unknown>");
         let version = run.parcel_version.as_deref().unwrap_or("<unspecified>");
         let schedule_summary = schedule_summary(&run.operation);
+        let listener_summary = listener_summary(&run.operation);
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             run.run_id,
             format_status(&run.status),
             run.operation.label(),
             name,
             version,
             schedule_summary,
+            listener_summary,
             run.log_path.display()
         );
     }
@@ -305,6 +321,7 @@ pub(crate) fn inspect_run(args: crate::InspectRunArgs) -> Result<()> {
     println!("Log: {}", record.log_path.display());
     println!("Session: {}", record.session_file.display());
     println!("Schedules: {}", schedule_summary(&record.operation));
+    println!("Listeners: {}", listener_summary(&record.operation));
     if let Some(pid) = record.pid {
         println!("PID: {pid}");
     }
@@ -343,7 +360,15 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
             payload,
             interval_ms,
             schedules,
-        } => execute_service_loop(&record, payload, interval_ms, schedules),
+            listeners,
+        } => execute_service_loop(
+            &record_path,
+            &record,
+            payload,
+            interval_ms,
+            schedules,
+            listeners,
+        ),
     };
 
     match result {
@@ -402,20 +427,37 @@ fn execute_recorded_run(record: &RunRecord, mode: RecordedMode) -> Result<()> {
 }
 
 fn execute_service_loop(
+    record_path: &Path,
     record: &RunRecord,
     payload: Option<String>,
     interval_ms: u64,
     mut schedules: Vec<RunSchedule>,
+    mut listeners: Vec<RunListener>,
 ) -> Result<()> {
-    let poll_interval_ms = service_poll_interval_ms(interval_ms, &schedules);
+    let mut bound_listeners = bind_service_listeners(record_path, &mut listeners)?;
+    let poll_interval_ms = service_poll_interval_ms(interval_ms, &schedules, &listeners);
+    let mut next_heartbeat_at_ms = schedules.is_empty().then(now_ms);
     if record.detached {
         let stdout = io::stdout();
         let mut output = stdout.lock();
         loop {
-            let fired =
-                execute_due_service_work(record, payload.as_deref(), &mut schedules, &mut output)?;
-            if fired {
-                persist_service_schedules(record, &schedules)?;
+            let fired = execute_due_service_work(
+                record,
+                payload.as_deref(),
+                interval_ms,
+                &mut next_heartbeat_at_ms,
+                &mut schedules,
+                &mut output,
+            )?;
+            let handled = execute_service_ingress(
+                record_path,
+                record,
+                &mut listeners,
+                &mut bound_listeners,
+                &mut output,
+            )?;
+            if fired || handled {
+                persist_service_state(record_path, &schedules, &listeners)?;
             }
             thread::sleep(Duration::from_millis(poll_interval_ms));
         }
@@ -428,10 +470,23 @@ fn execute_service_loop(
         let stdout = io::stdout();
         let mut tee = TeeWriter::new(stdout.lock(), log_file);
         loop {
-            let fired =
-                execute_due_service_work(record, payload.as_deref(), &mut schedules, &mut tee)?;
-            if fired {
-                persist_service_schedules(record, &schedules)?;
+            let fired = execute_due_service_work(
+                record,
+                payload.as_deref(),
+                interval_ms,
+                &mut next_heartbeat_at_ms,
+                &mut schedules,
+                &mut tee,
+            )?;
+            let handled = execute_service_ingress(
+                record_path,
+                record,
+                &mut listeners,
+                &mut bound_listeners,
+                &mut tee,
+            )?;
+            if fired || handled {
+                persist_service_state(record_path, &schedules, &listeners)?;
             }
             thread::sleep(Duration::from_millis(poll_interval_ms));
         }
@@ -441,16 +496,25 @@ fn execute_service_loop(
 fn execute_due_service_work(
     record: &RunRecord,
     payload: Option<&str>,
+    interval_ms: u64,
+    next_heartbeat_at_ms: &mut Option<u64>,
     schedules: &mut [RunSchedule],
     output: &mut impl io::Write,
 ) -> Result<bool> {
+    let now = now_ms();
     if schedules.is_empty() {
+        let Some(next_fire_at_ms) = next_heartbeat_at_ms.as_mut() else {
+            return Ok(false);
+        };
+        if now < *next_fire_at_ms {
+            return Ok(false);
+        }
         execute_service_heartbeat(record, payload, output)?;
+        *next_fire_at_ms = now.saturating_add(interval_ms);
         return Ok(true);
     }
 
     let mut fired = false;
-    let now = now_ms();
     for schedule in schedules.iter_mut() {
         if schedule.next_fire_at_ms > now {
             continue;
@@ -587,6 +651,16 @@ fn build_run_record_for_service(
             payload: args.payload.clone(),
             interval_ms: args.interval_ms,
             schedules,
+            listeners: args
+                .listens
+                .iter()
+                .map(|listen_addr| RunListener {
+                    listen_addr: listen_addr.clone(),
+                    bound_addr: None,
+                    requests_handled: 0,
+                    last_request_at_ms: None,
+                })
+                .collect(),
         },
         status: RunStatus::Starting,
         pid: None,
@@ -671,16 +745,25 @@ fn collect_run_records(root: &Path) -> Result<Vec<RunRecord>> {
     Ok(runs)
 }
 
-fn persist_service_schedules(record: &RunRecord, schedules: &[RunSchedule]) -> Result<()> {
-    let record_path =
-        crate::resolve_runs_root(&record.parcel_path).join(format!("{}.json", record.run_id));
-    let mut updated = load_run_record(&record_path)?;
+fn persist_service_state(
+    record_path: &Path,
+    schedules: &[RunSchedule],
+    listeners: &[RunListener],
+) -> Result<()> {
+    let mut updated = load_run_record(record_path)?;
     if let RunOperation::Service {
-        schedules: current, ..
+        schedules: current_schedules,
+        listeners: current_listeners,
+        ..
     } = &mut updated.operation
     {
-        *current = schedules.to_vec();
-        persist_run_record(&record_path, &updated)?;
+        if !schedules.is_empty() {
+            *current_schedules = schedules.to_vec();
+        }
+        if !listeners.is_empty() {
+            *current_listeners = listeners.to_vec();
+        }
+        persist_run_record(record_path, &updated)?;
     }
     Ok(())
 }
@@ -846,12 +929,43 @@ fn schedule_summary(operation: &RunOperation) -> String {
     }
 }
 
-fn service_poll_interval_ms(interval_ms: u64, schedules: &[RunSchedule]) -> u64 {
-    if schedules.is_empty() {
-        interval_ms
-    } else {
-        interval_ms.min(1_000)
+fn listener_summary(operation: &RunOperation) -> String {
+    match operation {
+        RunOperation::Service { listeners, .. } if listeners.is_empty() => "none".to_string(),
+        RunOperation::Service { listeners, .. } => {
+            let mut parts = listeners
+                .iter()
+                .map(|listener| {
+                    let addr = listener
+                        .bound_addr
+                        .as_deref()
+                        .unwrap_or(listener.listen_addr.as_str());
+                    format!("{addr} ({} req)", listener.requests_handled)
+                })
+                .collect::<Vec<_>>();
+            if parts.len() > 2 {
+                parts.truncate(2);
+                parts.push("...".to_string());
+            }
+            parts.join(", ")
+        }
+        _ => "-".to_string(),
     }
+}
+
+fn service_poll_interval_ms(
+    interval_ms: u64,
+    schedules: &[RunSchedule],
+    listeners: &[RunListener],
+) -> u64 {
+    let mut poll_interval_ms = interval_ms;
+    if !schedules.is_empty() {
+        poll_interval_ms = poll_interval_ms.min(1_000);
+    }
+    if !listeners.is_empty() {
+        poll_interval_ms = poll_interval_ms.min(100);
+    }
+    poll_interval_ms
 }
 
 fn now_ms() -> u64 {
@@ -864,6 +978,13 @@ fn now_ms() -> u64 {
 fn validate_schedule_expr(expr: &str) -> Result<()> {
     let _ = Schedule::from_str(expr)
         .with_context(|| format!("failed to parse cron schedule `{expr}`"))?;
+    Ok(())
+}
+
+fn validate_listen_addr(addr: &str) -> Result<()> {
+    let _ = addr
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("failed to parse listen address `{addr}`"))?;
     Ok(())
 }
 
@@ -887,6 +1008,266 @@ fn format_timestamp_ms(ms: u64) -> String {
     timestamp_from_ms(ms)
         .map(|timestamp| timestamp.to_rfc3339())
         .unwrap_or_else(|_| ms.to_string())
+}
+
+struct BoundServiceListener {
+    index: usize,
+    listener: TcpListener,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceIngressEnvelope {
+    kind: &'static str,
+    received_at_ms: u64,
+    listener: String,
+    remote_addr: String,
+    method: String,
+    target: String,
+    path: String,
+    query: Option<String>,
+    headers: BTreeMap<String, String>,
+    body: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedHttpRequest {
+    method: String,
+    target: String,
+    path: String,
+    query: Option<String>,
+    headers: BTreeMap<String, String>,
+    body: Option<String>,
+}
+
+fn bind_service_listeners(
+    record_path: &Path,
+    listeners: &mut [RunListener],
+) -> Result<Vec<BoundServiceListener>> {
+    let mut bound = Vec::with_capacity(listeners.len());
+    for (index, listener_state) in listeners.iter_mut().enumerate() {
+        let listener = TcpListener::bind(&listener_state.listen_addr)
+            .with_context(|| format!("failed to bind {}", listener_state.listen_addr))?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to configure {}", listener_state.listen_addr))?;
+        listener_state.bound_addr = Some(
+            listener
+                .local_addr()
+                .with_context(|| format!("failed to inspect {}", listener_state.listen_addr))?
+                .to_string(),
+        );
+        bound.push(BoundServiceListener { index, listener });
+    }
+    if !listeners.is_empty() {
+        persist_service_state(record_path, &[], listeners)?;
+    }
+    Ok(bound)
+}
+
+fn execute_service_ingress(
+    record_path: &Path,
+    record: &RunRecord,
+    listeners: &mut [RunListener],
+    bound_listeners: &mut [BoundServiceListener],
+    output: &mut impl io::Write,
+) -> Result<bool> {
+    let mut handled = false;
+    for bound in bound_listeners.iter_mut() {
+        loop {
+            match bound.listener.accept() {
+                Ok((stream, remote_addr)) => {
+                    handled = true;
+                    let now = now_ms();
+                    let listener_state = &mut listeners[bound.index];
+                    listener_state.requests_handled += 1;
+                    listener_state.last_request_at_ms = Some(now);
+                    handle_service_connection(
+                        record,
+                        listener_state,
+                        stream,
+                        remote_addr.to_string(),
+                        output,
+                    )?;
+                    persist_service_state(record_path, &[], listeners)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    writeln!(
+                        output,
+                        "[dispatch serve] ingress accept failed on {}: {error}",
+                        listeners[bound.index]
+                            .bound_addr
+                            .as_deref()
+                            .unwrap_or(listeners[bound.index].listen_addr.as_str())
+                    )?;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(handled)
+}
+
+fn handle_service_connection(
+    record: &RunRecord,
+    listener: &RunListener,
+    stream: TcpStream,
+    remote_addr: String,
+    output: &mut impl io::Write,
+) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("failed to configure ingress read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .context("failed to configure ingress write timeout")?;
+    let mut writer = stream
+        .try_clone()
+        .context("failed to clone ingress connection")?;
+    let mut reader = BufReader::new(stream);
+    match parse_http_request(&mut reader) {
+        Ok(request) => {
+            writeln!(
+                output,
+                "[dispatch serve] ingress {} {} from {} via {}",
+                request.method,
+                request.target,
+                remote_addr,
+                listener
+                    .bound_addr
+                    .as_deref()
+                    .unwrap_or(listener.listen_addr.as_str())
+            )?;
+            let payload =
+                serde_json::to_string(&request_payload_envelope(listener, &remote_addr, &request))?;
+            match execute_service_heartbeat(record, Some(payload.as_str()), output) {
+                Ok(()) => write_http_response(
+                    &mut writer,
+                    202,
+                    "Accepted",
+                    &format!("accepted {}\n", record.run_id),
+                ),
+                Err(error) => write_http_response(
+                    &mut writer,
+                    500,
+                    "Internal Server Error",
+                    &format!("dispatch serve failed: {error}\n"),
+                ),
+            }
+        }
+        Err(error) => write_http_response(
+            &mut writer,
+            400,
+            "Bad Request",
+            &format!("invalid request: {error}\n"),
+        ),
+    }
+}
+
+fn request_payload_envelope(
+    listener: &RunListener,
+    remote_addr: &str,
+    request: &ParsedHttpRequest,
+) -> ServiceIngressEnvelope {
+    ServiceIngressEnvelope {
+        kind: "http_request",
+        received_at_ms: now_ms(),
+        listener: listener
+            .bound_addr
+            .clone()
+            .unwrap_or_else(|| listener.listen_addr.clone()),
+        remote_addr: remote_addr.to_string(),
+        method: request.method.clone(),
+        target: request.target.clone(),
+        path: request.path.clone(),
+        query: request.query.clone(),
+        headers: request.headers.clone(),
+        body: request.body.clone(),
+    }
+}
+
+fn parse_http_request(reader: &mut impl io::BufRead) -> Result<ParsedHttpRequest> {
+    let mut request_line = String::new();
+    let read = reader
+        .read_line(&mut request_line)
+        .context("failed to read request line")?;
+    if read == 0 {
+        bail!("empty request");
+    }
+    let request_line = request_line.trim_end();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+    let version = parts.next().unwrap_or_default();
+    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/") {
+        bail!("malformed request line `{request_line}`");
+    }
+
+    let mut headers = BTreeMap::new();
+    let mut content_length = 0usize;
+    loop {
+        let mut header_line = String::new();
+        reader
+            .read_line(&mut header_line)
+            .context("failed to read request header")?;
+        let header_line = header_line.trim_end();
+        if header_line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = header_line.split_once(':') else {
+            bail!("malformed header `{header_line}`");
+        };
+        let header_name = name.trim().to_ascii_lowercase();
+        let header_value = value.trim().to_string();
+        if header_name == "content-length" {
+            content_length = header_value
+                .parse::<usize>()
+                .with_context(|| format!("invalid content-length `{header_value}`"))?;
+        }
+        if header_name == "transfer-encoding" {
+            bail!("transfer-encoding is not supported");
+        }
+        headers.insert(header_name, header_value);
+    }
+
+    if content_length > 256 * 1024 {
+        bail!("request body exceeds 262144 bytes");
+    }
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .context("failed to read request body")?;
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (target.clone(), None),
+    };
+
+    Ok(ParsedHttpRequest {
+        method,
+        target,
+        path,
+        query,
+        headers,
+        body: if body.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&body).into_owned())
+        },
+    })
+}
+
+fn write_http_response(
+    writer: &mut impl io::Write,
+    status_code: u16,
+    status_text: &str,
+    body: &str,
+) -> Result<()> {
+    write!(
+        writer,
+        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .context("failed to write ingress response")
 }
 
 #[cfg(unix)]
@@ -988,6 +1369,8 @@ impl<A: io::Write, B: io::Write> io::Write for TeeWriter<A, B> {
 mod tests {
     use super::{RunOperation, RunRecord, RunStatus, resolve_run_prefix};
     use crate::CliA2aPolicy;
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
     use tempfile::tempdir;
 
     #[test]
@@ -1058,9 +1441,26 @@ mod tests {
             next_fire_at_ms: 1,
             last_fired_at_ms: None,
         }];
-        assert_eq!(super::service_poll_interval_ms(30_000, &schedules), 1_000);
-        assert_eq!(super::service_poll_interval_ms(500, &schedules), 500);
-        assert_eq!(super::service_poll_interval_ms(30_000, &[]), 30_000);
+        assert_eq!(
+            super::service_poll_interval_ms(30_000, &schedules, &[]),
+            1_000
+        );
+        assert_eq!(super::service_poll_interval_ms(500, &schedules, &[]), 500);
+        assert_eq!(super::service_poll_interval_ms(30_000, &[], &[]), 30_000);
+    }
+
+    #[test]
+    fn service_poll_interval_uses_fast_polls_for_listeners() {
+        let listeners = vec![super::RunListener {
+            listen_addr: "127.0.0.1:0".to_string(),
+            bound_addr: None,
+            requests_handled: 0,
+            last_request_at_ms: None,
+        }];
+        assert_eq!(
+            super::service_poll_interval_ms(30_000, &[], &listeners),
+            100
+        );
     }
 
     #[test]
@@ -1089,8 +1489,46 @@ mod tests {
                 next_fire_at_ms: 1_700_000_000_000,
                 last_fired_at_ms: None,
             }],
+            listeners: Vec::new(),
         });
         assert!(summary.contains("*/5 * * * * * *=>"));
         assert!(summary.contains("2023-11-14T22:13:20+00:00"));
+    }
+
+    #[test]
+    fn listener_summary_reports_bound_address_and_count() {
+        let summary = super::listener_summary(&RunOperation::Service {
+            payload: None,
+            interval_ms: 30_000,
+            schedules: Vec::new(),
+            listeners: vec![super::RunListener {
+                listen_addr: "127.0.0.1:0".to_string(),
+                bound_addr: Some("127.0.0.1:48123".to_string()),
+                requests_handled: 2,
+                last_request_at_ms: Some(1_700_000_000_000),
+            }],
+        });
+        assert_eq!(summary, "127.0.0.1:48123 (2 req)");
+    }
+
+    #[test]
+    fn parse_http_request_extracts_target_headers_and_body() {
+        let request = b"POST /hook?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\n{\"ok\":1}";
+        let parsed = super::parse_http_request(&mut Cursor::new(&request[..])).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("content-length".to_string(), "8".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("host".to_string(), "localhost".to_string());
+        assert_eq!(
+            parsed,
+            super::ParsedHttpRequest {
+                method: "POST".to_string(),
+                target: "/hook?a=1".to_string(),
+                path: "/hook".to_string(),
+                query: Some("a=1".to_string()),
+                headers,
+                body: Some("{\"ok\":1}".to_string()),
+            }
+        );
     }
 }

@@ -261,6 +261,9 @@ struct ServeArgs {
     /// Cron schedule to trigger a service heartbeat; may be repeated
     #[arg(long = "schedule")]
     schedules: Vec<String>,
+    /// Bind a local HTTP listener that wakes the service on inbound requests; may be repeated
+    #[arg(long = "listen")]
+    listens: Vec<String>,
     /// Detach the service and return immediately
     #[arg(long)]
     detach: bool,
@@ -1594,6 +1597,8 @@ mod tests {
             "5000",
             "--schedule",
             "*/5 * * * * * *",
+            "--listen",
+            "127.0.0.1:9000",
             "--detach",
         ])
         .unwrap();
@@ -1604,6 +1609,7 @@ mod tests {
         assert_eq!(args.payload.as_deref(), Some("tick"));
         assert_eq!(args.interval_ms, 5000);
         assert_eq!(args.schedules, vec!["*/5 * * * * * *"]);
+        assert_eq!(args.listens, vec!["127.0.0.1:9000"]);
         assert!(args.detach);
     }
 
