@@ -8,6 +8,8 @@ The core idea: an agent should be a self-describing, verifiable artifact - separ
 Agentfile  ->  dispatch parcel build  ->  parcel (artifact)  ->  dispatch run  ->  courier
 ```
 
+An `Agentfile` is the source definition; a **parcel** is the built artifact; a **courier** executes it; a **session** is the active run.
+
 Available couriers today include native, Docker, WASM, and external JSONL plugins. The WASM path runs a guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) in any host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
 
 ## Why Dispatch
@@ -38,7 +40,8 @@ The practical applications: deploying untrusted third-party agents in a sandboxe
 - `parcel.lock` records parcel integrity metadata
 - a **courier** executes a parcel
 - a **depot** stores parcels
-- a running parcel execution is a **dispatch**
+- a running parcel execution is a **session**
+- the resolved prompt stack is the parcel's **brief** to the model
 
 ## Agentfile
 
@@ -242,56 +245,56 @@ Build and run the reference examples:
 
 ```bash
 # Lint an Agentfile
-cargo run -p dispatch -- parcel lint examples/parcels/basic
-cargo run -p dispatch -- parcel lint examples/parcels/wasm-reference
-cargo run -p dispatch -- parcel lint examples/skills/file-analyst
+cargo run -- parcel lint examples/parcels/basic
+cargo run -- parcel lint examples/parcels/wasm-reference
+cargo run -- parcel lint examples/skills/file-analyst
 
 # Build a parcel
-cargo run -p dispatch -- parcel build examples/parcels/basic
-cargo run -p dispatch -- parcel build examples/parcels/wasm-reference
-cargo run -p dispatch -- parcel build examples/skills/file-analyst
+cargo run -- parcel build examples/parcels/basic
+cargo run -- parcel build examples/parcels/wasm-reference
+cargo run -- parcel build examples/skills/file-analyst
 
 # Run packaged evals
-cargo run -p dispatch -- parcel eval examples/parcels/basic
-cargo run -p dispatch -- parcel eval examples/parcels/basic --courier native
-cargo run -p dispatch -- parcel eval examples/skills/file-analyst --courier native
+cargo run -- parcel eval examples/parcels/basic
+cargo run -- parcel eval examples/parcels/basic --courier native
+cargo run -- parcel eval examples/skills/file-analyst --courier native
 
 # Inspect a built parcel
-cargo run -p dispatch -- parcel inspect examples/parcels/basic/.dispatch/parcels/<digest>
-cargo run -p dispatch -- parcel inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
+cargo run -- parcel inspect examples/parcels/basic/.dispatch/parcels/<digest>
+cargo run -- parcel inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
 
 # Verify parcel integrity
-cargo run -p dispatch -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest>
+cargo run -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest>
 
 # Sign a parcel
-cargo run -p dispatch -- parcel keygen --key-id release --output-dir .dispatch/keys
-cargo run -p dispatch -- parcel sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
-cargo run -p dispatch -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
+cargo run -- parcel keygen --key-id release --output-dir .dispatch/keys
+cargo run -- parcel sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
+cargo run -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
 
 # Run a parcel (native courier, requires LLM_API_KEY or provider env vars)
-cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
-cargo run -p dispatch -- run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
+cargo run -- run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
+cargo run -- run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
 
 # Run a skill bundle directly without authoring an Agentfile
-cargo run -p dispatch -- skill validate examples/skills/file-analyst/skills/file-analyst
-cargo run -p dispatch -- skill run examples/skills/file-analyst/skills/file-analyst --list-tools
-cargo run -p dispatch -- skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5-mini --provider openai --chat "Summarize this repository."
+cargo run -- skill validate examples/skills/file-analyst/skills/file-analyst
+cargo run -- skill run examples/skills/file-analyst/skills/file-analyst --list-tools
+cargo run -- skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5-mini --provider openai --chat "Summarize this repository."
 
 # Run a WASM parcel
-cargo run -p dispatch -- run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
+cargo run -- run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
 
 # Run a heartbeat
-cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
+cargo run -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
 
 # Test the Codex backend (requires `codex app-server` access)
-cargo run -p dispatch -- parcel lint examples/parcels/codex
-cargo run -p dispatch -- parcel build examples/parcels/codex
-cargo run -p dispatch -- run examples/parcels/codex/.dispatch/parcels/<digest> --chat "Say hello in one sentence."
-cargo run -p dispatch -- run examples/parcels/codex/.dispatch/parcels/<digest> --interactive
+cargo run -- parcel lint examples/parcels/codex
+cargo run -- parcel build examples/parcels/codex
+cargo run -- run examples/parcels/codex/.dispatch/parcels/<digest> --chat "Say hello in one sentence."
+cargo run -- run examples/parcels/codex/.dispatch/parcels/<digest> --interactive
 
 # List and invoke tools
-cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
-cargo run -p dispatch -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
+cargo run -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
+cargo run -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
 
 # Push/pull to a depot
 dispatch depot push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
@@ -307,7 +310,7 @@ dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --trust-policy t
 Print the parsed AST:
 
 ```bash
-cargo run -p dispatch -- parcel lint examples/parcels/basic --json
+cargo run -- parcel lint examples/parcels/basic --json
 ```
 
 ## Parcel Format
@@ -401,7 +404,7 @@ Supported backends:
 - `--chat <text>` - single chat turn
 - `--job <payload>` - execute the parcel `job` entrypoint
 - `--heartbeat [payload]` - execute the parcel `heartbeat` entrypoint
-- `--print-prompt` - resolve and print the courier prompt stack
+- `--print-prompt` - resolve and print the parcel's brief to the model
 - `--list-tools` - list declared tools
 - `--json` - when combined with `--list-tools`, print full tool metadata as JSON
 - `--tool <name>` - execute one declared local tool
