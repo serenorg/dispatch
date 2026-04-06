@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{self, BufReader, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{self, BufReader, IsTerminal, Read as _, Seek as _, SeekFrom, Write as _},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -305,6 +305,28 @@ pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn prune(args: crate::PruneArgs) -> Result<()> {
+    let root = crate::resolve_runs_root(&args.path);
+    let runs = collect_run_records(&root)?;
+    let inactive_count = runs.iter().filter(|run| !run.status.is_active()).count();
+    if inactive_count == 0 {
+        println!("No inactive runs found under {}", root.display());
+        return Ok(());
+    }
+
+    if !args.force && !confirm_prune(&root, inactive_count)? {
+        println!("Aborted prune");
+        return Ok(());
+    }
+
+    let removed = prune_root(&root)?;
+    for run_id in &removed {
+        println!("Removed run {run_id}");
+    }
+    println!("Pruned {} inactive run(s)", removed.len());
+    Ok(())
+}
+
 pub(crate) fn rm(args: crate::RemoveRunArgs) -> Result<()> {
     let root = crate::resolve_runs_root(&args.path);
     let record_path = resolve_run_prefix(&root, &args.run)?;
@@ -326,23 +348,7 @@ pub(crate) fn rm(args: crate::RemoveRunArgs) -> Result<()> {
         record = load_run_record(&record_path)?;
     }
 
-    if let Err(error) = fs::remove_file(&record_path)
-        && (!args.force || error.kind() != io::ErrorKind::NotFound)
-    {
-        return Err(error).with_context(|| format!("failed to remove {}", record_path.display()));
-    }
-    if let Err(error) = fs::remove_file(&record.log_path)
-        && (!args.force || error.kind() != io::ErrorKind::NotFound)
-    {
-        return Err(error)
-            .with_context(|| format!("failed to remove {}", record.log_path.display()));
-    }
-    if let Err(error) = fs::remove_file(&record.session_file)
-        && (!args.force || error.kind() != io::ErrorKind::NotFound)
-    {
-        return Err(error)
-            .with_context(|| format!("failed to remove {}", record.session_file.display()));
-    }
+    remove_run_artifacts(&record, args.force, Some(&record_path))?;
     println!("Removed run {}", record.run_id);
     Ok(())
 }
@@ -868,6 +874,39 @@ fn collect_run_records(root: &Path) -> Result<Vec<RunRecord>> {
     Ok(runs)
 }
 
+fn prune_root(root: &Path) -> Result<Vec<String>> {
+    let runs = collect_run_records(root)?;
+    let mut removed = Vec::new();
+    for run in runs.into_iter().filter(|run| !run.status.is_active()) {
+        let record_path = root.join(format!("{}.json", run.run_id));
+        remove_run_artifacts(&run, true, Some(&record_path))?;
+        removed.push(run.run_id);
+    }
+    Ok(removed)
+}
+
+fn confirm_prune(root: &Path, inactive_count: usize) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "refusing to prune {} inactive run(s) under {} without --force in a non-interactive session",
+            inactive_count,
+            root.display()
+        );
+    }
+    eprint!(
+        "Remove {} inactive run(s) under {}? [y/N] ",
+        inactive_count,
+        root.display()
+    );
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn persist_service_state(
     record_path: &Path,
     schedules: &[RunSchedule],
@@ -962,6 +1001,27 @@ fn persist_run_record(path: &Path, record: &RunRecord) -> Result<()> {
     }
     fs::write(path, serde_json::to_vec_pretty(record)?)
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn remove_run_artifacts(
+    record: &RunRecord,
+    tolerate_missing: bool,
+    record_path_override: Option<&Path>,
+) -> Result<()> {
+    let record_path = record_path_override.unwrap_or(record.log_path.as_path());
+    remove_path(record_path, tolerate_missing)?;
+    remove_path(&record.log_path, tolerate_missing)?;
+    remove_path(&record.session_file, tolerate_missing)?;
+    Ok(())
+}
+
+fn remove_path(path: &Path, tolerate_missing: bool) -> Result<()> {
+    if let Err(error) = fs::remove_file(path)
+        && (!tolerate_missing || error.kind() != io::ErrorKind::NotFound)
+    {
+        return Err(error).with_context(|| format!("failed to remove {}", path.display()));
+    }
+    Ok(())
 }
 
 fn spawn_detached_runner(record_path: &Path, log_path: &Path) -> Result<()> {
@@ -1681,6 +1741,7 @@ mod tests {
     use super::{RunOperation, RunRecord, RunStatus, ServiceIngressConfig, resolve_run_prefix};
     use crate::CliA2aPolicy;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1778,6 +1839,64 @@ mod tests {
         let loaded: RunRecord =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn prune_root_removes_only_inactive_runs() {
+        let dir = tempdir().unwrap();
+        let active = RunRecord {
+            run_id: "active".to_string(),
+            parcel_digest: "digest".to_string(),
+            parcel_name: Some("demo".to_string()),
+            parcel_version: Some("1.0.0".to_string()),
+            parcel_path: dir.path().join("parcel"),
+            courier: "native".to_string(),
+            registry: None,
+            operation: RunOperation::Heartbeat { payload: None },
+            status: RunStatus::Running,
+            pid: None,
+            process_group_id: None,
+            started_at_ms: Some(1),
+            stopped_at_ms: None,
+            exit_code: None,
+            session_file: dir.path().join("active.session.json"),
+            log_path: dir.path().join("active.log"),
+            tool_approval: crate::CliToolApprovalMode::Never,
+            a2a_policy: CliA2aPolicy::default(),
+            last_error: None,
+            detached: true,
+        };
+        let inactive = RunRecord {
+            run_id: "stopped".to_string(),
+            status: RunStatus::Stopped,
+            session_file: dir.path().join("stopped.session.json"),
+            log_path: dir.path().join("stopped.log"),
+            ..active.clone()
+        };
+
+        fs::write(
+            dir.path().join("active.json"),
+            serde_json::to_vec_pretty(&active).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("stopped.json"),
+            serde_json::to_vec_pretty(&inactive).unwrap(),
+        )
+        .unwrap();
+        fs::write(&active.log_path, "active").unwrap();
+        fs::write(&active.session_file, "{}").unwrap();
+        fs::write(&inactive.log_path, "inactive").unwrap();
+        fs::write(&inactive.session_file, "{}").unwrap();
+
+        let removed = super::prune_root(dir.path()).unwrap();
+        assert_eq!(removed, vec!["stopped".to_string()]);
+        assert!(dir.path().join("active.json").exists());
+        assert!(active.log_path.exists());
+        assert!(active.session_file.exists());
+        assert!(!dir.path().join("stopped.json").exists());
+        assert!(!inactive.log_path.exists());
+        assert!(!inactive.session_file.exists());
     }
 
     #[test]

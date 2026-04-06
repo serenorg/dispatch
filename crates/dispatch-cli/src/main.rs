@@ -72,6 +72,8 @@ enum Command {
     Logs(LogsArgs),
     /// Stop a local run
     Stop(StopArgs),
+    /// Remove inactive local run records and logs
+    Prune(PruneArgs),
     /// Remove a local run record and logs
     Rm(RemoveRunArgs),
     /// Inspect a local run record
@@ -325,6 +327,16 @@ struct StopArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct PruneArgs {
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Remove inactive runs without prompting
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
 struct RemoveRunArgs {
     /// Run id or unique run id prefix
     run: String,
@@ -539,12 +551,14 @@ enum CourierCommand {
 #[derive(Debug, Subcommand)]
 enum ContainerCommand {
     /// List active and completed local runs
-    #[command(visible_alias = "ls")]
+    #[command(visible_alias = "ls", alias = "ps")]
     List(PsArgs),
     /// Print logs for a local run
     Logs(LogsArgs),
     /// Stop a local run
     Stop(StopArgs),
+    /// Remove inactive local run records and logs
+    Prune(PruneArgs),
     /// Remove a local run record and logs
     Rm(RemoveRunArgs),
     /// Inspect a local run record
@@ -716,6 +730,7 @@ fn main() -> Result<()> {
         Command::Ps(args) => runs::ps(args),
         Command::Logs(args) => runs::logs(args),
         Command::Stop(args) => runs::stop(args),
+        Command::Prune(args) => runs::prune(args),
         Command::Rm(args) => runs::rm(args),
         Command::InspectRun(args) => runs::inspect_run(args),
         Command::Skill { command } => match command {
@@ -809,6 +824,7 @@ fn container_command(command: ContainerCommand) -> Result<()> {
         ContainerCommand::List(args) => runs::ps(args),
         ContainerCommand::Logs(args) => runs::logs(args),
         ContainerCommand::Stop(args) => runs::stop(args),
+        ContainerCommand::Prune(args) => runs::prune(args),
         ContainerCommand::Rm(args) => runs::rm(args),
         ContainerCommand::Inspect(args) => runs::inspect_run(args),
     }
@@ -1045,9 +1061,9 @@ mod tests {
     use super::{
         Cli, CliA2aPolicy, CliToolApprovalMode, Command, ContainerCommand, CourierCommand,
         DepotCommand, EvalArgs, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand,
-        KeygenArgs, LogsArgs, ParcelCommand, PsArgs, PullArgs, PushArgs, RemoveRunArgs, SignArgs,
-        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs,
-        VerifyArgs,
+        KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs,
+        SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
+        ValidateSkillArgs, VerifyArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -1671,6 +1687,13 @@ mod tests {
         assert_eq!(path, PathBuf::from("examples/demo"));
         assert!(force);
 
+        let prune = Cli::try_parse_from(["dispatch", "prune", "examples/demo", "--force"]).unwrap();
+        let Command::Prune(PruneArgs { path, force }) = prune.command else {
+            panic!("expected prune command");
+        };
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(force);
+
         let rm =
             Cli::try_parse_from(["dispatch", "rm", "abc123", "examples/demo", "--force"]).unwrap();
         let Command::Rm(RemoveRunArgs { run, path, force }) = rm.command else {
@@ -1712,6 +1735,28 @@ mod tests {
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("examples/demo"));
         assert!(!json);
+
+        let container_ps =
+            Cli::try_parse_from(["dispatch", "container", "ps", "examples/demo"]).unwrap();
+        let Command::Container {
+            command: ContainerCommand::List(PsArgs { path, json }),
+        } = container_ps.command
+        else {
+            panic!("expected container ps command");
+        };
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(!json);
+
+        let container_prune =
+            Cli::try_parse_from(["dispatch", "container", "prune", "--force"]).unwrap();
+        let Command::Container {
+            command: ContainerCommand::Prune(PruneArgs { path, force }),
+        } = container_prune.command
+        else {
+            panic!("expected container prune command");
+        };
+        assert_eq!(path, PathBuf::from("."));
+        assert!(force);
     }
 
     #[test]
