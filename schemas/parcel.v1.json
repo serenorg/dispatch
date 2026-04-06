@@ -82,6 +82,16 @@
         "type": "string"
       }
     },
+    "ingress": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ingress"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "instructions": {
       "type": "array",
       "items": {
@@ -201,6 +211,47 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "methods"
+      ],
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shared_secret_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_body_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "max_header_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         }
       }
     },

@@ -268,6 +268,17 @@ Listener bindings can originate from:
 The current implementation supports both and merges them without duplication
 when a service run record is created.
 
+Additional ingress policy can also originate from the parcel:
+
+- `LISTEN_PATH "/hook"`
+- repeatable `LISTEN_METHOD POST`
+- `LISTEN_SECRET DISPATCH_WEBHOOK_SECRET`
+- `LISTEN_MAX_BODY_BYTES 8192`
+- `LISTEN_MAX_HEADER_BYTES 4096`
+
+Runtime CLI flags override the authored scalar policy (`path`, shared secret,
+size limits) while methods are merged without duplication.
+
 ## Current Ingress Behavior
 
 The current implementation supports local HTTP ingress on service runs via:
@@ -300,6 +311,8 @@ new parcel entrypoint. The current envelope shape includes:
 Auth behavior:
 
 - shared secrets are accepted via `x-dispatch-secret` or `authorization: Bearer ...`
+- parcel-authored shared secrets reference a declared `SECRET` name and are
+  resolved from the environment when `dispatch serve` starts
 - the run record stores only the SHA-256 digest of the configured secret
 - forwarded heartbeat payload headers redact auth-bearing headers before they
   reach parcel history/logs

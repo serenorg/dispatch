@@ -1,10 +1,10 @@
 use crate::{
     Value,
     manifest::{
-        CompactionConfig, CourierTarget, EnvVar, FrameworkProvenance, InstructionConfig,
-        InstructionKind, LimitSpec, ModelPolicy, MountConfig, NetworkRule, PARCEL_FORMAT_VERSION,
-        PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec, TestSpec, TimeoutSpec,
-        ToolConfig, Visibility,
+        CompactionConfig, CourierTarget, EnvVar, FrameworkProvenance, IngressPolicyConfig,
+        InstructionConfig, InstructionKind, LimitSpec, ModelPolicy, MountConfig, NetworkRule,
+        PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
+        TestSpec, TimeoutSpec, ToolConfig, Visibility,
     },
     parse_agentfile,
 };
@@ -26,10 +26,11 @@ mod verify;
 use component::process_component_instruction;
 use parsing::{
     a2a_auth_secret_names, infer_runner, parse_compaction, parse_component, parse_env_var,
-    parse_framework, parse_label, parse_limit, parse_model_reference, parse_mount,
-    parse_network_rule, parse_test_spec, parse_timeout, parse_tool, parse_visibility,
+    parse_framework, parse_label, parse_limit, parse_listener_size_limit, parse_model_reference,
+    parse_mount, parse_network_rule, parse_test_spec, parse_timeout, parse_tool, parse_visibility,
     validate_courier_requirements, validate_entrypoint_value, validate_for_build,
-    validate_heartbeat_entrypoint, validate_test_specs, validate_tool_schema,
+    validate_heartbeat_entrypoint, validate_listener_method, validate_listener_path,
+    validate_test_specs, validate_tool_schema,
 };
 use skill::{
     insert_resolved_tool, package_tool_config, process_skill_instruction,
@@ -112,6 +113,7 @@ struct ProvisionalParcelManifest {
     entrypoint: Option<String>,
     schedules: Vec<String>,
     listeners: Vec<String>,
+    ingress: Option<IngressPolicyConfig>,
     instructions: Vec<InstructionConfig>,
     inline_prompts: Vec<String>,
     env: Vec<EnvVar>,
@@ -138,6 +140,11 @@ struct ResolvedAgentSpec {
     entrypoint: Option<String>,
     schedules: Vec<String>,
     listeners: Vec<String>,
+    ingress_path: Option<String>,
+    ingress_methods: Vec<String>,
+    ingress_secret_env: Option<String>,
+    ingress_max_body_bytes: Option<usize>,
+    ingress_max_header_bytes: Option<usize>,
     instructions: Vec<InstructionConfig>,
     inline_prompts: Vec<String>,
     env: Vec<EnvVar>,
@@ -236,6 +243,41 @@ pub fn build_agentfile(
             "LISTEN" => {
                 if let Some(listen_addr) = first_scalar(instruction.args.first()) {
                     resolved.listeners.push(listen_addr);
+                }
+            }
+            "LISTEN_PATH" => {
+                if let Some(path) = first_scalar(instruction.args.first()) {
+                    resolved.ingress_path =
+                        Some(validate_listener_path(&path, "Agentfile LISTEN_PATH")?);
+                }
+            }
+            "LISTEN_METHOD" => {
+                if let Some(method) = first_scalar(instruction.args.first()) {
+                    resolved.ingress_methods.push(validate_listener_method(
+                        &method,
+                        "Agentfile LISTEN_METHOD",
+                    )?);
+                }
+            }
+            "LISTEN_SECRET" => {
+                if let Some(secret_name) = first_scalar(instruction.args.first()) {
+                    resolved.ingress_secret_env = Some(secret_name);
+                }
+            }
+            "LISTEN_MAX_BODY_BYTES" => {
+                if let Some(limit) = first_scalar(instruction.args.first()) {
+                    resolved.ingress_max_body_bytes = Some(parse_listener_size_limit(
+                        &limit,
+                        "Agentfile LISTEN_MAX_BODY_BYTES",
+                    )?);
+                }
+            }
+            "LISTEN_MAX_HEADER_BYTES" => {
+                if let Some(limit) = first_scalar(instruction.args.first()) {
+                    resolved.ingress_max_header_bytes = Some(parse_listener_size_limit(
+                        &limit,
+                        "Agentfile LISTEN_MAX_HEADER_BYTES",
+                    )?);
                 }
             }
             "VISIBILITY" => {
@@ -424,6 +466,19 @@ pub fn build_agentfile(
         }
     }
 
+    if let Some(secret_name) = &resolved.ingress_secret_env
+        && !resolved
+            .secrets
+            .iter()
+            .any(|secret| secret.name == *secret_name)
+    {
+        return Err(BuildError::Validation(format!(
+            "LISTEN_SECRET `{secret_name}` is not declared via `SECRET`"
+        )));
+    }
+
+    let ingress = resolved_ingress_policy(&resolved);
+
     let provisional = ProvisionalParcelManifest {
         schema: PARCEL_SCHEMA_URL.to_string(),
         format_version: PARCEL_FORMAT_VERSION,
@@ -437,6 +492,7 @@ pub fn build_agentfile(
         entrypoint: resolved.entrypoint,
         schedules: resolved.schedules,
         listeners: resolved.listeners,
+        ingress,
         instructions: resolved.instructions,
         inline_prompts: resolved.inline_prompts,
         env: resolved.env,
@@ -492,6 +548,7 @@ pub fn build_agentfile(
         entrypoint: provisional.entrypoint,
         schedules: provisional.schedules,
         listeners: provisional.listeners,
+        ingress: provisional.ingress,
         instructions: provisional.instructions,
         inline_prompts: provisional.inline_prompts,
         env: provisional.env,
@@ -558,6 +615,7 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
         entrypoint: parcel.entrypoint.clone(),
         schedules: parcel.schedules.clone(),
         listeners: parcel.listeners.clone(),
+        ingress: parcel.ingress.clone(),
         instructions: parcel.instructions.clone(),
         inline_prompts: parcel.inline_prompts.clone(),
         env: parcel.env.clone(),
@@ -576,6 +634,24 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
     };
     let serialized = serde_json::to_vec_pretty(&provisional)?;
     Ok(hex_digest(&serialized))
+}
+
+fn resolved_ingress_policy(resolved: &ResolvedAgentSpec) -> Option<IngressPolicyConfig> {
+    let has_ingress = resolved.ingress_path.is_some()
+        || !resolved.ingress_methods.is_empty()
+        || resolved.ingress_secret_env.is_some()
+        || resolved.ingress_max_body_bytes.is_some()
+        || resolved.ingress_max_header_bytes.is_some();
+    if !has_ingress {
+        return None;
+    }
+    Some(IngressPolicyConfig {
+        path: resolved.ingress_path.clone(),
+        methods: resolved.ingress_methods.clone(),
+        shared_secret_env: resolved.ingress_secret_env.clone(),
+        max_body_bytes: resolved.ingress_max_body_bytes,
+        max_header_bytes: resolved.ingress_max_header_bytes,
+    })
 }
 
 fn package_path(
@@ -1637,6 +1713,75 @@ ENTRYPOINT heartbeat
             serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
 
         assert_eq!(parcel.listeners, vec!["127.0.0.1:0", "127.0.0.1:9000"]);
+    }
+
+    #[test]
+    fn build_preserves_authored_ingress_policy_in_manifest() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+SECRET DISPATCH_WEBHOOK_SECRET
+LISTEN \"127.0.0.1:0\"
+LISTEN_PATH \"/hook\"
+LISTEN_METHOD POST
+LISTEN_METHOD PUT
+LISTEN_SECRET DISPATCH_WEBHOOK_SECRET
+LISTEN_MAX_BODY_BYTES 8192
+LISTEN_MAX_HEADER_BYTES 4096
+ENTRYPOINT heartbeat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        let ingress = parcel.ingress.expect("ingress policy should be preserved");
+        assert_eq!(ingress.path.as_deref(), Some("/hook"));
+        assert_eq!(ingress.methods, vec!["POST", "PUT"]);
+        assert_eq!(
+            ingress.shared_secret_env.as_deref(),
+            Some("DISPATCH_WEBHOOK_SECRET")
+        );
+        assert_eq!(ingress.max_body_bytes, Some(8192));
+        assert_eq!(ingress.max_header_bytes, Some(4096));
+    }
+
+    #[test]
+    fn build_rejects_undeclared_listener_secret() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+LISTEN_SECRET DISPATCH_WEBHOOK_SECRET
+ENTRYPOINT heartbeat
+",
+        )
+        .unwrap();
+
+        let error = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "validation failed:\nLISTEN_SECRET `DISPATCH_WEBHOOK_SECRET` is not declared via `SECRET`"
+        );
     }
 
     #[test]

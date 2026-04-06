@@ -20,6 +20,8 @@ pub struct ParcelManifest {
     pub entrypoint: Option<String>,
     pub schedules: Vec<String>,
     pub listeners: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<IngressPolicyConfig>,
     pub instructions: Vec<InstructionConfig>,
     pub inline_prompts: Vec<String>,
     pub env: Vec<EnvVar>,
@@ -36,6 +38,19 @@ pub struct ParcelManifest {
     pub network: Vec<NetworkRule>,
     pub labels: BTreeMap<String, String>,
     pub files: Vec<ParcelFileRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngressPolicyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub methods: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_secret_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_header_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -274,11 +274,11 @@ struct ServeArgs {
     #[arg(long = "listen-shared-secret")]
     listen_shared_secret: Option<String>,
     /// Maximum accepted request body size in bytes
-    #[arg(long = "listen-max-body-bytes", default_value_t = 262_144)]
-    listen_max_body_bytes: usize,
+    #[arg(long = "listen-max-body-bytes")]
+    listen_max_body_bytes: Option<usize>,
     /// Maximum accepted request line + header bytes
-    #[arg(long = "listen-max-header-bytes", default_value_t = 16_384)]
-    listen_max_header_bytes: usize,
+    #[arg(long = "listen-max-header-bytes")]
+    listen_max_header_bytes: Option<usize>,
     /// Detach the service and return immediately
     #[arg(long)]
     detach: bool,
@@ -1640,8 +1640,8 @@ mod tests {
         assert_eq!(args.listen_path.as_deref(), Some("/hook"));
         assert_eq!(args.listen_methods, vec!["post", "PUT"]);
         assert_eq!(args.listen_shared_secret.as_deref(), Some("topsecret"));
-        assert_eq!(args.listen_max_body_bytes, 8192);
-        assert_eq!(args.listen_max_header_bytes, 4096);
+        assert_eq!(args.listen_max_body_bytes, Some(8192));
+        assert_eq!(args.listen_max_header_bytes, Some(4096));
         assert!(args.detach);
     }
 

@@ -116,6 +116,9 @@ struct RunPaths {
     session_path: PathBuf,
 }
 
+const DEFAULT_INGRESS_MAX_BODY_BYTES: usize = 262_144;
+const DEFAULT_INGRESS_MAX_HEADER_BYTES: usize = 16_384;
+
 pub(crate) fn run_detached(args: crate::RunArgs) -> Result<()> {
     let crate::RunArgs { path, exec } = args;
     let operation = run_operation_from_exec(&exec)?;
@@ -148,7 +151,12 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     for method in &args.listen_methods {
         validate_listen_method(method)?;
     }
-    validate_ingress_limits(args.listen_max_body_bytes, args.listen_max_header_bytes)?;
+    validate_ingress_limits(
+        args.listen_max_body_bytes
+            .unwrap_or(DEFAULT_INGRESS_MAX_BODY_BYTES),
+        args.listen_max_header_bytes
+            .unwrap_or(DEFAULT_INGRESS_MAX_HEADER_BYTES),
+    )?;
     let parcel = crate::run::load_or_build_parcel_for_run(args.path.clone())?;
     validate_service_parcel(&parcel)?;
     for schedule in &parcel.config.schedules {
@@ -156,6 +164,22 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     }
     for listen in &parcel.config.listeners {
         validate_listen_addr(listen)?;
+    }
+    if let Some(ingress) = &parcel.config.ingress {
+        if let Some(path) = ingress.path.as_deref() {
+            validate_listen_path(path)?;
+        }
+        for method in &ingress.methods {
+            validate_listen_method(method)?;
+        }
+        validate_ingress_limits(
+            ingress
+                .max_body_bytes
+                .unwrap_or(DEFAULT_INGRESS_MAX_BODY_BYTES),
+            ingress
+                .max_header_bytes
+                .unwrap_or(DEFAULT_INGRESS_MAX_HEADER_BYTES),
+        )?;
     }
     let paths = allocate_run_paths(&parcel, None)?;
     let record = build_run_record_for_service(&parcel, &paths, &args);
@@ -662,17 +686,8 @@ fn build_run_record_for_service(
         .collect::<Result<Vec<_>>>()
         .expect("schedules are validated before the run record is built");
     let listeners = merged_listener_addrs(&parcel.config.listeners, &args.listens);
-    let ingress = ServiceIngressConfig {
-        path: args.listen_path.as_deref().map(normalize_listen_path),
-        methods: args
-            .listen_methods
-            .iter()
-            .map(|method| normalize_listen_method(method))
-            .collect(),
-        shared_secret_sha256: args.listen_shared_secret.as_deref().map(hash_shared_secret),
-        max_body_bytes: args.listen_max_body_bytes,
-        max_header_bytes: args.listen_max_header_bytes,
-    };
+    let ingress = resolve_service_ingress_config(parcel, args)
+        .expect("service ingress is validated before the run record is built");
     RunRecord {
         run_id: paths
             .record_path
@@ -737,6 +752,65 @@ fn merged_listener_addrs(parcel_listens: &[String], cli_listens: &[String]) -> V
     for listen in parcel_listens.iter().chain(cli_listens.iter()) {
         if !merged.iter().any(|existing| existing == listen) {
             merged.push(listen.clone());
+        }
+    }
+    merged
+}
+
+fn resolve_service_ingress_config(
+    parcel: &dispatch_core::LoadedParcel,
+    args: &crate::ServeArgs,
+) -> Result<ServiceIngressConfig> {
+    let parcel_ingress = parcel.config.ingress.as_ref();
+    let path = args
+        .listen_path
+        .as_deref()
+        .map(normalize_listen_path)
+        .or_else(|| {
+            parcel_ingress.and_then(|ingress| ingress.path.as_deref().map(normalize_listen_path))
+        });
+    let methods = merged_ingress_methods(
+        parcel_ingress
+            .map(|ingress| ingress.methods.as_slice())
+            .unwrap_or(&[]),
+        &args.listen_methods,
+    );
+    let shared_secret_sha256 = if let Some(secret) = args.listen_shared_secret.as_deref() {
+        Some(hash_shared_secret(secret))
+    } else if let Some(secret_env) =
+        parcel_ingress.and_then(|ingress| ingress.shared_secret_env.as_deref())
+    {
+        let secret = env::var(secret_env).with_context(|| {
+            format!("service listener secret `{secret_env}` is not available in the environment")
+        })?;
+        Some(hash_shared_secret(&secret))
+    } else {
+        None
+    };
+    let max_body_bytes = args
+        .listen_max_body_bytes
+        .or_else(|| parcel_ingress.and_then(|ingress| ingress.max_body_bytes))
+        .unwrap_or(DEFAULT_INGRESS_MAX_BODY_BYTES);
+    let max_header_bytes = args
+        .listen_max_header_bytes
+        .or_else(|| parcel_ingress.and_then(|ingress| ingress.max_header_bytes))
+        .unwrap_or(DEFAULT_INGRESS_MAX_HEADER_BYTES);
+    validate_ingress_limits(max_body_bytes, max_header_bytes)?;
+    Ok(ServiceIngressConfig {
+        path,
+        methods,
+        shared_secret_sha256,
+        max_body_bytes,
+        max_header_bytes,
+    })
+}
+
+fn merged_ingress_methods(parcel_methods: &[String], cli_methods: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    for method in parcel_methods.iter().chain(cli_methods.iter()) {
+        let method = normalize_listen_method(method);
+        if !merged.iter().any(|existing| existing == &method) {
+            merged.push(method);
         }
     }
     merged
@@ -1591,7 +1665,49 @@ mod tests {
     use crate::CliA2aPolicy;
     use std::collections::BTreeMap;
     use std::io::Cursor;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    fn test_parcel(
+        dir: &std::path::Path,
+        ingress: Option<dispatch_core::IngressPolicyConfig>,
+    ) -> dispatch_core::LoadedParcel {
+        dispatch_core::LoadedParcel {
+            parcel_dir: dir.join("parcel"),
+            manifest_path: dir.join("parcel/manifest.json"),
+            config: dispatch_core::ParcelManifest {
+                schema: dispatch_core::PARCEL_SCHEMA_URL.to_string(),
+                format_version: dispatch_core::PARCEL_FORMAT_VERSION,
+                digest: "d".repeat(64),
+                source_agentfile: "Agentfile".to_string(),
+                courier: dispatch_core::CourierTarget::from_reference(
+                    "dispatch/native:latest".to_string(),
+                ),
+                framework: None,
+                name: Some("demo".to_string()),
+                version: Some("1.0.0".to_string()),
+                entrypoint: Some("heartbeat".to_string()),
+                schedules: Vec::new(),
+                listeners: vec!["127.0.0.1:0".to_string()],
+                ingress,
+                instructions: Vec::new(),
+                inline_prompts: Vec::new(),
+                env: Vec::new(),
+                secrets: Vec::new(),
+                visibility: None,
+                mounts: Vec::new(),
+                tools: Vec::new(),
+                tests: Vec::new(),
+                models: dispatch_core::ModelPolicy::default(),
+                compaction: None,
+                limits: Vec::new(),
+                timeouts: Vec::new(),
+                network: Vec::new(),
+                labels: BTreeMap::new(),
+                files: Vec::new(),
+            },
+        }
+    }
 
     #[test]
     fn resolve_run_prefix_matches_unique_ids() {
@@ -1899,5 +2015,93 @@ mod tests {
             envelope.headers.get("content-type"),
             Some(&"application/json".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_service_ingress_config_uses_authored_policy_defaults() {
+        let dir = tempdir().unwrap();
+        let parcel = test_parcel(
+            dir.path(),
+            Some(dispatch_core::IngressPolicyConfig {
+                path: Some("/hook".to_string()),
+                methods: vec!["POST".to_string()],
+                shared_secret_env: Some("DISPATCH_WEBHOOK_SECRET_DEFAULTS".to_string()),
+                max_body_bytes: Some(2048),
+                max_header_bytes: Some(4096),
+            }),
+        );
+        // SAFETY: test-only environment mutation scoped to this process.
+        unsafe { std::env::set_var("DISPATCH_WEBHOOK_SECRET_DEFAULTS", "topsecret") };
+        let args = crate::ServeArgs {
+            path: PathBuf::from("."),
+            courier: "native".to_string(),
+            registry: None,
+            session_file: None,
+            payload: None,
+            interval_ms: 30_000,
+            schedules: Vec::new(),
+            listens: Vec::new(),
+            listen_path: None,
+            listen_methods: vec!["PUT".to_string()],
+            listen_shared_secret: None,
+            listen_max_body_bytes: None,
+            listen_max_header_bytes: Some(8192),
+            detach: false,
+            a2a_allowed_origins: None,
+            a2a_trust_policy: None,
+        };
+        let ingress = super::resolve_service_ingress_config(&parcel, &args).unwrap();
+        assert_eq!(ingress.path.as_deref(), Some("/hook"));
+        assert_eq!(ingress.methods, vec!["POST".to_string(), "PUT".to_string()]);
+        assert_eq!(
+            ingress.shared_secret_sha256,
+            Some(super::hash_shared_secret("topsecret"))
+        );
+        assert_eq!(ingress.max_body_bytes, 2048);
+        assert_eq!(ingress.max_header_bytes, 8192);
+        // SAFETY: paired cleanup for test-only environment mutation.
+        unsafe { std::env::remove_var("DISPATCH_WEBHOOK_SECRET_DEFAULTS") };
+    }
+
+    #[test]
+    fn resolve_service_ingress_config_prefers_cli_secret_over_authored_env() {
+        let dir = tempdir().unwrap();
+        let parcel = test_parcel(
+            dir.path(),
+            Some(dispatch_core::IngressPolicyConfig {
+                path: None,
+                methods: Vec::new(),
+                shared_secret_env: Some("DISPATCH_WEBHOOK_SECRET_OVERRIDE".to_string()),
+                max_body_bytes: None,
+                max_header_bytes: None,
+            }),
+        );
+        // SAFETY: test-only environment mutation scoped to this process.
+        unsafe { std::env::set_var("DISPATCH_WEBHOOK_SECRET_OVERRIDE", "fromenv") };
+        let args = crate::ServeArgs {
+            path: PathBuf::from("."),
+            courier: "native".to_string(),
+            registry: None,
+            session_file: None,
+            payload: None,
+            interval_ms: 30_000,
+            schedules: Vec::new(),
+            listens: Vec::new(),
+            listen_path: None,
+            listen_methods: Vec::new(),
+            listen_shared_secret: Some("fromcli".to_string()),
+            listen_max_body_bytes: None,
+            listen_max_header_bytes: None,
+            detach: false,
+            a2a_allowed_origins: None,
+            a2a_trust_policy: None,
+        };
+        let ingress = super::resolve_service_ingress_config(&parcel, &args).unwrap();
+        assert_eq!(
+            ingress.shared_secret_sha256,
+            Some(super::hash_shared_secret("fromcli"))
+        );
+        // SAFETY: paired cleanup for test-only environment mutation.
+        unsafe { std::env::remove_var("DISPATCH_WEBHOOK_SECRET_OVERRIDE") };
     }
 }

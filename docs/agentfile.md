@@ -540,6 +540,69 @@ SECRET OPENAI_API_KEY
 SECRET DATABASE_URL
 ```
 
+#### `LISTEN`
+
+Declares a local listener binding for `dispatch serve`.
+
+```dockerfile
+LISTEN "127.0.0.1:0"
+LISTEN "127.0.0.1:9000"
+```
+
+Semantics:
+
+- service-only metadata consumed by `dispatch serve`
+- preserved in the built parcel manifest
+- merged with any runtime `dispatch serve --listen ...` flags
+
+#### `LISTEN_PATH`
+
+Restricts ingress to one exact request path.
+
+```dockerfile
+LISTEN_PATH "/hook"
+```
+
+#### `LISTEN_METHOD`
+
+Restricts ingress to one HTTP method. May be repeated.
+
+```dockerfile
+LISTEN_METHOD POST
+LISTEN_METHOD PUT
+```
+
+#### `LISTEN_SECRET`
+
+References a declared `SECRET` whose runtime value is used as the shared listener secret.
+
+```dockerfile
+SECRET DISPATCH_WEBHOOK_SECRET
+LISTEN_SECRET DISPATCH_WEBHOOK_SECRET
+```
+
+Semantics:
+
+- the referenced name must also be declared via `SECRET`
+- the secret value is read from the process environment when `dispatch serve` starts
+- the secret value is not stored in the parcel manifest or run record
+
+#### `LISTEN_MAX_BODY_BYTES`
+
+Sets the maximum accepted request body size.
+
+```dockerfile
+LISTEN_MAX_BODY_BYTES 8192
+```
+
+#### `LISTEN_MAX_HEADER_BYTES`
+
+Sets the maximum accepted request line plus header size.
+
+```dockerfile
+LISTEN_MAX_HEADER_BYTES 4096
+```
+
 #### `NETWORK`
 
 ```dockerfile

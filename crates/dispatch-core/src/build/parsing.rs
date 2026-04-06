@@ -49,6 +49,48 @@ pub(super) fn validate_entrypoint_value(value: &str, context: &str) -> Result<St
     }
 }
 
+pub(super) fn validate_listener_path(value: &str, context: &str) -> Result<String, BuildError> {
+    if value.starts_with('/') {
+        Ok(if value == "/" {
+            "/".to_string()
+        } else {
+            value.trim_end_matches('/').to_string()
+        })
+    } else {
+        Err(BuildError::Validation(format!(
+            "{context} must start with `/`, got `{value}`"
+        )))
+    }
+}
+
+pub(super) fn validate_listener_method(value: &str, context: &str) -> Result<String, BuildError> {
+    let normalized = value.trim().to_ascii_uppercase();
+    if normalized.is_empty()
+        || !normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
+    {
+        return Err(BuildError::Validation(format!(
+            "{context} must be an uppercase HTTP method token, got `{value}`"
+        )));
+    }
+    Ok(normalized)
+}
+
+pub(super) fn parse_listener_size_limit(value: &str, context: &str) -> Result<usize, BuildError> {
+    let parsed = value.parse::<usize>().map_err(|_| {
+        BuildError::Validation(format!(
+            "{context} must be a positive integer, got `{value}`"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(BuildError::Validation(format!(
+            "{context} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
+}
+
 pub(super) fn parse_test_spec(args: &[Value], line: usize) -> Result<TestSpec, BuildError> {
     let target = scalar_at(args, 0);
     let Some(tool) = target.strip_prefix("tool:") else {
