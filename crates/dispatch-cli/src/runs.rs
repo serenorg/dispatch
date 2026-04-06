@@ -17,6 +17,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+static TEST_ENV_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> =
+    std::sync::OnceLock::new();
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunStatus {
@@ -118,6 +122,40 @@ struct RunPaths {
 
 const DEFAULT_INGRESS_MAX_BODY_BYTES: usize = 262_144;
 const DEFAULT_INGRESS_MAX_HEADER_BYTES: usize = 16_384;
+
+fn env_var(name: &str) -> Result<String, env::VarError> {
+    #[cfg(test)]
+    if let Some(overrides) = TEST_ENV_OVERRIDES.get()
+        && let Some(value) = overrides
+            .lock()
+            .expect("test env override lock poisoned")
+            .get(name)
+            .cloned()
+    {
+        return value.ok_or(env::VarError::NotPresent);
+    }
+
+    env::var(name)
+}
+
+#[cfg(test)]
+fn set_test_env_override(name: &str, value: Option<&str>) {
+    TEST_ENV_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("test env override lock poisoned")
+        .insert(name.to_string(), value.map(ToString::to_string));
+}
+
+#[cfg(test)]
+fn clear_test_env_override(name: &str) {
+    if let Some(overrides) = TEST_ENV_OVERRIDES.get() {
+        overrides
+            .lock()
+            .expect("test env override lock poisoned")
+            .remove(name);
+    }
+}
 
 pub(crate) fn run_detached(args: crate::RunArgs) -> Result<()> {
     let crate::RunArgs { path, exec } = args;
@@ -833,7 +871,7 @@ fn resolve_service_ingress_config(
     } else if let Some(secret_env) =
         parcel_ingress.and_then(|ingress| ingress.shared_secret_env.as_deref())
     {
-        let secret = env::var(secret_env).with_context(|| {
+        let secret = env_var(secret_env).with_context(|| {
             format!("service listener secret `{secret_env}` is not available in the environment")
         })?;
         Some(hash_shared_secret(&secret))
@@ -1850,7 +1888,10 @@ impl<A: io::Write, B: io::Write> io::Write for TeeWriter<A, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunOperation, RunRecord, RunStatus, ServiceIngressConfig, resolve_run_prefix};
+    use super::{
+        RunOperation, RunRecord, RunStatus, ServiceIngressConfig, clear_test_env_override,
+        resolve_run_prefix, set_test_env_override,
+    };
     use crate::CliA2aPolicy;
     use serial_test::serial;
     use std::collections::BTreeMap;
@@ -1858,6 +1899,21 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    struct TestEnvOverride(&'static str);
+
+    impl TestEnvOverride {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            set_test_env_override(name, value);
+            Self(name)
+        }
+    }
+
+    impl Drop for TestEnvOverride {
+        fn drop(&mut self) {
+            clear_test_env_override(self.0);
+        }
+    }
 
     fn test_parcel(
         dir: &std::path::Path,
@@ -2356,8 +2412,7 @@ mod tests {
                 max_header_bytes: Some(4096),
             }),
         );
-        // SAFETY: test-only environment mutation scoped to this process.
-        unsafe { std::env::set_var("DISPATCH_WEBHOOK_SECRET_DEFAULTS", "topsecret") };
+        let _env = TestEnvOverride::set("DISPATCH_WEBHOOK_SECRET_DEFAULTS", Some("topsecret"));
         let args = crate::ServeArgs {
             path: PathBuf::from("."),
             courier: "native".to_string(),
@@ -2385,8 +2440,6 @@ mod tests {
         );
         assert_eq!(ingress.max_body_bytes, 2048);
         assert_eq!(ingress.max_header_bytes, 8192);
-        // SAFETY: paired cleanup for test-only environment mutation.
-        unsafe { std::env::remove_var("DISPATCH_WEBHOOK_SECRET_DEFAULTS") };
     }
 
     #[test]
@@ -2403,8 +2456,7 @@ mod tests {
                 max_header_bytes: None,
             }),
         );
-        // SAFETY: test-only environment mutation scoped to this process.
-        unsafe { std::env::set_var("DISPATCH_WEBHOOK_SECRET_OVERRIDE", "fromenv") };
+        let _env = TestEnvOverride::set("DISPATCH_WEBHOOK_SECRET_OVERRIDE", Some("fromenv"));
         let args = crate::ServeArgs {
             path: PathBuf::from("."),
             courier: "native".to_string(),
@@ -2428,7 +2480,5 @@ mod tests {
             ingress.shared_secret_sha256,
             Some(super::hash_shared_secret("fromcli"))
         );
-        // SAFETY: paired cleanup for test-only environment mutation.
-        unsafe { std::env::remove_var("DISPATCH_WEBHOOK_SECRET_OVERRIDE") };
     }
 }

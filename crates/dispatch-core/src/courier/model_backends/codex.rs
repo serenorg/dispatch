@@ -120,7 +120,7 @@ fn codex_binary_path() -> String {
         return path;
     }
 
-    std::env::var("CODEX_BINARY").unwrap_or_else(|_| "codex".to_string())
+    env_var("CODEX_BINARY").unwrap_or_else(|_| "codex".to_string())
 }
 
 fn requested_model_reasoning_effort(request: &ModelRequest) -> Option<String> {
@@ -129,7 +129,7 @@ fn requested_model_reasoning_effort(request: &ModelRequest) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
         .or_else(|| {
-            std::env::var("DISPATCH_REASONING_EFFORT")
+            env_var("DISPATCH_REASONING_EFFORT")
                 .ok()
                 .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty())
@@ -283,7 +283,7 @@ impl CodexProcess {
         command
             .arg("app-server")
             .current_dir(Path::new(working_directory));
-        if let Ok(home) = std::env::var("CODEX_HOME") {
+        if let Ok(home) = env_var("CODEX_HOME") {
             let trimmed = home.trim();
             if !trimmed.is_empty() {
                 command.env("CODEX_HOME", trimmed);

@@ -265,7 +265,7 @@ fn claude_binary_path() -> String {
         return path;
     }
 
-    std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
+    env_var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string())
 }
 
 fn claude_persistence_enabled(request: &ModelRequest) -> bool {
@@ -280,7 +280,7 @@ fn claude_reasoning_effort(request: &ModelRequest) -> Result<Option<String>, Cou
         .filter(|v| !v.is_empty())
         .map(|v| v.to_ascii_lowercase())
         .or_else(|| {
-            std::env::var("DISPATCH_REASONING_EFFORT")
+            env_var("DISPATCH_REASONING_EFFORT")
                 .ok()
                 .map(|v| v.trim().to_ascii_lowercase())
                 .filter(|v| !v.is_empty())

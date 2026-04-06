@@ -1,5 +1,23 @@
 use super::*;
 
+// These overrides are process-global within the test binary. Only use them in
+// tests that also hold `lock_codex_backend_test()` so backend env state remains
+// serialized alongside the mocked binary overrides.
+struct TestEnvOverride(&'static str);
+
+impl TestEnvOverride {
+    fn set(name: &'static str, value: Option<&str>) -> Self {
+        set_test_env_override(name, value);
+        Self(name)
+    }
+}
+
+impl Drop for TestEnvOverride {
+    fn drop(&mut self) {
+        clear_test_env_override(self.0);
+    }
+}
+
 #[test]
 fn openai_tool_definition_uses_function_shape_for_schema_tools() {
     let value = openai_tool_definition(&ModelToolDefinition {
@@ -646,10 +664,7 @@ fn claude_backend_uses_reasoning_effort_model_option() {
 #[cfg(unix)]
 fn claude_backend_uses_reasoning_effort_env_override() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
-    unsafe {
-        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_REASONING_EFFORT", Some("low"));
 
     let dir = tempdir().unwrap();
     let args_log_path = dir.path().join("claude-args.log");
@@ -686,15 +701,6 @@ fn claude_backend_uses_reasoning_effort_env_override() {
         &mut |_| {},
     );
 
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_REASONING_EFFORT");
-        },
-    }
-
     result.unwrap();
 
     let log = fs::read_to_string(&args_log_path).unwrap();
@@ -708,10 +714,7 @@ fn claude_backend_uses_reasoning_effort_env_override() {
 #[cfg(unix)]
 fn claude_backend_model_option_takes_precedence_over_reasoning_effort_env() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
-    unsafe {
-        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_REASONING_EFFORT", Some("low"));
 
     let dir = tempdir().unwrap();
     let args_log_path = dir.path().join("claude-args.log");
@@ -749,15 +752,6 @@ fn claude_backend_model_option_takes_precedence_over_reasoning_effort_env() {
         },
         &mut |_| {},
     );
-
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_REASONING_EFFORT");
-        },
-    }
 
     result.unwrap();
 
@@ -811,10 +805,7 @@ fn claude_backend_rejects_unsupported_reasoning_effort_model_option() {
 
 #[test]
 fn claude_backend_rejects_unsupported_reasoning_effort_env_override() {
-    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
-    unsafe {
-        std::env::set_var("DISPATCH_REASONING_EFFORT", "turbo");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_REASONING_EFFORT", Some("turbo"));
 
     let backend = ClaudeCliBackend;
     let result = backend.generate_with_events(
@@ -839,15 +830,6 @@ fn claude_backend_rejects_unsupported_reasoning_effort_env_override() {
         },
         &mut |_| {},
     );
-
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_REASONING_EFFORT");
-        },
-    }
 
     let error = result.unwrap_err().to_string();
     assert!(
@@ -1192,10 +1174,7 @@ fn codex_backend_can_disable_persistent_history_per_request() {
 #[cfg(unix)]
 fn codex_backend_env_override_disables_persistent_history() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_PERSIST_THREAD");
-    unsafe {
-        std::env::set_var("DISPATCH_PERSIST_THREAD", "0");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_PERSIST_THREAD", Some("0"));
 
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("codex.log");
@@ -1234,15 +1213,6 @@ fn codex_backend_env_override_disables_persistent_history() {
         },
         &mut |_| {},
     );
-
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_PERSIST_THREAD", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_PERSIST_THREAD");
-        },
-    }
 
     let reply = match result.unwrap() {
         ModelGeneration::Reply(reply) => reply,
@@ -1313,10 +1283,7 @@ fn codex_backend_uses_reasoning_effort_model_option() {
 #[cfg(unix)]
 fn codex_backend_env_override_sets_reasoning_effort() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
-    unsafe {
-        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_REASONING_EFFORT", Some("low"));
 
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("codex.log");
@@ -1355,15 +1322,6 @@ fn codex_backend_env_override_sets_reasoning_effort() {
         &mut |_| {},
     );
 
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_REASONING_EFFORT");
-        },
-    }
-
     result.unwrap();
 
     let log = fs::read_to_string(&log_path).unwrap();
@@ -1381,10 +1339,7 @@ fn codex_backend_env_override_sets_reasoning_effort() {
 #[cfg(unix)]
 fn codex_backend_model_option_takes_precedence_over_reasoning_effort_env() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
-    unsafe {
-        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_REASONING_EFFORT", Some("low"));
 
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("codex.log");
@@ -1425,15 +1380,6 @@ fn codex_backend_model_option_takes_precedence_over_reasoning_effort_env() {
         &mut |_| {},
     );
 
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_REASONING_EFFORT");
-        },
-    }
-
     result.unwrap();
 
     let log = fs::read_to_string(&log_path).unwrap();
@@ -1451,10 +1397,7 @@ fn codex_backend_model_option_takes_precedence_over_reasoning_effort_env() {
 #[cfg(unix)]
 fn codex_backend_omits_reasoning_effort_when_unset() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
-    unsafe {
-        std::env::remove_var("DISPATCH_REASONING_EFFORT");
-    }
+    let _env = TestEnvOverride::set("DISPATCH_REASONING_EFFORT", None);
     let dir = tempdir().unwrap();
     let log_path = dir.path().join("codex.log");
     let script_path = dir.path().join("codex-app-server");
@@ -1492,15 +1435,6 @@ fn codex_backend_omits_reasoning_effort_when_unset() {
             &mut |_| {},
         )
         .unwrap();
-
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
-        },
-        None => unsafe {
-            std::env::remove_var("DISPATCH_REASONING_EFFORT");
-        },
-    }
 
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -1670,13 +1604,10 @@ fn codex_backend_respects_llm_timeout() {
 #[cfg(unix)]
 fn codex_backend_preserves_existing_codex_home() {
     let _guard = lock_codex_backend_test();
-    let previous = std::env::var_os("CODEX_HOME");
     let dir = tempdir().unwrap();
     let expected_home = dir.path().join("codex-home");
     fs::create_dir_all(&expected_home).unwrap();
-    unsafe {
-        std::env::set_var("CODEX_HOME", &expected_home);
-    }
+    let _env = TestEnvOverride::set("CODEX_HOME", Some(&expected_home.to_string_lossy()));
 
     let env_log_path = dir.path().join("codex-home.log");
     let script_path = dir.path().join("codex-app-server");
@@ -1712,15 +1643,6 @@ fn codex_backend_preserves_existing_codex_home() {
         },
         &mut |_| {},
     );
-
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("CODEX_HOME", value);
-        },
-        None => unsafe {
-            std::env::remove_var("CODEX_HOME");
-        },
-    }
 
     result.unwrap();
 

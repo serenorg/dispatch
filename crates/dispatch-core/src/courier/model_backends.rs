@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::{
     io::BufRead,
     process::Child,
@@ -45,6 +47,44 @@ fn request_timeout(request: &ModelRequest) -> Option<Duration> {
     request.llm_timeout_ms.map(Duration::from_millis)
 }
 
+#[cfg(test)]
+static TEST_ENV_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> =
+    std::sync::OnceLock::new();
+
+fn env_var(name: &str) -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    if let Some(overrides) = TEST_ENV_OVERRIDES.get()
+        && let Some(value) = overrides
+            .lock()
+            .expect("test env override lock poisoned")
+            .get(name)
+            .cloned()
+    {
+        return value.ok_or(std::env::VarError::NotPresent);
+    }
+
+    std::env::var(name)
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_env_override(name: &str, value: Option<&str>) {
+    TEST_ENV_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("test env override lock poisoned")
+        .insert(name.to_string(), value.map(ToString::to_string));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_env_override(name: &str) {
+    if let Some(overrides) = TEST_ENV_OVERRIDES.get() {
+        overrides
+            .lock()
+            .expect("test env override lock poisoned")
+            .remove(name);
+    }
+}
+
 pub(super) fn model_option_value<'a>(request: &'a ModelRequest, key: &str) -> Option<&'a str> {
     request.model_options.get(key).map(String::as_str)
 }
@@ -54,9 +94,7 @@ pub(super) fn model_option_bool(request: &ModelRequest, key: &str) -> Option<boo
 }
 
 pub(super) fn env_flag_override(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| parse_flag_bool(&value))
+    env_var(name).ok().and_then(|value| parse_flag_bool(&value))
 }
 
 pub(super) fn parse_flag_bool(value: &str) -> Option<bool> {
@@ -181,15 +219,13 @@ where
 }
 
 fn model_api_key(primary: &str, fallback: &str) -> Option<String> {
-    std::env::var(primary)
-        .ok()
-        .or_else(|| std::env::var(fallback).ok())
+    env_var(primary).ok().or_else(|| env_var(fallback).ok())
 }
 
 fn model_base_url(primary: &str, fallback: &str, default: &str) -> String {
-    std::env::var(primary)
+    env_var(primary)
         .ok()
-        .or_else(|| std::env::var(fallback).ok())
+        .or_else(|| env_var(fallback).ok())
         .unwrap_or_else(|| default.to_string())
 }
 

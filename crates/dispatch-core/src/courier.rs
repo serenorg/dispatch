@@ -48,7 +48,8 @@ use self::memory_store::{memory_delete, memory_get, memory_list, memory_put};
 #[cfg(test)]
 use self::model_backends::{
     ClaudeCliBackend, CodexAppServerBackend, clear_test_claude_binary_override,
-    clear_test_codex_binary_override, clear_test_plugin_binary_override,
+    clear_test_codex_binary_override, clear_test_env_override, clear_test_plugin_binary_override,
+    set_test_env_override,
 };
 #[cfg(test)]
 use self::model_request::{

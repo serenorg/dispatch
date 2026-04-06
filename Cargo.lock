@@ -818,6 +818,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "libc",
+ "nix",
  "serde",
  "serde_json",
  "serial_test",

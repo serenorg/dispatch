@@ -1,3 +1,8 @@
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -305,10 +310,7 @@ fn inspect_run_reconciles_dead_service_helpers() -> Result<(), Box<dyn std::erro
     let record = wait_for_run_record(&record_path, |record| record["status"] == "running")?;
     let pid = record["pid"].as_u64().ok_or("missing pid")? as i32;
 
-    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    kill(Pid::from_raw(pid), Signal::SIGKILL)?;
 
     let inspect_output = require_success(
         run_dispatch(dir.path(), &[], &["inspect-run", &run_id, ".", "--json"])?,
