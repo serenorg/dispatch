@@ -54,6 +54,17 @@ fn default_chat_backend_selects_gemini_from_env() {
 }
 
 #[test]
+fn default_chat_backend_selects_claude_from_env() {
+    let backend = default_chat_backend_for_provider_with(None, |name| match name {
+        "LLM_BACKEND" => Some("claude".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(backend.id(), "claude");
+    assert!(backend.supports_previous_response_id());
+}
+
+#[test]
 fn default_chat_backend_selects_codex_from_env() {
     let backend = default_chat_backend_for_provider_with(None, |name| match name {
         "LLM_BACKEND" => Some("codex".to_string()),
@@ -62,6 +73,14 @@ fn default_chat_backend_selects_codex_from_env() {
 
     assert_eq!(backend.id(), CODEX_BACKEND_ID);
     assert!(backend.supports_previous_response_id());
+}
+
+#[test]
+fn default_chat_backend_selects_plugin_for_unknown_provider() {
+    let backend = default_chat_backend_for_provider_with(Some("demo-plugin"), |_| None);
+
+    assert_eq!(backend.id(), "demo-plugin");
+    assert!(!backend.supports_previous_response_id());
 }
 
 #[test]
@@ -349,6 +368,508 @@ fn gemini_messages_include_function_call_and_response_parts() {
         messages[2]["parts"][0]["functionResponse"]["name"],
         "lookup"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_streams_reply_and_resumes_previous_session() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let args_log_path = dir.path().join("claude-args.log");
+    let stdin_log_path = dir.path().join("claude-stdin.log");
+    let script_path = dir.path().join("claude");
+    // Mock script emits stream-json NDJSON. Detects resume by checking for
+    // --resume in the CLI args it received.
+    write_executable_script(
+        &script_path,
+        &format!(
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' \"$*\" >> '{log}'\n",
+                "while IFS= read -r line; do\n",
+                "  printf '%s\\n' \"$line\" >> '{stdin_log}'\n",
+                "done\n",
+                "case \"$*\" in\n",
+                "*--resume\\ session-new*)\n",
+                "  printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"followed up\"}}}}}}'\n",
+                "  printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"followed up\",\"session_id\":\"session-new\",\"is_error\":false}}'\n",
+                "  ;;\n",
+                "*)\n",
+                "  printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"hello \"}}}}}}'\n",
+                "  printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"world\"}}}}}}'\n",
+                "  printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hello world\",\"session_id\":\"session-new\",\"is_error\":false}}'\n",
+                "  ;;\n",
+                "esac\n",
+            ),
+            log = args_log_path.display(),
+            stdin_log = stdin_log_path.display(),
+        ),
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let mut first_deltas = Vec::new();
+    let first = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |event| match event {
+                ModelStreamEvent::TextDelta { content } => first_deltas.push(content),
+            },
+        )
+        .unwrap();
+    let first = match first {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected claude reply, got {other:?}"),
+    };
+    assert_eq!(first.text.as_deref(), Some("hello world"));
+    assert_eq!(
+        first_deltas,
+        vec!["hello ".to_string(), "world".to_string()]
+    );
+    let first_state = first
+        .response_id
+        .clone()
+        .expect("claude state should persist");
+
+    let second = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "follow up".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: Some(first_state),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    let second = match second {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected claude reply, got {other:?}"),
+    };
+    assert_eq!(second.text.as_deref(), Some("followed up"));
+    assert_eq!(second.response_id.as_deref(), Some("session-new"));
+
+    let log = fs::read_to_string(&args_log_path).unwrap();
+    assert!(
+        !log.contains("--bare"),
+        "--bare must not be used; it disables OAuth auth"
+    );
+    assert!(log.contains("--input-format stream-json"));
+    assert!(log.contains("--output-format stream-json"));
+    assert!(log.contains("--setting-sources"));
+    assert!(log.contains("--model claude-sonnet-4-6"));
+    assert!(log.contains("--resume session-new"));
+
+    let stdin_log = fs::read_to_string(&stdin_log_path).unwrap();
+    let stdin_lines = stdin_log.lines().collect::<Vec<_>>();
+    assert_eq!(
+        stdin_lines.len(),
+        2,
+        "unexpected stdin payloads: {stdin_log}"
+    );
+
+    let first_payload: serde_json::Value = serde_json::from_str(stdin_lines[0]).unwrap();
+    assert_eq!(first_payload["type"], "user");
+    assert_eq!(first_payload["message"]["role"], "user");
+    assert_eq!(first_payload["message"]["content"], "hello");
+    assert_eq!(first_payload["session_id"], "");
+
+    let second_payload: serde_json::Value = serde_json::from_str(stdin_lines[1]).unwrap();
+    assert_eq!(second_payload["type"], "user");
+    assert_eq!(second_payload["message"]["role"], "user");
+    assert_eq!(second_payload["message"]["content"], "follow up");
+    assert_eq!(second_payload["session_id"], "session-new");
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_can_disable_persistent_session_per_request() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let args_log_path = dir.path().join("claude-args.log");
+    let stdin_log_path = dir.path().join("claude-stdin.log");
+    let script_path = dir.path().join("claude");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> '{}'\ndone\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"some-session\",\"is_error\":false}}'\n",
+            args_log_path.display(),
+            stdin_log_path.display()
+        ),
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let reply = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: [("persist-thread".to_string(), "false".to_string())]
+                    .into_iter()
+                    .collect(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: Some("session-old".to_string()),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    let reply = match reply {
+        ModelGeneration::Reply(reply) => reply,
+        other => panic!("expected claude reply, got {other:?}"),
+    };
+    // persist-thread=false -> no response_id returned, no --resume passed,
+    // and --no-session-persistence is used to avoid writing a session file.
+    assert!(reply.response_id.is_none());
+    let log = fs::read_to_string(&args_log_path).unwrap();
+    assert!(
+        !log.contains("--resume"),
+        "expected no --resume when persist-thread=false"
+    );
+    assert!(
+        log.contains("--no-session-persistence"),
+        "expected --no-session-persistence when persist-thread=false"
+    );
+    assert!(
+        log.contains("--append-system-prompt Be helpful."),
+        "expected system instructions on fresh ephemeral session: {log}"
+    );
+
+    let stdin_log = fs::read_to_string(&stdin_log_path).unwrap();
+    let stdin_lines = stdin_log.lines().collect::<Vec<_>>();
+    assert_eq!(
+        stdin_lines.len(),
+        1,
+        "unexpected stdin payloads: {stdin_log}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(stdin_lines[0]).unwrap();
+    assert_eq!(payload["message"]["content"], "hello");
+    assert_eq!(payload["session_id"], "");
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_uses_reasoning_effort_model_option() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let args_log_path = dir.path().join("claude-args.log");
+    let script_path = dir.path().join("claude");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"s1\",\"is_error\":false}}'\n",
+            args_log_path.display()
+        ),
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let _ = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: [("reasoning-effort".to_string(), "high".to_string())]
+                    .into_iter()
+                    .collect(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    let log = fs::read_to_string(&args_log_path).unwrap();
+    assert!(
+        log.contains("--effort high"),
+        "expected --effort high in args: {log}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_uses_reasoning_effort_env_override() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
+    unsafe {
+        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
+    }
+
+    let dir = tempdir().unwrap();
+    let args_log_path = dir.path().join("claude-args.log");
+    let script_path = dir.path().join("claude");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"s1\",\"is_error\":false}}'\n",
+            args_log_path.display()
+        ),
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            provider: Some("claude".to_string()),
+            model_options: Default::default(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: Some(dir.path().display().to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_REASONING_EFFORT");
+        },
+    }
+
+    result.unwrap();
+
+    let log = fs::read_to_string(&args_log_path).unwrap();
+    assert!(
+        log.contains("--effort low"),
+        "expected env-supplied --effort low in args: {log}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_returns_not_configured_when_binary_is_missing() {
+    let _guard = lock_codex_backend_test();
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(
+        "/definitely/missing/dispatch-test-claude".to_string(),
+    );
+
+    let result = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: None,
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    match result {
+        ModelGeneration::NotConfigured { backend, reason } => {
+            assert_eq!(backend, "claude");
+            assert!(
+                reason.contains("CLAUDE_BINARY"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected NotConfigured, got {other:?}"),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_surfaces_result_errors() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("claude");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error\",\"result\":\"auth failed\",\"is_error\":true}'\n",
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("auth failed"));
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_includes_stderr_on_non_zero_exit() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("claude");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nprintf '%s\\n' 'fatal from stderr' >&2\nexit 7\n",
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("status exit status: 7"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("fatal from stderr"),
+        "stderr detail missing from error: {message}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_backend_respects_llm_timeout() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("claude");
+    write_executable_script(&script_path, "#!/bin/sh\nsleep 2\n");
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: Some(50),
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("timed out"));
 }
 
 #[test]

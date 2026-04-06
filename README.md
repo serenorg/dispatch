@@ -374,7 +374,7 @@ The native courier runs the parcel directly on the local machine as a host proce
 Model backend selection:
 
 - if the parcel declares `MODEL <id> PROVIDER <backend>`, that provider is used
-- if no parcel-level provider, `LLM_BACKEND` selects the backend: `openai`, `anthropic`, `gemini`, `openai_compatible`, `codex`
+- if no parcel-level provider, `LLM_BACKEND` selects the backend: `openai`, `anthropic`, `claude`, `gemini`, `openai_compatible`, `codex`
 - `FALLBACK <id> [PROVIDER <backend>]` entries are tried in order when the primary backend fails before producing a reply
 
 Supported backends:
@@ -383,11 +383,14 @@ Supported backends:
 |---------|-----|-------------|
 | `openai` | OpenAI Responses API | `OPENAI_API_KEY` |
 | `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
+| `claude` | `claude` CLI | local `claude` auth; optional `CLAUDE_BINARY`, `DISPATCH_PERSIST_THREAD`, `DISPATCH_REASONING_EFFORT` |
 | `gemini` | Gemini generateContent | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 | `openai_compatible` | Chat Completions | `LLM_API_KEY` + `LLM_BASE_URL` |
 | `codex` | Local `codex app-server` JSON-RPC transport | optional `CODEX_BINARY`, `CODEX_HOME`, `DISPATCH_PERSIST_THREAD`, `DISPATCH_REASONING_EFFORT` (value passed through to Codex; typically `low`, `medium`, or `high`) |
 
 `LLM_API_KEY` and `LLM_BASE_URL` take precedence over provider-specific vars. Provider-specific vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) are checked as fallbacks when the `LLM_*` vars are not set.
+
+`claude` uses the local `claude` CLI instead of a hosted HTTP API. Authentication is handled entirely by the local `claude` binary using whatever login, config, or environment-based credentials it already supports; Dispatch does not preflight or inject API keys for this backend. Dispatch does not load `CLAUDE.md` or Claude settings files from the working directory, which keeps the execution context explicit. By default Dispatch persists Claude session state and resumes that session on later turns. Parcel authors can declare `MODEL ... PROVIDER claude --persist-thread=false` to request ephemeral sessions instead, and may also set `--reasoning-effort=high` at the parcel level. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. Set `CLAUDE_BINARY` to override the path to the `claude` executable (default: `claude` on `PATH`). To preserve Dispatch's capability boundary, ambient Claude tool actions are denied unless Dispatch grows an explicit tool bridge for them.
 
 `codex` uses the local `codex app-server` process instead of a hosted HTTP API. Dispatch starts a fresh app-server process per model call, but by default it persists Codex thread state and resumes that thread on later turns when `--session-file` or interactive session state is present. Parcel authors can declare `MODEL ... PROVIDER codex --persist-thread=false` to request ephemeral Codex threads instead, and may also set `--reasoning-effort=high` at the parcel level. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. If neither the parcel nor the env sets a reasoning effort, Dispatch omits the override and lets Codex use the selected model's default effort. Dispatch leaves Codex using its normal home/config/auth location unless the environment already overrides `CODEX_HOME`. When persistence is disabled, no Codex rollout files are saved and follow-up context comes from Dispatch session history instead. To preserve Dispatch's capability boundary, app-server permission requests are denied by default in this backend, so ambient Codex command/file/MCP actions are not available unless Dispatch grows an explicit tool bridge for them. This backend intentionally preserves the user's Codex auth/config for both modes. On Unix the reference implementation uses a PTY-backed transport for Codex; other targets currently fall back to plain process pipes.
 

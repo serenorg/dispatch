@@ -3,7 +3,8 @@ use super::{
     LoadedParcel, LocalToolSpec, LocalToolTarget, ModelReference, ModelRequest,
     ModelToolDefinition, ModelToolFormat, Sha256, WasmModelRequestInput,
     builtin_memory_tool_description, default_chat_backend_for_provider, effective_llm_timeout_ms,
-    encode_hex, list_native_builtin_tools, process_env_lookup, resolve_prompt_text,
+    encode_hex, is_provider_session_state_capable, list_native_builtin_tools, process_env_lookup,
+    resolve_prompt_text,
 };
 use sha2::Digest;
 use std::fs;
@@ -49,16 +50,17 @@ pub(super) fn build_model_requests(
     Ok(model_refs
         .into_iter()
         .map(|model| {
-            // Only pass backend_state as previous_response_id to Codex providers.
-            // Non-Codex backends (OpenAI, Anthropic, …) use previous_response_id
-            // for their own response-continuation semantics and would reject a
-            // Codex thread-state blob.
-            let is_codex = model
+            // Only pass backend_state to providers whose previous_response_id is
+            // used for Dispatch-managed session resume semantics. Hosted backends
+            // use previous_response_id for provider-owned response continuation
+            // and would reject a Dispatch-local session token.
+            let uses_dispatch_session_state = model
                 .provider
                 .as_deref()
-                .map(|p| p.eq_ignore_ascii_case("codex"))
+                .map(is_provider_session_state_capable)
                 .or_else(|| {
-                    process_env_lookup("LLM_BACKEND").map(|p| p.eq_ignore_ascii_case("codex"))
+                    process_env_lookup("LLM_BACKEND")
+                        .map(|provider| is_provider_session_state_capable(&provider))
                 })
                 .unwrap_or(false);
             ModelRequest {
@@ -75,7 +77,7 @@ pub(super) fn build_model_requests(
                 tools: tools.clone(),
                 pending_tool_calls: Vec::new(),
                 tool_outputs: Vec::new(),
-                previous_response_id: if is_codex {
+                previous_response_id: if uses_dispatch_session_state {
                     backend_state.map(ToString::to_string)
                 } else {
                     None

@@ -65,16 +65,15 @@ ENTRYPOINT chat
 }
 
 #[test]
-fn build_model_requests_only_passes_backend_state_to_codex_provider() {
-    // When a parcel has a Codex primary and a non-Codex fallback, backend_state
-    // (a Codex thread-state blob) must NOT be forwarded to the non-Codex fallback
-    // request: other backends treat previous_response_id as their own opaque
-    // continuation token and would send the Codex JSON blob to a provider API,
-    // causing an API error.
+fn build_model_requests_only_passes_backend_state_to_dispatch_session_backends() {
+    // Dispatch-managed session state should flow to local session backends like
+    // Codex and Claude, but not to hosted backends that interpret
+    // previous_response_id as their own provider-owned continuation token.
     let test_image = build_test_image(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5.4 PROVIDER codex
+FALLBACK claude-sonnet-4 PROVIDER claude
 FALLBACK gpt-5.4-mini PROVIDER openai
 ENTRYPOINT chat
 ",
@@ -94,15 +93,21 @@ ENTRYPOINT chat
     )
     .unwrap();
 
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     // Codex primary gets the thread state.
     assert_eq!(
         requests[0].previous_response_id.as_deref(),
         Some(codex_thread_state),
     );
+    // Claude fallback also gets the Dispatch session token.
+    assert_eq!(requests[1].provider.as_deref(), Some("claude"));
+    assert_eq!(
+        requests[1].previous_response_id.as_deref(),
+        Some(codex_thread_state),
+    );
     // OpenAI fallback must not receive the Codex blob.
-    assert_eq!(requests[1].provider.as_deref(), Some("openai"));
-    assert!(requests[1].previous_response_id.is_none());
+    assert_eq!(requests[2].provider.as_deref(), Some("openai"));
+    assert!(requests[2].previous_response_id.is_none());
 }
 
 #[test]

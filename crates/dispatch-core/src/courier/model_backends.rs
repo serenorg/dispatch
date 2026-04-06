@@ -2,15 +2,20 @@ use super::*;
 use std::{io::BufRead, time::Duration};
 
 mod anthropic;
+mod claude;
 mod codex;
 mod gemini;
 mod openai;
+mod plugin;
 
 use anthropic::AnthropicMessagesBackend;
 #[cfg(test)]
 pub(super) use anthropic::parse_anthropic_streaming_events;
 #[cfg(test)]
 pub(super) use anthropic::{anthropic_max_tokens, anthropic_messages, extract_anthropic_output};
+pub(crate) use claude::ClaudeCliBackend;
+#[cfg(test)]
+pub(crate) use claude::clear_test_claude_binary_override;
 pub(crate) use codex::CodexAppServerBackend;
 #[cfg(test)]
 pub(crate) use codex::clear_test_codex_binary_override;
@@ -26,6 +31,9 @@ pub(super) use openai::{
     openai_chat_completions_messages, openai_tool_definition,
     parse_openai_chat_completions_streaming_events, parse_openai_streaming_events,
 };
+pub(crate) use plugin::PluginModelBackend;
+#[cfg(test)]
+pub(crate) use plugin::clear_test_plugin_binary_override;
 
 fn request_timeout(request: &ModelRequest) -> Option<Duration> {
     request.llm_timeout_ms.map(Duration::from_millis)
@@ -40,8 +48,17 @@ fn generate_with_noop_events(
 
 pub(super) const CODEX_BACKEND_ID: &str = "codex_app_server";
 
-pub(super) fn is_codex_backend_id(backend_id: &str) -> bool {
-    backend_id == CODEX_BACKEND_ID
+pub(super) fn is_persistent_session_backend_id(backend_id: &str) -> bool {
+    // "claude_agent_sdk" is kept as a legacy alias so older persisted session
+    // state can still be resumed after the Claude CLI backend rename.
+    matches!(backend_id, CODEX_BACKEND_ID | "claude" | "claude_agent_sdk")
+}
+
+pub(super) fn is_provider_session_state_capable(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "codex" | "claude" | "claude_agent_sdk"
+    )
 }
 
 pub(super) fn default_chat_backend_for_provider(
@@ -57,19 +74,24 @@ pub(super) fn default_chat_backend_for_provider_with<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    match provider
+    let provider = provider
         .map(ToString::to_string)
         .or_else(|| env_lookup("LLM_BACKEND"))
         .unwrap_or_else(|| "openai".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
+        .to_ascii_lowercase();
+
+    match provider.as_str() {
         "codex" => Arc::new(CodexAppServerBackend),
+        "claude" | "claude_agent_sdk" => Arc::new(ClaudeCliBackend),
         "anthropic" => Arc::new(AnthropicMessagesBackend),
         "gemini" | "google" | "google_gemini" => Arc::new(GeminiGenerateContentBackend),
         "openai_compatible" | "openrouter" | "together" | "fireworks" | "litellm" | "vllm"
         | "lm_studio" => Arc::new(OpenAiChatCompletionsBackend),
-        _ => Arc::new(OpenAiResponsesBackend),
+        "openai" => Arc::new(OpenAiResponsesBackend),
+        _ => Arc::new(PluginModelBackend::new(
+            provider.clone(),
+            is_provider_session_state_capable(&provider),
+        )),
     }
 }
 

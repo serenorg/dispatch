@@ -383,6 +383,7 @@ EOF
 ```dockerfile
 MODEL gpt-5.4-mini
 MODEL claude-sonnet-4-6 PROVIDER anthropic
+MODEL claude-sonnet-4-6 PROVIDER claude --persist-thread=false --reasoning-effort=high
 MODEL gpt-5.4 PROVIDER codex
 MODEL gpt-5.4 PROVIDER codex --persist-thread=false --reasoning-effort=high
 ```
@@ -391,11 +392,12 @@ Reference implementation providers currently include:
 
 - `openai`
 - `anthropic`
+- `claude`
 - `gemini`
 - `openai_compatible`
 - `codex`
 
-`MODEL` and `FALLBACK` may also carry `--flag=value` model options. The current reference implementation recognizes `--persist-thread=<true|false>` and `--reasoning-effort=<value>` for the Codex backend. `PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. `--persist-thread=false` requests ephemeral Codex threads so follow-up context comes from Dispatch session history instead of Codex rollout files; the default is `true`. `--reasoning-effort=high` overrides the Codex effort for that parcel model and falls back to `DISPATCH_REASONING_EFFORT` only when the parcel does not set it. If neither is set, Dispatch lets Codex use the selected model's default effort. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. The reference implementation denies ambient app-server permission requests by default so undeclared Codex command/file/MCP actions are not exposed through the courier implicitly. The Codex backend intentionally inherits the parent process environment so local Codex auth and config continue to work, and it leaves `CODEX_HOME` alone unless the caller already set it. Unix targets use a PTY-backed Codex transport; other targets currently fall back to standard process pipes.
+`MODEL` and `FALLBACK` may also carry `--flag=value` model options. The current reference implementation recognizes `--persist-thread=<true|false>` for the local `claude` and `codex` backends, and `--reasoning-effort=<value>` for both backends as well. `PROVIDER claude` uses the local `claude` CLI. Authentication is handled by the local `claude` binary using whatever login, config, or environment-based credentials it already supports; Dispatch does not inject API keys. Set `CLAUDE_BINARY` to override the path to the `claude` executable. `--persist-thread=false` requests ephemeral Claude sessions so follow-up context comes from Dispatch session history; the default is `true`. `--reasoning-effort=high` is forwarded as `--effort high` and falls back to `DISPATCH_REASONING_EFFORT` only when the parcel does not set it. To preserve Dispatch's capability boundary, ambient Claude tool actions are denied. `PROVIDER codex` uses the local `codex app-server` transport instead of a hosted HTTP API. `--persist-thread=false` requests ephemeral Codex threads so follow-up context comes from Dispatch session history instead of Codex rollout files; the default is `true`. `--reasoning-effort=high` overrides the Codex effort for that parcel model and falls back to `DISPATCH_REASONING_EFFORT` only when the parcel does not set it. If neither is set, Dispatch lets Codex use the selected model's default effort. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. Dispatch leaves Codex using its normal home/config/auth location unless the environment already overrides `CODEX_HOME`. Unix targets use a PTY-backed Codex transport; other targets currently fall back to standard process pipes. Local Codex auth is whatever the `codex` binary itself resolves from login, config, or environment.
 
 #### `FALLBACK`
 

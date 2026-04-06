@@ -46,7 +46,10 @@ use self::builtin_tools::{execute_builtin_tool, handle_native_memory_command};
 use self::host_turn::{execute_host_turn, format_heartbeat_payload, format_job_payload};
 use self::memory_store::{memory_delete, memory_get, memory_list, memory_put};
 #[cfg(test)]
-use self::model_backends::{CodexAppServerBackend, clear_test_codex_binary_override};
+use self::model_backends::{
+    ClaudeCliBackend, CodexAppServerBackend, clear_test_claude_binary_override,
+    clear_test_codex_binary_override, clear_test_plugin_binary_override,
+};
 #[cfg(test)]
 use self::model_request::{
     build_model_request, configured_context_token_limit, configured_model_id_with,

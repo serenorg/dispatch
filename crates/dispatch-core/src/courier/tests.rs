@@ -97,6 +97,8 @@ struct CodexBackendTestGuard {
 impl Drop for CodexBackendTestGuard {
     fn drop(&mut self) {
         clear_test_codex_binary_override();
+        clear_test_claude_binary_override();
+        clear_test_plugin_binary_override("claude");
     }
 }
 
