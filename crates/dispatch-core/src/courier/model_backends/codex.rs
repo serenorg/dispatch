@@ -1,16 +1,16 @@
 use super::*;
 use std::{
     fs::File,
-    io::{BufRead, BufReader, Write},
+    io::{BufReader, Write},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::mpsc,
-    thread,
+    sync::mpsc::Receiver,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 #[cfg(not(unix))]
-use std::process::{ChildStdin, ChildStdout};
+use std::process::ChildStdin;
 
 #[cfg(unix)]
 use nix::{
@@ -55,31 +55,34 @@ impl ChatModelBackend for CodexAppServerBackend {
         };
         let deadline = request_timeout_deadline(request);
 
-        process.initialize(deadline)?;
-        let reasoning_effort = process.resolve_reasoning_effort(request, deadline)?;
-        let thread = process.open_thread(request, deadline)?;
-        let prompt = codex_prompt_text(request);
-        let turn_id = process.start_turn(
-            &thread.thread_id,
-            &request.model,
-            reasoning_effort.as_deref(),
-            &prompt,
-            deadline,
-        )?;
-        let text = process.collect_turn_output(&turn_id, on_event, deadline)?;
-        let response_id = if codex_history_persistence_enabled(request) {
-            Some(thread.encode())
-        } else {
-            None
-        };
-        process.shutdown(deadline);
+        let result = (|| {
+            process.initialize(deadline)?;
+            let reasoning_effort = process.resolve_reasoning_effort(request, deadline)?;
+            let thread = process.open_thread(request, deadline)?;
+            let prompt = codex_prompt_text(request);
+            let turn_id = process.start_turn(
+                &thread.thread_id,
+                &request.model,
+                reasoning_effort.as_deref(),
+                &prompt,
+                deadline,
+            )?;
+            let text = process.collect_turn_output(&turn_id, on_event, deadline)?;
+            let response_id = if codex_history_persistence_enabled(request) {
+                Some(thread.encode())
+            } else {
+                None
+            };
 
-        Ok(ModelGeneration::Reply(ModelReply {
-            text: Some(text),
-            backend: self.id().to_string(),
-            response_id,
-            tool_calls: Vec::new(),
-        }))
+            Ok(ModelGeneration::Reply(ModelReply {
+                text: Some(text),
+                backend: self.id().to_string(),
+                response_id,
+                tool_calls: Vec::new(),
+            }))
+        })();
+        process.shutdown(deadline);
+        result
     }
 }
 
@@ -137,28 +140,6 @@ fn codex_history_persistence_enabled(request: &ModelRequest) -> bool {
     env_flag_override("DISPATCH_PERSIST_THREAD")
         .or_else(|| model_option_bool(request, "persist-thread"))
         .unwrap_or(true)
-}
-
-fn model_option_bool(request: &ModelRequest, key: &str) -> Option<bool> {
-    model_option_value(request, key).and_then(parse_flag_bool)
-}
-
-fn model_option_value<'a>(request: &'a ModelRequest, key: &str) -> Option<&'a str> {
-    request.model_options.get(key).map(String::as_str)
-}
-
-fn env_flag_override(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| parse_flag_bool(&value))
-}
-
-fn parse_flag_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "0" | "false" | "no" | "off" => Some(false),
-        "1" | "true" | "yes" | "on" => Some(true),
-        _ => None,
-    }
 }
 
 fn codex_prompt_text(request: &ModelRequest) -> String {
@@ -233,6 +214,8 @@ fn render_conversation_transcript(messages: &[ConversationMessage]) -> String {
 struct CodexProcess {
     child: Child,
     io: CodexIo,
+    stdout_receiver: Receiver<LineReadResult>,
+    stdout_reader: Option<JoinHandle<()>>,
     next_request_id: i64,
 }
 
@@ -285,15 +268,9 @@ impl CodexThreadState {
 
 enum CodexIo {
     #[cfg(not(unix))]
-    Pipes {
-        stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
-    },
+    Pipes { stdin: ChildStdin },
     #[cfg(unix)]
-    Pty {
-        stdin: File,
-        stdout: BufReader<File>,
-    },
+    Pty { stdin: File },
 }
 
 impl CodexProcess {
@@ -357,6 +334,7 @@ impl CodexProcess {
                 "failed to clone codex app-server PTY master for output: {error}"
             ))
         })?));
+        let (stdout_receiver, stdout_reader) = spawn_line_reader(stdout);
 
         command
             .stdin(Stdio::from(File::from(dup(&pty.slave).map_err(
@@ -386,7 +364,9 @@ impl CodexProcess {
 
         Ok(Some(Self {
             child,
-            io: CodexIo::Pty { stdin, stdout },
+            io: CodexIo::Pty { stdin },
+            stdout_receiver,
+            stdout_reader: Some(stdout_reader),
             next_request_id: 1,
         }))
     }
@@ -412,12 +392,12 @@ impl CodexProcess {
         let stdout = child.stdout.take().ok_or_else(|| {
             CourierError::ModelBackendRequest("codex app-server missing stdout".to_string())
         })?;
+        let (stdout_receiver, stdout_reader) = spawn_line_reader(BufReader::new(stdout));
         Ok(Some(Self {
             child,
-            io: CodexIo::Pipes {
-                stdin,
-                stdout: BufReader::new(stdout),
-            },
+            io: CodexIo::Pipes { stdin },
+            stdout_receiver,
+            stdout_reader: Some(stdout_reader),
             next_request_id: 1,
         }))
     }
@@ -780,16 +760,8 @@ impl CodexProcess {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<serde_json::Value, CourierError> {
-        let bytes_and_line = match &mut self.io {
-            #[cfg(not(unix))]
-            CodexIo::Pipes { stdout, .. } => {
-                read_line_with_timeout(stdout, &mut self.child, deadline)?
-            }
-            #[cfg(unix)]
-            CodexIo::Pty { stdout, .. } => {
-                read_line_with_timeout(stdout, &mut self.child, deadline)?
-            }
-        };
+        let bytes_and_line =
+            read_line_with_timeout(&self.stdout_receiver, &mut self.child, deadline)?;
         let Some((bytes, line)) = bytes_and_line else {
             return Err(CourierError::ModelBackendRequest(
                 read_stderr(&mut self.child)
@@ -809,7 +781,12 @@ impl CodexProcess {
     }
 
     fn shutdown(self, deadline: Option<Instant>) {
-        let CodexProcess { mut child, io, .. } = self;
+        let CodexProcess {
+            mut child,
+            io,
+            stdout_reader,
+            ..
+        } = self;
         drop(io);
 
         let timeout = remaining_timeout(deadline)
@@ -830,6 +807,14 @@ impl CodexProcess {
                     break;
                 }
             }
+        }
+        if let Some(stdout_reader) = stdout_reader {
+            let _ = join_line_reader(
+                stdout_reader,
+                CourierError::ModelBackendRequest(
+                    "codex app-server stdout reader panicked".to_string(),
+                ),
+            );
         }
     }
 }
@@ -855,42 +840,20 @@ fn codex_timeout_error() -> CourierError {
     CourierError::ModelBackendRequest("codex app-server request timed out".to_string())
 }
 
-fn read_line_with_timeout<R: BufRead + Send>(
-    reader: &mut R,
+fn read_line_with_timeout(
+    receiver: &Receiver<LineReadResult>,
     child: &mut Child,
     deadline: Option<Instant>,
 ) -> Result<Option<(usize, String)>, CourierError> {
-    let Some(timeout) = remaining_timeout(deadline)? else {
-        let mut line = String::new();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-        return Ok(Some((bytes, line)));
-    };
-
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::scope(|scope| {
-        scope.spawn(move || {
-            let mut line = String::new();
-            let result = reader
-                .read_line(&mut line)
-                .map(|bytes| (bytes, line))
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-        });
-
-        match receiver.recv_timeout(timeout) {
-            Ok(Ok((bytes, line))) => Ok(Some((bytes, line))),
-            Ok(Err(error)) => Err(CourierError::ModelBackendRequest(error)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                Err(codex_timeout_error())
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(CourierError::ModelBackendRequest(
-                "codex app-server reader disconnected unexpectedly".to_string(),
-            )),
-        }
-    })
+    recv_line_with_timeout(
+        receiver,
+        child,
+        remaining_timeout(deadline)?,
+        codex_timeout_error(),
+        CourierError::ModelBackendRequest(
+            "codex app-server reader disconnected unexpectedly".to_string(),
+        ),
+    )
 }
 
 fn read_stderr(child: &mut Child) -> Option<String> {

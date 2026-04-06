@@ -1,5 +1,11 @@
 use super::*;
-use std::{io::BufRead, time::Duration};
+use std::{
+    io::BufRead,
+    process::Child,
+    sync::mpsc::{self, Receiver},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 mod anthropic;
 mod claude;
@@ -37,6 +43,85 @@ pub(crate) use plugin::clear_test_plugin_binary_override;
 
 fn request_timeout(request: &ModelRequest) -> Option<Duration> {
     request.llm_timeout_ms.map(Duration::from_millis)
+}
+
+pub(super) fn model_option_value<'a>(request: &'a ModelRequest, key: &str) -> Option<&'a str> {
+    request.model_options.get(key).map(String::as_str)
+}
+
+pub(super) fn model_option_bool(request: &ModelRequest, key: &str) -> Option<bool> {
+    model_option_value(request, key).and_then(parse_flag_bool)
+}
+
+pub(super) fn env_flag_override(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_flag_bool(&value))
+}
+
+pub(super) fn parse_flag_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "on" => Some(true),
+        _ => None,
+    }
+}
+
+pub(super) type LineReadResult = Result<(usize, String), String>;
+
+pub(super) fn spawn_line_reader<R>(mut reader: R) -> (Receiver<LineReadResult>, JoinHandle<()>)
+where
+    R: BufRead + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            let mut line = String::new();
+            let result = reader
+                .read_line(&mut line)
+                .map(|bytes| (bytes, line))
+                .map_err(|error| error.to_string());
+            let done = matches!(result, Ok((0, _)));
+            if sender.send(result).is_err() {
+                break;
+            }
+            if done {
+                break;
+            }
+        }
+    });
+    (receiver, handle)
+}
+
+pub(super) fn join_line_reader(
+    handle: JoinHandle<()>,
+    panic_error: CourierError,
+) -> Result<(), CourierError> {
+    handle.join().map_err(|_| panic_error)
+}
+
+pub(super) fn recv_line_with_timeout(
+    receiver: &Receiver<LineReadResult>,
+    child: &mut Child,
+    timeout: Option<Duration>,
+    timeout_error: CourierError,
+    disconnect_error: CourierError,
+) -> Result<Option<(usize, String)>, CourierError> {
+    let recv_result = match timeout {
+        Some(timeout) => match receiver.recv_timeout(timeout) {
+            Ok(result) => Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                Err(timeout_error)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(disconnect_error),
+        },
+        None => receiver.recv().map_err(|_| disconnect_error),
+    }?;
+
+    recv_result
+        .map(Some)
+        .map_err(CourierError::ModelBackendRequest)
 }
 
 fn generate_with_noop_events(

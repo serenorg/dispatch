@@ -2,9 +2,8 @@ use super::*;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -217,7 +216,7 @@ fn collect_plugin_output(
             "`dispatch-backend-{provider}` stdout was not captured"
         ))
     })?;
-    let mut stdout = BufReader::new(stdout);
+    let (stdout_receiver, stdout_reader) = spawn_line_reader(BufReader::new(stdout));
 
     let mut streamed_text = String::new();
     let mut result_text: Option<String> = None;
@@ -227,7 +226,8 @@ fn collect_plugin_output(
     let mut tool_calls: Vec<ModelToolCall> = Vec::new();
     let mut output_error: Option<CourierError> = None;
 
-    while let Some((bytes, line)) = read_line_with_timeout(&mut stdout, child, deadline, provider)?
+    while let Some((bytes, line)) =
+        read_line_with_timeout(&stdout_receiver, child, deadline, provider)?
     {
         if bytes == 0 {
             break;
@@ -338,7 +338,15 @@ fn collect_plugin_output(
         }
     }
 
-    let status = wait_for_exit(child, deadline, provider)?;
+    let status = match wait_for_exit(child, deadline, provider) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = join_plugin_stdout_reader(stdout_reader, provider);
+            let _ = join_stderr_capture(stderr_capture, provider);
+            return Err(error);
+        }
+    };
+    join_plugin_stdout_reader(stdout_reader, provider)?;
     let stderr_text = join_stderr_capture(stderr_capture, provider)?;
 
     if let Some(error) = output_error {
@@ -414,6 +422,15 @@ fn join_stderr_capture(handle: JoinHandle<String>, provider: &str) -> Result<Str
     })
 }
 
+fn join_plugin_stdout_reader(handle: JoinHandle<()>, provider: &str) -> Result<(), CourierError> {
+    join_line_reader(
+        handle,
+        CourierError::ModelBackendRequest(format!(
+            "`dispatch-backend-{provider}` stdout reader panicked"
+        )),
+    )
+}
+
 fn plugin_timeout_error(provider: &str) -> CourierError {
     CourierError::ModelBackendRequest(format!("`dispatch-backend-{provider}` request timed out"))
 }
@@ -431,42 +448,21 @@ fn remaining_timeout(
         .ok_or_else(|| plugin_timeout_error(provider))
 }
 
-fn read_line_with_timeout<R: BufRead + Send>(
-    reader: &mut R,
+fn read_line_with_timeout(
+    receiver: &std::sync::mpsc::Receiver<LineReadResult>,
     child: &mut Child,
     deadline: Option<Instant>,
     provider: &str,
 ) -> Result<Option<(usize, String)>, CourierError> {
-    let Some(timeout) = remaining_timeout(deadline, provider)? else {
-        let mut line = String::new();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-        return Ok(Some((bytes, line)));
-    };
-
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut line = String::new();
-            let result = reader
-                .read_line(&mut line)
-                .map(|bytes| (bytes, line))
-                .map_err(|error| CourierError::ModelBackendRequest(error.to_string()));
-            let _ = sender.send(result);
-        });
-
-        match receiver.recv_timeout(timeout) {
-            Ok(result) => result.map(Some),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                Err(plugin_timeout_error(provider))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(CourierError::ModelBackendRequest(
-                format!("`dispatch-backend-{provider}` output reader disconnected unexpectedly"),
-            )),
-        }
-    })
+    recv_line_with_timeout(
+        receiver,
+        child,
+        remaining_timeout(deadline, provider)?,
+        plugin_timeout_error(provider),
+        CourierError::ModelBackendRequest(format!(
+            "`dispatch-backend-{provider}` output reader disconnected unexpectedly"
+        )),
+    )
 }
 
 fn wait_for_exit(
