@@ -275,6 +275,20 @@ pub(crate) fn logs(args: crate::LogsArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn wait(args: crate::WaitArgs) -> Result<()> {
+    let root = crate::resolve_runs_root(&args.path);
+    let record_path = resolve_run_prefix(&root, &args.run)?;
+    loop {
+        let mut record = load_run_record(&record_path)?;
+        refresh_run_record(&record_path, &mut record)?;
+        if !record.status.is_active() {
+            println!("{}", run_exit_code(&record));
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
     let root = crate::resolve_runs_root(&args.path);
     let record_path = resolve_run_prefix(&root, &args.run)?;
@@ -302,6 +316,39 @@ pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
     record.last_error = None;
     persist_run_record(&record_path, &record)?;
     println!("Stopped run {}", record.run_id);
+    Ok(())
+}
+
+pub(crate) fn restart(args: crate::RestartArgs) -> Result<()> {
+    let root = crate::resolve_runs_root(&args.path);
+    let record_path = resolve_run_prefix(&root, &args.run)?;
+    let mut record = load_run_record(&record_path)?;
+    refresh_run_record(&record_path, &mut record)?;
+    let previous_pid = record.pid;
+
+    if record.status.is_active() {
+        stop(crate::StopArgs {
+            run: record.run_id.clone(),
+            path: args.path.clone(),
+            force: args.force,
+        })?;
+        if let Some(pid) = previous_pid {
+            wait_for_pid_exit(pid, Duration::from_secs(5)).with_context(|| {
+                format!(
+                    "run `{}` did not stop before restart; try again with --force",
+                    record.run_id
+                )
+            })?;
+        }
+        record = load_run_record(&record_path)?;
+    }
+
+    prepare_record_for_restart(&mut record)?;
+    persist_run_record(&record_path, &record)?;
+    spawn_detached_runner(&record_path, &record.log_path)?;
+    println!("Restarted run {}", record.run_id);
+    println!("Status: {}", format_status(&record.status));
+    println!("Log: {}", record.log_path.display());
     Ok(())
 }
 
@@ -930,6 +977,53 @@ fn persist_service_state(
     Ok(())
 }
 
+fn prepare_record_for_restart(record: &mut RunRecord) -> Result<()> {
+    record.status = RunStatus::Starting;
+    record.pid = None;
+    record.process_group_id = None;
+    record.started_at_ms = None;
+    record.stopped_at_ms = None;
+    record.exit_code = None;
+    record.last_error = None;
+    record.detached = true;
+    if let RunOperation::Service {
+        payload,
+        interval_ms,
+        schedules,
+        listeners,
+        ingress,
+    } = &record.operation
+    {
+        let schedule_exprs = schedules
+            .iter()
+            .map(|schedule| schedule.schedule_expr.as_str())
+            .collect::<Vec<_>>();
+        let listen_addrs = listeners
+            .iter()
+            .map(|listener| listener.listen_addr.clone())
+            .collect::<Vec<_>>();
+        record.operation = RunOperation::Service {
+            payload: payload.clone(),
+            interval_ms: *interval_ms,
+            schedules: schedule_exprs
+                .into_iter()
+                .map(build_run_schedule)
+                .collect::<Result<Vec<_>>>()?,
+            listeners: listen_addrs
+                .into_iter()
+                .map(|listen_addr| RunListener {
+                    listen_addr,
+                    bound_addr: None,
+                    requests_handled: 0,
+                    last_request_at_ms: None,
+                })
+                .collect(),
+            ingress: ingress.clone(),
+        };
+    }
+    Ok(())
+}
+
 fn resolve_run_prefix(root: &Path, prefix: &str) -> Result<PathBuf> {
     if prefix.contains(std::path::MAIN_SEPARATOR) || prefix.ends_with(".json") {
         let path = PathBuf::from(prefix);
@@ -984,6 +1078,17 @@ fn refresh_run_record(record_path: &Path, record: &mut RunRecord) -> Result<()> 
     record.status = RunStatus::Stopped;
     record.stopped_at_ms.get_or_insert_with(now_ms);
     persist_run_record(record_path, record)
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !pid_is_running(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!("process {pid} is still running")
 }
 
 fn load_run_record(path: &Path) -> Result<RunRecord> {
@@ -1075,6 +1180,13 @@ fn format_status(status: &RunStatus) -> &'static str {
         RunStatus::Failed => "failed",
         RunStatus::Stopped => "stopped",
     }
+}
+
+fn run_exit_code(record: &RunRecord) -> i32 {
+    record.exit_code.unwrap_or(match record.status {
+        RunStatus::Failed => 1,
+        _ => 0,
+    })
 }
 
 fn validate_service_parcel(parcel: &dispatch_core::LoadedParcel) -> Result<()> {
@@ -1839,6 +1951,82 @@ mod tests {
         let loaded: RunRecord =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn prepare_record_for_restart_resets_service_runtime_state() {
+        let dir = tempdir().unwrap();
+        let mut record = RunRecord {
+            run_id: "service".to_string(),
+            parcel_digest: "digest".to_string(),
+            parcel_name: Some("demo".to_string()),
+            parcel_version: Some("1.0.0".to_string()),
+            parcel_path: dir.path().join("parcel"),
+            courier: "native".to_string(),
+            registry: None,
+            operation: RunOperation::Service {
+                payload: Some("tick".to_string()),
+                interval_ms: 30_000,
+                schedules: vec![super::RunSchedule {
+                    schedule_expr: "*/5 * * * * * *".to_string(),
+                    next_fire_at_ms: 1,
+                    last_fired_at_ms: Some(2),
+                }],
+                listeners: vec![super::RunListener {
+                    listen_addr: "127.0.0.1:0".to_string(),
+                    bound_addr: Some("127.0.0.1:48123".to_string()),
+                    requests_handled: 4,
+                    last_request_at_ms: Some(3),
+                }],
+                ingress: ServiceIngressConfig {
+                    path: Some("/hook".to_string()),
+                    methods: vec!["POST".to_string()],
+                    shared_secret_sha256: Some("deadbeef".to_string()),
+                    max_body_bytes: 1024,
+                    max_header_bytes: 2048,
+                },
+            },
+            status: RunStatus::Stopped,
+            pid: Some(42),
+            process_group_id: Some(42),
+            started_at_ms: Some(1),
+            stopped_at_ms: Some(2),
+            exit_code: Some(1),
+            session_file: dir.path().join("service.session.json"),
+            log_path: dir.path().join("service.log"),
+            tool_approval: crate::CliToolApprovalMode::Never,
+            a2a_policy: CliA2aPolicy::default(),
+            last_error: Some("boom".to_string()),
+            detached: false,
+        };
+
+        super::prepare_record_for_restart(&mut record).unwrap();
+
+        assert_eq!(record.status, RunStatus::Starting);
+        assert_eq!(record.pid, None);
+        assert_eq!(record.process_group_id, None);
+        assert_eq!(record.started_at_ms, None);
+        assert_eq!(record.stopped_at_ms, None);
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.last_error, None);
+        assert!(record.detached);
+
+        let RunOperation::Service {
+            schedules,
+            listeners,
+            ..
+        } = &record.operation
+        else {
+            panic!("expected service operation");
+        };
+        assert_eq!(schedules.len(), 1);
+        assert!(schedules[0].next_fire_at_ms > 0);
+        assert_eq!(schedules[0].last_fired_at_ms, None);
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].listen_addr, "127.0.0.1:0");
+        assert_eq!(listeners[0].bound_addr, None);
+        assert_eq!(listeners[0].requests_handled, 0);
+        assert_eq!(listeners[0].last_request_at_ms, None);
     }
 
     #[test]

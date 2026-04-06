@@ -201,6 +201,17 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
     let stopped = wait_for_run_record(&record_path, |record| record["status"] == "stopped")?;
     assert_eq!(stopped["status"], "stopped");
 
+    let restart_output = require_success(
+        run_dispatch(dir.path(), &[], &["restart", &run_id, ".", "--force"])?,
+        "dispatch restart",
+    )?;
+    assert!(restart_output.contains(&format!("Restarted run {run_id}")));
+    let restarted = wait_for_run_record(&record_path, |record| {
+        record["status"] == "running"
+            && record["operation"]["listeners"][0]["bound_addr"].is_string()
+    })?;
+    assert_eq!(restarted["status"], "running");
+
     require_success(
         run_dispatch(dir.path(), &[], &["rm", &run_id, ".", "--force"])?,
         "dispatch rm --force",
@@ -216,6 +227,34 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
         .exists()
     );
 
+    Ok(())
+}
+
+#[test]
+fn detached_heartbeat_wait_returns_exit_code() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    write_heartbeat_parcel(dir.path(), &[])?;
+
+    let run_output = require_success(
+        run_dispatch(dir.path(), &[], &["run", ".", "--heartbeat", "--detach"])?,
+        "dispatch run --heartbeat --detach",
+    )?;
+    let run_id = extract_value("Started run ", &run_output)?;
+    let record_path = PathBuf::from(extract_value("Record: ", &run_output)?);
+
+    let wait_output = require_success(
+        run_dispatch(dir.path(), &[], &["wait", &run_id, "."])?,
+        "dispatch wait",
+    )?;
+    assert_eq!(wait_output.trim(), "0");
+
+    let record = wait_for_run_record(&record_path, |record| record["status"] == "exited")?;
+    assert_eq!(record["exit_code"], 0);
+
+    require_success(
+        run_dispatch(dir.path(), &[], &["rm", &run_id, ".", "--force"])?,
+        "dispatch rm after wait",
+    )?;
     Ok(())
 }
 

@@ -70,8 +70,12 @@ enum Command {
     Ps(PsArgs),
     /// Print logs for a local run
     Logs(LogsArgs),
+    /// Block until a local run exits and print its exit code
+    Wait(WaitArgs),
     /// Stop a local run
     Stop(StopArgs),
+    /// Restart a local run
+    Restart(RestartArgs),
     /// Remove inactive local run records and logs
     Prune(PruneArgs),
     /// Remove a local run record and logs
@@ -315,6 +319,15 @@ struct LogsArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct WaitArgs {
+    /// Run id or unique run id prefix
+    run: String,
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
 struct StopArgs {
     /// Run id or unique run id prefix
     run: String,
@@ -322,6 +335,18 @@ struct StopArgs {
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Forcefully terminate the run
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RestartArgs {
+    /// Run id or unique run id prefix
+    run: String,
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Forcefully terminate an active run before restarting it
     #[arg(long)]
     force: bool,
 }
@@ -555,8 +580,12 @@ enum ContainerCommand {
     List(PsArgs),
     /// Print logs for a local run
     Logs(LogsArgs),
+    /// Block until a local run exits and print its exit code
+    Wait(WaitArgs),
     /// Stop a local run
     Stop(StopArgs),
+    /// Restart a local run
+    Restart(RestartArgs),
     /// Remove inactive local run records and logs
     Prune(PruneArgs),
     /// Remove a local run record and logs
@@ -729,7 +758,9 @@ fn main() -> Result<()> {
         Command::Serve(args) => runs::serve(args),
         Command::Ps(args) => runs::ps(args),
         Command::Logs(args) => runs::logs(args),
+        Command::Wait(args) => runs::wait(args),
         Command::Stop(args) => runs::stop(args),
+        Command::Restart(args) => runs::restart(args),
         Command::Prune(args) => runs::prune(args),
         Command::Rm(args) => runs::rm(args),
         Command::InspectRun(args) => runs::inspect_run(args),
@@ -823,7 +854,9 @@ fn container_command(command: ContainerCommand) -> Result<()> {
     match command {
         ContainerCommand::List(args) => runs::ps(args),
         ContainerCommand::Logs(args) => runs::logs(args),
+        ContainerCommand::Wait(args) => runs::wait(args),
         ContainerCommand::Stop(args) => runs::stop(args),
+        ContainerCommand::Restart(args) => runs::restart(args),
         ContainerCommand::Prune(args) => runs::prune(args),
         ContainerCommand::Rm(args) => runs::rm(args),
         ContainerCommand::Inspect(args) => runs::inspect_run(args),
@@ -1062,8 +1095,8 @@ mod tests {
         Cli, CliA2aPolicy, CliToolApprovalMode, Command, ContainerCommand, CourierCommand,
         DepotCommand, EvalArgs, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand,
         KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs,
-        SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
-        ValidateSkillArgs, VerifyArgs,
+        RestartArgs, SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
+        ValidateSkillArgs, VerifyArgs, WaitArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -1678,10 +1711,27 @@ mod tests {
         assert_eq!(path, PathBuf::from("."));
         assert!(follow);
 
+        let wait = Cli::try_parse_from(["dispatch", "wait", "abc123", "examples/demo"]).unwrap();
+        let Command::Wait(WaitArgs { run, path }) = wait.command else {
+            panic!("expected wait command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("examples/demo"));
+
         let stop = Cli::try_parse_from(["dispatch", "stop", "abc123", "examples/demo", "--force"])
             .unwrap();
         let Command::Stop(StopArgs { run, path, force }) = stop.command else {
             panic!("expected stop command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(force);
+
+        let restart =
+            Cli::try_parse_from(["dispatch", "restart", "abc123", "examples/demo", "--force"])
+                .unwrap();
+        let Command::Restart(RestartArgs { run, path, force }) = restart.command else {
+            panic!("expected restart command");
         };
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("examples/demo"));
@@ -1755,6 +1805,29 @@ mod tests {
         else {
             panic!("expected container prune command");
         };
+        assert_eq!(path, PathBuf::from("."));
+        assert!(force);
+
+        let container_wait =
+            Cli::try_parse_from(["dispatch", "container", "wait", "abc123"]).unwrap();
+        let Command::Container {
+            command: ContainerCommand::Wait(WaitArgs { run, path }),
+        } = container_wait.command
+        else {
+            panic!("expected container wait command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("."));
+
+        let container_restart =
+            Cli::try_parse_from(["dispatch", "container", "restart", "abc123", "--force"]).unwrap();
+        let Command::Container {
+            command: ContainerCommand::Restart(RestartArgs { run, path, force }),
+        } = container_restart.command
+        else {
+            panic!("expected container restart command");
+        };
+        assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("."));
         assert!(force);
     }
