@@ -19,6 +19,8 @@ serde_json.workspace = true
 tempfile.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
+chrono.workspace = true
+cron.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

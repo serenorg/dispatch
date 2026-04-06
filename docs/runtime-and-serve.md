@@ -52,6 +52,7 @@ The full runtime command set should converge on:
 - `dispatch run <path> --detach --job <payload>`
 - `dispatch run <path> --detach --heartbeat [payload]`
 - `dispatch serve <path>`
+- `dispatch serve <path> --schedule "<cron>"`
 - `dispatch ps`
 - `dispatch logs <run>`
 - `dispatch stop <run>`
@@ -233,7 +234,8 @@ But the runtime primitives should exist before exposing the scheduling UX:
 
 Schedules should be stored in the run record or an adjacent SQLite table, not
 in-memory only. This allows the service helper to reconstruct its schedule after
-a restart without the user re-specifying it.
+a restart without the user re-specifying it. The current implementation stores
+the schedule state directly in the run record.
 
 Minimal schema:
 
@@ -252,8 +254,8 @@ Schedules can originate from:
 - Agentfile declaration: a future `SCHEDULE` directive
 - Runtime API: if Dispatch ever exposes a control socket
 
-The first implementation should support the CLI flag only. Agentfile-level
-scheduling is a natural follow-on once the primitives exist.
+The first implementation supports the CLI flag only. Agentfile-level scheduling
+is a natural follow-on once the primitives exist.
 
 ## Session Semantics
 

@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, TimeZone, Utc};
+use cron::Schedule;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -7,6 +9,7 @@ use std::{
     io::{self, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    str::FromStr,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +42,7 @@ pub(crate) enum RunOperation {
     Service {
         payload: Option<String>,
         interval_ms: u64,
+        schedules: Vec<RunSchedule>,
     },
 }
 
@@ -50,6 +54,13 @@ impl RunOperation {
             Self::Service { .. } => "service",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunSchedule {
+    pub schedule_expr: String,
+    pub next_fire_at_ms: u64,
+    pub last_fired_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +113,9 @@ pub(crate) fn run_detached(args: crate::RunArgs) -> Result<()> {
 pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     if args.interval_ms == 0 {
         bail!("`dispatch serve` requires --interval-ms > 0");
+    }
+    for schedule in &args.schedules {
+        validate_schedule_expr(schedule)?;
     }
 
     let parcel = crate::run::load_or_build_parcel_for_run(args.path.clone())?;
@@ -322,7 +336,8 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
         RunOperation::Service {
             payload,
             interval_ms,
-        } => execute_service_loop(&record, payload, interval_ms),
+            schedules,
+        } => execute_service_loop(&record, payload, interval_ms, schedules),
     };
 
     match result {
@@ -384,36 +399,19 @@ fn execute_service_loop(
     record: &RunRecord,
     payload: Option<String>,
     interval_ms: u64,
+    mut schedules: Vec<RunSchedule>,
 ) -> Result<()> {
+    let poll_interval_ms = service_poll_interval_ms(interval_ms, &schedules);
     if record.detached {
         let stdout = io::stdout();
         let mut output = stdout.lock();
         loop {
-            crate::run::run_into(
-                crate::RunArgs {
-                    path: record.parcel_path.clone(),
-                    exec: crate::RunExecutionArgs {
-                        courier: record.courier.clone(),
-                        registry: record.registry.clone(),
-                        session_file: Some(record.session_file.clone()),
-                        chat: None,
-                        job: None,
-                        heartbeat: Some(payload.clone().unwrap_or_default()),
-                        interactive: false,
-                        print_prompt: false,
-                        list_tools: false,
-                        json: false,
-                        tool: None,
-                        input: None,
-                        tool_approval: Some(record.tool_approval),
-                        a2a_allowed_origins: record.a2a_policy.allowed_origins.clone(),
-                        a2a_trust_policy: record.a2a_policy.trust_policy.clone(),
-                        detach: false,
-                    },
-                },
-                &mut output,
-            )?;
-            thread::sleep(Duration::from_millis(interval_ms));
+            let fired =
+                execute_due_service_work(record, payload.as_deref(), &mut schedules, &mut output)?;
+            if fired {
+                persist_service_schedules(record, &schedules)?;
+            }
+            thread::sleep(Duration::from_millis(poll_interval_ms));
         }
     } else {
         let log_file = fs::OpenOptions::new()
@@ -424,33 +422,71 @@ fn execute_service_loop(
         let stdout = io::stdout();
         let mut tee = TeeWriter::new(stdout.lock(), log_file);
         loop {
-            crate::run::run_into(
-                crate::RunArgs {
-                    path: record.parcel_path.clone(),
-                    exec: crate::RunExecutionArgs {
-                        courier: record.courier.clone(),
-                        registry: record.registry.clone(),
-                        session_file: Some(record.session_file.clone()),
-                        chat: None,
-                        job: None,
-                        heartbeat: Some(payload.clone().unwrap_or_default()),
-                        interactive: false,
-                        print_prompt: false,
-                        list_tools: false,
-                        json: false,
-                        tool: None,
-                        input: None,
-                        tool_approval: Some(record.tool_approval),
-                        a2a_allowed_origins: record.a2a_policy.allowed_origins.clone(),
-                        a2a_trust_policy: record.a2a_policy.trust_policy.clone(),
-                        detach: false,
-                    },
-                },
-                &mut tee,
-            )?;
-            thread::sleep(Duration::from_millis(interval_ms));
+            let fired =
+                execute_due_service_work(record, payload.as_deref(), &mut schedules, &mut tee)?;
+            if fired {
+                persist_service_schedules(record, &schedules)?;
+            }
+            thread::sleep(Duration::from_millis(poll_interval_ms));
         }
     }
+}
+
+fn execute_due_service_work(
+    record: &RunRecord,
+    payload: Option<&str>,
+    schedules: &mut [RunSchedule],
+    output: &mut impl io::Write,
+) -> Result<bool> {
+    if schedules.is_empty() {
+        execute_service_heartbeat(record, payload, output)?;
+        return Ok(true);
+    }
+
+    let mut fired = false;
+    let now = now_ms();
+    for schedule in schedules.iter_mut() {
+        if schedule.next_fire_at_ms > now {
+            continue;
+        }
+        execute_service_heartbeat(record, payload, output)?;
+        schedule.last_fired_at_ms = Some(now);
+        schedule.next_fire_at_ms = next_schedule_fire_ms(&schedule.schedule_expr, now)?;
+        fired = true;
+    }
+
+    Ok(fired)
+}
+
+fn execute_service_heartbeat(
+    record: &RunRecord,
+    payload: Option<&str>,
+    output: &mut impl io::Write,
+) -> Result<()> {
+    crate::run::run_into(
+        crate::RunArgs {
+            path: record.parcel_path.clone(),
+            exec: crate::RunExecutionArgs {
+                courier: record.courier.clone(),
+                registry: record.registry.clone(),
+                session_file: Some(record.session_file.clone()),
+                chat: None,
+                job: None,
+                heartbeat: Some(payload.unwrap_or_default().to_string()),
+                interactive: false,
+                print_prompt: false,
+                list_tools: false,
+                json: false,
+                tool: None,
+                input: None,
+                tool_approval: Some(record.tool_approval),
+                a2a_allowed_origins: record.a2a_policy.allowed_origins.clone(),
+                a2a_trust_policy: record.a2a_policy.trust_policy.clone(),
+                detach: false,
+            },
+        },
+        output,
+    )
 }
 
 fn run_operation_from_exec(exec: &crate::RunExecutionArgs) -> Result<RunOperation> {
@@ -523,6 +559,12 @@ fn build_run_record_for_service(
     paths: &RunPaths,
     args: &crate::ServeArgs,
 ) -> RunRecord {
+    let schedules = args
+        .schedules
+        .iter()
+        .map(|expr| build_run_schedule(expr))
+        .collect::<Result<Vec<_>>>()
+        .expect("schedules are validated before the run record is built");
     RunRecord {
         run_id: paths
             .record_path
@@ -539,6 +581,7 @@ fn build_run_record_for_service(
         operation: RunOperation::Service {
             payload: args.payload.clone(),
             interval_ms: args.interval_ms,
+            schedules,
         },
         status: RunStatus::Starting,
         pid: None,
@@ -559,6 +602,14 @@ fn build_run_record_for_service(
         last_error: None,
         detached: args.detach,
     }
+}
+
+fn build_run_schedule(expr: &str) -> Result<RunSchedule> {
+    Ok(RunSchedule {
+        schedule_expr: expr.to_string(),
+        next_fire_at_ms: next_schedule_fire_ms(expr, now_ms())?,
+        last_fired_at_ms: None,
+    })
 }
 
 fn allocate_run_paths(
@@ -603,6 +654,20 @@ fn collect_run_records(root: &Path) -> Result<Vec<RunRecord>> {
         runs.push(record);
     }
     Ok(runs)
+}
+
+fn persist_service_schedules(record: &RunRecord, schedules: &[RunSchedule]) -> Result<()> {
+    let record_path =
+        crate::resolve_runs_root(&record.parcel_path).join(format!("{}.json", record.run_id));
+    let mut updated = load_run_record(&record_path)?;
+    if let RunOperation::Service {
+        schedules: current, ..
+    } = &mut updated.operation
+    {
+        *current = schedules.to_vec();
+        persist_run_record(&record_path, &updated)?;
+    }
+    Ok(())
 }
 
 fn resolve_run_prefix(root: &Path, prefix: &str) -> Result<PathBuf> {
@@ -731,11 +796,41 @@ fn format_status(status: &RunStatus) -> &'static str {
     }
 }
 
+fn service_poll_interval_ms(interval_ms: u64, schedules: &[RunSchedule]) -> u64 {
+    if schedules.is_empty() {
+        interval_ms
+    } else {
+        interval_ms.min(1_000)
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn validate_schedule_expr(expr: &str) -> Result<()> {
+    let _ = Schedule::from_str(expr)
+        .with_context(|| format!("failed to parse cron schedule `{expr}`"))?;
+    Ok(())
+}
+
+fn next_schedule_fire_ms(expr: &str, after_ms: u64) -> Result<u64> {
+    let schedule = Schedule::from_str(expr)
+        .with_context(|| format!("failed to parse cron schedule `{expr}`"))?;
+    let after = timestamp_from_ms(after_ms)?;
+    let next = schedule.after(&after).next().ok_or_else(|| {
+        anyhow::anyhow!("cron schedule `{expr}` did not produce a next fire time")
+    })?;
+    Ok(next.timestamp_millis() as u64)
+}
+
+fn timestamp_from_ms(ms: u64) -> Result<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(ms as i64)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("invalid timestamp `{ms}`"))
 }
 
 #[cfg(unix)]
@@ -891,5 +986,24 @@ mod tests {
         let loaded: RunRecord =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn build_run_schedule_sets_next_fire_time() {
+        let schedule = super::build_run_schedule("*/5 * * * * * *").unwrap();
+        assert!(schedule.next_fire_at_ms > 0);
+        assert!(schedule.last_fired_at_ms.is_none());
+    }
+
+    #[test]
+    fn service_poll_interval_uses_one_second_when_scheduled() {
+        let schedules = vec![super::RunSchedule {
+            schedule_expr: "*/5 * * * * * *".to_string(),
+            next_fire_at_ms: 1,
+            last_fired_at_ms: None,
+        }];
+        assert_eq!(super::service_poll_interval_ms(30_000, &schedules), 1_000);
+        assert_eq!(super::service_poll_interval_ms(500, &schedules), 500);
+        assert_eq!(super::service_poll_interval_ms(30_000, &[]), 30_000);
     }
 }

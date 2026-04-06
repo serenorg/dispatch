@@ -258,6 +258,9 @@ struct ServeArgs {
     /// Milliseconds to wait between heartbeats
     #[arg(long, default_value_t = 30_000)]
     interval_ms: u64,
+    /// Cron schedule to trigger a service heartbeat; may be repeated
+    #[arg(long = "schedule")]
+    schedules: Vec<String>,
     /// Detach the service and return immediately
     #[arg(long)]
     detach: bool,
@@ -1589,6 +1592,8 @@ mod tests {
             "tick",
             "--interval-ms",
             "5000",
+            "--schedule",
+            "*/5 * * * * * *",
             "--detach",
         ])
         .unwrap();
@@ -1598,6 +1603,7 @@ mod tests {
         assert_eq!(args.path, PathBuf::from("examples/demo"));
         assert_eq!(args.payload.as_deref(), Some("tick"));
         assert_eq!(args.interval_ms, 5000);
+        assert_eq!(args.schedules, vec!["*/5 * * * * * *"]);
         assert!(args.detach);
     }
 
