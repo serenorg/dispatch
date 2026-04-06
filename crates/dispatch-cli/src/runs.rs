@@ -118,6 +118,7 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
         validate_schedule_expr(schedule)?;
     }
     let parcel = crate::run::load_or_build_parcel_for_run(args.path.clone())?;
+    validate_service_parcel(&parcel)?;
     for schedule in &parcel.config.schedules {
         validate_schedule_expr(schedule)?;
     }
@@ -154,13 +155,15 @@ pub(crate) fn ps(args: crate::PsArgs) -> Result<()> {
     for run in runs {
         let name = run.parcel_name.as_deref().unwrap_or("<unknown>");
         let version = run.parcel_version.as_deref().unwrap_or("<unspecified>");
+        let schedule_summary = schedule_summary(&run.operation);
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             run.run_id,
             format_status(&run.status),
             run.operation.label(),
             name,
             version,
+            schedule_summary,
             run.log_path.display()
         );
     }
@@ -301,6 +304,7 @@ pub(crate) fn inspect_run(args: crate::InspectRunArgs) -> Result<()> {
     println!("Parcel: {}", record.parcel_path.display());
     println!("Log: {}", record.log_path.display());
     println!("Session: {}", record.session_file.display());
+    println!("Schedules: {}", schedule_summary(&record.operation));
     if let Some(pid) = record.pid {
         println!("PID: {pid}");
     }
@@ -807,6 +811,41 @@ fn format_status(status: &RunStatus) -> &'static str {
     }
 }
 
+fn validate_service_parcel(parcel: &dispatch_core::LoadedParcel) -> Result<()> {
+    if parcel.config.entrypoint.as_deref() == Some("heartbeat") {
+        Ok(())
+    } else {
+        bail!(
+            "`dispatch serve` requires parcels with `ENTRYPOINT heartbeat`, found {}",
+            parcel.config.entrypoint.as_deref().unwrap_or("<unset>")
+        )
+    }
+}
+
+fn schedule_summary(operation: &RunOperation) -> String {
+    match operation {
+        RunOperation::Service { schedules, .. } if schedules.is_empty() => "none".to_string(),
+        RunOperation::Service { schedules, .. } => {
+            let mut parts = schedules
+                .iter()
+                .map(|schedule| {
+                    format!(
+                        "{}=>{}",
+                        schedule.schedule_expr,
+                        format_timestamp_ms(schedule.next_fire_at_ms)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if parts.len() > 2 {
+                parts.truncate(2);
+                parts.push("...".to_string());
+            }
+            parts.join(", ")
+        }
+        _ => "-".to_string(),
+    }
+}
+
 fn service_poll_interval_ms(interval_ms: u64, schedules: &[RunSchedule]) -> u64 {
     if schedules.is_empty() {
         interval_ms
@@ -842,6 +881,12 @@ fn timestamp_from_ms(ms: u64) -> Result<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms as i64)
         .single()
         .ok_or_else(|| anyhow::anyhow!("invalid timestamp `{ms}`"))
+}
+
+fn format_timestamp_ms(ms: u64) -> String {
+    timestamp_from_ms(ms)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|_| ms.to_string())
 }
 
 #[cfg(unix)]
@@ -1032,5 +1077,20 @@ mod tests {
                 "*/1 * * * * * *".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn schedule_summary_reports_next_fire_time() {
+        let summary = super::schedule_summary(&RunOperation::Service {
+            payload: None,
+            interval_ms: 30_000,
+            schedules: vec![super::RunSchedule {
+                schedule_expr: "*/5 * * * * * *".to_string(),
+                next_fire_at_ms: 1_700_000_000_000,
+                last_fired_at_ms: None,
+            }],
+        });
+        assert!(summary.contains("*/5 * * * * * *=>"));
+        assert!(summary.contains("2023-11-14T22:13:20+00:00"));
     }
 }
