@@ -110,6 +110,7 @@ struct ProvisionalParcelManifest {
     name: Option<String>,
     version: Option<String>,
     entrypoint: Option<String>,
+    schedules: Vec<String>,
     instructions: Vec<InstructionConfig>,
     inline_prompts: Vec<String>,
     env: Vec<EnvVar>,
@@ -134,6 +135,7 @@ struct ResolvedAgentSpec {
     name: Option<String>,
     version: Option<String>,
     entrypoint: Option<String>,
+    schedules: Vec<String>,
     instructions: Vec<InstructionConfig>,
     inline_prompts: Vec<String>,
     env: Vec<EnvVar>,
@@ -222,6 +224,11 @@ pub fn build_agentfile(
                         "Agentfile ENTRYPOINT",
                     )?);
                     resolved.entrypoint_declared = true;
+                }
+            }
+            "SCHEDULE" => {
+                if let Some(schedule) = first_scalar(instruction.args.first()) {
+                    resolved.schedules.push(schedule);
                 }
             }
             "VISIBILITY" => {
@@ -421,6 +428,7 @@ pub fn build_agentfile(
         name: resolved.name,
         version: resolved.version,
         entrypoint: resolved.entrypoint,
+        schedules: resolved.schedules,
         instructions: resolved.instructions,
         inline_prompts: resolved.inline_prompts,
         env: resolved.env,
@@ -474,6 +482,7 @@ pub fn build_agentfile(
         name: provisional.name,
         version: provisional.version,
         entrypoint: provisional.entrypoint,
+        schedules: provisional.schedules,
         instructions: provisional.instructions,
         inline_prompts: provisional.inline_prompts,
         env: provisional.env,
@@ -538,6 +547,7 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
         name: parcel.name.clone(),
         version: parcel.version.clone(),
         entrypoint: parcel.entrypoint.clone(),
+        schedules: parcel.schedules.clone(),
         instructions: parcel.instructions.clone(),
         inline_prompts: parcel.inline_prompts.clone(),
         env: parcel.env.clone(),
@@ -1561,6 +1571,34 @@ ENTRYPOINT chat
             error.to_string(),
             "validation failed:\n`HEARTBEAT` requires `ENTRYPOINT heartbeat`"
         );
+    }
+
+    #[test]
+    fn build_preserves_authored_schedules_in_manifest() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+SCHEDULE \"*/5 * * * * * *\"
+SCHEDULE \"0 */2 * * * * *\"
+ENTRYPOINT heartbeat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        assert_eq!(parcel.schedules, vec!["*/5 * * * * * *", "0 */2 * * * * *"]);
     }
 
     #[test]

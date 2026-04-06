@@ -18,6 +18,7 @@ pub struct ParcelManifest {
     pub name: Option<String>,
     pub version: Option<String>,
     pub entrypoint: Option<String>,
+    pub schedules: Vec<String>,
     pub instructions: Vec<InstructionConfig>,
     pub inline_prompts: Vec<String>,
     pub env: Vec<EnvVar>,

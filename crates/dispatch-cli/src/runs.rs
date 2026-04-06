@@ -117,8 +117,10 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     for schedule in &args.schedules {
         validate_schedule_expr(schedule)?;
     }
-
     let parcel = crate::run::load_or_build_parcel_for_run(args.path.clone())?;
+    for schedule in &parcel.config.schedules {
+        validate_schedule_expr(schedule)?;
+    }
     let paths = allocate_run_paths(&parcel, None)?;
     let record = build_run_record_for_service(&parcel, &paths, &args);
     persist_run_record(&paths.record_path, &record)?;
@@ -559,10 +561,9 @@ fn build_run_record_for_service(
     paths: &RunPaths,
     args: &crate::ServeArgs,
 ) -> RunRecord {
-    let schedules = args
-        .schedules
-        .iter()
-        .map(|expr| build_run_schedule(expr))
+    let schedules = merged_schedule_exprs(&parcel.config.schedules, &args.schedules)
+        .into_iter()
+        .map(|expr| build_run_schedule(&expr))
         .collect::<Result<Vec<_>>>()
         .expect("schedules are validated before the run record is built");
     RunRecord {
@@ -602,6 +603,16 @@ fn build_run_record_for_service(
         last_error: None,
         detached: args.detach,
     }
+}
+
+fn merged_schedule_exprs(parcel_schedules: &[String], cli_schedules: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    for expr in parcel_schedules.iter().chain(cli_schedules.iter()) {
+        if !merged.iter().any(|existing| existing == expr) {
+            merged.push(expr.clone());
+        }
+    }
+    merged
 }
 
 fn build_run_schedule(expr: &str) -> Result<RunSchedule> {
@@ -1005,5 +1016,21 @@ mod tests {
         assert_eq!(super::service_poll_interval_ms(30_000, &schedules), 1_000);
         assert_eq!(super::service_poll_interval_ms(500, &schedules), 500);
         assert_eq!(super::service_poll_interval_ms(30_000, &[]), 30_000);
+    }
+
+    #[test]
+    fn merged_schedule_exprs_deduplicates_and_preserves_order() {
+        let merged = super::merged_schedule_exprs(
+            &["*/5 * * * * * *".to_string(), "0 */2 * * * * *".to_string()],
+            &["0 */2 * * * * *".to_string(), "*/1 * * * * * *".to_string()],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "*/5 * * * * * *".to_string(),
+                "0 */2 * * * * *".to_string(),
+                "*/1 * * * * * *".to_string()
+            ]
+        );
     }
 }

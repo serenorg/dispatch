@@ -251,11 +251,11 @@ expression.
 Schedules can originate from:
 
 - CLI flag: `dispatch serve <path> --schedule "*/5 * * * *"`
-- Agentfile declaration: a future `SCHEDULE` directive
+- Agentfile declaration: `SCHEDULE "<cron>"`
 - Runtime API: if Dispatch ever exposes a control socket
 
-The first implementation supports the CLI flag only. Agentfile-level scheduling
-is a natural follow-on once the primitives exist.
+The current implementation supports CLI flags and parcel-authored `SCHEDULE`
+directives. Runtime APIs remain a later follow-on.
 
 ## Session Semantics
 
