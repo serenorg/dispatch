@@ -111,6 +111,7 @@ struct ProvisionalParcelManifest {
     version: Option<String>,
     entrypoint: Option<String>,
     schedules: Vec<String>,
+    listeners: Vec<String>,
     instructions: Vec<InstructionConfig>,
     inline_prompts: Vec<String>,
     env: Vec<EnvVar>,
@@ -136,6 +137,7 @@ struct ResolvedAgentSpec {
     version: Option<String>,
     entrypoint: Option<String>,
     schedules: Vec<String>,
+    listeners: Vec<String>,
     instructions: Vec<InstructionConfig>,
     inline_prompts: Vec<String>,
     env: Vec<EnvVar>,
@@ -229,6 +231,11 @@ pub fn build_agentfile(
             "SCHEDULE" => {
                 if let Some(schedule) = first_scalar(instruction.args.first()) {
                     resolved.schedules.push(schedule);
+                }
+            }
+            "LISTEN" => {
+                if let Some(listen_addr) = first_scalar(instruction.args.first()) {
+                    resolved.listeners.push(listen_addr);
                 }
             }
             "VISIBILITY" => {
@@ -429,6 +436,7 @@ pub fn build_agentfile(
         version: resolved.version,
         entrypoint: resolved.entrypoint,
         schedules: resolved.schedules,
+        listeners: resolved.listeners,
         instructions: resolved.instructions,
         inline_prompts: resolved.inline_prompts,
         env: resolved.env,
@@ -483,6 +491,7 @@ pub fn build_agentfile(
         version: provisional.version,
         entrypoint: provisional.entrypoint,
         schedules: provisional.schedules,
+        listeners: provisional.listeners,
         instructions: provisional.instructions,
         inline_prompts: provisional.inline_prompts,
         env: provisional.env,
@@ -548,6 +557,7 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
         version: parcel.version.clone(),
         entrypoint: parcel.entrypoint.clone(),
         schedules: parcel.schedules.clone(),
+        listeners: parcel.listeners.clone(),
         instructions: parcel.instructions.clone(),
         inline_prompts: parcel.inline_prompts.clone(),
         env: parcel.env.clone(),
@@ -1599,6 +1609,34 @@ ENTRYPOINT heartbeat
             serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
 
         assert_eq!(parcel.schedules, vec!["*/5 * * * * * *", "0 */2 * * * * *"]);
+    }
+
+    #[test]
+    fn build_preserves_authored_listeners_in_manifest() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+LISTEN \"127.0.0.1:0\"
+LISTEN \"127.0.0.1:9000\"
+ENTRYPOINT heartbeat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        assert_eq!(parcel.listeners, vec!["127.0.0.1:0", "127.0.0.1:9000"]);
     }
 
     #[test]

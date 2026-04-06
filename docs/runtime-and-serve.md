@@ -258,6 +258,16 @@ Schedules can originate from:
 The current implementation supports CLI flags and parcel-authored `SCHEDULE`
 directives. Runtime APIs remain a later follow-on.
 
+## Ingress Sources
+
+Listener bindings can originate from:
+
+- CLI flag: `dispatch serve <path> --listen 127.0.0.1:0`
+- Agentfile declaration: `LISTEN "127.0.0.1:0"`
+
+The current implementation supports both and merges them without duplication
+when a service run record is created.
+
 ## Current Ingress Behavior
 
 The current implementation supports local HTTP ingress on service runs via:

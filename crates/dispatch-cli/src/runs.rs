@@ -136,6 +136,9 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     for schedule in &parcel.config.schedules {
         validate_schedule_expr(schedule)?;
     }
+    for listen in &parcel.config.listeners {
+        validate_listen_addr(listen)?;
+    }
     let paths = allocate_run_paths(&parcel, None)?;
     let record = build_run_record_for_service(&parcel, &paths, &args);
     persist_run_record(&paths.record_path, &record)?;
@@ -634,6 +637,7 @@ fn build_run_record_for_service(
         .map(|expr| build_run_schedule(&expr))
         .collect::<Result<Vec<_>>>()
         .expect("schedules are validated before the run record is built");
+    let listeners = merged_listener_addrs(&parcel.config.listeners, &args.listens);
     RunRecord {
         run_id: paths
             .record_path
@@ -651,8 +655,7 @@ fn build_run_record_for_service(
             payload: args.payload.clone(),
             interval_ms: args.interval_ms,
             schedules,
-            listeners: args
-                .listens
+            listeners: listeners
                 .iter()
                 .map(|listen_addr| RunListener {
                     listen_addr: listen_addr.clone(),
@@ -688,6 +691,16 @@ fn merged_schedule_exprs(parcel_schedules: &[String], cli_schedules: &[String]) 
     for expr in parcel_schedules.iter().chain(cli_schedules.iter()) {
         if !merged.iter().any(|existing| existing == expr) {
             merged.push(expr.clone());
+        }
+    }
+    merged
+}
+
+fn merged_listener_addrs(parcel_listens: &[String], cli_listens: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    for listen in parcel_listens.iter().chain(cli_listens.iter()) {
+        if !merged.iter().any(|existing| existing == listen) {
+            merged.push(listen.clone());
         }
     }
     merged
@@ -1475,6 +1488,22 @@ mod tests {
                 "*/5 * * * * * *".to_string(),
                 "0 */2 * * * * *".to_string(),
                 "*/1 * * * * * *".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_listener_addrs_deduplicates_and_preserves_order() {
+        let merged = super::merged_listener_addrs(
+            &["127.0.0.1:0".to_string(), "127.0.0.1:9000".to_string()],
+            &["127.0.0.1:9000".to_string(), "127.0.0.1:7000".to_string()],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "127.0.0.1:0".to_string(),
+                "127.0.0.1:9000".to_string(),
+                "127.0.0.1:7000".to_string()
             ]
         );
     }

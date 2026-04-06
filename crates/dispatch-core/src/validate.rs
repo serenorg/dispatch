@@ -130,7 +130,7 @@ fn validate_agentfile_base(agentfile: &ParsedAgentfile) -> ValidationReport {
 
         match instruction.keyword.as_str() {
             "FROM" => require_min_args(instruction, 1, &mut diagnostics),
-            "NAME" | "VERSION" | "ENTRYPOINT" | "VISIBILITY" | "SCHEDULE" => {
+            "NAME" | "VERSION" | "ENTRYPOINT" | "VISIBILITY" | "SCHEDULE" | "LISTEN" => {
                 require_exact_args(instruction, 1, &mut diagnostics)
             }
             "MODEL" | "FALLBACK" => require_min_args(instruction, 1, &mut diagnostics),
@@ -186,6 +186,7 @@ fn allowed_instructions() -> HashSet<&'static str> {
         "FRAMEWORK",
         "COMPONENT",
         "SCHEDULE",
+        "LISTEN",
         "LABEL",
         "IDENTITY",
         "SOUL",
