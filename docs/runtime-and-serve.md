@@ -87,7 +87,7 @@ discoverable next to `.dispatch/parcels` and `.dispatch/state`.
 
 ## Run Record Schema
 
-The current run record shape should contain:
+The current run record contains:
 
 - `run_id`
 - `parcel_digest`
@@ -95,25 +95,26 @@ The current run record shape should contain:
 - `parcel_version`
 - `parcel_path`
 - `courier`
-- `operation`
+- `registry` (optional registry path override)
+- `operation` (tagged by `kind`: `job`, `heartbeat`, `service`)
 - `status`
 - `pid`
 - `process_group_id`
-- `started_at`
-- `stopped_at`
+- `started_at_ms` (epoch milliseconds)
+- `stopped_at_ms` (epoch milliseconds)
 - `exit_code`
 - `session_file`
 - `log_path`
-- `trigger`
-- `metadata`
+- `tool_approval` (CLI tool-approval mode carried into detached helper)
+- `a2a_policy` (CLI A2A policy carried into detached helper)
+- `last_error` (last error message, if any)
+- `detached` (whether the run was started with `--detach`)
 
-Recommended enums:
+Status values: `starting`, `running`, `stopped`, `exited`, `failed`.
 
-- `status`: `starting`, `running`, `stopped`, `exited`, `failed`
-- `trigger`: `manual`, `schedule`, `webhook`, `event`, `resume`
-
-`operation.kind` carries the runtime kind (`job`, `heartbeat`, `service`) today,
-so a separate top-level `kind` field is optional rather than required.
+`operation.kind` carries the runtime kind (`job`, `heartbeat`, `service`).
+Service operations additionally contain `interval_ms`, `schedules`,
+`listeners`, and `ingress` inline.
 
 ## Process Architecture
 
@@ -204,6 +205,19 @@ The service helper should own:
 - trigger dispatch
 - log emission
 - graceful shutdown
+
+### Service poll interval
+
+The service helper uses `--interval-ms` (default 30s) as its base poll
+interval. When schedules or listeners are active, the effective poll interval
+is automatically reduced to maintain responsiveness:
+
+- with active schedules: capped at 1000ms
+- with active listeners: capped at 100ms
+
+This means `--interval-ms 30000` with an active listener still polls at
+100ms. The flag controls the idle heartbeat cadence, not the listener
+accept loop.
 
 ## Ingress Model
 

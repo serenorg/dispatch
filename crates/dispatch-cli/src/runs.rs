@@ -1186,6 +1186,17 @@ fn hash_shared_secret(secret: &str) -> String {
         .collect()
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 fn next_schedule_fire_ms(expr: &str, after_ms: u64) -> Result<u64> {
     let schedule = Schedule::from_str(expr)
         .with_context(|| format!("failed to parse cron schedule `{expr}`"))?;
@@ -1432,7 +1443,7 @@ fn parse_http_request(
     }
     let request_line = request_line.trim_end();
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
+    let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let target = parts.next().unwrap_or_default().to_string();
     let version = parts.next().unwrap_or_default();
     if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/") {
@@ -1524,7 +1535,11 @@ fn validate_ingress_request(
     if let Some(expected_hash) = ingress.shared_secret_sha256.as_deref() {
         let presented = request_shared_secret(request);
         let presented_hash = presented.as_deref().map(hash_shared_secret);
-        if presented_hash.as_deref() != Some(expected_hash) {
+        let matches = match presented_hash.as_deref() {
+            Some(h) => constant_time_eq(h.as_bytes(), expected_hash.as_bytes()),
+            None => false,
+        };
+        if !matches {
             return Err((
                 401,
                 "Unauthorized",
@@ -1543,9 +1558,11 @@ fn request_shared_secret(request: &ParsedHttpRequest) -> Option<String> {
         .headers
         .get("authorization")
         .and_then(|value| {
-            value
-                .strip_prefix("Bearer ")
-                .or_else(|| value.strip_prefix("bearer "))
+            if value.len() > 7 && value.as_bytes()[..7].eq_ignore_ascii_case(b"Bearer ") {
+                Some(&value[7..])
+            } else {
+                None
+            }
         })
         .map(ToString::to_string)
 }
