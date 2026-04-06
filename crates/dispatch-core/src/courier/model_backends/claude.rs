@@ -1,8 +1,7 @@
 use super::*;
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -147,7 +146,7 @@ impl ChatModelBackend for ClaudeCliBackend {
         let stdout = child.stdout.take().ok_or_else(|| {
             CourierError::ModelBackendRequest("`claude` stdout was not captured".to_string())
         })?;
-        let mut reader = BufReader::new(stdout);
+        let (stdout_receiver, stdout_reader) = spawn_line_reader(BufReader::new(stdout));
 
         let mut streamed_text = String::new();
         let mut result_text: Option<String> = None;
@@ -155,7 +154,7 @@ impl ChatModelBackend for ClaudeCliBackend {
         let mut response_error: Option<CourierError> = None;
 
         while let Some((bytes, line)) =
-            claude_read_line_with_timeout(&mut reader, &mut child, deadline)?
+            claude_read_line_with_timeout(&stdout_receiver, &mut child, deadline)?
         {
             if bytes == 0 {
                 break;
@@ -215,11 +214,13 @@ impl ChatModelBackend for ClaudeCliBackend {
             Ok(status) => status,
             Err(error) => {
                 let _ = claude_join_stdin_writer(stdin_thread);
+                let _ = claude_join_stdout_reader(stdout_reader);
                 let _ = claude_join_stderr_capture(stderr_capture);
                 return Err(error);
             }
         };
         claude_join_stdin_writer(stdin_thread)?;
+        claude_join_stdout_reader(stdout_reader)?;
         let stderr_text = claude_join_stderr_capture(stderr_capture)?;
 
         if let Some(error) = response_error {
@@ -269,12 +270,12 @@ fn claude_binary_path() -> String {
 
 fn claude_persistence_enabled(request: &ModelRequest) -> bool {
     env_flag_override("DISPATCH_PERSIST_THREAD")
-        .or_else(|| claude_model_option_bool(request, "persist-thread"))
+        .or_else(|| model_option_bool(request, "persist-thread"))
         .unwrap_or(true)
 }
 
 fn claude_reasoning_effort(request: &ModelRequest) -> Result<Option<String>, CourierError> {
-    let effort = claude_model_option_value(request, "reasoning-effort")
+    let effort = model_option_value(request, "reasoning-effort")
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_ascii_lowercase())
@@ -306,13 +307,16 @@ fn claude_reasoning_effort(request: &ModelRequest) -> Result<Option<String>, Cou
 /// the full message list is sent in order.
 fn claude_stdin_messages(request: &ModelRequest, session_id: &str) -> Vec<String> {
     if !session_id.is_empty() {
-        let content = request
+        let Some(content) = request
             .messages
             .iter()
             .rev()
             .find(|m| m.role.eq_ignore_ascii_case("user"))
             .map(|m| m.content.as_str())
-            .unwrap_or("");
+            .filter(|content| !content.is_empty())
+        else {
+            return Vec::new();
+        };
         let msg = serde_json::json!({
             "type": "user",
             "message": { "role": "user", "content": content },
@@ -360,32 +364,17 @@ fn claude_join_stdin_writer(handle: JoinHandle<()>) -> Result<(), CourierError> 
     })
 }
 
+fn claude_join_stdout_reader(handle: JoinHandle<()>) -> Result<(), CourierError> {
+    join_line_reader(
+        handle,
+        CourierError::ModelBackendRequest("`claude` stdout reader panicked".to_string()),
+    )
+}
+
 fn claude_join_stderr_capture(handle: JoinHandle<String>) -> Result<String, CourierError> {
     handle.join().map_err(|_| {
         CourierError::ModelBackendRequest("`claude` stderr reader panicked".to_string())
     })
-}
-
-fn env_flag_override(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| parse_claude_flag_bool(&value))
-}
-
-fn claude_model_option_bool(request: &ModelRequest, key: &str) -> Option<bool> {
-    claude_model_option_value(request, key).and_then(parse_claude_flag_bool)
-}
-
-fn claude_model_option_value<'a>(request: &'a ModelRequest, key: &str) -> Option<&'a str> {
-    request.model_options.get(key).map(String::as_str)
-}
-
-fn parse_claude_flag_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "0" | "false" | "no" | "off" => Some(false),
-        "1" | "true" | "yes" | "on" => Some(true),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,41 +402,20 @@ fn claude_remaining_timeout(deadline: Option<Instant>) -> Result<Option<Duration
         .ok_or_else(claude_timeout_error)
 }
 
-fn claude_read_line_with_timeout<R: BufRead + Send>(
-    reader: &mut R,
+fn claude_read_line_with_timeout(
+    receiver: &std::sync::mpsc::Receiver<LineReadResult>,
     child: &mut Child,
     deadline: Option<Instant>,
 ) -> Result<Option<(usize, String)>, CourierError> {
-    let Some(timeout) = claude_remaining_timeout(deadline)? else {
-        let mut line = String::new();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|e| CourierError::ModelBackendRequest(e.to_string()))?;
-        return Ok(Some((bytes, line)));
-    };
-
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut line = String::new();
-            let result = reader
-                .read_line(&mut line)
-                .map(|bytes| (bytes, line))
-                .map_err(|e| CourierError::ModelBackendRequest(e.to_string()));
-            let _ = sender.send(result);
-        });
-
-        match receiver.recv_timeout(timeout) {
-            Ok(result) => result.map(Some),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                Err(claude_timeout_error())
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(CourierError::ModelBackendRequest(
-                "`claude` output reader disconnected unexpectedly".to_string(),
-            )),
-        }
-    })
+    recv_line_with_timeout(
+        receiver,
+        child,
+        claude_remaining_timeout(deadline)?,
+        claude_timeout_error(),
+        CourierError::ModelBackendRequest(
+            "`claude` output reader disconnected unexpectedly".to_string(),
+        ),
+    )
 }
 
 fn claude_wait_for_exit(
@@ -589,6 +557,29 @@ mod tests {
         };
 
         let lines = claude_stdin_messages(&request, "");
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn claude_stdin_messages_returns_empty_for_no_messages_on_resume() {
+        let request = ModelRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            provider: Some("claude".to_string()),
+            model_options: Default::default(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: None,
+            instructions: "Be helpful.".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: Some("session-abc".to_string()),
+        };
+
+        let lines = claude_stdin_messages(&request, "session-abc");
         assert!(lines.is_empty());
     }
 

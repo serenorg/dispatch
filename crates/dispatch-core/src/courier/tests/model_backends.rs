@@ -487,8 +487,10 @@ fn claude_backend_streams_reply_and_resumes_previous_session() {
     );
     assert!(log.contains("--input-format stream-json"));
     assert!(log.contains("--output-format stream-json"));
+    assert!(log.contains("--verbose"));
     assert!(log.contains("--setting-sources"));
     assert!(log.contains("--model claude-sonnet-4-6"));
+    assert!(log.contains("--append-system-prompt Be helpful."));
     assert!(log.contains("--resume session-new"));
 
     let stdin_log = fs::read_to_string(&stdin_log_path).unwrap();
