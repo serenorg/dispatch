@@ -289,7 +289,7 @@ where
             let secret_value =
                 env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
-                    message: format!("configured A2A auth secret `{secret_name}` is not available"),
+                    message: "configured A2A bearer auth secret is not available".to_string(),
                 })?;
             request.header("authorization", &format!("Bearer {secret_value}"))
         }
@@ -300,7 +300,7 @@ where
             let secret_value =
                 env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
-                    message: format!("configured A2A auth secret `{secret_name}` is not available"),
+                    message: "configured A2A header auth secret is not available".to_string(),
                 })?;
             request.header(header_name, &secret_value)
         }
@@ -311,16 +311,14 @@ where
             let username =
                 env_lookup(username_secret_name).ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
-                    message: format!(
-                        "configured A2A auth secret `{username_secret_name}` is not available"
-                    ),
+                    message: "configured A2A basic auth username secret is not available"
+                        .to_string(),
                 })?;
             let password =
                 env_lookup(password_secret_name).ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
-                    message: format!(
-                        "configured A2A auth secret `{password_secret_name}` is not available"
-                    ),
+                    message: "configured A2A basic auth password secret is not available"
+                        .to_string(),
                 })?;
             let encoded = {
                 use base64::Engine as _;

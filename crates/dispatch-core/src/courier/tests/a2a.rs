@@ -207,7 +207,129 @@ fn native_courier_rejects_a2a_call_when_auth_secret_is_missing() {
     assert!(
         error
             .to_string()
-            .contains("configured A2A auth secret `A2A_TOKEN` is not available")
+            .contains("configured A2A bearer auth secret is not available")
+    );
+}
+
+#[test]
+fn native_courier_rejects_a2a_header_auth_when_secret_is_missing() {
+    let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+        expected_auth: Some("X-Api-Key: topsecret".to_string()),
+        ..Default::default()
+    });
+    let tool = LocalToolSpec {
+        alias: "broker".to_string(),
+        description: None,
+        input_schema_packaged_path: None,
+        input_schema_sha256: None,
+        approval: None,
+        risk: None,
+        skill_source: None,
+        target: LocalToolTarget::A2a {
+            endpoint_url: server.base_url.clone(),
+            endpoint_mode: None,
+            auth: Some(crate::manifest::A2aAuthConfig::Header {
+                header_name: "X-Api-Key".to_string(),
+                secret_name: "API_KEY".to_string(),
+            }),
+            expected_agent_name: None,
+            expected_card_sha256: None,
+        },
+    };
+
+    let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None, None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configured A2A header auth secret is not available")
+    );
+}
+
+#[test]
+fn native_courier_rejects_a2a_basic_auth_when_username_secret_is_missing() {
+    let encoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode("demo-user:topsecret")
+    };
+    let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+        expected_auth: Some(format!("Basic {encoded}")),
+        ..Default::default()
+    });
+    let tool = LocalToolSpec {
+        alias: "broker".to_string(),
+        description: None,
+        input_schema_packaged_path: None,
+        input_schema_sha256: None,
+        approval: None,
+        risk: None,
+        skill_source: None,
+        target: LocalToolTarget::A2a {
+            endpoint_url: server.base_url.clone(),
+            endpoint_mode: None,
+            auth: Some(crate::manifest::A2aAuthConfig::Basic {
+                username_secret_name: "A2A_USER".to_string(),
+                password_secret_name: "A2A_PASSWORD".to_string(),
+            }),
+            expected_agent_name: None,
+            expected_card_sha256: None,
+        },
+    };
+
+    let error = execute_a2a_tool_with_env(
+        &tool,
+        Some("hello"),
+        |name| (name == "A2A_PASSWORD").then(|| "topsecret".to_string()),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configured A2A basic auth username secret is not available")
+    );
+}
+
+#[test]
+fn native_courier_rejects_a2a_basic_auth_when_password_secret_is_missing() {
+    let encoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode("demo-user:topsecret")
+    };
+    let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+        expected_auth: Some(format!("Basic {encoded}")),
+        ..Default::default()
+    });
+    let tool = LocalToolSpec {
+        alias: "broker".to_string(),
+        description: None,
+        input_schema_packaged_path: None,
+        input_schema_sha256: None,
+        approval: None,
+        risk: None,
+        skill_source: None,
+        target: LocalToolTarget::A2a {
+            endpoint_url: server.base_url.clone(),
+            endpoint_mode: None,
+            auth: Some(crate::manifest::A2aAuthConfig::Basic {
+                username_secret_name: "A2A_USER".to_string(),
+                password_secret_name: "A2A_PASSWORD".to_string(),
+            }),
+            expected_agent_name: None,
+            expected_card_sha256: None,
+        },
+    };
+
+    let error = execute_a2a_tool_with_env(
+        &tool,
+        Some("hello"),
+        |name| (name == "A2A_USER").then(|| "demo-user".to_string()),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configured A2A basic auth password secret is not available")
     );
 }
 

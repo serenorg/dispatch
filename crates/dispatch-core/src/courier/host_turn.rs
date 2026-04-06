@@ -31,22 +31,34 @@ pub(super) fn execute_host_turn(
     }
 
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/tools") {
-        if local_tools.is_empty() {
+        if local_tools.is_empty() && builtin_tools.is_empty() {
             return Ok(ChatTurnResult {
-                reply: "No local tools are declared for this image.".to_string(),
+                reply: "No tools are declared for this image.".to_string(),
                 events: Vec::new(),
                 streamed_reply: false,
                 backend_state: session.backend_state.clone(),
             });
         }
 
-        let names = local_tools
-            .iter()
-            .map(|tool| tool.alias.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut parts = Vec::new();
+        if !local_tools.is_empty() {
+            let names = local_tools
+                .iter()
+                .map(|tool| tool.alias.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Local tools: {names}"));
+        }
+        if !builtin_tools.is_empty() {
+            let names = builtin_tools
+                .iter()
+                .map(|tool| tool.capability.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Builtin tools: {names}"));
+        }
         return Ok(ChatTurnResult {
-            reply: format!("Declared local tools: {names}"),
+            reply: parts.join("\n"),
             events: Vec::new(),
             streamed_reply: false,
             backend_state: session.backend_state.clone(),

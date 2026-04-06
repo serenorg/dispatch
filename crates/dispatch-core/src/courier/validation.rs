@@ -19,6 +19,8 @@ pub(super) fn validate_courier_reference(
 }
 
 fn courier_reference_matches(kind: CourierKind, reference: &str) -> bool {
+    let reference = reference.to_ascii_lowercase();
+    let reference = reference.as_str();
     match kind {
         CourierKind::Native => {
             reference == "native"
@@ -114,5 +116,22 @@ pub(super) fn resolve_manifest_path(path: &Path) -> Result<PathBuf, CourierError
         Ok(path.join("manifest.json"))
     } else {
         Ok(path.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn courier_reference_matching_is_case_insensitive() {
+        assert!(courier_reference_matches(
+            CourierKind::Native,
+            "Dispatch/Native:latest",
+        ));
+        assert!(courier_reference_matches(
+            CourierKind::Docker,
+            "DISPATCH/DOCKER@sha256:abc123",
+        ));
     }
 }

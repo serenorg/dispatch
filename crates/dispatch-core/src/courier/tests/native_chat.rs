@@ -819,3 +819,69 @@ ENTRYPOINT chat
         Some(CourierEvent::Message { content, .. }) if content.contains("# SOUL")
     ));
 }
+
+#[test]
+fn native_courier_chat_tools_command_lists_builtin_tools_when_no_local_tools() {
+    let test_image = build_test_image(
+        "\
+FROM dispatch/native:latest
+TOOL BUILTIN memory_get
+TOOL BUILTIN checkpoint_list
+ENTRYPOINT chat
+",
+        &[],
+    );
+    let courier = NativeCourier::default();
+    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+    let response = futures::executor::block_on(courier.run(
+        &test_image.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat {
+                input: "/tools".to_string(),
+            },
+        },
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        response.events.first(),
+        Some(CourierEvent::Message { content, .. })
+            if content.contains("Builtin tools: memory_get, checkpoint_list")
+                && !content.contains("Local tools:")
+    ));
+}
+
+#[test]
+fn native_courier_chat_tools_command_lists_local_and_builtin_tools_separately() {
+    let test_image = build_test_image(
+        "\
+FROM dispatch/native:latest
+TOOL LOCAL tools/demo.sh AS demo
+TOOL BUILTIN memory_get
+ENTRYPOINT chat
+",
+        &[("tools/demo.sh", "printf demo")],
+    );
+    let courier = NativeCourier::default();
+    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+
+    let response = futures::executor::block_on(courier.run(
+        &test_image.image,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat {
+                input: "/tools".to_string(),
+            },
+        },
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        response.events.first(),
+        Some(CourierEvent::Message { content, .. })
+            if content.contains("Local tools: demo")
+                && content.contains("Builtin tools: memory_get")
+    ));
+}

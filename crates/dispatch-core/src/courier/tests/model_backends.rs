@@ -1185,8 +1185,7 @@ fn codex_backend_can_disable_persistent_history_per_request() {
     let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("\"method\":\"thread/start\""));
     assert!(!log.contains("\"method\":\"thread/resume\""));
-    assert!(log.contains("\"ephemeral\":true"));
-    assert!(!log.contains("\"persistExtendedHistory\":true"));
+    assert!(log.contains("\"persistExtendedHistory\":false"));
 }
 
 #[test]
@@ -1252,8 +1251,7 @@ fn codex_backend_env_override_disables_persistent_history() {
     assert!(reply.response_id.is_none());
 
     let log = fs::read_to_string(&log_path).unwrap();
-    assert!(log.contains("\"ephemeral\":true"));
-    assert!(!log.contains("\"persistExtendedHistory\":true"));
+    assert!(log.contains("\"persistExtendedHistory\":false"));
 }
 
 #[test]

@@ -950,7 +950,6 @@ fn codex_thread_start_params(
         "sandbox": "workspace-write",
         "experimentalRawEvents": false,
         "persistExtendedHistory": persistence_enabled,
-        "ephemeral": (!persistence_enabled),
         "model": request.model,
     })
 }
