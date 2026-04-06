@@ -68,7 +68,7 @@ pub(super) fn execute_host_turn(
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/help") {
         return Ok(ChatTurnResult {
             reply: format!(
-                "{} chat is a reference backend. Available commands: /prompt, /tools, /memory, /help.",
+                "{} chat runs locally. Available commands: /prompt, /tools, /memory, /help.",
                 context.host_label
             ),
             events: Vec::new(),
@@ -115,7 +115,7 @@ pub(super) fn execute_host_turn(
                 events.push(CourierEvent::BackendFallback {
                     backend: backend.id().to_string(),
                     error: format!(
-                        "tool call loop reached {} rounds without a final reply; falling back to local reference reply",
+                        "tool call loop reached {} rounds without a final reply; falling back to the local parcel reply",
                         max_tool_rounds
                     ),
                 });
@@ -349,7 +349,7 @@ pub(super) fn execute_host_turn(
 
     Ok(ChatTurnResult {
         reply: format!(
-            "{} {} reference reply for turn {}. Loaded {} prompt section(s) and {} tool(s). Prior messages in session: {}. Input: {}",
+            "{} {} reply for turn {}. Loaded {} prompt section(s) and {} tool(s). Prior messages in session: {}. Input: {}",
             context.host_label,
             native_turn_mode_name(mode),
             session.turn_count,

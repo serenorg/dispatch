@@ -84,7 +84,7 @@ ENTRYPOINT chat
 }
 
 #[test]
-fn docker_courier_chat_executes_reference_reply_and_records_history() {
+fn docker_courier_chat_executes_local_reply_and_records_history() {
     let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
@@ -109,7 +109,7 @@ ENTRYPOINT chat
     assert!(matches!(
         response.events.first(),
         Some(CourierEvent::Message { content, .. })
-            if content.contains("Docker chat reference reply")
+            if content.contains("Docker chat reply")
     ));
     assert_eq!(response.session.turn_count, 1);
     assert_eq!(response.session.history.len(), 2);

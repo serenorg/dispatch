@@ -378,7 +378,7 @@ ENTRYPOINT chat
     assert!(matches!(
         response.events.get(1),
         Some(CourierEvent::Message { content, .. })
-            if content.contains("Native chat reference reply")
+            if content.contains("Native chat reply")
     ));
     assert_eq!(backend.calls.lock().unwrap().len(), 1);
 }
@@ -416,7 +416,7 @@ ENTRYPOINT chat
     assert!(matches!(
         response.events.get(1),
         Some(CourierEvent::Message { content, .. })
-            if content.contains("Native chat reference reply")
+            if content.contains("Native chat reply")
     ));
     assert_eq!(backend.calls.lock().unwrap().len(), 1);
 }
@@ -530,7 +530,7 @@ ENTRYPOINT chat
     assert!(matches!(
         response.events.iter().rev().nth(1),
         Some(CourierEvent::Message { content, .. })
-            if content.contains("Native chat reference reply")
+            if content.contains("Native chat reply")
     ));
     assert_eq!(backend.calls.lock().unwrap().len(), 8);
 }

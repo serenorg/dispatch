@@ -317,7 +317,7 @@ ENTRYPOINT job
     assert!(matches!(
         response.events.first(),
         Some(CourierEvent::Message { content, .. })
-            if content.contains("Native job reference reply")
+            if content.contains("Native job reply")
     ));
     assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
 }
@@ -349,7 +349,7 @@ ENTRYPOINT heartbeat
     assert!(matches!(
         response.events.first(),
         Some(CourierEvent::Message { content, .. })
-            if content.contains("Native heartbeat reference reply")
+            if content.contains("Native heartbeat reply")
     ));
     assert!(matches!(response.events.last(), Some(CourierEvent::Done)));
 }
