@@ -4,10 +4,123 @@ use dispatch_core::{
     load_parcel, parse_depot_reference, pull_parcel_verified, push_parcel, sign_parcel,
     verify_parcel, verify_parcel_signature,
 };
+use serde::Serialize;
 use std::{
     collections::BTreeSet,
+    fs,
     path::{Path, PathBuf},
 };
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ParcelListEntry {
+    pub digest: String,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub courier: String,
+    pub entrypoint: Option<String>,
+    pub parcel_dir: PathBuf,
+    pub manifest_path: PathBuf,
+}
+
+pub(crate) fn list(path: PathBuf, emit_json: bool) -> Result<()> {
+    let parcels_root = crate::resolve_parcels_root(&path);
+    let entries = collect_parcel_entries(&parcels_root)?;
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        print_parcel_list(&parcels_root, &entries);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn collect_parcel_entries(parcels_root: &Path) -> Result<Vec<ParcelListEntry>> {
+    if !parcels_root.exists() {
+        return Ok(Vec::new());
+    }
+    if !parcels_root.is_dir() {
+        bail!("parcel store {} is not a directory", parcels_root.display());
+    }
+
+    let mut entries = fs::read_dir(parcels_root)
+        .with_context(|| format!("failed to read {}", parcels_root.display()))?
+        .map(|entry| -> Result<Option<ParcelListEntry>> {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() || !path.join("manifest.json").exists() {
+                return Ok(None);
+            }
+
+            let parcel = match load_parcel(&path) {
+                Ok(parcel) => parcel,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(ParcelListEntry {
+                digest: parcel.config.digest.clone(),
+                name: parcel.config.name.clone(),
+                version: parcel.config.version.clone(),
+                courier: parcel.config.courier.reference().to_string(),
+                entrypoint: parcel.config.entrypoint.clone(),
+                parcel_dir: parcel.parcel_dir,
+                manifest_path: parcel.manifest_path,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| left.digest.cmp(&right.digest));
+    Ok(entries)
+}
+
+pub(crate) fn resolve_parcel_prefix(parcels_root: &Path, prefix: &str) -> Result<PathBuf> {
+    let prefix = prefix.to_ascii_lowercase();
+    if prefix.len() < 8 {
+        bail!("parcel id prefix `{prefix}` is too short; use at least 8 characters");
+    }
+    if !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("parcel id prefix `{prefix}` must be hexadecimal");
+    }
+    if !parcels_root.exists() {
+        bail!("parcel store {} does not exist", parcels_root.display());
+    }
+    if !parcels_root.is_dir() {
+        bail!("parcel store {} is not a directory", parcels_root.display());
+    }
+
+    let mut matches = fs::read_dir(parcels_root)
+        .with_context(|| format!("failed to read {}", parcels_root.display()))?
+        .map(|entry| -> Result<Option<PathBuf>> {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return Ok(None);
+            };
+            if path.is_dir() && path.join("manifest.json").exists() && name.starts_with(&prefix) {
+                return Ok(Some(path));
+            }
+            Ok(None)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    matches.sort();
+    match matches.as_slice() {
+        [] => bail!(
+            "no parcel matching id prefix `{prefix}` found in {}",
+            parcels_root.display()
+        ),
+        [path] => Ok(path.clone()),
+        _ => bail!(
+            "parcel id prefix `{prefix}` is ambiguous in {}",
+            parcels_root.display()
+        ),
+    }
+}
 
 pub(crate) fn verify(path: PathBuf, public_keys: Vec<PathBuf>, emit_json: bool) -> Result<()> {
     let report =
@@ -240,5 +353,97 @@ pub(crate) fn print_signature_verifications(verifications: &[SignatureVerificati
         println!("  Signature Found: {}", verification.signature_found);
         println!("  Digest Matches: {}", verification.digest_matches);
         println!("  Signature Matches: {}", verification.signature_matches);
+    }
+}
+
+fn print_parcel_list(parcels_root: &Path, entries: &[ParcelListEntry]) {
+    if entries.is_empty() {
+        println!("No local parcels found in {}", parcels_root.display());
+        return;
+    }
+
+    println!(
+        "{:<12}  {:<24}  {:<10}  {:<18}  PATH",
+        "DIGEST", "NAME", "VERSION", "COURIER"
+    );
+    for entry in entries {
+        let short_digest = entry.digest.chars().take(12).collect::<String>();
+        println!(
+            "{:<12}  {:<24}  {:<10}  {:<18}  {}",
+            short_digest,
+            entry.name.as_deref().unwrap_or("-"),
+            entry.version.as_deref().unwrap_or("-"),
+            entry.courier,
+            entry.parcel_dir.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_parcel_entries, resolve_parcel_prefix};
+    use dispatch_core::{BuildOptions, build_agentfile};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn collect_parcel_entries_reads_local_store_metadata() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "\
+FROM dispatch/native:latest
+NAME parcel-list-test
+VERSION 1.2.3
+ENTRYPOINT chat
+",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &source_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: source_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let entries = collect_parcel_entries(&source_dir.join(".dispatch/parcels")).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].digest, built.digest);
+        assert_eq!(entries[0].name.as_deref(), Some("parcel-list-test"));
+        assert_eq!(entries[0].version.as_deref(), Some("1.2.3"));
+        assert_eq!(entries[0].courier, "dispatch/native:latest");
+    }
+
+    #[test]
+    fn resolve_parcel_prefix_returns_unique_match() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("parcels");
+        fs::create_dir_all(&root).unwrap();
+        let digest = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let parcel_dir = root.join(digest);
+        fs::create_dir_all(&parcel_dir).unwrap();
+        fs::write(parcel_dir.join("manifest.json"), "{}").unwrap();
+
+        let resolved = resolve_parcel_prefix(&root, "abcdef12").unwrap();
+
+        assert_eq!(resolved, parcel_dir);
+    }
+
+    #[test]
+    fn collect_parcel_entries_skips_invalid_parcel_directories() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("parcels");
+        let invalid = root.join("deadbeefdeadbeef");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join("manifest.json"), "{}").unwrap();
+
+        let entries = collect_parcel_entries(&root).unwrap();
+
+        assert!(entries.is_empty());
     }
 }

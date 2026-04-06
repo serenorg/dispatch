@@ -9,9 +9,9 @@ use dispatch_core::{
 use futures::executor::block_on;
 use serde::Serialize;
 use std::{
-    fs,
+    env, fs,
     io::{self, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub(crate) fn run(args: crate::RunArgs) -> Result<()> {
@@ -54,8 +54,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
         tool_approval,
         ..
     } = exec;
-    let parcel =
-        load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))?;
+    let parcel = load_or_build_parcel_for_run(path)?;
     if list_tools && json {
         print_tool_manifest_json(&parcel)?;
         return Ok(());
@@ -236,6 +235,53 @@ fn load_or_open_session(
         .with_context(|| "failed to open dispatch session")?;
     persist_session(session_file, &session)?;
     Ok(session)
+}
+
+fn load_or_build_parcel_for_run(path: PathBuf) -> Result<LoadedParcel> {
+    if crate::is_agentfile_target(&path) {
+        return crate::build_parcel_from_source(path, None);
+    }
+
+    if path.exists() {
+        return load_parcel(&path)
+            .with_context(|| format!("failed to load parcel {}", path.display()));
+    }
+
+    if let Some((parcels_root, prefix)) = parcel_prefix_lookup(&path)? {
+        let parcel_dir = crate::parcel_ops::resolve_parcel_prefix(&parcels_root, &prefix)?;
+        return load_parcel(&parcel_dir)
+            .with_context(|| format!("failed to load parcel {}", parcel_dir.display()));
+    }
+
+    load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))
+}
+
+fn parcel_prefix_lookup(path: &Path) -> Result<Option<(PathBuf, String)>> {
+    let Some(prefix) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    if !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+
+    let parcels_root = if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if parent == Path::new(".") {
+            crate::resolve_parcels_root(
+                &env::current_dir().context("failed to resolve current working directory")?,
+            )
+        } else {
+            crate::resolve_parcels_root(parent)
+        }
+    } else {
+        crate::resolve_parcels_root(
+            &env::current_dir().context("failed to resolve current working directory")?,
+        )
+    };
+
+    Ok(Some((parcels_root, prefix.to_ascii_lowercase())))
 }
 
 pub(crate) fn load_session(path: &Path) -> Result<CourierSession> {
@@ -633,5 +679,75 @@ ENTRYPOINT chat
                     && entry["approval"] == "never"
                     && entry["risk"] == "medium")
         );
+    }
+
+    #[test]
+    fn load_or_build_parcel_for_run_builds_agentfile_source() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nNAME run-source-test\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let parcel = load_or_build_parcel_for_run(source_dir.clone()).unwrap();
+
+        assert_eq!(parcel.config.name.as_deref(), Some("run-source-test"));
+        assert!(parcel.manifest_path.exists());
+    }
+
+    #[test]
+    fn load_or_build_parcel_for_run_resolves_unique_digest_prefix() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nNAME run-prefix-test\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &source_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: source_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let prefix = built.digest.chars().take(8).collect::<String>();
+        let parcel =
+            load_or_build_parcel_for_run(source_dir.join(".dispatch/parcels").join(prefix))
+                .unwrap();
+
+        assert_eq!(parcel.config.digest, built.digest);
+    }
+
+    #[test]
+    fn load_or_build_parcel_for_run_rejects_short_digest_prefix() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nNAME run-prefix-short-test\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &source_dir.join("Agentfile"),
+            &BuildOptions {
+                output_root: source_dir.join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let prefix = built.digest.chars().take(4).collect::<String>();
+        let error = load_or_build_parcel_for_run(source_dir.join(".dispatch/parcels").join(prefix))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("too short"));
     }
 }

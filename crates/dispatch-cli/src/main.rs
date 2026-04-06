@@ -14,7 +14,11 @@ use dispatch_core::{
     A2aOperatorPolicyOverrides, BuildOptions, Level, build_agentfile, parse_agentfile,
     validate_agentfile_at_path, with_a2a_operator_policy_overrides,
 };
-use std::{fs, io::IsTerminal, path::PathBuf};
+use std::{
+    fs,
+    io::IsTerminal,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "dispatch")]
@@ -73,6 +77,16 @@ struct BuildArgs {
     /// Output directory for built parcels
     #[arg(long)]
     output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ParcelListArgs {
+    /// Path to an Agentfile, directory containing one, parcel store root, or built parcel
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Print full parcel inventory as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -180,7 +194,7 @@ struct PullArgs {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// Path to a parcel directory or a `manifest.json` file
+    /// Path to a built parcel, Agentfile, directory containing one, or unique parcel id prefix
     path: PathBuf,
     #[command(flatten)]
     exec: RunExecutionArgs,
@@ -276,6 +290,9 @@ enum ParcelCommand {
     Lint(LintArgs),
     /// Build an immutable agent parcel
     Build(BuildArgs),
+    /// List locally built parcels
+    #[command(visible_alias = "ls")]
+    List(ParcelListArgs),
     /// Execute packaged evals against a live courier
     Eval(EvalArgs),
     /// Inspect a built parcel
@@ -509,6 +526,7 @@ fn parcel_command(command: ParcelCommand) -> Result<()> {
     match command {
         ParcelCommand::Lint(LintArgs { path, json }) => lint(path, json),
         ParcelCommand::Build(BuildArgs { path, output_dir }) => build(path, output_dir),
+        ParcelCommand::List(ParcelListArgs { path, json }) => parcel_ops::list(path, json),
         ParcelCommand::Eval(EvalArgs {
             path,
             courier,
@@ -620,6 +638,79 @@ fn resolve_agentfile_path(path: PathBuf) -> PathBuf {
     } else {
         path
     }
+}
+
+pub(crate) fn is_agentfile_target(path: &Path) -> bool {
+    if path.is_dir() {
+        return path.join("Agentfile").exists();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "Agentfile")
+}
+
+pub(crate) fn default_parcels_root_for_source(path: &Path) -> PathBuf {
+    let agentfile_path = resolve_agentfile_path(path.to_path_buf());
+    agentfile_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".dispatch/parcels")
+}
+
+pub(crate) fn resolve_parcels_root(path: &Path) -> PathBuf {
+    if is_agentfile_target(path) {
+        return default_parcels_root_for_source(path);
+    }
+
+    if path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+    {
+        return path
+            .parent()
+            .and_then(Path::parent)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+    }
+
+    if path.is_dir() {
+        if path.join("manifest.json").exists() {
+            return path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf());
+        }
+
+        let nested = path.join(".dispatch/parcels");
+        if nested.exists() {
+            return nested;
+        }
+    }
+
+    path.to_path_buf()
+}
+
+pub(crate) fn build_parcel_from_source(
+    path: PathBuf,
+    output_dir: Option<PathBuf>,
+) -> Result<dispatch_core::LoadedParcel> {
+    let agentfile_path = resolve_agentfile_path(path);
+    let output_root =
+        output_dir.unwrap_or_else(|| default_parcels_root_for_source(agentfile_path.as_path()));
+
+    let built = build_agentfile(
+        &agentfile_path,
+        &BuildOptions {
+            output_root: output_root.clone(),
+        },
+    )
+    .with_context(|| format!("failed to build {}", agentfile_path.display()))?;
+
+    dispatch_core::load_parcel(&built.parcel_dir)
+        .with_context(|| format!("failed to load parcel {}", built.parcel_dir.display()))
 }
 
 fn build(path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
@@ -814,6 +905,64 @@ mod tests {
         assert_eq!(
             a2a_trust_policy.as_deref(),
             Some(Path::new("/tmp/a2a-policy.toml"))
+        );
+    }
+
+    #[test]
+    fn cli_parses_parcel_list_command() {
+        let cli =
+            Cli::try_parse_from(["dispatch", "parcel", "list", "examples/demo", "--json"]).unwrap();
+
+        let Command::Parcel { command } = cli.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::List(args) = command else {
+            panic!("expected parcel list command");
+        };
+        assert_eq!(args.path, Path::new("examples/demo"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn cli_accepts_parcel_ls_alias() {
+        let cli = Cli::try_parse_from(["dispatch", "parcel", "ls"]).unwrap();
+
+        let Command::Parcel { command } = cli.command else {
+            panic!("expected parcel command");
+        };
+        let ParcelCommand::List(args) = command else {
+            panic!("expected parcel list command");
+        };
+        assert_eq!(args.path, Path::new("."));
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn resolve_parcels_root_prefers_source_context_store() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::resolve_parcels_root(&source_dir),
+            source_dir.join(".dispatch/parcels")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_parcels_root_accepts_built_parcel_directory() {
+        let dir = tempdir().unwrap();
+        let (parcel_dir, _) = build_test_image(dir.path());
+
+        assert_eq!(
+            crate::resolve_parcels_root(&parcel_dir),
+            parcel_dir.parent().unwrap()
         );
     }
 

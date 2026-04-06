@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::eval::{ToolA2aEndpointExpectation, ToolSchemaExpectation};
 use dispatch_core::{
-    BuildOptions, BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest,
-    DockerCourier, EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier, ResolvedCourier,
-    TestSpec, ToolConfig, ToolExitExpectation, ToolInvocation, ToolRunResult, ToolTextExpectation,
-    WasmCourier, build_agentfile, load_parcel, load_parcel_evals, load_parcel_tests,
-    resolve_courier,
+    BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest, DockerCourier,
+    EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier, ResolvedCourier, TestSpec,
+    ToolConfig, ToolExitExpectation, ToolInvocation, ToolRunResult, ToolTextExpectation,
+    WasmCourier, load_parcel, load_parcel_evals, load_parcel_tests, resolve_courier,
 };
 use futures::executor::block_on;
 use jsonschema::Validator;
@@ -66,42 +65,11 @@ fn load_or_build_parcel_for_eval(
     path: PathBuf,
     output_dir: Option<PathBuf>,
 ) -> Result<LoadedParcel> {
-    if is_agentfile_target(&path) {
-        let agentfile_path = resolve_agentfile_path(path);
-        let context_dir = agentfile_path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let output_root = output_dir.unwrap_or_else(|| context_dir.join(".dispatch/parcels"));
-        let built = build_agentfile(
-            &agentfile_path,
-            &BuildOptions {
-                output_root: output_root.clone(),
-            },
-        )
-        .with_context(|| format!("failed to build {}", agentfile_path.display()))?;
-        return load_parcel(&built.parcel_dir)
-            .with_context(|| format!("failed to load parcel {}", built.parcel_dir.display()));
+    if crate::is_agentfile_target(&path) {
+        return crate::build_parcel_from_source(path, output_dir);
     }
 
     load_parcel(&path).with_context(|| format!("failed to load parcel {}", path.display()))
-}
-
-fn is_agentfile_target(path: &Path) -> bool {
-    if path.is_dir() {
-        return path.join("Agentfile").exists();
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "Agentfile")
-}
-
-fn resolve_agentfile_path(path: PathBuf) -> PathBuf {
-    if path.is_dir() {
-        path.join("Agentfile")
-    } else {
-        path
-    }
 }
 
 fn eval_with_builtin_courier(
@@ -699,7 +667,7 @@ fn print_eval_report(report: &EvalReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch_core::build_agentfile;
+    use dispatch_core::{BuildOptions, build_agentfile};
     use tempfile::tempdir;
 
     fn build_eval_parcel(
