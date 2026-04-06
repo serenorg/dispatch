@@ -4,6 +4,7 @@ mod eval;
 mod inspect;
 mod parcel_ops;
 mod run;
+mod runs;
 mod skill_run;
 mod state;
 mod tool_display;
@@ -14,6 +15,7 @@ use dispatch_core::{
     A2aOperatorPolicyOverrides, BuildOptions, Level, build_agentfile, parse_agentfile,
     validate_agentfile_at_path, with_a2a_operator_policy_overrides,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::IsTerminal,
@@ -55,8 +57,25 @@ enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Manage local runs using Docker-style container commands
+    Container {
+        #[command(subcommand)]
+        command: ContainerCommand,
+    },
     /// Execute part of a built parcel locally
     Run(RunArgs),
+    /// Run a parcel as a long-lived local service
+    Serve(ServeArgs),
+    /// List active and completed local runs
+    Ps(PsArgs),
+    /// Print logs for a local run
+    Logs(LogsArgs),
+    /// Stop a local run
+    Stop(StopArgs),
+    /// Remove a local run record and logs
+    Rm(RemoveRunArgs),
+    /// Inspect a local run record
+    InspectRun(InspectRunArgs),
     /// Execute Agent Skills bundles and files
     Skill {
         #[command(subcommand)]
@@ -71,6 +90,11 @@ enum Command {
     State {
         #[command(subcommand)]
         command: StateCommand,
+    },
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        command: InternalCommand,
     },
 }
 
@@ -215,6 +239,94 @@ struct RunArgs {
     exec: RunExecutionArgs,
 }
 
+#[derive(Debug, Args, Clone)]
+struct ServeArgs {
+    /// Path to a built parcel, Agentfile, directory containing one, or unique parcel id prefix
+    path: PathBuf,
+    /// Courier backend to use for execution
+    #[arg(long = "courier", default_value = "native")]
+    courier: String,
+    /// Override the courier plugin registry path
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// Persist and resume dispatch state from a JSON file
+    #[arg(long)]
+    session_file: Option<PathBuf>,
+    /// Heartbeat payload to send on each service tick
+    #[arg(long)]
+    payload: Option<String>,
+    /// Milliseconds to wait between heartbeats
+    #[arg(long, default_value_t = 30_000)]
+    interval_ms: u64,
+    /// Detach the service and return immediately
+    #[arg(long)]
+    detach: bool,
+    /// Override allowed outbound A2A origins or hostnames for this command
+    #[arg(long)]
+    a2a_allowed_origins: Option<String>,
+    /// Apply a structured A2A trust policy file for this command
+    #[arg(long)]
+    a2a_trust_policy: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct PsArgs {
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Print full run inventory as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct LogsArgs {
+    /// Run id or unique run id prefix
+    run: String,
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Follow appended log output until the run exits
+    #[arg(long)]
+    follow: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct StopArgs {
+    /// Run id or unique run id prefix
+    run: String,
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Forcefully terminate the run
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RemoveRunArgs {
+    /// Run id or unique run id prefix
+    run: String,
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Remove run files even when ancillary files are missing
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct InspectRunArgs {
+    /// Run id or unique run id prefix
+    run: String,
+    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Print the full run record as JSON
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Args)]
 struct SkillSynthesisOverrideArgs {
     /// Primary model id override for synthesized skill execution
@@ -297,6 +409,9 @@ struct RunExecutionArgs {
     /// Apply a structured A2A trust policy file for this command
     #[arg(long)]
     a2a_trust_policy: Option<PathBuf>,
+    /// Detach the run and return immediately
+    #[arg(long)]
+    detach: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -400,13 +515,28 @@ enum CourierCommand {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Subcommand)]
+enum ContainerCommand {
+    /// List active and completed local runs
+    #[command(visible_alias = "ls")]
+    List(PsArgs),
+    /// Print logs for a local run
+    Logs(LogsArgs),
+    /// Stop a local run
+    Stop(StopArgs),
+    /// Remove a local run record and logs
+    Rm(RemoveRunArgs),
+    /// Inspect a local run record
+    Inspect(InspectRunArgs),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CliA2aPolicy {
     pub allowed_origins: Option<String>,
     pub trust_policy: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub(crate) enum CliToolApprovalMode {
     Ask,
     Always,
@@ -536,6 +666,15 @@ enum StateCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum InternalCommand {
+    /// Execute a recorded local run
+    RunRecord {
+        /// Path to a recorded run JSON file
+        record: PathBuf,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -550,13 +689,21 @@ fn main() -> Result<()> {
         Command::Push(args) => depot_command(DepotCommand::Push(args)),
         Command::Images(args) => parcel_ops::list(args.path, args.json),
         Command::Image { command } => image_command(command),
+        Command::Container { command } => container_command(command),
         Command::Run(args) => run::run(args),
+        Command::Serve(args) => runs::serve(args),
+        Command::Ps(args) => runs::ps(args),
+        Command::Logs(args) => runs::logs(args),
+        Command::Stop(args) => runs::stop(args),
+        Command::Rm(args) => runs::rm(args),
+        Command::InspectRun(args) => runs::inspect_run(args),
         Command::Skill { command } => match command {
             SkillCommand::Validate(args) => skill_run::validate_skill(*args),
             SkillCommand::Run(args) => skill_run::run_skill(*args),
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
+        Command::Internal { command } => runs::internal_command(command),
     }
 }
 
@@ -633,6 +780,16 @@ fn image_command(command: ImageCommand) -> Result<()> {
         }) => inspect::inspect(path, courier, registry, json),
         ImageCommand::Pull(args) => depot_command(DepotCommand::Pull(args)),
         ImageCommand::Push(args) => depot_command(DepotCommand::Push(args)),
+    }
+}
+
+fn container_command(command: ContainerCommand) -> Result<()> {
+    match command {
+        ContainerCommand::List(args) => runs::ps(args),
+        ContainerCommand::Logs(args) => runs::logs(args),
+        ContainerCommand::Stop(args) => runs::stop(args),
+        ContainerCommand::Rm(args) => runs::rm(args),
+        ContainerCommand::Inspect(args) => runs::inspect_run(args),
     }
 }
 
@@ -746,6 +903,55 @@ pub(crate) fn resolve_parcels_root(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+pub(crate) fn resolve_runs_root(path: &Path) -> PathBuf {
+    if is_agentfile_target(path) {
+        return resolve_agentfile_path(path.to_path_buf())
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".dispatch/runs");
+    }
+
+    if path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+    {
+        return runs_root_for_parcel_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+    }
+
+    if path.is_dir() {
+        if path.join("manifest.json").exists() {
+            return runs_root_for_parcel_dir(path);
+        }
+
+        let nested = path.join(".dispatch/runs");
+        if nested.exists() {
+            return nested;
+        }
+    }
+
+    path.to_path_buf()
+}
+
+fn runs_root_for_parcel_dir(parcel_dir: &Path) -> PathBuf {
+    let store_root = parcel_dir.parent().unwrap_or(parcel_dir);
+    if store_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "parcels")
+    {
+        store_root
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| store_root.to_path_buf())
+            .join("runs")
+    } else {
+        store_root.join("runs")
+    }
+}
+
 pub(crate) fn build_parcel_from_source(
     path: PathBuf,
     output_dir: Option<PathBuf>,
@@ -816,9 +1022,11 @@ fn state_command(command: StateCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CliA2aPolicy, CliToolApprovalMode, Command, CourierCommand, DepotCommand, EvalArgs,
-        ImageCommand, InspectArgs, KeygenArgs, ParcelCommand, PullArgs, PushArgs, SignArgs,
-        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, ValidateSkillArgs, VerifyArgs,
+        Cli, CliA2aPolicy, CliToolApprovalMode, Command, ContainerCommand, CourierCommand,
+        DepotCommand, EvalArgs, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand,
+        KeygenArgs, LogsArgs, ParcelCommand, PsArgs, PullArgs, PushArgs, RemoveRunArgs, SignArgs,
+        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs,
+        VerifyArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -922,6 +1130,7 @@ mod tests {
             Some(Path::new("/tmp/a2a-policy.toml"))
         );
         assert!(args.exec.print_prompt);
+        assert!(!args.exec.detach);
     }
 
     #[test]
@@ -1010,6 +1219,20 @@ mod tests {
         };
         let ImageCommand::List(args) = command else {
             panic!("expected image list command");
+        };
+        assert_eq!(args.path, Path::new("examples/demo"));
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn cli_parses_container_ls_alias() {
+        let cli = Cli::try_parse_from(["dispatch", "container", "ls", "examples/demo"]).unwrap();
+
+        let Command::Container { command } = cli.command else {
+            panic!("expected container command");
+        };
+        let ContainerCommand::List(args) = command else {
+            panic!("expected container list command");
         };
         assert_eq!(args.path, Path::new("examples/demo"));
         assert!(!args.json);
@@ -1342,6 +1565,123 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_detached_run_and_service_commands() {
+        let run = Cli::try_parse_from([
+            "dispatch",
+            "run",
+            "manifest.json",
+            "--job",
+            "{\"ok\":true}",
+            "--detach",
+        ])
+        .unwrap();
+        let Command::Run(args) = run.command else {
+            panic!("expected run command");
+        };
+        assert!(args.exec.detach);
+        assert_eq!(args.exec.job.as_deref(), Some("{\"ok\":true}"));
+
+        let serve = Cli::try_parse_from([
+            "dispatch",
+            "serve",
+            "examples/demo",
+            "--payload",
+            "tick",
+            "--interval-ms",
+            "5000",
+            "--detach",
+        ])
+        .unwrap();
+        let Command::Serve(args) = serve.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.path, PathBuf::from("examples/demo"));
+        assert_eq!(args.payload.as_deref(), Some("tick"));
+        assert_eq!(args.interval_ms, 5000);
+        assert!(args.detach);
+    }
+
+    #[test]
+    fn cli_parses_run_management_commands() {
+        let ps = Cli::try_parse_from(["dispatch", "ps", "--json"]).unwrap();
+        let Command::Ps(PsArgs { path, json }) = ps.command else {
+            panic!("expected ps command");
+        };
+        assert_eq!(path, PathBuf::from("."));
+        assert!(json);
+
+        let logs = Cli::try_parse_from(["dispatch", "logs", "abc123", "--follow"]).unwrap();
+        let Command::Logs(LogsArgs { run, path, follow }) = logs.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("."));
+        assert!(follow);
+
+        let stop = Cli::try_parse_from(["dispatch", "stop", "abc123", "examples/demo", "--force"])
+            .unwrap();
+        let Command::Stop(StopArgs { run, path, force }) = stop.command else {
+            panic!("expected stop command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(force);
+
+        let rm =
+            Cli::try_parse_from(["dispatch", "rm", "abc123", "examples/demo", "--force"]).unwrap();
+        let Command::Rm(RemoveRunArgs { run, path, force }) = rm.command else {
+            panic!("expected rm command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(force);
+
+        let inspect = Cli::try_parse_from([
+            "dispatch",
+            "inspect-run",
+            "abc123",
+            "examples/demo",
+            "--json",
+        ])
+        .unwrap();
+        let Command::InspectRun(InspectRunArgs { run, path, json }) = inspect.command else {
+            panic!("expected inspect-run command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(json);
+
+        let container = Cli::try_parse_from([
+            "dispatch",
+            "container",
+            "inspect",
+            "abc123",
+            "examples/demo",
+        ])
+        .unwrap();
+        let Command::Container { command } = container.command else {
+            panic!("expected container command");
+        };
+        let ContainerCommand::Inspect(InspectRunArgs { run, path, json }) = command else {
+            panic!("expected container inspect command");
+        };
+        assert_eq!(run, "abc123");
+        assert_eq!(path, PathBuf::from("examples/demo"));
+        assert!(!json);
+    }
+
+    #[test]
+    fn cli_parses_hidden_internal_run_record_command() {
+        let cli =
+            Cli::try_parse_from(["dispatch", "internal", "run-record", "/tmp/run.json"]).unwrap();
+        let Command::Internal { command } = cli.command else {
+            panic!("expected internal command");
+        };
+        let InternalCommand::RunRecord { record } = command;
+        assert_eq!(record, PathBuf::from("/tmp/run.json"));
+    }
+
+    #[test]
     fn cli_parses_run_skill_command() {
         let cli = Cli::try_parse_from([
             "dispatch",
@@ -1514,6 +1854,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runs_root_prefers_source_context_store() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::resolve_runs_root(&source_dir),
+            source_dir.join(".dispatch/runs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_runs_root_accepts_built_parcel_directory() {
+        let dir = tempdir().unwrap();
+        let (parcel_dir, _) = build_test_image(dir.path());
+
+        assert_eq!(
+            crate::resolve_runs_root(&parcel_dir),
+            parcel_dir.parent().unwrap().parent().unwrap().join("runs")
+        );
+    }
+
+    #[test]
     fn cli_parses_parcel_inspect_registry_override() {
         let cli = Cli::try_parse_from([
             "dispatch",
@@ -1616,6 +1985,7 @@ mod tests {
                 tool_approval: None,
                 a2a_allowed_origins: None,
                 a2a_trust_policy: None,
+                detach: false,
             },
         })
         .unwrap();

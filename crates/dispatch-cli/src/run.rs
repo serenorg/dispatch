@@ -15,6 +15,15 @@ use std::{
 };
 
 pub(crate) fn run(args: crate::RunArgs) -> Result<()> {
+    if args.exec.detach {
+        return crate::runs::run_detached(args);
+    }
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    run_into(args, &mut output)
+}
+
+pub(crate) fn run_into(args: crate::RunArgs, output: &mut impl io::Write) -> Result<()> {
     let policy = crate::CliA2aPolicy {
         allowed_origins: args.exec.a2a_allowed_origins.clone(),
         trust_policy: args.exec.a2a_trust_policy.clone(),
@@ -22,23 +31,31 @@ pub(crate) fn run(args: crate::RunArgs) -> Result<()> {
     let courier_name = args.exec.courier.clone();
     crate::with_cli_a2a_policy(policy, || {
         match resolve_courier(&courier_name, args.exec.registry.as_deref())? {
-            ResolvedCourier::Builtin(courier) => run_with_builtin_courier(courier, args),
+            ResolvedCourier::Builtin(courier) => run_with_builtin_courier(courier, args, output),
             ResolvedCourier::Plugin(plugin) => {
-                run_with_courier(dispatch_core::JsonlCourierPlugin::new(plugin), args)
+                run_with_courier(dispatch_core::JsonlCourierPlugin::new(plugin), args, output)
             }
         }
     })
 }
 
-fn run_with_builtin_courier(courier: BuiltinCourier, args: crate::RunArgs) -> Result<()> {
+fn run_with_builtin_courier(
+    courier: BuiltinCourier,
+    args: crate::RunArgs,
+    output: &mut impl io::Write,
+) -> Result<()> {
     match courier {
-        BuiltinCourier::Native => run_with_courier(NativeCourier::default(), args),
-        BuiltinCourier::Docker => run_with_courier(DockerCourier::default(), args),
-        BuiltinCourier::Wasm => run_with_courier(WasmCourier::new()?, args),
+        BuiltinCourier::Native => run_with_courier(NativeCourier::default(), args, output),
+        BuiltinCourier::Docker => run_with_courier(DockerCourier::default(), args, output),
+        BuiltinCourier::Wasm => run_with_courier(WasmCourier::new()?, args, output),
     }
 }
 
-fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Result<()> {
+fn run_with_courier<R: CourierBackend>(
+    courier: R,
+    args: crate::RunArgs,
+    output: &mut impl io::Write,
+) -> Result<()> {
     let crate::RunArgs { path, exec } = args;
     let crate::RunExecutionArgs {
         session_file,
@@ -52,11 +69,12 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
         tool,
         input,
         tool_approval,
+        detach: _,
         ..
     } = exec;
     let parcel = load_or_build_parcel_for_run(path)?;
     if list_tools && json {
-        print_tool_manifest_json(&parcel)?;
+        print_tool_manifest_json(output, &parcel)?;
         return Ok(());
     }
 
@@ -65,7 +83,13 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
 
     crate::with_cli_tool_approval(approval_mode, || {
         if interactive {
-            return run_interactive_chat(&courier, &parcel, &mut session, session_file.as_deref());
+            return run_interactive_chat(
+                &courier,
+                &parcel,
+                &mut session,
+                session_file.as_deref(),
+                output,
+            );
         }
 
         if let Some(chat_input) = chat {
@@ -78,7 +102,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
             ))
             .with_context(|| "failed to execute chat turn")?;
             persist_session(session_file.as_deref(), &response.session)?;
-            print_courier_events(&response.events);
+            print_courier_events(output, &response.events)?;
             return Ok(());
         }
 
@@ -94,7 +118,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
             ))
             .with_context(|| "failed to execute job turn")?;
             persist_session(session_file.as_deref(), &response.session)?;
-            print_courier_events(&response.events);
+            print_courier_events(output, &response.events)?;
             return Ok(());
         }
 
@@ -113,7 +137,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
             ))
             .with_context(|| "failed to execute heartbeat turn")?;
             persist_session(session_file.as_deref(), &response.session)?;
-            print_courier_events(&response.events);
+            print_courier_events(output, &response.events)?;
             return Ok(());
         }
 
@@ -127,7 +151,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
             ))
             .with_context(|| "failed to resolve prompt stack")?;
             persist_session(session_file.as_deref(), &response.session)?;
-            print_courier_events(&response.events);
+            print_courier_events(output, &response.events)?;
             return Ok(());
         }
 
@@ -141,7 +165,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
             ))
             .with_context(|| "failed to list local tools")?;
             persist_session(session_file.as_deref(), &response.session)?;
-            print_courier_events(&response.events);
+            print_courier_events(output, &response.events)?;
             return Ok(());
         }
 
@@ -160,7 +184,7 @@ fn run_with_courier<R: CourierBackend>(courier: R, args: crate::RunArgs) -> Resu
             ))
             .with_context(|| format!("failed to run local tool `{tool}`"))?;
             persist_session(session_file.as_deref(), &response.session)?;
-            print_courier_events(&response.events);
+            print_courier_events(output, &response.events)?;
             return Ok(());
         }
 
@@ -175,6 +199,7 @@ fn run_interactive_chat<R: CourierBackend>(
     parcel: &LoadedParcel,
     session: &mut CourierSession,
     session_file: Option<&Path>,
+    output: &mut impl io::Write,
 ) -> Result<()> {
     println!("Interactive chat started. Type /exit or /quit to stop.");
 
@@ -214,7 +239,7 @@ fn run_interactive_chat<R: CourierBackend>(
 
         *session = response.session;
         persist_session(session_file, session)?;
-        print_courier_events(&response.events);
+        print_courier_events(output, &response.events)?;
     }
 
     Ok(())
@@ -237,7 +262,7 @@ fn load_or_open_session(
     Ok(session)
 }
 
-fn load_or_build_parcel_for_run(path: PathBuf) -> Result<LoadedParcel> {
+pub(crate) fn load_or_build_parcel_for_run(path: PathBuf) -> Result<LoadedParcel> {
     if crate::is_agentfile_target(&path) {
         return crate::build_parcel_from_source(path, None);
     }
@@ -308,64 +333,69 @@ pub(crate) fn persist_session(path: Option<&Path>, session: &CourierSession) -> 
     Ok(())
 }
 
-fn print_courier_events(events: &[CourierEvent]) {
+pub(crate) fn print_courier_events(
+    output: &mut impl io::Write,
+    events: &[CourierEvent],
+) -> Result<()> {
     let mut streamed_assistant_reply = false;
     let mut stream_line_open = false;
     for event in events {
         if stream_line_open && !matches!(event, CourierEvent::TextDelta { .. }) {
-            println!();
+            writeln!(output)?;
             stream_line_open = false;
         }
         match event {
-            CourierEvent::PromptResolved { text } => println!("{text}"),
+            CourierEvent::PromptResolved { text } => writeln!(output, "{text}")?,
             CourierEvent::LocalToolsListed { tools } => {
                 for tool in tools {
-                    println!("{}", format_listed_tool(tool));
+                    writeln!(output, "{}", format_listed_tool(tool))?;
                 }
             }
             CourierEvent::BackendFallback { backend, error } => {
-                println!("backend fallback ({backend}): {error}");
+                writeln!(output, "backend fallback ({backend}): {error}")?;
             }
             CourierEvent::ToolCallStarted {
                 invocation,
                 command,
                 args,
             } => {
-                println!("Tool: {}", invocation.name);
-                println!("Command: {command}");
+                writeln!(output, "Tool: {}", invocation.name)?;
+                writeln!(output, "Command: {command}")?;
                 if !args.is_empty() {
-                    println!("Args: {}", args.join(" "));
+                    writeln!(output, "Args: {}", args.join(" "))?;
                 }
             }
             CourierEvent::ToolCallFinished { result } => {
-                println!("Exit: {}", result.exit_code);
+                writeln!(output, "Exit: {}", result.exit_code)?;
                 if !result.stdout.is_empty() {
-                    println!("Stdout:\n{}", result.stdout.trim_end());
+                    writeln!(output, "Stdout:\n{}", result.stdout.trim_end())?;
                 }
                 if !result.stderr.is_empty() {
-                    println!("Stderr:\n{}", result.stderr.trim_end());
+                    writeln!(output, "Stderr:\n{}", result.stderr.trim_end())?;
                 }
             }
             CourierEvent::Message { role, content } => {
                 if streamed_assistant_reply && role == "assistant" {
                     continue;
                 }
-                println!("{role}: {content}");
+                writeln!(output, "{role}: {content}")?;
             }
             CourierEvent::TextDelta { content } => {
                 streamed_assistant_reply = true;
                 stream_line_open = true;
-                print!("{content}");
-                let _ = io::stdout().flush();
+                write!(output, "{content}")?;
+                output.flush()?;
             }
             CourierEvent::Done => {
                 if stream_line_open {
-                    println!();
+                    writeln!(output)?;
                     stream_line_open = false;
                 }
             }
         }
     }
+    output.flush()?;
+    Ok(())
 }
 
 fn format_listed_tool(tool: &LocalToolSpec) -> String {
@@ -479,9 +509,9 @@ enum ToolManifestEntry {
     },
 }
 
-fn print_tool_manifest_json(parcel: &LoadedParcel) -> Result<()> {
+fn print_tool_manifest_json(output: &mut impl io::Write, parcel: &LoadedParcel) -> Result<()> {
     let payload = tool_manifest_entries(parcel)?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
+    writeln!(output, "{}", serde_json::to_string_pretty(&payload)?)?;
     Ok(())
 }
 

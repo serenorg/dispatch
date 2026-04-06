@@ -791,6 +791,7 @@ dependencies = [
  "dispatch-core",
  "futures",
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
