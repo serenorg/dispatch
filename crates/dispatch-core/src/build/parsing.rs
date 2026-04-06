@@ -624,9 +624,15 @@ pub(super) fn parse_limit(args: &[Value]) -> Result<Option<LimitSpec>, BuildErro
             "invalid limit scope `{scope}`; expected one of ITERATIONS, TOOL_CALLS, TOOL_OUTPUT, CONTEXT_TOKENS, TOOL_ROUNDS"
         )));
     }
+    let value = tokens[1].clone();
+    if value.parse::<u64>().is_err() {
+        return Err(BuildError::Validation(format!(
+            "limit value `{value}` is not a valid positive integer"
+        )));
+    }
     Ok(Some(LimitSpec {
         scope,
-        value: tokens[1].clone(),
+        value,
         qualifiers: tokens[2..].to_vec(),
     }))
 }

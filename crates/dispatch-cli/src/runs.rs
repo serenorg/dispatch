@@ -1379,7 +1379,8 @@ fn next_schedule_fire_ms(expr: &str, after_ms: u64) -> Result<u64> {
 }
 
 fn timestamp_from_ms(ms: u64) -> Result<DateTime<Utc>> {
-    Utc.timestamp_millis_opt(ms as i64)
+    let ms_i64 = i64::try_from(ms).map_err(|_| anyhow::anyhow!("timestamp `{ms}` out of range"))?;
+    Utc.timestamp_millis_opt(ms_i64)
         .single()
         .ok_or_else(|| anyhow::anyhow!("invalid timestamp `{ms}`"))
 }
@@ -1851,6 +1852,7 @@ impl<A: io::Write, B: io::Write> io::Write for TeeWriter<A, B> {
 mod tests {
     use super::{RunOperation, RunRecord, RunStatus, ServiceIngressConfig, resolve_run_prefix};
     use crate::CliA2aPolicy;
+    use serial_test::serial;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::Cursor;
@@ -2341,6 +2343,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_service_ingress_config_uses_authored_policy_defaults() {
         let dir = tempdir().unwrap();
         let parcel = test_parcel(
@@ -2387,6 +2390,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn resolve_service_ingress_config_prefers_cli_secret_over_authored_env() {
         let dir = tempdir().unwrap();
         let parcel = test_parcel(

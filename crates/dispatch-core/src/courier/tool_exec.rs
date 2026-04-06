@@ -280,6 +280,7 @@ where
                 source,
             })?;
     }
+    drop(child.stdin.take());
 
     let output = wait_for_tool_output(
         child,
@@ -370,6 +371,7 @@ pub(super) fn execute_local_tool_in_docker(
                 source,
             })?;
     }
+    drop(child.stdin.take());
 
     let output = wait_for_tool_output(
         child,
