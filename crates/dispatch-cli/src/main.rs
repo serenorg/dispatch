@@ -264,6 +264,21 @@ struct ServeArgs {
     /// Bind a local HTTP listener that wakes the service on inbound requests; may be repeated
     #[arg(long = "listen")]
     listens: Vec<String>,
+    /// Restrict listener ingress to this exact request path
+    #[arg(long = "listen-path")]
+    listen_path: Option<String>,
+    /// Restrict listener ingress to this HTTP method; may be repeated
+    #[arg(long = "listen-method")]
+    listen_methods: Vec<String>,
+    /// Require this shared secret via `x-dispatch-secret` or `authorization: Bearer ...`
+    #[arg(long = "listen-shared-secret")]
+    listen_shared_secret: Option<String>,
+    /// Maximum accepted request body size in bytes
+    #[arg(long = "listen-max-body-bytes", default_value_t = 262_144)]
+    listen_max_body_bytes: usize,
+    /// Maximum accepted request line + header bytes
+    #[arg(long = "listen-max-header-bytes", default_value_t = 16_384)]
+    listen_max_header_bytes: usize,
     /// Detach the service and return immediately
     #[arg(long)]
     detach: bool,
@@ -1599,6 +1614,18 @@ mod tests {
             "*/5 * * * * * *",
             "--listen",
             "127.0.0.1:9000",
+            "--listen-path",
+            "/hook",
+            "--listen-method",
+            "post",
+            "--listen-method",
+            "PUT",
+            "--listen-shared-secret",
+            "topsecret",
+            "--listen-max-body-bytes",
+            "8192",
+            "--listen-max-header-bytes",
+            "4096",
             "--detach",
         ])
         .unwrap();
@@ -1610,6 +1637,11 @@ mod tests {
         assert_eq!(args.interval_ms, 5000);
         assert_eq!(args.schedules, vec!["*/5 * * * * * *"]);
         assert_eq!(args.listens, vec!["127.0.0.1:9000"]);
+        assert_eq!(args.listen_path.as_deref(), Some("/hook"));
+        assert_eq!(args.listen_methods, vec!["post", "PUT"]);
+        assert_eq!(args.listen_shared_secret.as_deref(), Some("topsecret"));
+        assert_eq!(args.listen_max_body_bytes, 8192);
+        assert_eq!(args.listen_max_header_bytes, 4096);
         assert!(args.detach);
     }
 

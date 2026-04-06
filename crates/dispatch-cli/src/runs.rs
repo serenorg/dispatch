@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeZone, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
@@ -46,6 +47,7 @@ pub(crate) enum RunOperation {
         interval_ms: u64,
         schedules: Vec<RunSchedule>,
         listeners: Vec<RunListener>,
+        ingress: ServiceIngressConfig,
     },
 }
 
@@ -72,6 +74,15 @@ pub(crate) struct RunListener {
     pub bound_addr: Option<String>,
     pub requests_handled: u64,
     pub last_request_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ServiceIngressConfig {
+    pub path: Option<String>,
+    pub methods: Vec<String>,
+    pub shared_secret_sha256: Option<String>,
+    pub max_body_bytes: usize,
+    pub max_header_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +142,13 @@ pub(crate) fn serve(args: crate::ServeArgs) -> Result<()> {
     for listen in &args.listens {
         validate_listen_addr(listen)?;
     }
+    if let Some(path) = args.listen_path.as_deref() {
+        validate_listen_path(path)?;
+    }
+    for method in &args.listen_methods {
+        validate_listen_method(method)?;
+    }
+    validate_ingress_limits(args.listen_max_body_bytes, args.listen_max_header_bytes)?;
     let parcel = crate::run::load_or_build_parcel_for_run(args.path.clone())?;
     validate_service_parcel(&parcel)?;
     for schedule in &parcel.config.schedules {
@@ -325,6 +343,7 @@ pub(crate) fn inspect_run(args: crate::InspectRunArgs) -> Result<()> {
     println!("Session: {}", record.session_file.display());
     println!("Schedules: {}", schedule_summary(&record.operation));
     println!("Listeners: {}", listener_summary(&record.operation));
+    println!("Ingress: {}", ingress_summary(&record.operation));
     if let Some(pid) = record.pid {
         println!("PID: {pid}");
     }
@@ -364,6 +383,7 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
             interval_ms,
             schedules,
             listeners,
+            ingress,
         } => execute_service_loop(
             &record_path,
             &record,
@@ -371,6 +391,7 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
             interval_ms,
             schedules,
             listeners,
+            ingress,
         ),
     };
 
@@ -436,6 +457,7 @@ fn execute_service_loop(
     interval_ms: u64,
     mut schedules: Vec<RunSchedule>,
     mut listeners: Vec<RunListener>,
+    ingress: ServiceIngressConfig,
 ) -> Result<()> {
     let mut bound_listeners = bind_service_listeners(record_path, &mut listeners)?;
     let poll_interval_ms = service_poll_interval_ms(interval_ms, &schedules, &listeners);
@@ -457,6 +479,7 @@ fn execute_service_loop(
                 record,
                 &mut listeners,
                 &mut bound_listeners,
+                &ingress,
                 &mut output,
             )?;
             if fired || handled {
@@ -486,6 +509,7 @@ fn execute_service_loop(
                 record,
                 &mut listeners,
                 &mut bound_listeners,
+                &ingress,
                 &mut tee,
             )?;
             if fired || handled {
@@ -638,6 +662,17 @@ fn build_run_record_for_service(
         .collect::<Result<Vec<_>>>()
         .expect("schedules are validated before the run record is built");
     let listeners = merged_listener_addrs(&parcel.config.listeners, &args.listens);
+    let ingress = ServiceIngressConfig {
+        path: args.listen_path.as_deref().map(normalize_listen_path),
+        methods: args
+            .listen_methods
+            .iter()
+            .map(|method| normalize_listen_method(method))
+            .collect(),
+        shared_secret_sha256: args.listen_shared_secret.as_deref().map(hash_shared_secret),
+        max_body_bytes: args.listen_max_body_bytes,
+        max_header_bytes: args.listen_max_header_bytes,
+    };
     RunRecord {
         run_id: paths
             .record_path
@@ -664,6 +699,7 @@ fn build_run_record_for_service(
                     last_request_at_ms: None,
                 })
                 .collect(),
+            ingress,
         },
         status: RunStatus::Starting,
         pid: None,
@@ -966,6 +1002,29 @@ fn listener_summary(operation: &RunOperation) -> String {
     }
 }
 
+fn ingress_summary(operation: &RunOperation) -> String {
+    match operation {
+        RunOperation::Service { ingress, .. } => {
+            let path = ingress.path.as_deref().unwrap_or("*");
+            let methods = if ingress.methods.is_empty() {
+                "*".to_string()
+            } else {
+                ingress.methods.join(",")
+            };
+            let auth = if ingress.shared_secret_sha256.is_some() {
+                "secret"
+            } else {
+                "open"
+            };
+            format!(
+                "path={path} methods={methods} auth={auth} body<={} header<={}",
+                ingress.max_body_bytes, ingress.max_header_bytes
+            )
+        }
+        _ => "-".to_string(),
+    }
+}
+
 fn service_poll_interval_ms(
     interval_ms: u64,
     schedules: &[RunSchedule],
@@ -999,6 +1058,58 @@ fn validate_listen_addr(addr: &str) -> Result<()> {
         .parse::<std::net::SocketAddr>()
         .with_context(|| format!("failed to parse listen address `{addr}`"))?;
     Ok(())
+}
+
+fn validate_listen_path(path: &str) -> Result<()> {
+    if path.starts_with('/') {
+        Ok(())
+    } else {
+        bail!("listener path `{path}` must start with `/`");
+    }
+}
+
+fn normalize_listen_path(path: &str) -> String {
+    if path == "/" {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
+}
+
+fn validate_listen_method(method: &str) -> Result<()> {
+    let method = normalize_listen_method(method);
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
+    {
+        bail!("invalid listener method `{method}`");
+    }
+    Ok(())
+}
+
+fn normalize_listen_method(method: &str) -> String {
+    method.trim().to_ascii_uppercase()
+}
+
+fn validate_ingress_limits(max_body_bytes: usize, max_header_bytes: usize) -> Result<()> {
+    if max_body_bytes == 0 {
+        bail!("`dispatch serve` requires --listen-max-body-bytes > 0");
+    }
+    if max_header_bytes == 0 {
+        bail!("`dispatch serve` requires --listen-max-header-bytes > 0");
+    }
+    Ok(())
+}
+
+fn hash_shared_secret(secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn next_schedule_fire_ms(expr: &str, after_ms: u64) -> Result<u64> {
@@ -1082,6 +1193,7 @@ fn execute_service_ingress(
     record: &RunRecord,
     listeners: &mut [RunListener],
     bound_listeners: &mut [BoundServiceListener],
+    ingress: &ServiceIngressConfig,
     output: &mut impl io::Write,
 ) -> Result<bool> {
     let mut handled = false;
@@ -1099,6 +1211,7 @@ fn execute_service_ingress(
                         listener_state,
                         stream,
                         remote_addr.to_string(),
+                        ingress,
                         output,
                     )?;
                     persist_service_state(record_path, &[], listeners)?;
@@ -1126,6 +1239,7 @@ fn handle_service_connection(
     listener: &RunListener,
     stream: TcpStream,
     remote_addr: String,
+    ingress: &ServiceIngressConfig,
     output: &mut impl io::Write,
 ) -> Result<()> {
     stream
@@ -1138,8 +1252,22 @@ fn handle_service_connection(
         .try_clone()
         .context("failed to clone ingress connection")?;
     let mut reader = BufReader::new(stream);
-    match parse_http_request(&mut reader) {
+    match parse_http_request(
+        &mut reader,
+        ingress.max_body_bytes,
+        ingress.max_header_bytes,
+    ) {
         Ok(request) => {
+            if let Err((status_code, status_text, response_body)) =
+                validate_ingress_request(&request, ingress)
+            {
+                writeln!(
+                    output,
+                    "[dispatch serve] rejected ingress {} {} from {}: {status_code} {status_text}",
+                    request.method, request.target, remote_addr
+                )?;
+                return write_http_response(&mut writer, status_code, status_text, &response_body);
+            }
             writeln!(
                 output,
                 "[dispatch serve] ingress {} {} from {} via {}",
@@ -1194,18 +1322,39 @@ fn request_payload_envelope(
         target: request.target.clone(),
         path: request.path.clone(),
         query: request.query.clone(),
-        headers: request.headers.clone(),
+        headers: redacted_ingress_headers(&request.headers),
         body: request.body.clone(),
     }
 }
 
-fn parse_http_request(reader: &mut impl io::BufRead) -> Result<ParsedHttpRequest> {
+fn redacted_ingress_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            if matches!(name.as_str(), "x-dispatch-secret" | "authorization") {
+                (name.clone(), "[redacted]".to_string())
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
+fn parse_http_request(
+    reader: &mut impl io::BufRead,
+    max_body_bytes: usize,
+    max_header_bytes: usize,
+) -> Result<ParsedHttpRequest> {
     let mut request_line = String::new();
     let read = reader
         .read_line(&mut request_line)
         .context("failed to read request line")?;
     if read == 0 {
         bail!("empty request");
+    }
+    let mut header_bytes = request_line.len();
+    if header_bytes > max_header_bytes {
+        bail!("request headers exceed {max_header_bytes} bytes");
     }
     let request_line = request_line.trim_end();
     let mut parts = request_line.split_whitespace();
@@ -1223,6 +1372,10 @@ fn parse_http_request(reader: &mut impl io::BufRead) -> Result<ParsedHttpRequest
         reader
             .read_line(&mut header_line)
             .context("failed to read request header")?;
+        header_bytes += header_line.len();
+        if header_bytes > max_header_bytes {
+            bail!("request headers exceed {max_header_bytes} bytes");
+        }
         let header_line = header_line.trim_end();
         if header_line.is_empty() {
             break;
@@ -1243,8 +1396,8 @@ fn parse_http_request(reader: &mut impl io::BufRead) -> Result<ParsedHttpRequest
         headers.insert(header_name, header_value);
     }
 
-    if content_length > 256 * 1024 {
-        bail!("request body exceeds 262144 bytes");
+    if content_length > max_body_bytes {
+        bail!("request body exceeds {max_body_bytes} bytes");
     }
     let mut body = vec![0u8; content_length];
     reader
@@ -1267,6 +1420,60 @@ fn parse_http_request(reader: &mut impl io::BufRead) -> Result<ParsedHttpRequest
             Some(String::from_utf8_lossy(&body).into_owned())
         },
     })
+}
+
+fn validate_ingress_request(
+    request: &ParsedHttpRequest,
+    ingress: &ServiceIngressConfig,
+) -> std::result::Result<(), (u16, &'static str, String)> {
+    if let Some(path) = ingress.path.as_deref()
+        && request.path != path
+    {
+        return Err((
+            404,
+            "Not Found",
+            "listener path did not match\n".to_string(),
+        ));
+    }
+    if !ingress.methods.is_empty()
+        && !ingress
+            .methods
+            .iter()
+            .any(|method| method == &request.method)
+    {
+        return Err((
+            405,
+            "Method Not Allowed",
+            format!("listener does not allow {}\n", request.method),
+        ));
+    }
+    if let Some(expected_hash) = ingress.shared_secret_sha256.as_deref() {
+        let presented = request_shared_secret(request);
+        let presented_hash = presented.as_deref().map(hash_shared_secret);
+        if presented_hash.as_deref() != Some(expected_hash) {
+            return Err((
+                401,
+                "Unauthorized",
+                "listener shared secret did not match\n".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn request_shared_secret(request: &ParsedHttpRequest) -> Option<String> {
+    if let Some(secret) = request.headers.get("x-dispatch-secret") {
+        return Some(secret.clone());
+    }
+    request
+        .headers
+        .get("authorization")
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(ToString::to_string)
 }
 
 fn write_http_response(
@@ -1380,7 +1587,7 @@ impl<A: io::Write, B: io::Write> io::Write for TeeWriter<A, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunOperation, RunRecord, RunStatus, resolve_run_prefix};
+    use super::{RunOperation, RunRecord, RunStatus, ServiceIngressConfig, resolve_run_prefix};
     use crate::CliA2aPolicy;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -1519,6 +1726,13 @@ mod tests {
                 last_fired_at_ms: None,
             }],
             listeners: Vec::new(),
+            ingress: ServiceIngressConfig {
+                path: None,
+                methods: Vec::new(),
+                shared_secret_sha256: None,
+                max_body_bytes: 262_144,
+                max_header_bytes: 16_384,
+            },
         });
         assert!(summary.contains("*/5 * * * * * *=>"));
         assert!(summary.contains("2023-11-14T22:13:20+00:00"));
@@ -1536,14 +1750,42 @@ mod tests {
                 requests_handled: 2,
                 last_request_at_ms: Some(1_700_000_000_000),
             }],
+            ingress: ServiceIngressConfig {
+                path: None,
+                methods: Vec::new(),
+                shared_secret_sha256: None,
+                max_body_bytes: 262_144,
+                max_header_bytes: 16_384,
+            },
         });
         assert_eq!(summary, "127.0.0.1:48123 (2 req)");
     }
 
     #[test]
+    fn ingress_summary_reports_path_methods_and_auth_mode() {
+        let summary = super::ingress_summary(&RunOperation::Service {
+            payload: None,
+            interval_ms: 30_000,
+            schedules: Vec::new(),
+            listeners: Vec::new(),
+            ingress: ServiceIngressConfig {
+                path: Some("/hook".to_string()),
+                methods: vec!["POST".to_string(), "PUT".to_string()],
+                shared_secret_sha256: Some("deadbeef".to_string()),
+                max_body_bytes: 1024,
+                max_header_bytes: 2048,
+            },
+        });
+        assert_eq!(
+            summary,
+            "path=/hook methods=POST,PUT auth=secret body<=1024 header<=2048"
+        );
+    }
+
+    #[test]
     fn parse_http_request_extracts_target_headers_and_body() {
         let request = b"POST /hook?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\n{\"ok\":1}";
-        let parsed = super::parse_http_request(&mut Cursor::new(&request[..])).unwrap();
+        let parsed = super::parse_http_request(&mut Cursor::new(&request[..]), 1024, 1024).unwrap();
         let mut headers = BTreeMap::new();
         headers.insert("content-length".to_string(), "8".to_string());
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -1558,6 +1800,104 @@ mod tests {
                 headers,
                 body: Some("{\"ok\":1}".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn validate_ingress_request_rejects_path_method_and_secret_mismatches() {
+        let ingress = ServiceIngressConfig {
+            path: Some("/hook".to_string()),
+            methods: vec!["POST".to_string()],
+            shared_secret_sha256: Some(super::hash_shared_secret("topsecret")),
+            max_body_bytes: 1024,
+            max_header_bytes: 1024,
+        };
+        let request = super::ParsedHttpRequest {
+            method: "GET".to_string(),
+            target: "/wrong".to_string(),
+            path: "/wrong".to_string(),
+            query: None,
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        assert_eq!(
+            super::validate_ingress_request(&request, &ingress),
+            Err((
+                404,
+                "Not Found",
+                "listener path did not match\n".to_string()
+            ))
+        );
+
+        let request = super::ParsedHttpRequest {
+            method: "GET".to_string(),
+            target: "/hook".to_string(),
+            path: "/hook".to_string(),
+            query: None,
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        assert_eq!(
+            super::validate_ingress_request(&request, &ingress),
+            Err((
+                405,
+                "Method Not Allowed",
+                "listener does not allow GET\n".to_string()
+            ))
+        );
+
+        let request = super::ParsedHttpRequest {
+            method: "POST".to_string(),
+            target: "/hook".to_string(),
+            path: "/hook".to_string(),
+            query: None,
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        assert_eq!(
+            super::validate_ingress_request(&request, &ingress),
+            Err((
+                401,
+                "Unauthorized",
+                "listener shared secret did not match\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn request_payload_envelope_redacts_auth_headers() {
+        let mut headers = BTreeMap::new();
+        headers.insert("authorization".to_string(), "Bearer topsecret".to_string());
+        headers.insert("x-dispatch-secret".to_string(), "topsecret".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let envelope = super::request_payload_envelope(
+            &super::RunListener {
+                listen_addr: "127.0.0.1:0".to_string(),
+                bound_addr: Some("127.0.0.1:48123".to_string()),
+                requests_handled: 0,
+                last_request_at_ms: None,
+            },
+            "127.0.0.1:50000",
+            &super::ParsedHttpRequest {
+                method: "POST".to_string(),
+                target: "/hook".to_string(),
+                path: "/hook".to_string(),
+                query: None,
+                headers,
+                body: Some("{\"ok\":true}".to_string()),
+            },
+        );
+        assert_eq!(
+            envelope.headers.get("authorization"),
+            Some(&"[redacted]".to_string())
+        );
+        assert_eq!(
+            envelope.headers.get("x-dispatch-secret"),
+            Some(&"[redacted]".to_string())
+        );
+        assert_eq!(
+            envelope.headers.get("content-type"),
+            Some(&"application/json".to_string())
         );
     }
 }

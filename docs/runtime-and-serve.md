@@ -273,6 +273,12 @@ when a service run record is created.
 The current implementation supports local HTTP ingress on service runs via:
 
 - `dispatch serve <path> --listen 127.0.0.1:0`
+- optional controls:
+  - `--listen-path /hook`
+  - `--listen-method POST`
+  - `--listen-shared-secret <token>`
+  - `--listen-max-body-bytes <n>`
+  - `--listen-max-header-bytes <n>`
 
 Listener state is persisted directly in the run record:
 
@@ -291,9 +297,19 @@ new parcel entrypoint. The current envelope shape includes:
 - lowercased request headers
 - text body
 
+Auth behavior:
+
+- shared secrets are accepted via `x-dispatch-secret` or `authorization: Bearer ...`
+- the run record stores only the SHA-256 digest of the configured secret
+- forwarded heartbeat payload headers redact auth-bearing headers before they
+  reach parcel history/logs
+
 Responses are intentionally simple:
 
 - `202 Accepted` when the heartbeat dispatch succeeds
+- `401 Unauthorized` when a shared secret is configured and does not match
+- `404 Not Found` when a listener path filter is configured and does not match
+- `405 Method Not Allowed` when a listener method filter is configured and does not match
 - `400 Bad Request` for malformed HTTP
 - `500 Internal Server Error` when the heartbeat execution fails
 

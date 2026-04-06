@@ -21,6 +21,7 @@ jsonschema.workspace = true
 libc.workspace = true
 chrono.workspace = true
 cron.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
