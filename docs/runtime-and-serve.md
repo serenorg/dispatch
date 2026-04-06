@@ -1,9 +1,10 @@
 # Long-Lived Runtime and `dispatch serve`
 
-This document defines the full runtime program for Dispatch long-lived execution.
+This document describes the current Dispatch long-lived runtime and the design
+constraints that shaped it.
 
-The goal is not to treat detached runs and `dispatch serve` as separate products.
-They should share one runtime model, one run registry, and one lifecycle contract.
+Dispatch does not treat detached runs and `dispatch serve` as separate products.
+They share one runtime model, one run registry, and one lifecycle contract.
 
 ## Goals
 
@@ -23,7 +24,7 @@ They should share one runtime model, one run registry, and one lifecycle contrac
 
 ## Runtime Model
 
-Dispatch should treat a long-lived execution as a first-class `run`.
+Dispatch treats a long-lived execution as a first-class `run`.
 
 A run is distinct from:
 
@@ -35,7 +36,7 @@ A run is the process-level lifecycle wrapper around one parcel execution mode.
 
 ## Run Types
 
-The runtime should support these run kinds:
+The runtime supports these run kinds:
 
 - `job`
 - `heartbeat`
@@ -47,7 +48,7 @@ The runtime should support these run kinds:
 
 ## Command Surface
 
-The full runtime command set should converge on:
+The current runtime command set is:
 
 - `dispatch run <path> --detach --job <payload>`
 - `dispatch run <path> --detach --heartbeat [payload]`
@@ -57,20 +58,23 @@ The full runtime command set should converge on:
 - `dispatch ps`
 - `dispatch logs <run>`
 - `dispatch stop <run>`
+- `dispatch prune`
 - `dispatch rm <run>`
 - `dispatch inspect-run <run>`
 
 Docker-style aliases also make sense on top of the base commands:
 
 - `dispatch container ls`
+- `dispatch container ps`
 - `dispatch container logs <run>`
 - `dispatch container inspect <run>`
 - `dispatch container stop <run>`
+- `dispatch container prune`
 - `dispatch container rm <run>`
 
 ## Shared Run Registry
 
-All detached and service execution should use the same on-disk run registry.
+All detached and service execution uses the same on-disk run registry.
 
 Default location:
 
@@ -118,7 +122,7 @@ Service operations additionally contain `interval_ms`, `schedules`,
 
 ## Process Architecture
 
-Dispatch should use a helper process model.
+Dispatch uses a helper process model.
 
 Foreground CLI:
 
@@ -143,7 +147,7 @@ This keeps lifecycle behavior in one binary and avoids shell-script wrappers.
 
 ## Daemonless First, Service-Compatible Later
 
-The first working implementation should not require a resident daemon.
+The current implementation does not require a resident daemon.
 
 Instead:
 
@@ -182,14 +186,14 @@ than introduce a parallel runtime identity.
 
 ## `dispatch serve`
 
-`dispatch serve` should be built on the same runtime layer, not as a parallel system.
+`dispatch serve` is built on the same runtime layer, not as a parallel system.
 
-`dispatch serve <path>` should:
+`dispatch serve <path>`:
 
 - create a `service` run record
 - spawn a long-lived helper
 - keep the run alive while idle
-- react to wake reasons
+- reacts to wake reasons
 
 Wake reasons:
 
@@ -199,7 +203,7 @@ Wake reasons:
 - webhook/event ingress
 - resume/recovery
 
-The service helper should own:
+The service helper owns:
 
 - a parcel/session lifecycle
 - trigger dispatch
@@ -221,9 +225,9 @@ accept loop.
 
 ## Ingress Model
 
-Do not add `ENTRYPOINT http`.
+Dispatch does not add `ENTRYPOINT http`.
 
-If ingress is added, it should land as:
+Ingress lands as:
 
 1. a courier/runtime operation contract that represents inbound requests/events
 2. a server layer that binds ports and turns inbound traffic into runtime wake events
@@ -232,25 +236,13 @@ This keeps the network server separate from the parcel execution contract.
 
 ## Scheduling
 
-Scheduling should be attached to `service` runs, not one-off detached jobs.
-
-Possible future command shape:
-
-- `dispatch serve <path> --schedule "*/5 * * * *"`
-
-But the runtime primitives should exist before exposing the scheduling UX:
-
-- run registry
-- service helper
-- wake reasons
-- status/logging
+Scheduling is attached to `service` runs, not one-off detached jobs.
 
 ### Schedule persistence
 
-Schedules should be stored in the run record or an adjacent SQLite table, not
-in-memory only. This allows the service helper to reconstruct its schedule after
-a restart without the user re-specifying it. The current implementation stores
-the schedule state directly in the run record.
+Schedules are stored in the run record rather than in-memory only. This allows
+the service helper to reconstruct schedule state after a restart without the
+user re-specifying it.
 
 Minimal schema:
 
@@ -392,7 +384,7 @@ This follows the same broad pattern as local process supervisors that:
 
 ## State Separation
 
-Keep these roots separate:
+The runtime keeps these roots separate:
 
 - `.dispatch/parcels`
 - `.dispatch/state`
@@ -403,6 +395,12 @@ Keep these roots separate:
 `runs` is process-scoped lifecycle data for long-lived execution.
 
 Do not merge them.
+
+## Historical Rollout Notes
+
+The remaining sections capture rollout notes and external references that
+informed the implementation. They are background context, not the normative
+source for current CLI behavior.
 
 ## Implementation Order
 

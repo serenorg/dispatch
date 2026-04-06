@@ -307,6 +307,35 @@ dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --public-key .di
 dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.toml
 ```
 
+Long-lived runtime examples:
+
+```bash
+# Run directly from source and let Dispatch build/resolve the parcel
+cargo run -- run examples/parcels/codex --chat "Say hello in one sentence."
+
+# List locally built parcels
+cargo run -- parcel list examples/parcels/basic
+cargo run -- images examples/parcels/basic
+
+# Start a detached heartbeat/job run
+cargo run -- run examples/parcels/heartbeat-monitor --heartbeat --detach
+
+# Start a long-lived service run for a heartbeat parcel
+cargo run -- serve examples/parcels/heartbeat-monitor --detach
+cargo run -- serve examples/parcels/heartbeat-monitor --schedule "*/5 * * * * * *" --detach
+
+# Inspect and manage long-lived runs
+cargo run -- ps examples/parcels/heartbeat-monitor
+cargo run -- inspect-run <run-id> examples/parcels/heartbeat-monitor --json
+cargo run -- logs <run-id> examples/parcels/heartbeat-monitor --follow
+cargo run -- stop <run-id> examples/parcels/heartbeat-monitor
+cargo run -- rm <run-id> examples/parcels/heartbeat-monitor
+
+# Docker-style aliases for the same run-management surface
+cargo run -- container ls examples/parcels/heartbeat-monitor
+cargo run -- container logs <run-id> examples/parcels/heartbeat-monitor
+```
+
 Print the parsed AST:
 
 ```bash
@@ -410,6 +439,37 @@ Supported backends:
 - `--tool <name>` - execute one declared local tool
 - `--tool-approval <ask|always|never>` - control how `APPROVAL confirm` tools are handled at the CLI
 - `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
+
+## Long-Lived Runtime
+
+Dispatch also has a local long-lived runtime for detached execution and always-on
+heartbeat services.
+
+- `dispatch run --detach` starts a detached `job` or `heartbeat` run and writes a
+  run record under `.dispatch/runs/`
+- `dispatch serve` starts a long-lived `service` run that can wake from heartbeat
+  intervals, persisted cron schedules, and local HTTP ingress
+- `dispatch ps`, `dispatch logs`, `dispatch stop`, `dispatch rm`, and
+  `dispatch prune`, and `dispatch inspect-run` manage those runs
+- `dispatch container ...` exposes Docker-style aliases for the same run
+  management commands
+
+`dispatch serve` currently requires a parcel authored with
+`ENTRYPOINT heartbeat`.
+
+Service scheduling and ingress can be authored into the parcel:
+
+- `SCHEDULE "<cron>"`
+- `LISTEN "127.0.0.1:0"`
+- `LISTEN_PATH "/hook"`
+- `LISTEN_METHOD POST`
+- `LISTEN_SECRET DISPATCH_WEBHOOK_SECRET`
+- `LISTEN_MAX_BODY_BYTES 8192`
+- `LISTEN_MAX_HEADER_BYTES 4096`
+
+CLI `dispatch serve` flags can also provide or override schedules, listeners,
+and ingress policy at runtime. For the full runtime contract, see
+[docs/runtime-and-serve.md](./docs/runtime-and-serve.md).
 
 `dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and run the same synthesis and parcel build that an authored `Agentfile` would use. `dispatch skill validate` stops after that build-time validation, while `dispatch skill run` then delegates to `dispatch run`. This means `validate` surfaces sidecar, frontmatter, packaging, and build errors directly and is suitable for CI, but it is intentionally heavier than a schema-only lint. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 

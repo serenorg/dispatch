@@ -351,6 +351,22 @@ HEARTBEAT EVERY 30s FILE HEARTBEAT.md
 HEARTBEAT CRON "*/5 * * * *" FILE HEARTBEAT.md
 ```
 
+#### `SCHEDULE`
+
+Declares an additional cron wake schedule for `dispatch serve`.
+
+```dockerfile
+SCHEDULE "*/5 * * * *"
+SCHEDULE "0 */1 * * *"
+```
+
+Semantics:
+
+- service-only metadata consumed by `dispatch serve`
+- preserved in the built parcel manifest
+- merged with any runtime `dispatch serve --schedule ...` flags
+- currently only used when the parcel is authored with `ENTRYPOINT heartbeat`
+
 #### `MEMORY`
 
 Declares memory policy, not the memory contents themselves.
@@ -554,6 +570,7 @@ Semantics:
 - service-only metadata consumed by `dispatch serve`
 - preserved in the built parcel manifest
 - merged with any runtime `dispatch serve --listen ...` flags
+- currently only used when the parcel is authored with `ENTRYPOINT heartbeat`
 
 #### `LISTEN_PATH`
 
@@ -808,6 +825,11 @@ ENTRYPOINT chat
 ENTRYPOINT heartbeat
 ENTRYPOINT job
 ```
+
+Current runtime note:
+
+- `dispatch serve` currently only supports parcels authored with `ENTRYPOINT heartbeat`
+- `ENTRYPOINT chat` and `ENTRYPOINT job` remain foreground or detached one-shot modes
 
 ## Resolution Order
 
