@@ -395,7 +395,7 @@ pub(crate) fn rm(args: crate::RemoveRunArgs) -> Result<()> {
         record = load_run_record(&record_path)?;
     }
 
-    remove_run_artifacts(&record, args.force, Some(&record_path))?;
+    remove_run_artifacts(&record, args.force, &record_path)?;
     println!("Removed run {}", record.run_id);
     Ok(())
 }
@@ -926,7 +926,7 @@ fn prune_root(root: &Path) -> Result<Vec<String>> {
     let mut removed = Vec::new();
     for run in runs.into_iter().filter(|run| !run.status.is_active()) {
         let record_path = root.join(format!("{}.json", run.run_id));
-        remove_run_artifacts(&run, true, Some(&record_path))?;
+        remove_run_artifacts(&run, true, &record_path)?;
         removed.push(run.run_id);
     }
     Ok(removed)
@@ -1111,9 +1111,8 @@ fn persist_run_record(path: &Path, record: &RunRecord) -> Result<()> {
 fn remove_run_artifacts(
     record: &RunRecord,
     tolerate_missing: bool,
-    record_path_override: Option<&Path>,
+    record_path: &Path,
 ) -> Result<()> {
-    let record_path = record_path_override.unwrap_or(record.log_path.as_path());
     remove_path(record_path, tolerate_missing)?;
     remove_path(&record.log_path, tolerate_missing)?;
     remove_path(&record.session_file, tolerate_missing)?;

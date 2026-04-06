@@ -211,6 +211,25 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
             && record["operation"]["listeners"][0]["bound_addr"].is_string()
     })?;
     assert_eq!(restarted["status"], "running");
+    let restarted_bound_addr = restarted["operation"]["listeners"][0]["bound_addr"]
+        .as_str()
+        .ok_or("missing restarted bound listener address")?;
+    let restarted_authorized = http_request(
+        restarted_bound_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nx-dispatch-secret: topsecret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    )?;
+    assert!(restarted_authorized.starts_with("HTTP/1.1 202 Accepted"));
+    let restarted_after_request = wait_for_run_record(&record_path, |record| {
+        record["status"] == "running"
+            && record["operation"]["listeners"][0]["requests_handled"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+    })?;
+    assert_eq!(
+        restarted_after_request["operation"]["listeners"][0]["requests_handled"],
+        1
+    );
 
     require_success(
         run_dispatch(dir.path(), &[], &["rm", &run_id, ".", "--force"])?,
