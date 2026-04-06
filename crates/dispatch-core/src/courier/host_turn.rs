@@ -10,20 +10,20 @@ use super::{
 };
 
 pub(super) fn execute_host_turn(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     session: &CourierSession,
     input: &str,
     mode: NativeTurnMode,
     context: HostTurnContext<'_>,
 ) -> Result<ChatTurnResult, CourierError> {
     let trimmed = input.trim();
-    let local_tools = list_local_tools(image);
-    let builtin_tools = list_native_builtin_tools(image);
+    let local_tools = list_local_tools(parcel);
+    let builtin_tools = list_native_builtin_tools(parcel);
     let mut events = Vec::new();
 
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/prompt") {
         return Ok(ChatTurnResult {
-            reply: resolve_prompt_text(image)?,
+            reply: resolve_prompt_text(parcel)?,
             events: Vec::new(),
             streamed_reply: false,
             backend_state: session.backend_state.clone(),
@@ -33,7 +33,7 @@ pub(super) fn execute_host_turn(
     if matches!(mode, NativeTurnMode::Chat) && trimmed.eq_ignore_ascii_case("/tools") {
         if local_tools.is_empty() && builtin_tools.is_empty() {
             return Ok(ChatTurnResult {
-                reply: "No tools are declared for this image.".to_string(),
+                reply: "No tools are declared for this parcel.".to_string(),
                 events: Vec::new(),
                 streamed_reply: false,
                 backend_state: session.backend_state.clone(),
@@ -87,7 +87,7 @@ pub(super) fn execute_host_turn(
     }
 
     let requests = build_model_requests(
-        image,
+        parcel,
         &session.history,
         &local_tools,
         context.run_deadline,
@@ -95,7 +95,7 @@ pub(super) fn execute_host_turn(
     )?;
     if let Some(mut request) = requests.first().cloned() {
         let mut remaining_requests = requests.into_iter().skip(1).collect::<Vec<_>>();
-        for secret in &image.config.secrets {
+        for secret in &parcel.config.secrets {
             if secret.required && std::env::var(&secret.name).is_err() {
                 return Err(CourierError::MissingSecret {
                     name: secret.name.clone(),
@@ -104,7 +104,7 @@ pub(super) fn execute_host_turn(
         }
         const DEFAULT_MAX_TOOL_ROUNDS: u32 = 8;
         let max_tool_rounds =
-            configured_tool_round_limit(&image.config.limits).unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
+            configured_tool_round_limit(&parcel.config.limits).unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
         let mut rounds = 0u32;
         let mut executed_tool_calls = 0u32;
         let mut backend = select_chat_backend(context.chat_backend_override, &request);
@@ -124,7 +124,7 @@ pub(super) fn execute_host_turn(
             rounds += 1;
 
             request.llm_timeout_ms =
-                effective_llm_timeout_ms(&image.config.timeouts, context.run_deadline)?;
+                effective_llm_timeout_ms(&parcel.config.timeouts, context.run_deadline)?;
             let mut streamed_deltas = Vec::new();
             let reply = match backend.generate_with_events(&request, &mut |event| match event {
                 ModelStreamEvent::TextDelta { content } => streamed_deltas.push(content),
@@ -219,7 +219,7 @@ pub(super) fn execute_host_turn(
                         {
                             if check_tool_approval(&request)? {
                                 execute_host_local_tool(
-                                    image,
+                                    parcel,
                                     tool,
                                     Some(normalized_input.as_ref()),
                                     context.tool_runner,
@@ -230,7 +230,7 @@ pub(super) fn execute_host_turn(
                             }
                         } else {
                             execute_host_local_tool(
-                                image,
+                                parcel,
                                 tool,
                                 Some(normalized_input.as_ref()),
                                 context.tool_runner,
@@ -325,7 +325,7 @@ pub(super) fn execute_host_turn(
         }
     }
 
-    let prompt_sections = image
+    let prompt_sections = parcel
         .config
         .instructions
         .iter()
@@ -343,7 +343,7 @@ pub(super) fn execute_host_turn(
             )
         })
         .count()
-        + usize::from(!image.config.inline_prompts.is_empty());
+        + usize::from(!parcel.config.inline_prompts.is_empty());
     let tool_count = local_tools.len() + builtin_tools.len();
     let prior_messages = session.history.len().saturating_sub(1);
 

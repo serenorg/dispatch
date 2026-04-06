@@ -11,41 +11,41 @@ use std::fs;
 
 #[cfg(test)]
 pub(super) fn build_model_request(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
 ) -> Result<Option<ModelRequest>, CourierError> {
     Ok(
-        build_model_requests(image, messages, local_tools, None, None)?
+        build_model_requests(parcel, messages, local_tools, None, None)?
             .into_iter()
             .next(),
     )
 }
 
 pub(super) fn build_model_requests(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     messages: &[ConversationMessage],
     local_tools: &[LocalToolSpec],
     run_deadline: Option<Instant>,
     backend_state: Option<&str>,
 ) -> Result<Vec<ModelRequest>, CourierError> {
-    let model_refs = configured_model_references(&image.config.models);
+    let model_refs = configured_model_references(&parcel.config.models);
     if model_refs.is_empty() {
         return Ok(Vec::new());
     }
-    let builtin_tools = list_native_builtin_tools(image);
+    let builtin_tools = list_native_builtin_tools(parcel);
     let mut tools = local_tools
         .iter()
-        .map(|tool| build_model_tool_definition(image, tool))
+        .map(|tool| build_model_tool_definition(parcel, tool))
         .collect::<Result<Vec<_>, _>>()?;
     tools.extend(
         builtin_tools
             .iter()
             .map(build_builtin_model_tool_definition),
     );
-    let instructions = resolve_prompt_text(image)?;
-    let llm_timeout_ms = effective_llm_timeout_ms(&image.config.timeouts, run_deadline)?;
-    let working_directory = model_working_directory(image);
+    let instructions = resolve_prompt_text(parcel)?;
+    let llm_timeout_ms = effective_llm_timeout_ms(&parcel.config.timeouts, run_deadline)?;
+    let working_directory = model_working_directory(parcel);
 
     Ok(model_refs
         .into_iter()
@@ -68,9 +68,9 @@ pub(super) fn build_model_requests(
                 provider: model.provider.clone(),
                 model_options: model.options.clone(),
                 llm_timeout_ms,
-                context_token_limit: configured_context_token_limit(&image.config.limits),
-                tool_call_limit: configured_tool_call_limit(&image.config.limits),
-                tool_output_limit: configured_tool_output_limit(&image.config.limits),
+                context_token_limit: configured_context_token_limit(&parcel.config.limits),
+                tool_call_limit: configured_tool_call_limit(&parcel.config.limits),
+                tool_output_limit: configured_tool_output_limit(&parcel.config.limits),
                 working_directory: working_directory.clone(),
                 instructions: instructions.clone(),
                 messages: messages.to_vec(),
@@ -261,7 +261,7 @@ pub(super) fn select_chat_backend(
 }
 
 pub(super) fn build_model_tool_definition(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     tool: &LocalToolSpec,
 ) -> Result<ModelToolDefinition, CourierError> {
     let description = tool.description.clone().unwrap_or_else(|| match &tool.target {
@@ -279,7 +279,7 @@ pub(super) fn build_model_tool_definition(
         tool.input_schema_sha256.as_deref(),
     ) {
         (Some(source), expected_sha256) => ModelToolFormat::JsonSchema {
-            schema: load_tool_schema(image, &tool.alias, source, expected_sha256)?,
+            schema: load_tool_schema(parcel, &tool.alias, source, expected_sha256)?,
         },
         (None, _) => ModelToolFormat::Text,
     };
@@ -341,12 +341,12 @@ fn normalize_local_tool_input_impl<'a>(
 }
 
 pub(super) fn load_tool_schema(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     tool: &str,
     packaged_path: &str,
     expected_sha256: Option<&str>,
 ) -> Result<serde_json::Value, CourierError> {
-    let path = image.parcel_dir.join("context").join(packaged_path);
+    let path = parcel.parcel_dir.join("context").join(packaged_path);
     let body = fs::read(&path).map_err(|source_error| CourierError::ReadFile {
         path: path.display().to_string(),
         source: source_error,

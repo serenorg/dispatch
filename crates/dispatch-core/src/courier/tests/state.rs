@@ -4,7 +4,7 @@ use serde_json::Value;
 
 #[test]
 fn native_courier_memory_sqlite_persists_across_sessions() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -15,10 +15,10 @@ ENTRYPOINT chat
     );
     let courier = NativeCourier::default();
     let first_session =
-        futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let first_response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first_session,
             operation: CourierOperation::Chat {
@@ -33,9 +33,9 @@ ENTRYPOINT chat
     ));
 
     let second_session =
-        futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let second_response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: second_session,
             operation: CourierOperation::Chat {
@@ -53,7 +53,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_memory_put_reports_updates_after_first_write() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -63,10 +63,10 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let first = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -81,7 +81,7 @@ ENTRYPOINT chat
     ));
 
     let second = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first.session,
             operation: CourierOperation::Chat {
@@ -96,7 +96,7 @@ ENTRYPOINT chat
     ));
 
     let third = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: second.session,
             operation: CourierOperation::Chat {
@@ -113,7 +113,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_memory_list_treats_underscore_as_literal_prefix_character() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -123,10 +123,10 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let session = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -137,7 +137,7 @@ ENTRYPOINT chat
     .unwrap()
     .session;
     let session = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -148,7 +148,7 @@ ENTRYPOINT chat
     .unwrap()
     .session;
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -167,7 +167,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_executes_builtin_memory_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -210,10 +210,10 @@ ENTRYPOINT chat
         }),
     ]));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -287,7 +287,7 @@ ENTRYPOINT chat
 
 #[test]
 fn execute_builtin_memory_range_and_batch_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT MEMORY sqlite
@@ -296,7 +296,7 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let put_many = execute_builtin_tool(
         &session,
@@ -337,7 +337,7 @@ ENTRYPOINT chat
 
 #[test]
 fn execute_builtin_checkpoint_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -346,7 +346,7 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let put = execute_builtin_tool(
         &session,
@@ -370,7 +370,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_inspect_reports_mounts_secrets_and_local_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo
@@ -382,7 +382,7 @@ ENTRYPOINT job
     );
     let courier = NativeCourier::default();
 
-    let inspection = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap();
+    let inspection = futures::executor::block_on(courier.inspect(&test_parcel.parcel)).unwrap();
 
     assert_eq!(inspection.entrypoint.as_deref(), Some("job"));
     assert_eq!(inspection.required_secrets, vec!["CAST_SAMPLE_SECRET"]);
@@ -394,7 +394,7 @@ ENTRYPOINT job
 
 #[test]
 fn load_parcel_rejects_manifests_that_fail_schema_validation() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -403,7 +403,7 @@ ENTRYPOINT chat
         &[("SOUL.md", "You are schema-checked.")],
     );
 
-    let manifest_path = test_image.image.parcel_dir.join("manifest.json");
+    let manifest_path = test_parcel.parcel.parcel_dir.join("manifest.json");
     let mut manifest = serde_json::from_slice::<Value>(&fs::read(&manifest_path).unwrap()).unwrap();
     manifest["tools"] = Value::String("not-an-array".to_string());
     fs::write(
@@ -412,13 +412,13 @@ ENTRYPOINT chat
     )
     .unwrap();
 
-    let error = load_parcel(&test_image.image.parcel_dir).unwrap_err();
+    let error = load_parcel(&test_parcel.parcel.parcel_dir).unwrap_err();
     assert!(matches!(error, CourierError::InvalidParcelSchema { .. }));
 }
 
 #[test]
 fn native_courier_persists_session_sqlite_mounts() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -427,7 +427,7 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let sqlite_mount = session
         .resolved_mounts
@@ -447,7 +447,7 @@ ENTRYPOINT chat
     assert_eq!(persisted.id, session.id);
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {

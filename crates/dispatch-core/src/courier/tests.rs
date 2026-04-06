@@ -27,9 +27,9 @@ mod plugin;
 mod state;
 mod wasm;
 
-struct TestImage {
+struct TestParcel {
     _dir: tempfile::TempDir,
-    image: LoadedParcel,
+    parcel: LoadedParcel,
 }
 
 struct TestA2aServer {
@@ -307,38 +307,38 @@ fn write_test_http_response(writer: &mut TcpStream, status: u16, content_type: &
     let _ = writer.flush();
 }
 
-fn build_test_image(agentfile: &str, files: &[(&str, &str)]) -> TestImage {
+fn build_test_parcel(agentfile: &str, files: &[(&str, &str)]) -> TestParcel {
     let dir = tempdir().unwrap();
     let output_root = dir.path().join(".dispatch/parcels");
-    build_test_image_in_dir(dir, agentfile, files, &[], output_root)
+    build_test_parcel_in_dir(dir, agentfile, files, &[], output_root)
 }
 
-fn build_test_image_with_output_root(
+fn build_test_parcel_with_output_root(
     agentfile: &str,
     files: &[(&str, &str)],
     output_root: &Path,
-) -> TestImage {
+) -> TestParcel {
     let dir = tempdir().unwrap();
-    build_test_image_in_dir(dir, agentfile, files, &[], output_root.to_path_buf())
+    build_test_parcel_in_dir(dir, agentfile, files, &[], output_root.to_path_buf())
 }
 
-fn build_test_image_with_binary_files(
+fn build_test_parcel_with_binary_files(
     agentfile: &str,
     files: &[(&str, &str)],
     binary_files: &[(&str, &[u8])],
-) -> TestImage {
+) -> TestParcel {
     let dir = tempdir().unwrap();
     let output_root = dir.path().join(".dispatch/parcels");
-    build_test_image_in_dir(dir, agentfile, files, binary_files, output_root)
+    build_test_parcel_in_dir(dir, agentfile, files, binary_files, output_root)
 }
 
-fn build_test_image_in_dir(
+fn build_test_parcel_in_dir(
     dir: tempfile::TempDir,
     agentfile: &str,
     files: &[(&str, &str)],
     binary_files: &[(&str, &[u8])],
     output_root: PathBuf,
-) -> TestImage {
+) -> TestParcel {
     fs::write(dir.path().join("Agentfile"), agentfile).unwrap();
     for (relative, body) in files {
         let path = dir.path().join(relative);
@@ -358,8 +358,8 @@ fn build_test_image_in_dir(
     let built =
         build_agentfile(&dir.path().join("Agentfile"), &BuildOptions { output_root }).unwrap();
 
-    TestImage {
-        image: load_parcel(&built.parcel_dir).unwrap(),
+    TestParcel {
+        parcel: load_parcel(&built.parcel_dir).unwrap(),
         _dir: dir,
     }
 }

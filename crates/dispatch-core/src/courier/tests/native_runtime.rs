@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn native_courier_enforces_tool_timeout_for_local_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TIMEOUT TOOL 50ms
@@ -17,7 +17,7 @@ print('done')\n",
         )],
     );
 
-    let error = run_local_tool(&test_image.image, "slow", None).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "slow", None).unwrap_err();
     assert!(matches!(
         error,
         CourierError::ToolTimedOut { ref tool, ref timeout } if tool == "slow" && timeout == "TOOL"
@@ -26,7 +26,7 @@ print('done')\n",
 
 #[test]
 fn native_courier_caps_tool_timeout_by_remaining_run_budget() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TIMEOUT RUN 100ms
@@ -41,11 +41,12 @@ print('done')\n",
         )],
     );
     let courier = NativeCourier::default();
-    let mut session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let mut session =
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     session.elapsed_ms = 60;
 
     let error = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::InvokeTool {
@@ -67,7 +68,7 @@ print('done')\n",
 
 #[test]
 fn native_courier_open_session_sets_identity_and_zero_turns() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT chat
@@ -75,14 +76,14 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     assert!(
         session
             .id
-            .starts_with(&format!("native-{}", test_image.image.config.digest))
+            .starts_with(&format!("native-{}", test_parcel.parcel.config.digest))
     );
-    assert_eq!(session.parcel_digest, test_image.image.config.digest);
+    assert_eq!(session.parcel_digest, test_parcel.parcel.config.digest);
     assert_eq!(session.entrypoint.as_deref(), Some("chat"));
     assert_eq!(session.turn_count, 0);
     assert!(session.history.is_empty());
@@ -90,7 +91,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_validate_parcel_rejects_foreign_courier_reference() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM example/remote-worker:latest
 ENTRYPOINT chat
@@ -100,7 +101,7 @@ ENTRYPOINT chat
     let courier = NativeCourier::default();
 
     let error =
-        futures::executor::block_on(courier.validate_parcel(&test_image.image)).unwrap_err();
+        futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap_err();
 
     assert!(matches!(
         error,
@@ -111,7 +112,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_prompt_run_emits_events_and_increments_turns() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -120,10 +121,10 @@ ENTRYPOINT chat
         &[("SOUL.md", "Soul body")],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::ResolvePrompt,
@@ -141,7 +142,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_rejects_mismatched_entrypoint() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT job
@@ -149,10 +150,10 @@ ENTRYPOINT job
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let error = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -171,14 +172,14 @@ ENTRYPOINT job
 
 #[test]
 fn native_courier_run_rejects_session_for_different_parcel() {
-    let first_image = build_test_image(
+    let first_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT chat
 ",
         &[],
     );
-    let second_image = build_test_image(
+    let second_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -187,10 +188,10 @@ ENTRYPOINT chat
         &[("SOUL.md", "different")],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&first_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&first_parcel.parcel)).unwrap();
 
     let error = futures::executor::block_on(courier.run(
-        &second_image.image,
+        &second_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::ResolvePrompt,
@@ -201,14 +202,14 @@ ENTRYPOINT chat
     assert!(matches!(
         error,
         CourierError::SessionParcelMismatch { session_parcel_digest, parcel_digest }
-            if session_parcel_digest == first_image.image.config.digest
-                && parcel_digest == second_image.image.config.digest
+            if session_parcel_digest == first_parcel.parcel.config.digest
+                && parcel_digest == second_parcel.parcel.config.digest
     ));
 }
 
 #[test]
 fn native_courier_tool_run_emits_started_and_finished_events() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo
@@ -217,10 +218,10 @@ ENTRYPOINT job
         &[("tools/demo.sh", "printf '{\"ok\":true}'")],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::InvokeTool {
@@ -247,7 +248,7 @@ ENTRYPOINT job
 
 #[test]
 fn native_courier_chat_emits_assistant_message_and_records_history() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -257,10 +258,10 @@ ENTRYPOINT chat
         &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -286,7 +287,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_job_emits_assistant_message_and_records_history() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT job
@@ -294,10 +295,10 @@ ENTRYPOINT job
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Job {
@@ -323,7 +324,7 @@ ENTRYPOINT job
 
 #[test]
 fn native_courier_heartbeat_emits_assistant_message_and_records_history() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT heartbeat
@@ -331,10 +332,10 @@ ENTRYPOINT heartbeat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Heartbeat { payload: None },
@@ -355,7 +356,7 @@ ENTRYPOINT heartbeat
 
 #[test]
 fn open_session_sets_label_and_zero_elapsed_budget() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 NAME demo
 FROM dispatch/native:latest
@@ -365,7 +366,7 @@ ENTRYPOINT chat
     );
     let courier = NativeCourier::default();
 
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     assert_eq!(session.label.as_deref(), Some("demo"));
     assert_eq!(session.elapsed_ms, 0);
@@ -373,7 +374,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_rejects_runs_that_exceed_timeout_budget() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TIMEOUT RUN 100ms
@@ -382,11 +383,12 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let mut session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let mut session =
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     session.elapsed_ms = 100;
 
     let error = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -404,7 +406,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_inspection_helpers_do_not_consume_run_budget() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TIMEOUT RUN 100ms
@@ -413,11 +415,12 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let mut session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let mut session =
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     session.elapsed_ms = 100;
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::ListLocalTools,
@@ -434,7 +437,7 @@ ENTRYPOINT chat
 
 #[test]
 fn run_local_tool_requires_declared_secrets() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo
@@ -444,7 +447,7 @@ ENTRYPOINT job
         &[("tools/demo.sh", "printf ok")],
     );
 
-    let error = run_local_tool(&test_image.image, "demo", None).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "demo", None).unwrap_err();
     assert!(matches!(
         error,
         CourierError::MissingSecret { name } if name == "CAST_TEST_SECRET_DOES_NOT_EXIST"
@@ -453,7 +456,7 @@ ENTRYPOINT job
 
 #[test]
 fn open_session_prefers_secret_validation_to_late_tool_failure() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo
@@ -464,7 +467,7 @@ ENTRYPOINT chat
     );
     let courier = NativeCourier::default();
 
-    let error = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap_err();
+    let error = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap_err();
     assert!(matches!(
         error,
         CourierError::MissingSecret { name } if name == "CAST_TEST_SECRET_DOES_NOT_EXIST"
@@ -473,7 +476,7 @@ ENTRYPOINT chat
 
 #[test]
 fn run_local_tool_only_forwards_declared_environment() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/env.sh AS envcheck
@@ -495,7 +498,7 @@ ENTRYPOINT job
         ("CAST_HIDDEN_ENV".to_string(), "hidden-value".to_string()),
     ]);
 
-    let result = run_local_tool_with_env(&test_image.image, "envcheck", None, |name| {
+    let result = run_local_tool_with_env(&test_parcel.parcel, "envcheck", None, |name| {
         host_env.get(name).cloned()
     })
     .unwrap();

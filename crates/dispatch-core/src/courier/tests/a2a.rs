@@ -4,7 +4,7 @@ use crate::courier::a2a::a2a_origin;
 #[test]
 fn native_courier_executes_a2a_tools_via_host_transport() {
     let server = start_test_a2a_server();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -16,7 +16,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool(&test_image.image, "broker", Some("hello remote")).unwrap();
+    let result = run_local_tool(&test_parcel.parcel, "broker", Some("hello remote")).unwrap();
     assert_eq!(result.tool, "broker");
     assert_eq!(result.command, "dispatch-a2a");
     assert!(result.stdout.contains("echo:hello remote"));
@@ -25,7 +25,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_executes_a2a_tools_with_json_payloads() {
     let server = start_test_a2a_server();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -40,8 +40,12 @@ ENTRYPOINT job
         )],
     );
 
-    let result =
-        run_local_tool(&test_image.image, "broker", Some("{\"query\":\"weather\"}")).unwrap();
+    let result = run_local_tool(
+        &test_parcel.parcel,
+        "broker",
+        Some("{\"query\":\"weather\"}"),
+    )
+    .unwrap();
     let output: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
     assert_eq!(
         output.pointer("/query").and_then(serde_json::Value::as_str),
@@ -51,7 +55,7 @@ ENTRYPOINT job
 
 #[test]
 fn native_courier_rejects_non_loopback_cleartext_a2a_urls() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL A2A broker URL http://example.com DISCOVERY direct
@@ -60,7 +64,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(matches!(
         error,
         CourierError::A2aToolRequest { ref message, .. }
@@ -70,7 +74,7 @@ ENTRYPOINT job
 
 #[test]
 fn native_courier_rejects_a2a_urls_with_embedded_credentials() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL A2A broker URL http://user:pass@127.0.0.1:7777 DISCOVERY direct
@@ -79,7 +83,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(matches!(
         error,
         CourierError::A2aToolRequest { ref message, .. }
@@ -93,7 +97,7 @@ fn native_courier_executes_a2a_tools_with_bearer_auth() {
         expected_auth: Some("Bearer topsecret".to_string()),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -106,7 +110,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let result = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "A2A_TOKEN").then(|| "topsecret".to_string())
     })
     .unwrap();
@@ -119,7 +123,7 @@ fn native_courier_executes_a2a_tools_with_header_auth() {
         expected_auth: Some("X-Api-Key: topsecret".to_string()),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -132,7 +136,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let result = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "API_KEY").then(|| "topsecret".to_string())
     })
     .unwrap();
@@ -149,7 +153,7 @@ fn native_courier_executes_a2a_tools_with_basic_auth() {
         expected_auth: Some(format!("Basic {encoded}")),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -165,7 +169,7 @@ ENTRYPOINT job
 
     let result =
         run_local_tool_with_env(
-            &test_image.image,
+            &test_parcel.parcel,
             "broker",
             Some("hello"),
             |name| match name {
@@ -339,7 +343,7 @@ fn native_courier_rejects_a2a_agent_name_mismatch() {
         agent_name: Some("actual-agent".to_string()),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -351,7 +355,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(
         error
             .to_string()
@@ -365,7 +369,7 @@ fn native_courier_rejects_a2a_agent_name_requirement_when_card_has_no_name() {
         agent_name: None,
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -377,7 +381,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(
         error
             .to_string()
@@ -388,7 +392,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_rejects_a2a_card_digest_mismatch() {
     let server = start_test_a2a_server();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -400,7 +404,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(error
         .to_string()
         .contains("agent card digest mismatch: expected `ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff`"));
@@ -419,7 +423,7 @@ fn native_courier_accepts_matching_a2a_card_digest() {
         }))
         .unwrap(),
     ));
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -431,7 +435,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap();
+    let result = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap();
     assert!(result.stdout.contains("echo:hello"));
 }
 
@@ -441,7 +445,7 @@ fn native_courier_rejects_a2a_card_origin_pivot() {
         card_url: Some("https://evil.example.com/a2a".to_string()),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -453,7 +457,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(
         error
             .to_string()
@@ -467,7 +471,7 @@ fn native_courier_enforces_tool_timeout_for_a2a_tools() {
         response_delay: Duration::from_millis(200),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -480,7 +484,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(matches!(
         error,
         CourierError::ToolTimedOut { ref tool, ref timeout }
@@ -494,7 +498,7 @@ fn native_courier_requires_card_discovery_when_configured() {
         publish_card: false,
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -506,7 +510,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(
         error
             .to_string()
@@ -523,7 +527,7 @@ fn native_courier_polls_non_completed_a2a_tasks_until_completion() {
         task_get_status_message: Some("done".to_string()),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -535,7 +539,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap();
+    let result = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap();
     assert!(result.stdout.contains("echo:hello"));
 }
 
@@ -550,7 +554,7 @@ fn native_courier_times_out_polling_non_completed_a2a_tasks() {
         cancel_count: Some(cancel_count.clone()),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -563,7 +567,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(matches!(
         error,
         CourierError::ToolTimedOut { ref tool, ref timeout }
@@ -578,7 +582,7 @@ fn native_courier_surfaces_a2a_json_rpc_errors() {
         rpc_error: Some((-32001, "remote agent unavailable".to_string())),
         ..Default::default()
     });
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -590,7 +594,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool(&test_image.image, "broker", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap_err();
     assert!(
         error
             .to_string()
@@ -601,7 +605,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_rejects_a2a_url_outside_operator_allowlist() {
     let server = start_test_a2a_server();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -613,7 +617,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let error = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "DISPATCH_A2A_ALLOWED_ORIGINS")
             .then(|| "https://agents.example.com,broker.internal".to_string())
     })
@@ -630,7 +634,7 @@ fn native_courier_allows_a2a_url_with_matching_operator_allowlist_origin() {
     let server = start_test_a2a_server();
     let parsed = url::Url::parse(&server.base_url).unwrap();
     let origin = a2a_origin(&parsed).unwrap();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -642,7 +646,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let result = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "DISPATCH_A2A_ALLOWED_ORIGINS").then(|| origin.clone())
     })
     .unwrap();
@@ -652,7 +656,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_rejects_a2a_url_when_operator_allowlist_is_explicitly_empty() {
     let server = start_test_a2a_server();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -664,7 +668,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let error = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "DISPATCH_A2A_ALLOWED_ORIGINS").then(String::new)
     })
     .unwrap_err();
@@ -681,7 +685,7 @@ fn native_courier_rejects_a2a_url_outside_operator_trust_policy() {
         "[[rules]]\norigin_prefix = \"https://agents.example.com\"\n",
     )
     .unwrap();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -693,7 +697,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let error = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "DISPATCH_A2A_TRUST_POLICY").then(|| policy_path.display().to_string())
     })
     .unwrap_err();
@@ -726,7 +730,7 @@ fn native_courier_enforces_operator_a2a_trust_policy_identity() {
         ),
     )
     .unwrap();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -738,7 +742,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let result = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let result = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "DISPATCH_A2A_TRUST_POLICY").then(|| policy_path.display().to_string())
     })
     .unwrap();
@@ -755,7 +759,7 @@ fn native_courier_rejects_direct_a2a_with_operator_identity_requirement() {
         "[[rules]]\nhostname = \"127.0.0.1\"\nexpected_agent_name = \"planner-agent\"\n",
     )
     .unwrap();
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
@@ -767,7 +771,7 @@ ENTRYPOINT job
         &[],
     );
 
-    let error = run_local_tool_with_env(&test_image.image, "broker", Some("hello"), |name| {
+    let error = run_local_tool_with_env(&test_parcel.parcel, "broker", Some("hello"), |name| {
         (name == "DISPATCH_A2A_TRUST_POLICY").then(|| policy_path.display().to_string())
     })
     .unwrap_err();

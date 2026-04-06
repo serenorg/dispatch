@@ -257,7 +257,7 @@ where
 
     // Clear the inherited environment so undeclared variables from the parent
     // process (API keys, personal config, etc.) do not leak into tool
-    // subprocesses. Only declared ENV vars, the image's required secrets, and
+    // subprocesses. Only declared ENV vars, the parcel's required secrets, and
     // the minimal system variables needed to locate interpreters are forwarded.
     command.env_clear();
     for (name, value) in forwarded_tool_env_with(parcel, input, env_lookup) {

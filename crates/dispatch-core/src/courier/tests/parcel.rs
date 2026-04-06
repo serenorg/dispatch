@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn resolve_prompt_omits_eval_files() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -19,7 +19,7 @@ ENTRYPOINT chat
         ],
     );
 
-    let prompt = resolve_prompt_text(&test_image.image).unwrap();
+    let prompt = resolve_prompt_text(&test_parcel.parcel).unwrap();
     assert!(prompt.contains("# SOUL"));
     assert!(prompt.contains("# SKILL"));
     assert!(prompt.contains("# MEMORY"));
@@ -29,7 +29,7 @@ ENTRYPOINT chat
 
 #[test]
 fn resolve_prompt_strips_agent_skill_frontmatter_for_skill_directories() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SKILL file-analyst
@@ -51,7 +51,7 @@ ENTRYPOINT chat
         ],
     );
 
-    let prompt = resolve_prompt_text(&test_image.image).unwrap();
+    let prompt = resolve_prompt_text(&test_parcel.parcel).unwrap();
     assert!(prompt.contains("# SKILL"));
     assert!(prompt.contains("Use the file tools before answering."));
     assert!(!prompt.contains("dispatch-manifest"));
@@ -61,7 +61,7 @@ ENTRYPOINT chat
 
 #[test]
 fn resolve_prompt_keeps_file_based_skill_frontmatter_unchanged() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SKILL SKILL.md
@@ -73,7 +73,7 @@ ENTRYPOINT chat
         )],
     );
 
-    let prompt = resolve_prompt_text(&test_image.image).unwrap();
+    let prompt = resolve_prompt_text(&test_parcel.parcel).unwrap();
     assert!(prompt.contains("name: file-analyst"));
     assert!(prompt.contains("description: Analyze files"));
     assert!(prompt.contains("Use the file tools before answering."));
@@ -81,7 +81,7 @@ ENTRYPOINT chat
 
 #[test]
 fn collect_skill_allowed_tools_returns_skill_annotations() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SKILL file-analyst
@@ -103,7 +103,7 @@ ENTRYPOINT chat
         ],
     );
 
-    let allowed = collect_skill_allowed_tools(&test_image.image);
+    let allowed = collect_skill_allowed_tools(&test_parcel.parcel);
     assert_eq!(
         allowed.get("file-analyst"),
         Some(&vec!["Bash".to_string(), "Read".to_string()])
@@ -112,7 +112,7 @@ ENTRYPOINT chat
 
 #[test]
 fn resolve_prompt_includes_extended_workspace_files() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 IDENTITY IDENTITY.md
@@ -133,7 +133,7 @@ ENTRYPOINT chat
         ],
     );
 
-    let prompt = resolve_prompt_text(&test_image.image).unwrap();
+    let prompt = resolve_prompt_text(&test_parcel.parcel).unwrap();
     assert!(prompt.contains("# IDENTITY"));
     assert!(prompt.contains("Name: Demo"));
     assert!(prompt.contains("# AGENTS"));
@@ -144,7 +144,7 @@ ENTRYPOINT chat
 
 #[test]
 fn list_local_tools_uses_typed_manifest() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.py AS demo USING python3 -u
@@ -153,7 +153,7 @@ ENTRYPOINT job
         &[("tools/demo.py", "print('ok')")],
     );
 
-    let tools = list_local_tools(&test_image.image);
+    let tools = list_local_tools(&test_parcel.parcel);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].alias, "demo");
     assert_eq!(tools[0].command(), "python3");
@@ -163,7 +163,7 @@ ENTRYPOINT job
 
 #[test]
 fn list_local_tools_includes_a2a_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SECRET A2A_TOKEN
@@ -176,7 +176,7 @@ ENTRYPOINT job
         )],
     );
 
-    let tools = list_local_tools(&test_image.image);
+    let tools = list_local_tools(&test_parcel.parcel);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].alias, "broker");
     assert_eq!(tools[0].transport(), LocalToolTransport::A2a);

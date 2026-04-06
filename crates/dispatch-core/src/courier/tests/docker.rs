@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn docker_courier_accepts_docker_image_reference() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
 ENTRYPOINT job
@@ -11,9 +11,9 @@ ENTRYPOINT job
     );
     let courier = DockerCourier::default();
 
-    futures::executor::block_on(courier.validate_parcel(&test_image.image)).unwrap();
-    let inspection = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap();
+    let inspection = futures::executor::block_on(courier.inspect(&test_parcel.parcel)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     assert_eq!(inspection.courier_id, "docker");
     assert_eq!(inspection.kind, CourierKind::Docker);
@@ -23,7 +23,7 @@ ENTRYPOINT job
 
 #[test]
 fn docker_courier_rejects_native_image_reference() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT chat
@@ -33,7 +33,7 @@ ENTRYPOINT chat
     let courier = DockerCourier::default();
 
     let error =
-        futures::executor::block_on(courier.validate_parcel(&test_image.image)).unwrap_err();
+        futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap_err();
 
     assert!(matches!(
         error,
@@ -44,7 +44,7 @@ ENTRYPOINT chat
 
 #[test]
 fn docker_courier_can_resolve_prompt_and_list_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
 SOUL SOUL.md
@@ -54,10 +54,10 @@ ENTRYPOINT chat
         &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
     );
     let courier = DockerCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let prompt = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: session.clone(),
             operation: CourierOperation::ResolvePrompt,
@@ -65,7 +65,7 @@ ENTRYPOINT chat
     ))
     .unwrap();
     let tools = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::ListLocalTools,
@@ -85,7 +85,7 @@ ENTRYPOINT chat
 
 #[test]
 fn docker_courier_chat_executes_reference_reply_and_records_history() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
 ENTRYPOINT chat
@@ -93,10 +93,10 @@ ENTRYPOINT chat
         &[],
     );
     let courier = DockerCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -135,7 +135,7 @@ cat >/dev/null
     .unwrap();
     fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
 TOOL LOCAL tools/demo.sh AS demo
@@ -145,10 +145,10 @@ ENTRYPOINT job
         &[("tools/demo.sh", "printf ok")],
     );
     let courier = DockerCourier::new(&docker_bin, "python:3.13-alpine");
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::InvokeTool {
@@ -190,7 +190,7 @@ fn docker_courier_enforces_tool_timeout_for_local_tools() {
     fs::write(&docker_bin, "#!/bin/sh\nsleep 0.2\ncat >/dev/null\n").unwrap();
     fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
 TIMEOUT TOOL 50ms
@@ -200,10 +200,10 @@ ENTRYPOINT job
         &[("tools/demo.sh", "printf ok")],
     );
     let courier = DockerCourier::new(&docker_bin, "python:3.13-alpine");
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let error = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::InvokeTool {
@@ -235,7 +235,7 @@ fn docker_courier_chat_executes_model_tool_calls_via_docker_cli() {
     .unwrap();
     fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/docker:latest
 MODEL gpt-5-mini
@@ -271,10 +271,10 @@ ENTRYPOINT chat
     ]));
     let courier =
         DockerCourier::new(&docker_bin, "python:3.13-alpine").with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {

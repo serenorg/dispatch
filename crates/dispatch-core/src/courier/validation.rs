@@ -59,13 +59,13 @@ fn supported_courier_references(kind: CourierKind) -> &'static [&'static str] {
 }
 
 pub(super) fn ensure_session_matches_parcel(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     session: &CourierSession,
 ) -> Result<(), CourierError> {
-    if session.parcel_digest != image.config.digest {
+    if session.parcel_digest != parcel.config.digest {
         return Err(CourierError::SessionParcelMismatch {
             session_parcel_digest: session.parcel_digest.clone(),
-            parcel_digest: image.config.digest.clone(),
+            parcel_digest: parcel.config.digest.clone(),
         });
     }
 

@@ -3,7 +3,7 @@ use super::*;
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_courier_supports_capabilities_inspect_and_run() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 ENTRYPOINT chat
@@ -11,24 +11,24 @@ ENTRYPOINT chat
         &[],
     );
     let (courier, _) =
-        build_test_plugin_courier(&test_image._dir, &test_image.image.config.digest, false);
+        build_test_plugin_courier(&test_parcel._dir, &test_parcel.parcel.config.digest, false);
 
     let capabilities = futures::executor::block_on(courier.capabilities()).unwrap();
     assert_eq!(capabilities.courier_id, "demo-plugin");
     assert_eq!(capabilities.kind, CourierKind::Custom);
     assert!(capabilities.supports_chat);
 
-    futures::executor::block_on(courier.validate_parcel(&test_image.image)).unwrap();
-    let inspection = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap();
+    futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap();
+    let inspection = futures::executor::block_on(courier.inspect(&test_parcel.parcel)).unwrap();
     assert_eq!(inspection.courier_id, "demo-plugin");
     assert_eq!(inspection.entrypoint.as_deref(), Some("chat"));
 
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     assert_eq!(session.id, "plugin-session");
-    assert_eq!(session.parcel_digest, test_image.image.config.digest);
+    assert_eq!(session.parcel_digest, test_parcel.parcel.config.digest);
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -50,7 +50,7 @@ ENTRYPOINT chat
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_courier_surfaces_structured_errors() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 ENTRYPOINT chat
@@ -58,9 +58,9 @@ ENTRYPOINT chat
         &[],
     );
     let (courier, _) =
-        build_test_plugin_courier(&test_image._dir, &test_image.image.config.digest, true);
+        build_test_plugin_courier(&test_parcel._dir, &test_parcel.parcel.config.digest, true);
 
-    let error = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap_err();
+    let error = futures::executor::block_on(courier.inspect(&test_parcel.parcel)).unwrap_err();
     assert!(matches!(
         error,
         CourierError::PluginProtocol { courier, message }
@@ -71,7 +71,7 @@ ENTRYPOINT chat
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_reuses_persistent_process_across_turns() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 ENTRYPOINT chat
@@ -79,14 +79,14 @@ ENTRYPOINT chat
         &[],
     );
     let (courier, _plugin_path, starts_path) =
-        build_test_counting_plugin_courier(&test_image._dir, &test_image.image.config.digest);
+        build_test_counting_plugin_courier(&test_parcel._dir, &test_parcel.parcel.config.digest);
 
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let starts_after_open = fs::read_to_string(&starts_path).unwrap();
     assert_eq!(starts_after_open.lines().count(), 2);
 
     let first = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -105,7 +105,7 @@ ENTRYPOINT chat
     ));
 
     let second = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first.session,
             operation: CourierOperation::Chat {
@@ -127,7 +127,7 @@ ENTRYPOINT chat
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_resumes_persistent_session_after_new_host_process() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 ENTRYPOINT chat
@@ -135,11 +135,11 @@ ENTRYPOINT chat
         &[],
     );
     let (courier, _plugin_path, starts_path) =
-        build_test_counting_plugin_courier(&test_image._dir, &test_image.image.config.digest);
+        build_test_counting_plugin_courier(&test_parcel._dir, &test_parcel.parcel.config.digest);
 
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let first = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -158,7 +158,7 @@ ENTRYPOINT chat
 
     let resumed_courier = JsonlCourierPlugin::new(manifest);
     let second = futures::executor::block_on(resumed_courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first.session,
             operation: CourierOperation::Chat {
@@ -181,7 +181,7 @@ ENTRYPOINT chat
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_sends_shutdown_to_persistent_process_on_drop() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 ENTRYPOINT chat
@@ -190,11 +190,11 @@ ENTRYPOINT chat
     );
     let dir = tempdir().unwrap();
     let (courier, shutdowns_path) =
-        build_test_shutdown_plugin_courier(&dir, &test_image.image.config.digest);
+        build_test_shutdown_plugin_courier(&dir, &test_parcel.parcel.config.digest);
 
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let _ = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -213,7 +213,7 @@ ENTRYPOINT chat
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_run_timeout_uses_remaining_run_budget() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 TIMEOUT RUN 50ms
@@ -222,11 +222,11 @@ ENTRYPOINT chat
         &[],
     );
     let dir = tempdir().unwrap();
-    let courier = build_test_slow_plugin_courier(&dir, &test_image.image.config.digest);
+    let courier = build_test_slow_plugin_courier(&dir, &test_parcel.parcel.config.digest);
 
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let error = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -245,7 +245,7 @@ ENTRYPOINT chat
 #[test]
 #[cfg(unix)]
 fn jsonl_plugin_courier_detects_executable_drift() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/custom:latest
 ENTRYPOINT chat
@@ -253,7 +253,7 @@ ENTRYPOINT chat
         &[],
     );
     let (courier, plugin_path) =
-        build_test_plugin_courier(&test_image._dir, &test_image.image.config.digest, false);
+        build_test_plugin_courier(&test_parcel._dir, &test_parcel.parcel.config.digest, false);
     fs::write(&plugin_path, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&plugin_path, fs::Permissions::from_mode(0o755)).unwrap();
 

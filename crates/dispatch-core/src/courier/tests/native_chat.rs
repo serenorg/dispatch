@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn native_courier_chat_uses_backend_when_model_is_declared() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -12,10 +12,10 @@ ENTRYPOINT chat
     );
     let backend = Arc::new(FakeChatBackend::with_reply("backend reply"));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -38,7 +38,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_caps_llm_timeout_by_remaining_run_budget() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -50,11 +50,12 @@ ENTRYPOINT chat
     );
     let backend = Arc::new(FakeChatBackend::with_reply("backend reply"));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let mut session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let mut session =
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     session.elapsed_ms = 60;
 
     let _response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -72,7 +73,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_streams_text_delta_without_duplicate_message() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -85,10 +86,10 @@ ENTRYPOINT chat
         vec!["streamed ", "reply"],
     ));
     let courier = NativeCourier::with_chat_backend(backend);
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -139,7 +140,7 @@ fn native_courier_codex_backend_resumes_threads_and_denies_app_server_approvals(
         ),
     );
 
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5.4 PROVIDER codex
@@ -151,10 +152,10 @@ ENTRYPOINT chat
         script_path.display().to_string(),
     ));
     let courier = NativeCourier::with_chat_backend(backend);
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let first = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -176,7 +177,7 @@ ENTRYPOINT chat
     )));
 
     let second = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first.session,
             operation: CourierOperation::Chat {
@@ -208,7 +209,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_executes_tool_calls_then_continues_model_turn() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -237,10 +238,10 @@ ENTRYPOINT chat
         }),
     ]));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -280,7 +281,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_reconstructs_followup_without_response_threading() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -311,10 +312,10 @@ ENTRYPOINT chat
         ],
     ));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -346,7 +347,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_falls_back_when_backend_is_unavailable() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -356,10 +357,10 @@ ENTRYPOINT chat
     );
     let backend = Arc::new(FakeChatBackend::default());
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -384,7 +385,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_emits_backend_fallback_event_on_backend_error() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -394,10 +395,10 @@ ENTRYPOINT chat
     );
     let backend = Arc::new(FakeChatBackend::with_error("http status: 401"));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -422,7 +423,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_uses_fallback_model_after_primary_backend_error() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL primary-model
@@ -446,10 +447,10 @@ ENTRYPOINT chat
         supports_previous_response_id: false,
     });
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -479,7 +480,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_emits_backend_fallback_when_tool_loop_is_exhausted() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -506,10 +507,10 @@ ENTRYPOINT chat
             .collect(),
     ));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -536,7 +537,7 @@ ENTRYPOINT chat
 
 #[test]
 fn run_local_tool_requires_approval_handler_for_confirm_policy() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
@@ -545,13 +546,13 @@ ENTRYPOINT chat
         &[("tools/demo.sh", "printf ok")],
     );
 
-    let error = run_local_tool(&test_image.image, "demo", Some("hello")).unwrap_err();
+    let error = run_local_tool(&test_parcel.parcel, "demo", Some("hello")).unwrap_err();
     assert!(matches!(error, CourierError::ApprovalRequired { ref tool } if tool == "demo"));
 }
 
 #[test]
 fn native_courier_respects_configured_tool_round_limit() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL fake-model PROVIDER fake
@@ -580,10 +581,10 @@ ENTRYPOINT chat
             .collect(),
     ));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -605,7 +606,7 @@ ENTRYPOINT chat
 
 #[test]
 fn run_local_tool_can_be_denied_by_approval_handler() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
@@ -616,7 +617,7 @@ ENTRYPOINT chat
 
     let error = with_tool_approval_handler(
         |_| Ok(ToolApprovalDecision::Deny),
-        || run_local_tool(&test_image.image, "demo", Some("hello")),
+        || run_local_tool(&test_parcel.parcel, "demo", Some("hello")),
     )
     .unwrap_err();
     assert!(matches!(error, CourierError::ApprovalDenied { ref tool } if tool == "demo"));
@@ -624,7 +625,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_reports_denied_tool_calls() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -653,13 +654,13 @@ ENTRYPOINT chat
         }),
     ]));
     let courier = NativeCourier::with_chat_backend(backend);
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = with_tool_approval_handler(
         |_| Ok(ToolApprovalDecision::Deny),
         || {
             futures::executor::block_on(courier.run(
-                &test_image.image,
+                &test_parcel.parcel,
                 CourierRequest {
                     session,
                     operation: CourierOperation::Chat {
@@ -686,7 +687,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_executes_schema_tool_calls_as_function_outputs() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -721,10 +722,10 @@ ENTRYPOINT chat
         }),
     ]));
     let courier = NativeCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -748,7 +749,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_preserves_history_across_turns() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 ENTRYPOINT chat
@@ -756,10 +757,10 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let first = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -770,7 +771,7 @@ ENTRYPOINT chat
     .unwrap();
 
     let second = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first.session,
             operation: CourierOperation::Chat {
@@ -792,7 +793,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_supports_prompt_command() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -801,10 +802,10 @@ ENTRYPOINT chat
         &[("SOUL.md", "Soul body")],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -822,7 +823,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_tools_command_lists_builtin_tools_when_no_local_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL BUILTIN memory_get
@@ -832,10 +833,10 @@ ENTRYPOINT chat
         &[],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -855,7 +856,7 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_tools_command_lists_local_and_builtin_tools_separately() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 TOOL LOCAL tools/demo.sh AS demo
@@ -865,10 +866,10 @@ ENTRYPOINT chat
         &[("tools/demo.sh", "printf demo")],
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {

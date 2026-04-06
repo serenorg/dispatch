@@ -8,7 +8,7 @@ static REFERENCE_GUEST: &[u8] = include_bytes!(concat!(
 
 #[test]
 fn wasm_courier_accepts_component_backed_wasm_parcel() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/assistant.wat
@@ -24,19 +24,19 @@ ENTRYPOINT chat
     );
     let courier = WasmCourier::new().unwrap();
 
-    futures::executor::block_on(courier.validate_parcel(&test_image.image)).unwrap();
-    let inspection = futures::executor::block_on(courier.inspect(&test_image.image)).unwrap();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap();
+    let inspection = futures::executor::block_on(courier.inspect(&test_parcel.parcel)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     assert_eq!(inspection.courier_id, "wasm");
     assert_eq!(inspection.kind, CourierKind::Wasm);
     assert_eq!(inspection.local_tools.len(), 1);
     assert!(session.id.starts_with("wasm-"));
-    assert_eq!(session.parcel_digest, test_image.image.config.digest);
+    assert_eq!(session.parcel_digest, test_parcel.parcel.config.digest);
     assert_eq!(session.backend_state, None);
 
     let prompt = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: session.clone(),
             operation: CourierOperation::ResolvePrompt,
@@ -49,7 +49,7 @@ ENTRYPOINT chat
     ));
 
     let tools = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::ListLocalTools,
@@ -64,7 +64,7 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_executes_reference_guest_chat_with_model_and_tool_imports() {
-    let test_image = build_test_image_with_binary_files(
+    let test_parcel = build_test_parcel_with_binary_files(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
@@ -81,10 +81,10 @@ ENTRYPOINT chat
     );
     let backend = Arc::new(FakeChatBackend::with_reply("backend reply"));
     let courier = WasmCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let model_response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -95,7 +95,7 @@ ENTRYPOINT chat
     .unwrap();
 
     assert_eq!(model_response.session.turn_count, 1);
-    let expected_model_state = format!("opened:{}:1", test_image.image.config.digest);
+    let expected_model_state = format!("opened:{}:1", test_parcel.parcel.config.digest);
     assert_eq!(
         model_response.session.backend_state.as_deref(),
         Some(expected_model_state.as_str())
@@ -118,7 +118,7 @@ ENTRYPOINT chat
     drop(calls);
 
     let tool_response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: model_response.session,
             operation: CourierOperation::Chat {
@@ -129,7 +129,7 @@ ENTRYPOINT chat
     .unwrap();
 
     assert_eq!(tool_response.session.turn_count, 2);
-    let expected_tool_state = format!("opened:{}:2", test_image.image.config.digest);
+    let expected_tool_state = format!("opened:{}:2", test_parcel.parcel.config.digest);
     assert_eq!(
         tool_response.session.backend_state.as_deref(),
         Some(expected_tool_state.as_str())
@@ -145,7 +145,7 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_supports_direct_tool_invocation() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/assistant.wat
@@ -158,10 +158,10 @@ ENTRYPOINT chat
         ],
     );
     let courier = WasmCourier::new().unwrap();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::InvokeTool {
@@ -190,7 +190,7 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_host_model_complete_uses_fallback_models() {
-    let test_image = build_test_image_with_binary_files(
+    let test_parcel = build_test_parcel_with_binary_files(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
@@ -212,10 +212,10 @@ ENTRYPOINT chat
         }),
     ]));
     let courier = WasmCourier::with_chat_backend(backend.clone());
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {
@@ -239,7 +239,7 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_executes_reference_guest_job_and_heartbeat() {
-    let job_image = build_test_image_with_binary_files(
+    let job_parcel = build_test_parcel_with_binary_files(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
@@ -248,7 +248,7 @@ ENTRYPOINT job
         &[],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
-    let heartbeat_image = build_test_image_with_binary_files(
+    let heartbeat_parcel = build_test_parcel_with_binary_files(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
@@ -259,9 +259,10 @@ ENTRYPOINT heartbeat
     );
     let courier = WasmCourier::new().unwrap();
 
-    let job_session = futures::executor::block_on(courier.open_session(&job_image.image)).unwrap();
+    let job_session =
+        futures::executor::block_on(courier.open_session(&job_parcel.parcel)).unwrap();
     let job_response = futures::executor::block_on(courier.run(
-        &job_image.image,
+        &job_parcel.parcel,
         CourierRequest {
             session: job_session,
             operation: CourierOperation::Job {
@@ -276,16 +277,16 @@ ENTRYPOINT heartbeat
             if role == "assistant" && content == "job accepted: {\"task\":\"ping\"}"
     ));
     assert_eq!(job_response.session.turn_count, 1);
-    let expected_job_state = format!("opened:{}:1", job_image.image.config.digest);
+    let expected_job_state = format!("opened:{}:1", job_parcel.parcel.config.digest);
     assert_eq!(
         job_response.session.backend_state.as_deref(),
         Some(expected_job_state.as_str())
     );
 
     let heartbeat_session =
-        futures::executor::block_on(courier.open_session(&heartbeat_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&heartbeat_parcel.parcel)).unwrap();
     let heartbeat_response = futures::executor::block_on(courier.run(
-        &heartbeat_image.image,
+        &heartbeat_parcel.parcel,
         CourierRequest {
             session: heartbeat_session,
             operation: CourierOperation::Heartbeat {
@@ -299,7 +300,7 @@ ENTRYPOINT heartbeat
         Some(CourierEvent::TextDelta { content }) if content == "heartbeat:tick"
     ));
     assert_eq!(heartbeat_response.session.turn_count, 1);
-    let expected_heartbeat_state = format!("opened:{}:1", heartbeat_image.image.config.digest);
+    let expected_heartbeat_state = format!("opened:{}:1", heartbeat_parcel.parcel.config.digest);
     assert_eq!(
         heartbeat_response.session.backend_state.as_deref(),
         Some(expected_heartbeat_state.as_str())
@@ -308,7 +309,7 @@ ENTRYPOINT heartbeat
 
 #[test]
 fn wasm_courier_reference_guest_memory_persists_across_sessions() {
-    let test_image = build_test_image_with_binary_files(
+    let test_parcel = build_test_parcel_with_binary_files(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
@@ -322,9 +323,9 @@ ENTRYPOINT chat
     let courier = WasmCourier::new().unwrap();
 
     let first_session =
-        futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let first_response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: first_session,
             operation: CourierOperation::Chat {
@@ -339,9 +340,9 @@ ENTRYPOINT chat
     ));
 
     let second_session =
-        futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let second_response = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session: second_session,
             operation: CourierOperation::Chat {
@@ -358,7 +359,7 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_reference_guest_rejects_memory_ops_without_memory_mount() {
-    let test_image = build_test_image_with_binary_files(
+    let test_parcel = build_test_parcel_with_binary_files(
         "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
@@ -369,10 +370,10 @@ ENTRYPOINT chat
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
     let courier = WasmCourier::new().unwrap();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let error = futures::executor::block_on(courier.run(
-        &test_image.image,
+        &test_parcel.parcel,
         CourierRequest {
             session,
             operation: CourierOperation::Chat {

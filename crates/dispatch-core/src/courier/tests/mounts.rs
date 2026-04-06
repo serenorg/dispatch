@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn builtin_mounts_scope_session_state_per_session_and_memory_per_parcel() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -14,9 +14,9 @@ ENTRYPOINT chat
     );
     let courier = NativeCourier::default();
     let first_session =
-        futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
     let second_session =
-        futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+        futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let first_session_db = mount_path(&first_session, MountKind::Session, "sqlite");
     let second_session_db = mount_path(&second_session, MountKind::Session, "sqlite");
@@ -38,7 +38,7 @@ ENTRYPOINT chat
 fn builtin_mounts_use_explicit_state_root_for_custom_output_layouts() {
     let root = tempdir().unwrap();
     let output_root = root.path().join("pulled");
-    let test_image = build_test_image_with_output_root(
+    let test_parcel = build_test_parcel_with_output_root(
         "\
 FROM dispatch/native:latest
 MOUNT SESSION sqlite
@@ -50,7 +50,7 @@ ENTRYPOINT chat
         &output_root,
     );
     let courier = NativeCourier::default();
-    let session = futures::executor::block_on(courier.open_session(&test_image.image)).unwrap();
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
 
     let session_db = mount_path(&session, MountKind::Session, "sqlite");
     let memory_db = mount_path(&session, MountKind::Memory, "sqlite");
@@ -60,7 +60,7 @@ ENTRYPOINT chat
         .canonicalize()
         .unwrap()
         .join(".dispatch-state")
-        .join(&test_image.image.config.digest);
+        .join(&test_parcel.parcel.config.digest);
     assert!(session_db.starts_with(expected_root.join("sessions").to_string_lossy().as_ref()));
     assert_eq!(
         memory_db,

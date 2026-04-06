@@ -1133,50 +1133,50 @@ impl CourierBackend for NativeCourier {
 
     fn validate_parcel(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
-        let result = validate_native_parcel(image);
+        let result = validate_native_parcel(parcel);
         async move { result }
     }
 
     fn inspect(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
         let inspection = CourierInspection {
             courier_id: self.id().to_string(),
             kind: self.kind(),
-            entrypoint: image.config.entrypoint.clone(),
-            required_secrets: image
+            entrypoint: parcel.config.entrypoint.clone(),
+            required_secrets: parcel
                 .config
                 .secrets
                 .iter()
                 .map(|secret| secret.name.clone())
                 .collect(),
-            mounts: image.config.mounts.clone(),
-            local_tools: list_local_tools(image),
+            mounts: parcel.config.mounts.clone(),
+            local_tools: list_local_tools(parcel),
         };
         async move { Ok(inspection) }
     }
 
     fn open_session(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
-        let validation = validate_native_parcel(image);
-        let parcel_digest = image.config.digest.clone();
-        let entrypoint = image.config.entrypoint.clone();
+        let validation = validate_native_parcel(parcel);
+        let parcel_digest = parcel.config.digest.clone();
+        let entrypoint = parcel.config.entrypoint.clone();
         async move {
             validation?;
-            validate_required_secrets(image)?;
+            validate_required_secrets(parcel)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("native-{parcel_digest}-{sequence}");
             let session = CourierSession {
-                resolved_mounts: resolve_builtin_mounts(image, "native", &session_id)?,
+                resolved_mounts: resolve_builtin_mounts(parcel, "native", &session_id)?,
                 id: session_id,
                 parcel_digest,
                 entrypoint,
-                label: image.config.name.clone(),
+                label: parcel.config.name.clone(),
                 turn_count: 0,
                 elapsed_ms: 0,
                 history: Vec::new(),
@@ -1189,7 +1189,7 @@ impl CourierBackend for NativeCourier {
 
     fn run(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
         request: CourierRequest,
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let courier_id = self.id().to_string();
@@ -1198,15 +1198,15 @@ impl CourierBackend for NativeCourier {
         let chat_backend_override = self.chat_backend_override.clone();
 
         async move {
-            validate_native_parcel(image)?;
-            ensure_session_matches_parcel(image, &session)?;
+            validate_native_parcel(parcel)?;
+            ensure_session_matches_parcel(parcel, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
             if consumes_run_budget {
-                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+                ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
             }
             let run_deadline = if consumes_run_budget {
-                run_timeout_deadline(&session, &image.config.timeouts)?
+                run_timeout_deadline(&session, &parcel.config.timeouts)?
             } else {
                 None
             };
@@ -1222,7 +1222,7 @@ impl CourierBackend for NativeCourier {
                     },
                     events: vec![
                         CourierEvent::PromptResolved {
-                            text: resolve_prompt_text(image)?,
+                            text: resolve_prompt_text(parcel)?,
                         },
                         CourierEvent::Done,
                     ],
@@ -1235,13 +1235,13 @@ impl CourierBackend for NativeCourier {
                     },
                     events: vec![
                         CourierEvent::LocalToolsListed {
-                            tools: list_local_tools(image),
+                            tools: list_local_tools(parcel),
                         },
                         CourierEvent::Done,
                     ],
                 }),
                 CourierOperation::InvokeTool { invocation } => {
-                    let tool = resolve_local_tool(image, &invocation.name)?;
+                    let tool = resolve_local_tool(parcel, &invocation.name)?;
                     if let Some(request) =
                         build_local_tool_approval_request(&tool, invocation.input.as_deref())
                         && !check_tool_approval(&request)?
@@ -1249,7 +1249,7 @@ impl CourierBackend for NativeCourier {
                         return Err(CourierError::ApprovalDenied { tool: request.tool });
                     }
                     let result = execute_host_local_tool(
-                        image,
+                        parcel,
                         &tool,
                         invocation.input.as_deref(),
                         HostToolRunner::Native,
@@ -1279,7 +1279,7 @@ impl CourierBackend for NativeCourier {
                         content: input.clone(),
                     });
                     let mut chat_turn = execute_host_turn(
-                        image,
+                        parcel,
                         &session,
                         &input,
                         NativeTurnMode::Chat,
@@ -1311,7 +1311,7 @@ impl CourierBackend for NativeCourier {
                     })
                 }
                 CourierOperation::Job { payload } => run_host_task_operation(
-                    image,
+                    parcel,
                     session,
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
@@ -1323,7 +1323,7 @@ impl CourierBackend for NativeCourier {
                     },
                 ),
                 CourierOperation::Heartbeat { payload } => run_host_task_operation(
-                    image,
+                    parcel,
                     session,
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
@@ -1368,29 +1368,29 @@ impl CourierBackend for DockerCourier {
 
     fn validate_parcel(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
-        let reference = image.config.courier.reference().to_string();
+        let reference = parcel.config.courier.reference().to_string();
         async move { validate_courier_reference("docker", CourierKind::Docker, &reference) }
     }
 
     fn inspect(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
-        let reference = image.config.courier.reference().to_string();
+        let reference = parcel.config.courier.reference().to_string();
         let inspection = CourierInspection {
             courier_id: self.id().to_string(),
             kind: self.kind(),
-            entrypoint: image.config.entrypoint.clone(),
-            required_secrets: image
+            entrypoint: parcel.config.entrypoint.clone(),
+            required_secrets: parcel
                 .config
                 .secrets
                 .iter()
                 .map(|secret| secret.name.clone())
                 .collect(),
-            mounts: image.config.mounts.clone(),
-            local_tools: list_local_tools(image),
+            mounts: parcel.config.mounts.clone(),
+            local_tools: list_local_tools(parcel),
         };
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
@@ -1400,22 +1400,22 @@ impl CourierBackend for DockerCourier {
 
     fn open_session(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
-        let reference = image.config.courier.reference().to_string();
-        let parcel_digest = image.config.digest.clone();
-        let entrypoint = image.config.entrypoint.clone();
+        let reference = parcel.config.courier.reference().to_string();
+        let parcel_digest = parcel.config.digest.clone();
+        let entrypoint = parcel.config.entrypoint.clone();
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
-            validate_required_secrets(image)?;
+            validate_required_secrets(parcel)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("docker-{parcel_digest}-{sequence}");
             let session = CourierSession {
-                resolved_mounts: resolve_builtin_mounts(image, "docker", &session_id)?,
+                resolved_mounts: resolve_builtin_mounts(parcel, "docker", &session_id)?,
                 id: session_id,
                 parcel_digest,
                 entrypoint,
-                label: image.config.name.clone(),
+                label: parcel.config.name.clone(),
                 turn_count: 0,
                 elapsed_ms: 0,
                 history: Vec::new(),
@@ -1428,7 +1428,7 @@ impl CourierBackend for DockerCourier {
 
     fn run(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
         request: CourierRequest,
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let operation = request.operation;
@@ -1440,16 +1440,16 @@ impl CourierBackend for DockerCourier {
             validate_courier_reference(
                 "docker",
                 CourierKind::Docker,
-                image.config.courier.reference(),
+                parcel.config.courier.reference(),
             )?;
-            ensure_session_matches_parcel(image, &session)?;
+            ensure_session_matches_parcel(parcel, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
             if consumes_run_budget {
-                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+                ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
             }
             let run_deadline = if consumes_run_budget {
-                run_timeout_deadline(&session, &image.config.timeouts)?
+                run_timeout_deadline(&session, &parcel.config.timeouts)?
             } else {
                 None
             };
@@ -1465,7 +1465,7 @@ impl CourierBackend for DockerCourier {
                     },
                     events: vec![
                         CourierEvent::PromptResolved {
-                            text: resolve_prompt_text(image)?,
+                            text: resolve_prompt_text(parcel)?,
                         },
                         CourierEvent::Done,
                     ],
@@ -1478,13 +1478,13 @@ impl CourierBackend for DockerCourier {
                     },
                     events: vec![
                         CourierEvent::LocalToolsListed {
-                            tools: list_local_tools(image),
+                            tools: list_local_tools(parcel),
                         },
                         CourierEvent::Done,
                     ],
                 }),
                 CourierOperation::InvokeTool { invocation } => {
-                    let tool = resolve_local_tool(image, &invocation.name)?;
+                    let tool = resolve_local_tool(parcel, &invocation.name)?;
                     if let Some(request) =
                         build_local_tool_approval_request(&tool, invocation.input.as_deref())
                         && !check_tool_approval(&request)?
@@ -1492,7 +1492,7 @@ impl CourierBackend for DockerCourier {
                         return Err(CourierError::ApprovalDenied { tool: request.tool });
                     }
                     let result = execute_local_tool_in_docker(
-                        image,
+                        parcel,
                         &tool,
                         invocation.input.as_deref(),
                         &docker_courier,
@@ -1522,7 +1522,7 @@ impl CourierBackend for DockerCourier {
                         content: input.clone(),
                     });
                     let mut chat_turn = execute_host_turn(
-                        image,
+                        parcel,
                         &session,
                         &input,
                         NativeTurnMode::Chat,
@@ -1554,7 +1554,7 @@ impl CourierBackend for DockerCourier {
                     })
                 }
                 CourierOperation::Job { payload } => run_host_task_operation(
-                    image,
+                    parcel,
                     session,
                     NativeTurnMode::Job,
                     format_job_payload(&payload),
@@ -1566,7 +1566,7 @@ impl CourierBackend for DockerCourier {
                     },
                 ),
                 CourierOperation::Heartbeat { payload } => run_host_task_operation(
-                    image,
+                    parcel,
                     session,
                     NativeTurnMode::Heartbeat,
                     format_heartbeat_payload(payload.as_deref()),
@@ -1617,10 +1617,10 @@ impl CourierBackend for JsonlCourierPlugin {
 
     fn validate_parcel(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
         let courier = self.clone();
-        let parcel_dir = canonical_parcel_dir(image);
+        let parcel_dir = canonical_parcel_dir(parcel);
         async move {
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::ValidateParcel { parcel_dir })? {
@@ -1639,10 +1639,10 @@ impl CourierBackend for JsonlCourierPlugin {
 
     fn inspect(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
         let courier = self.clone();
-        let parcel_dir = canonical_parcel_dir(image);
+        let parcel_dir = canonical_parcel_dir(parcel);
         async move {
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::Inspect { parcel_dir })? {
@@ -1661,16 +1661,16 @@ impl CourierBackend for JsonlCourierPlugin {
 
     fn open_session(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
         let courier = self.clone();
-        let parcel_dir = canonical_parcel_dir(image);
+        let parcel_dir = canonical_parcel_dir(parcel);
         async move {
-            validate_required_secrets(image)?;
+            validate_required_secrets(parcel)?;
             let capabilities = courier.capabilities().await?;
             ensure_mounts_supported(
                 &courier.manifest.name,
-                image.config.mounts.as_slice(),
+                parcel.config.mounts.as_slice(),
                 &capabilities.supports_mounts,
             )?;
             let parcel_dir = parcel_dir?;
@@ -1697,24 +1697,24 @@ impl CourierBackend for JsonlCourierPlugin {
 
     fn run(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
         request: CourierRequest,
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let courier = self.clone();
-        let parcel_dir = canonical_parcel_dir(image);
+        let parcel_dir = canonical_parcel_dir(parcel);
         let operation = request.operation;
         let session = request.session;
         async move {
-            ensure_session_matches_parcel(image, &session)?;
+            ensure_session_matches_parcel(parcel, &session)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
             if consumes_run_budget {
-                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+                ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
             }
             let started_at = Instant::now();
             let parcel_dir = parcel_dir?;
             let session = courier.ensure_persistent_process(&parcel_dir, session)?;
             let run_timeout = if consumes_run_budget {
-                remaining_run_budget_with_literal(&session, &image.config.timeouts)?
+                remaining_run_budget_with_literal(&session, &parcel.config.timeouts)?
             } else {
                 None
             };
@@ -2242,33 +2242,33 @@ impl CourierBackend for StubCourier {
 
     fn validate_parcel(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
         let courier_id = self.courier_id;
         let kind = self.kind;
-        let reference = image.config.courier.reference().to_string();
+        let reference = parcel.config.courier.reference().to_string();
         async move { validate_courier_reference(courier_id, kind, &reference) }
     }
 
     fn inspect(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierInspection, CourierError>> + Send {
         let courier_id = self.courier_id;
         let kind = self.kind;
-        let reference = image.config.courier.reference().to_string();
+        let reference = parcel.config.courier.reference().to_string();
         let inspection = CourierInspection {
             courier_id: courier_id.to_string(),
             kind,
-            entrypoint: image.config.entrypoint.clone(),
-            required_secrets: image
+            entrypoint: parcel.config.entrypoint.clone(),
+            required_secrets: parcel
                 .config
                 .secrets
                 .iter()
                 .map(|secret| secret.name.clone())
                 .collect(),
-            mounts: image.config.mounts.clone(),
-            local_tools: list_local_tools(image),
+            mounts: parcel.config.mounts.clone(),
+            local_tools: list_local_tools(parcel),
         };
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;
@@ -2278,23 +2278,23 @@ impl CourierBackend for StubCourier {
 
     fn open_session(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<CourierSession, CourierError>> + Send {
         let courier_id = self.courier_id;
         let kind = self.kind;
-        let reference = image.config.courier.reference().to_string();
-        let parcel_digest = image.config.digest.clone();
-        let entrypoint = image.config.entrypoint.clone();
+        let reference = parcel.config.courier.reference().to_string();
+        let parcel_digest = parcel.config.digest.clone();
+        let entrypoint = parcel.config.entrypoint.clone();
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;
-            validate_required_secrets(image)?;
-            ensure_mounts_supported(courier_id, image.config.mounts.as_slice(), &[])?;
+            validate_required_secrets(parcel)?;
+            ensure_mounts_supported(courier_id, parcel.config.mounts.as_slice(), &[])?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session = CourierSession {
                 id: format!("{courier_id}-{parcel_digest}-{sequence}"),
                 parcel_digest,
                 entrypoint,
-                label: image.config.name.clone(),
+                label: parcel.config.name.clone(),
                 turn_count: 0,
                 elapsed_ms: 0,
                 history: Vec::new(),
@@ -2307,21 +2307,21 @@ impl CourierBackend for StubCourier {
 
     fn run(
         &self,
-        image: &LoadedParcel,
+        parcel: &LoadedParcel,
         request: CourierRequest,
     ) -> impl Future<Output = Result<CourierResponse, CourierError>> + Send {
         let courier_id = self.courier_id.to_string();
         let kind = self.kind;
-        let reference = image.config.courier.reference().to_string();
+        let reference = parcel.config.courier.reference().to_string();
         let operation = request.operation;
         let mut session = request.session;
 
         async move {
             validate_courier_reference(&courier_id, kind, &reference)?;
-            ensure_session_matches_parcel(image, &session)?;
+            ensure_session_matches_parcel(parcel, &session)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
             if consumes_run_budget {
-                ensure_run_timeout_budget(&session, &image.config.timeouts)?;
+                ensure_run_timeout_budget(&session, &parcel.config.timeouts)?;
             }
             session.turn_count += 1;
             let started_at = Instant::now();
@@ -2332,7 +2332,7 @@ impl CourierBackend for StubCourier {
                     session,
                     events: vec![
                         CourierEvent::PromptResolved {
-                            text: resolve_prompt_text(image)?,
+                            text: resolve_prompt_text(parcel)?,
                         },
                         CourierEvent::Done,
                     ],
@@ -2342,7 +2342,7 @@ impl CourierBackend for StubCourier {
                     session,
                     events: vec![
                         CourierEvent::LocalToolsListed {
-                            tools: list_local_tools(image),
+                            tools: list_local_tools(parcel),
                         },
                         CourierEvent::Done,
                     ],
@@ -2374,7 +2374,7 @@ impl CourierBackend for StubCourier {
 }
 
 fn run_host_task_operation(
-    image: &LoadedParcel,
+    parcel: &LoadedParcel,
     mut session: CourierSession,
     mode: NativeTurnMode,
     input: String,
@@ -2384,7 +2384,7 @@ fn run_host_task_operation(
         role: "user".to_string(),
         content: input.clone(),
     });
-    let mut turn = execute_host_turn(image, &session, &input, mode, context)?;
+    let mut turn = execute_host_turn(parcel, &session, &input, mode, context)?;
     session.history.push(ConversationMessage {
         role: "assistant".to_string(),
         content: turn.reply.clone(),
@@ -2406,11 +2406,11 @@ fn run_host_task_operation(
     })
 }
 
-fn validate_native_parcel(image: &LoadedParcel) -> Result<(), CourierError> {
+fn validate_native_parcel(parcel: &LoadedParcel) -> Result<(), CourierError> {
     validate_courier_reference(
         "native",
         CourierKind::Native,
-        image.config.courier.reference(),
+        parcel.config.courier.reference(),
     )
 }
 

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn build_model_request_uses_primary_model_prompt_and_history() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 SOUL SOUL.md
@@ -12,9 +12,9 @@ ENTRYPOINT chat
         &[("SOUL.md", "Soul body")],
     );
 
-    let local_tools = list_local_tools(&test_image.image);
+    let local_tools = list_local_tools(&test_parcel.parcel);
     let request = build_model_request(
-        &test_image.image,
+        &test_parcel.parcel,
         &[ConversationMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -34,7 +34,7 @@ ENTRYPOINT chat
 
 #[test]
 fn build_model_request_carries_model_persist_thread_setting() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5.4 PROVIDER codex --persist-thread=false
@@ -44,7 +44,7 @@ ENTRYPOINT chat
     );
 
     let request = build_model_request(
-        &test_image.image,
+        &test_parcel.parcel,
         &[ConversationMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -69,7 +69,7 @@ fn build_model_requests_only_passes_backend_state_to_dispatch_session_backends()
     // Dispatch-managed session state should flow to local session backends like
     // Codex and Claude, but not to hosted backends that interpret
     // previous_response_id as their own provider-owned continuation token.
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5.4 PROVIDER codex
@@ -82,7 +82,7 @@ ENTRYPOINT chat
 
     let codex_thread_state = r#"{"thread_id":"thr_abc","rollout_path":null}"#;
     let requests = build_model_requests(
-        &test_image.image,
+        &test_parcel.parcel,
         &[ConversationMessage {
             role: "user".to_string(),
             content: "follow up".to_string(),
@@ -112,7 +112,7 @@ ENTRYPOINT chat
 
 #[test]
 fn build_model_request_uses_declared_tool_description() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -122,9 +122,9 @@ ENTRYPOINT chat
         &[("tools/demo.sh", "printf ok")],
     );
 
-    let local_tools = list_local_tools(&test_image.image);
+    let local_tools = list_local_tools(&test_parcel.parcel);
     let request = build_model_request(
-        &test_image.image,
+        &test_parcel.parcel,
         &[ConversationMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -145,7 +145,7 @@ ENTRYPOINT chat
 
 #[test]
 fn build_model_request_loads_declared_tool_input_schema() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -161,9 +161,9 @@ ENTRYPOINT chat
         ],
     );
 
-    let local_tools = list_local_tools(&test_image.image);
+    let local_tools = list_local_tools(&test_parcel.parcel);
     let request = build_model_request(
-        &test_image.image,
+        &test_parcel.parcel,
         &[ConversationMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -185,7 +185,7 @@ ENTRYPOINT chat
 
 #[test]
 fn list_native_builtin_tools_only_exposes_supported_memory_capabilities() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -202,7 +202,7 @@ ENTRYPOINT chat
         &[],
     );
 
-    let tools = list_native_builtin_tools(&test_image.image);
+    let tools = list_native_builtin_tools(&test_parcel.parcel);
     assert_eq!(tools.len(), 7);
     assert_eq!(tools[0].capability, "memory_put");
     assert_eq!(tools[1].capability, "memory_get");
@@ -219,7 +219,7 @@ ENTRYPOINT chat
 
 #[test]
 fn build_model_request_includes_supported_builtin_memory_tools() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -236,7 +236,7 @@ ENTRYPOINT chat
     );
 
     let request = build_model_request(
-        &test_image.image,
+        &test_parcel.parcel,
         &[ConversationMessage {
             role: "user".to_string(),
             content: "remember this".to_string(),
@@ -262,7 +262,7 @@ ENTRYPOINT chat
 
 #[test]
 fn build_model_request_rejects_tampered_packaged_tool_schema() {
-    let test_image = build_test_image(
+    let test_parcel = build_test_parcel(
         "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
@@ -278,16 +278,16 @@ ENTRYPOINT chat
         ],
     );
     fs::write(
-        test_image
-            .image
+        test_parcel
+            .parcel
             .parcel_dir
             .join("context/schemas/demo.json"),
         "{ \"type\": \"array\" }",
     )
     .unwrap();
 
-    let local_tools = list_local_tools(&test_image.image);
-    let error = build_model_request(&test_image.image, &[], &local_tools).unwrap_err();
+    let local_tools = list_local_tools(&test_parcel.parcel);
+    let error = build_model_request(&test_parcel.parcel, &[], &local_tools).unwrap_err();
     assert!(matches!(
         error,
         CourierError::ToolSchemaDigestMismatch { tool, .. } if tool == "demo"
