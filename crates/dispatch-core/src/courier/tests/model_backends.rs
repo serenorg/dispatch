@@ -704,6 +704,158 @@ fn claude_backend_uses_reasoning_effort_env_override() {
 
 #[test]
 #[cfg(unix)]
+fn claude_backend_model_option_takes_precedence_over_reasoning_effort_env() {
+    let _guard = lock_codex_backend_test();
+    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
+    unsafe {
+        std::env::set_var("DISPATCH_REASONING_EFFORT", "low");
+    }
+
+    let dir = tempdir().unwrap();
+    let args_log_path = dir.path().join("claude-args.log");
+    let script_path = dir.path().join("claude");
+    write_executable_script(
+        &script_path,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"s1\",\"is_error\":false}}'\n",
+            args_log_path.display()
+        ),
+    );
+
+    let backend = ClaudeCliBackend::with_binary_path_for_tests(script_path.display().to_string());
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            provider: Some("claude".to_string()),
+            model_options: [("reasoning-effort".to_string(), "high".to_string())]
+                .into_iter()
+                .collect(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: Some(dir.path().display().to_string()),
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_REASONING_EFFORT");
+        },
+    }
+
+    result.unwrap();
+
+    let log = fs::read_to_string(&args_log_path).unwrap();
+    assert!(
+        log.contains("--effort high"),
+        "parcel model option should override env var: {log}"
+    );
+    assert!(
+        !log.contains("--effort low"),
+        "unexpected env reasoning effort when parcel option is set: {log}"
+    );
+}
+
+#[test]
+fn claude_backend_rejects_unsupported_reasoning_effort_model_option() {
+    let backend = ClaudeCliBackend;
+    let error = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: [("reasoning-effort".to_string(), "turbo".to_string())]
+                    .into_iter()
+                    .collect(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: None,
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("claude reasoning effort `turbo` is not supported"),
+        "unexpected invalid-effort error: {error}"
+    );
+}
+
+#[test]
+fn claude_backend_rejects_unsupported_reasoning_effort_env_override() {
+    let previous = std::env::var_os("DISPATCH_REASONING_EFFORT");
+    unsafe {
+        std::env::set_var("DISPATCH_REASONING_EFFORT", "turbo");
+    }
+
+    let backend = ClaudeCliBackend;
+    let result = backend.generate_with_events(
+        &ModelRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            provider: Some("claude".to_string()),
+            model_options: Default::default(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: None,
+            instructions: "Be helpful.".to_string(),
+            messages: vec![ConversationMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        },
+        &mut |_| {},
+    );
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DISPATCH_REASONING_EFFORT", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DISPATCH_REASONING_EFFORT");
+        },
+    }
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("claude reasoning effort `turbo` is not supported"),
+        "unexpected invalid-effort error: {error}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn claude_backend_returns_not_configured_when_binary_is_missing() {
     let _guard = lock_codex_backend_test();
     let backend = ClaudeCliBackend::with_binary_path_for_tests(
@@ -1542,7 +1694,7 @@ fn codex_backend_preserves_existing_codex_home() {
         &ModelRequest {
             model: "gpt-5.4".to_string(),
             provider: Some("codex".to_string()),
-            persist_history: None,
+            model_options: Default::default(),
             llm_timeout_ms: None,
             context_token_limit: None,
             tool_call_limit: None,

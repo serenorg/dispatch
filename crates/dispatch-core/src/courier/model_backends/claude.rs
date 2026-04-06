@@ -78,7 +78,7 @@ impl ChatModelBackend for ClaudeCliBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if let Some(effort) = claude_reasoning_effort(request) {
+        if let Some(effort) = claude_reasoning_effort(request)? {
             cmd.arg("--effort").arg(&effort);
         }
 
@@ -273,8 +273,8 @@ fn claude_persistence_enabled(request: &ModelRequest) -> bool {
         .unwrap_or(true)
 }
 
-fn claude_reasoning_effort(request: &ModelRequest) -> Option<String> {
-    claude_model_option_value(request, "reasoning-effort")
+fn claude_reasoning_effort(request: &ModelRequest) -> Result<Option<String>, CourierError> {
+    let effort = claude_model_option_value(request, "reasoning-effort")
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_ascii_lowercase())
@@ -283,7 +283,20 @@ fn claude_reasoning_effort(request: &ModelRequest) -> Option<String> {
                 .ok()
                 .map(|v| v.trim().to_ascii_lowercase())
                 .filter(|v| !v.is_empty())
-        })
+        });
+
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+
+    if matches!(effort.as_str(), "low" | "medium" | "high" | "max") {
+        return Ok(Some(effort));
+    }
+
+    Err(CourierError::ModelBackendRequest(format!(
+        "claude reasoning effort `{}` is not supported; expected one of: low, medium, high, max",
+        effort
+    )))
 }
 
 /// Build the NDJSON lines to write to Claude's stdin.
@@ -577,5 +590,62 @@ mod tests {
 
         let lines = claude_stdin_messages(&request, "");
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn claude_reasoning_effort_accepts_documented_values() {
+        for effort in ["low", "medium", "high", "max"] {
+            let request = ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: Some("claude".to_string()),
+                model_options: [("reasoning-effort".to_string(), effort.to_string())]
+                    .into_iter()
+                    .collect(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: None,
+                instructions: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            };
+
+            assert_eq!(
+                claude_reasoning_effort(&request).unwrap().as_deref(),
+                Some(effort)
+            );
+        }
+    }
+
+    #[test]
+    fn claude_reasoning_effort_rejects_unsupported_values() {
+        let request = ModelRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            provider: Some("claude".to_string()),
+            model_options: [("reasoning-effort".to_string(), "turbo".to_string())]
+                .into_iter()
+                .collect(),
+            llm_timeout_ms: None,
+            context_token_limit: None,
+            tool_call_limit: None,
+            tool_output_limit: None,
+            working_directory: None,
+            instructions: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            tool_outputs: Vec::new(),
+            previous_response_id: None,
+        };
+
+        let error = claude_reasoning_effort(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("claude reasoning effort `turbo` is not supported"),
+            "unexpected invalid-effort error: {error}"
+        );
     }
 }

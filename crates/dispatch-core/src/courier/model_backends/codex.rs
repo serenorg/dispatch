@@ -299,7 +299,7 @@ enum CodexIo {
 impl CodexProcess {
     fn spawn(
         working_directory: &str,
-        request: &ModelRequest,
+        _request: &ModelRequest,
     ) -> Result<Option<Self>, CourierError> {
         let binary = codex_binary_path();
         let mut command = Command::new(&binary);
