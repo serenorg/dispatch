@@ -670,6 +670,38 @@ mod tests {
     use dispatch_core::{BuildOptions, build_agentfile};
     use tempfile::tempdir;
 
+    fn smoke_test_tool_path() -> &'static str {
+        if cfg!(windows) {
+            "scripts/demo.cmd"
+        } else {
+            "scripts/demo.sh"
+        }
+    }
+
+    fn smoke_test_tool_success_body() -> &'static str {
+        if cfg!(windows) {
+            "@echo off\r\necho ok\r\n"
+        } else {
+            "#!/bin/sh\necho ok\n"
+        }
+    }
+
+    fn smoke_test_tool_failure_body() -> &'static str {
+        if cfg!(windows) {
+            "@echo off\r\nexit /b 7\r\n"
+        } else {
+            "#!/bin/sh\nexit 7\n"
+        }
+    }
+
+    fn build_tool_test_parcel(script_body: &str) -> (tempfile::TempDir, LoadedParcel) {
+        let agentfile = format!(
+            "FROM dispatch/native:latest\nTOOL LOCAL {} AS demo\nTEST tool:demo\nENTRYPOINT chat\n",
+            smoke_test_tool_path()
+        );
+        build_eval_parcel(&agentfile, &[(smoke_test_tool_path(), script_body)])
+    }
+
     fn build_eval_parcel(
         agentfile: &str,
         files: &[(&str, &str)],
@@ -813,15 +845,7 @@ mod tests {
 
     #[test]
     fn run_tool_test_case_passes_for_successful_tool_smoke_test() {
-        let (_dir, parcel) = build_eval_parcel(
-            concat!(
-                "FROM dispatch/native:latest\n",
-                "TOOL LOCAL scripts/demo.sh AS demo USING sh\n",
-                "TEST tool:demo\n",
-                "ENTRYPOINT chat\n",
-            ),
-            &[("scripts/demo.sh", "echo ok\n")],
-        );
+        let (_dir, parcel) = build_tool_test_parcel(smoke_test_tool_success_body());
 
         let result = run_tool_test_case(
             &NativeCourier::default(),
@@ -839,15 +863,7 @@ mod tests {
 
     #[test]
     fn run_tool_test_case_fails_when_tool_returns_nonzero_exit() {
-        let (_dir, parcel) = build_eval_parcel(
-            concat!(
-                "FROM dispatch/native:latest\n",
-                "TOOL LOCAL scripts/demo.sh AS demo USING sh\n",
-                "TEST tool:demo\n",
-                "ENTRYPOINT chat\n",
-            ),
-            &[("scripts/demo.sh", "exit 7\n")],
-        );
+        let (_dir, parcel) = build_tool_test_parcel(smoke_test_tool_failure_body());
 
         let result = run_tool_test_case(
             &NativeCourier::default(),
@@ -866,15 +882,7 @@ mod tests {
 
     #[test]
     fn eval_with_courier_accepts_test_only_parcels() {
-        let (_dir, parcel) = build_eval_parcel(
-            concat!(
-                "FROM dispatch/native:latest\n",
-                "TOOL LOCAL scripts/demo.sh AS demo USING sh\n",
-                "TEST tool:demo\n",
-                "ENTRYPOINT chat\n",
-            ),
-            &[("scripts/demo.sh", "echo ok\n")],
-        );
+        let (_dir, parcel) = build_tool_test_parcel(smoke_test_tool_success_body());
 
         let outcome = eval_with_courier(NativeCourier::default(), &parcel, "native", true);
 
