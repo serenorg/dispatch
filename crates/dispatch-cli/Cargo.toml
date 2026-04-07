@@ -22,6 +22,8 @@ libc.workspace = true
 chrono.workspace = true
 cron.workspace = true
 sha2.workspace = true
+signal-hook.workspace = true
+atomic-write-file.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

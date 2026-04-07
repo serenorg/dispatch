@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
+use atomic_write_file::AtomicWriteFile;
 use chrono::{DateTime, TimeZone, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -13,9 +16,18 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 #[cfg(test)]
 static TEST_ENV_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> =
@@ -323,6 +335,7 @@ pub(crate) fn wait(args: crate::WaitArgs) -> Result<()> {
         let mut record = load_run_record(&record_path)?;
         refresh_run_record(&record_path, &mut record)?;
         if !record.status.is_active() {
+            normalize_one_shot_terminal_record(&record_path, &mut record)?;
             println!("{}", run_exit_code(&record));
             return Ok(());
         }
@@ -333,6 +346,23 @@ pub(crate) fn wait(args: crate::WaitArgs) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn normalize_one_shot_terminal_record(record_path: &Path, record: &mut RunRecord) -> Result<()> {
+    if record.status != RunStatus::Stopped || record.exit_code.is_some() {
+        return Ok(());
+    }
+    if !matches!(
+        record.operation,
+        RunOperation::Job { .. } | RunOperation::Heartbeat { .. }
+    ) {
+        return Ok(());
+    }
+    record.status = RunStatus::Exited;
+    record.exit_code = Some(0);
+    record.last_error = None;
+    record.stopped_at_ms.get_or_insert_with(now_ms);
+    persist_run_record(record_path, record)
 }
 
 pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
@@ -489,7 +519,17 @@ pub(crate) fn internal_command(command: crate::InternalCommand) -> Result<()> {
     }
 }
 
+fn install_shutdown_flag() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, Arc::clone(&flag))
+            .with_context(|| format!("failed to register shutdown handler for signal {sig}"))?;
+    }
+    Ok(flag)
+}
+
 fn internal_run_record(record_path: PathBuf) -> Result<()> {
+    let shutdown = install_shutdown_flag()?;
     let mut record = load_run_record(&record_path)?;
     record.pid = Some(std::process::id());
     record.process_group_id = current_process_group_id();
@@ -509,6 +549,7 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
             listeners,
             ingress,
         } => execute_service_loop(
+            &shutdown,
             &record_path,
             &record,
             payload,
@@ -519,26 +560,21 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
         ),
     };
 
-    match result {
-        Ok(()) => {
-            let mut updated = load_run_record(&record_path)?;
-            updated.status = RunStatus::Exited;
-            updated.stopped_at_ms = Some(now_ms());
-            updated.exit_code = Some(0);
-            updated.last_error = None;
-            persist_run_record(&record_path, &updated)?;
-            Ok(())
-        }
-        Err(error) => {
-            let mut updated = load_run_record(&record_path)?;
-            updated.status = RunStatus::Failed;
-            updated.stopped_at_ms = Some(now_ms());
-            updated.exit_code = Some(1);
-            updated.last_error = Some(error.to_string());
-            persist_run_record(&record_path, &updated)?;
-            Err(error)
-        }
+    // Always attempt to write final status, even if the record file was
+    // modified or corrupted while we were running.  Fall back to the
+    // in-memory copy if reloading fails.
+    let reloaded = match load_run_record(&record_path) {
+        Ok(updated) => Some(updated),
+        Err(_) if !record_path.exists() => None,
+        Err(_) => Some(record),
+    };
+    if let Some(mut updated) = reloaded {
+        apply_final_run_result(&mut updated, &result);
+        // Best-effort persist: if this fails the pid-liveness reconciliation
+        // in `refresh_run_record` will mark the run as stopped on next read.
+        let _ = persist_run_record(&record_path, &updated);
     }
+    result
 }
 
 enum RecordedMode {
@@ -574,7 +610,9 @@ fn execute_recorded_run(record: &RunRecord, mode: RecordedMode) -> Result<()> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_service_loop(
+    shutdown: &AtomicBool,
     record_path: &Path,
     record: &RunRecord,
     payload: Option<String>,
@@ -589,7 +627,7 @@ fn execute_service_loop(
     if record.detached {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        loop {
+        while !shutdown.load(Ordering::Relaxed) {
             let fired = execute_due_service_work(
                 record,
                 payload.as_deref(),
@@ -609,7 +647,7 @@ fn execute_service_loop(
             if fired || handled {
                 persist_service_state(record_path, &schedules, &listeners)?;
             }
-            thread::sleep(Duration::from_millis(poll_interval_ms));
+            sleep_until_next_poll(shutdown, Duration::from_millis(poll_interval_ms));
         }
     } else {
         let log_file = fs::OpenOptions::new()
@@ -619,7 +657,7 @@ fn execute_service_loop(
             .with_context(|| format!("failed to open {}", record.log_path.display()))?;
         let stdout = io::stdout();
         let mut tee = TeeWriter::new(stdout.lock(), log_file);
-        loop {
+        while !shutdown.load(Ordering::Relaxed) {
             let fired = execute_due_service_work(
                 record,
                 payload.as_deref(),
@@ -639,8 +677,21 @@ fn execute_service_loop(
             if fired || handled {
                 persist_service_state(record_path, &schedules, &listeners)?;
             }
-            thread::sleep(Duration::from_millis(poll_interval_ms));
+            sleep_until_next_poll(shutdown, Duration::from_millis(poll_interval_ms));
         }
+    }
+    Ok(())
+}
+
+fn sleep_until_next_poll(shutdown: &AtomicBool, duration: Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    while !shutdown.load(Ordering::Relaxed) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        thread::sleep(std::cmp::min(remaining, Duration::from_millis(100)));
     }
 }
 
@@ -661,22 +712,61 @@ fn execute_due_service_work(
             return Ok(false);
         }
         execute_service_heartbeat(record, payload, output)?;
-        *next_fire_at_ms = now.saturating_add(interval_ms);
+        // Use fresh wall-clock time after execution so the next fire time
+        // accounts for however long the heartbeat took.
+        *next_fire_at_ms = now_ms().saturating_add(interval_ms);
         return Ok(true);
     }
 
     let mut fired = false;
     for schedule in schedules.iter_mut() {
-        if schedule.next_fire_at_ms > now {
+        if !schedule_is_due(schedule, now) {
             continue;
         }
         execute_service_heartbeat(record, payload, output)?;
-        schedule.last_fired_at_ms = Some(now);
-        schedule.next_fire_at_ms = next_schedule_fire_ms(&schedule.schedule_expr, now)?;
+        // Use fresh wall-clock time after execution so the next fire time
+        // is computed from the real completion moment.
+        let after = now_ms();
+        schedule.last_fired_at_ms = Some(after);
+        schedule.next_fire_at_ms = next_schedule_fire_ms(&schedule.schedule_expr, after)?;
         fired = true;
     }
 
     Ok(fired)
+}
+
+fn schedule_is_due(schedule: &RunSchedule, now_ms: u64) -> bool {
+    if schedule.next_fire_at_ms > now_ms {
+        return false;
+    }
+    if let Some(last) = schedule.last_fired_at_ms
+        && now_ms < last
+    {
+        return false;
+    }
+    true
+}
+
+fn apply_final_run_result(record: &mut RunRecord, result: &Result<()>) {
+    if !record.status.is_active() {
+        record.stopped_at_ms.get_or_insert_with(now_ms);
+        return;
+    }
+
+    let stopped_at_ms = now_ms();
+    match result {
+        Ok(()) => {
+            record.status = RunStatus::Exited;
+            record.exit_code = Some(0);
+            record.last_error = None;
+        }
+        Err(error) => {
+            record.status = RunStatus::Failed;
+            record.exit_code = Some(1);
+            record.last_error = Some(error.to_string());
+        }
+    }
+    record.stopped_at_ms = Some(stopped_at_ms);
 }
 
 fn execute_service_heartbeat(
@@ -1178,8 +1268,15 @@ fn persist_run_record(path: &Path, record: &RunRecord) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_vec_pretty(record)?)
-        .with_context(|| format!("failed to write {}", path.display()))
+    let data =
+        serde_json::to_vec_pretty(record).with_context(|| "failed to serialize run record")?;
+    let mut file = AtomicWriteFile::options()
+        .open(path)
+        .with_context(|| format!("failed to open {} for atomic write", path.display()))?;
+    file.write_all(&data)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.commit()
+        .with_context(|| format!("failed to persist {}", path.display()))
 }
 
 fn remove_run_artifacts(
@@ -1226,6 +1323,8 @@ fn spawn_detached_runner(record_path: &Path, log_path: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    #[cfg(windows)]
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
@@ -1840,8 +1939,19 @@ fn pid_is_running(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn pid_is_running(_pid: u32) -> bool {
-    false
+fn pid_is_running(pid: u32) -> bool {
+    let output = match Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim_start().starts_with('"')
 }
 
 #[cfg(unix)]
@@ -1875,14 +1985,14 @@ fn terminate_process_group(process_group_id: u32, force: bool) -> Result<()> {
 #[cfg(not(unix))]
 fn terminate_pid(pid: u32, force: bool) -> Result<()> {
     let mut command = Command::new("taskkill");
-    command.arg("/PID").arg(pid.to_string()).arg("/T");
+    command.arg("/PID").arg(pid.to_string());
     if force {
         command.arg("/F");
     }
     let status = command
         .status()
         .with_context(|| format!("failed to stop pid {pid}"))?;
-    if status.success() {
+    if status.success() || !force {
         Ok(())
     } else {
         bail!("failed to stop pid {pid}")
@@ -1999,6 +2109,33 @@ mod tests {
         }
     }
 
+    fn sample_run_record(dir: &std::path::Path) -> RunRecord {
+        RunRecord {
+            run_id: "run-1".to_string(),
+            parcel_digest: "digest".to_string(),
+            parcel_name: Some("demo".to_string()),
+            parcel_version: Some("1.0.0".to_string()),
+            parcel_path: dir.join("parcel"),
+            courier: "native".to_string(),
+            registry: None,
+            operation: RunOperation::Job {
+                payload: "{}".to_string(),
+            },
+            status: RunStatus::Starting,
+            pid: Some(42),
+            process_group_id: Some(42),
+            started_at_ms: Some(1),
+            stopped_at_ms: None,
+            exit_code: None,
+            session_file: dir.join("run.session.json"),
+            log_path: dir.join("run.log"),
+            tool_approval: crate::CliToolApprovalMode::Never,
+            a2a_policy: CliA2aPolicy::default(),
+            last_error: None,
+            detached: true,
+        }
+    }
+
     #[test]
     fn resolve_run_prefix_matches_unique_ids() {
         let dir = tempdir().unwrap();
@@ -2022,35 +2159,43 @@ mod tests {
     fn run_record_round_trips_json() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("run.json");
-        let record = RunRecord {
-            run_id: "run-1".to_string(),
-            parcel_digest: "digest".to_string(),
-            parcel_name: Some("demo".to_string()),
-            parcel_version: Some("1.0.0".to_string()),
-            parcel_path: dir.path().join("parcel"),
-            courier: "native".to_string(),
-            registry: None,
-            operation: RunOperation::Job {
-                payload: "{}".to_string(),
-            },
-            status: RunStatus::Starting,
-            pid: Some(42),
-            process_group_id: Some(42),
-            started_at_ms: Some(1),
-            stopped_at_ms: None,
-            exit_code: None,
-            session_file: dir.path().join("run.session.json"),
-            log_path: dir.path().join("run.log"),
-            tool_approval: crate::CliToolApprovalMode::Never,
-            a2a_policy: CliA2aPolicy::default(),
-            last_error: None,
-            detached: true,
-        };
+        let record = sample_run_record(dir.path());
         let payload = serde_json::to_string_pretty(&record).unwrap();
         std::fs::write(&path, payload).unwrap();
         let loaded: RunRecord =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn persist_run_record_handles_concurrent_writers_without_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.json");
+
+        std::thread::scope(|scope| {
+            for idx in 0..4 {
+                let path = path.clone();
+                let mut record = sample_run_record(dir.path());
+                record.run_id = format!("run-{idx}");
+                record.last_error = Some(format!("error-{idx}"));
+                scope.spawn(move || {
+                    for iteration in 0..32 {
+                        record.exit_code = Some(iteration);
+                        super::persist_run_record(&path, &record).unwrap();
+                    }
+                });
+            }
+        });
+
+        let loaded = super::load_run_record(&path).unwrap();
+        assert!(loaded.run_id.starts_with("run-"));
+        assert!(
+            loaded
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("error-")
+        );
     }
 
     #[test]
@@ -2127,6 +2272,32 @@ mod tests {
         assert_eq!(listeners[0].bound_addr, None);
         assert_eq!(listeners[0].requests_handled, 0);
         assert_eq!(listeners[0].last_request_at_ms, None);
+    }
+
+    #[test]
+    fn schedule_is_due_skips_backward_clock_jump() {
+        let schedule = super::RunSchedule {
+            schedule_expr: "*/5 * * * * * *".to_string(),
+            next_fire_at_ms: 10,
+            last_fired_at_ms: Some(20),
+        };
+        assert!(!super::schedule_is_due(&schedule, 15));
+        assert!(super::schedule_is_due(&schedule, 20));
+    }
+
+    #[test]
+    fn apply_final_run_result_preserves_existing_terminal_status() {
+        let dir = tempdir().unwrap();
+        let mut record = sample_run_record(dir.path());
+        record.status = RunStatus::Stopped;
+        record.stopped_at_ms = Some(7);
+
+        let result = Ok::<(), anyhow::Error>(());
+        super::apply_final_run_result(&mut record, &result);
+
+        assert_eq!(record.status, RunStatus::Stopped);
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.stopped_at_ms, Some(7));
     }
 
     #[test]

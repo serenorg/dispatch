@@ -15,8 +15,29 @@ use std::{
 };
 use tempfile::tempdir;
 
-fn dispatch_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_dispatch")
+fn dispatch_bin() -> PathBuf {
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(bin_dir) = current_exe.parent()
+        && bin_dir.file_name().is_some_and(|name| name == "deps")
+        && let Some(target_dir) = bin_dir.parent()
+    {
+        let sibling = target_dir.join(format!("dispatch{}", std::env::consts::EXE_SUFFIX));
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+
+    let cargo_bin = PathBuf::from(env!("CARGO_BIN_EXE_dispatch"));
+    if let Some(bin_dir) = cargo_bin.parent()
+        && bin_dir.file_name().is_some_and(|name| name == "deps")
+        && let Some(target_dir) = bin_dir.parent()
+    {
+        let sibling = target_dir.join(cargo_bin.file_name().unwrap_or_default());
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    cargo_bin
 }
 
 fn write_heartbeat_parcel(
@@ -48,12 +69,46 @@ fn run_dispatch(
     envs: &[(&str, &str)],
     args: &[&str],
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-    let mut command = Command::new(dispatch_bin());
-    command.current_dir(cwd).args(args);
+    let dispatch_bin = dispatch_bin();
+    let capture_dir = tempdir()?;
+    let stdout_path = capture_dir.path().join("stdout.txt");
+    let stderr_path = capture_dir.path().join("stderr.txt");
+    let stdout_file = fs::File::create(&stdout_path)?;
+    let stderr_file = fs::File::create(&stderr_path)?;
+    let mut command = Command::new(&dispatch_bin);
+    command
+        .current_dir(cwd)
+        .args(args)
+        .stdout(stdout_file)
+        .stderr(stderr_file);
     for (name, value) in envs {
         command.env(name, value);
     }
-    Ok(command.output()?)
+
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "`{}` {:?} timed out after 15s",
+                dispatch_bin.display(),
+                args
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: fs::read(stdout_path)?,
+        stderr: fs::read(stderr_path)?,
+    })
 }
 
 fn output_text(output: &std::process::Output) -> (String, String) {
@@ -112,6 +167,73 @@ fn http_request(addr: &str, request: &str) -> Result<String, Box<dyn std::error:
     Ok(response)
 }
 
+fn http_request_with_retry(
+    addr: &str,
+    request: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match http_request(addr, request) {
+            Ok(response) => return Ok(response),
+            Err(error) if Instant::now() < deadline => {
+                let retryable = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| {
+                        matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::ConnectionReset
+                        )
+                    });
+                if !retryable {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_service_persists_terminal_status_after_sigterm()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    write_heartbeat_parcel(dir.path(), &[])?;
+
+    let serve_output = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "serve",
+                ".",
+                "--courier",
+                "native",
+                "--interval-ms",
+                "60000",
+                "--detach",
+            ],
+        )?,
+        "dispatch serve --detach",
+    )?;
+    let record_path = PathBuf::from(extract_value("Record: ", &serve_output)?);
+
+    let running = wait_for_run_record(&record_path, |record| record["status"] == "running")?;
+    let pid = running["pid"].as_i64().ok_or("missing service pid")?;
+    kill(Pid::from_raw(pid as i32), Signal::SIGTERM)?;
+
+    let exited = wait_for_run_record(&record_path, |record| {
+        record["status"] == "exited" && record["stopped_at_ms"].is_u64()
+    })?;
+    assert_eq!(exited["status"], "exited");
+    assert_eq!(exited["exit_code"], 0);
+
+    Ok(())
+}
+
 #[test]
 fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
@@ -155,19 +277,19 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
         .as_str()
         .ok_or("missing bound listener address")?;
 
-    let wrong_path = http_request(
+    let wrong_path = http_request_with_retry(
         bound_addr,
         "GET /wrong HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     )?;
     assert!(wrong_path.starts_with("HTTP/1.1 404 Not Found"));
 
-    let unauthorized = http_request(
+    let unauthorized = http_request_with_retry(
         bound_addr,
         "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     )?;
     assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
 
-    let authorized = http_request(
+    let authorized = http_request_with_retry(
         bound_addr,
         "POST /hook HTTP/1.1\r\nHost: localhost\r\nx-dispatch-secret: topsecret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     )?;
@@ -223,7 +345,7 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
     let restarted_bound_addr = restarted["operation"]["listeners"][0]["bound_addr"]
         .as_str()
         .ok_or("missing restarted bound listener address")?;
-    let restarted_authorized = http_request(
+    let restarted_authorized = http_request_with_retry(
         restarted_bound_addr,
         "POST /hook HTTP/1.1\r\nHost: localhost\r\nx-dispatch-secret: topsecret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     )?;
@@ -308,6 +430,11 @@ fn wait_timeout_returns_error_for_active_service() -> Result<(), Box<dyn std::er
         "dispatch serve --detach",
     )?;
     let run_id = extract_value("Started service ", &serve_output)?;
+    let record_path = PathBuf::from(extract_value("Record: ", &serve_output)?);
+
+    let _running = wait_for_run_record(&record_path, |record| {
+        record["status"] == "running" && record["pid"].is_u64()
+    })?;
 
     let wait_output = run_dispatch(
         dir.path(),
