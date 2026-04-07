@@ -1,5 +1,7 @@
 use super::*;
 #[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::{
     io::{BufReader, Read, Write},
@@ -23,17 +25,16 @@ impl PluginModelBackend {
 }
 
 #[cfg(test)]
-static TEST_PLUGIN_BINARY_OVERRIDES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<String, String>>,
-> = std::sync::OnceLock::new();
+thread_local! {
+    static TEST_PLUGIN_BINARY_OVERRIDES: RefCell<HashMap<String, String>> =
+        RefCell::new(HashMap::new());
+}
 
 #[cfg(all(test, unix))]
 pub(crate) fn clear_test_plugin_binary_override(provider: &str) {
-    if let Some(slot) = TEST_PLUGIN_BINARY_OVERRIDES.get() {
-        slot.lock()
-            .expect("plugin binary override lock poisoned")
-            .remove(provider);
-    }
+    TEST_PLUGIN_BINARY_OVERRIDES.with(|slot| {
+        slot.borrow_mut().remove(provider);
+    });
 }
 
 impl ChatModelBackend for PluginModelBackend {
@@ -83,12 +84,8 @@ struct PluginLaunch {
 
 fn resolve_plugin_launch(provider: &str) -> Option<PluginLaunch> {
     #[cfg(test)]
-    if let Some(slot) = TEST_PLUGIN_BINARY_OVERRIDES.get()
-        && let Some(path) = slot
-            .lock()
-            .expect("plugin binary override lock poisoned")
-            .get(provider)
-            .cloned()
+    if let Some(path) =
+        TEST_PLUGIN_BINARY_OVERRIDES.with(|slot| slot.borrow().get(provider).cloned())
     {
         return Some(PluginLaunch {
             program: path,

@@ -1,8 +1,7 @@
 use super::*;
 
-// These overrides are process-global within the test binary. Only use them in
-// tests that also hold `lock_codex_backend_test()` so backend env state remains
-// serialized alongside the mocked binary overrides.
+// These overrides are scoped to the current test thread. `lock_codex_backend_test()`
+// exists to provide cleanup symmetry across codex/claude/plugin backend tests.
 struct TestEnvOverride(&'static str);
 
 impl TestEnvOverride {

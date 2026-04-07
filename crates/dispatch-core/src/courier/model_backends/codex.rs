@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     io::{BufReader, Write},
     path::Path,
@@ -91,34 +93,28 @@ impl ChatModelBackend for CodexAppServerBackend {
 #[cfg(all(test, unix))]
 impl CodexAppServerBackend {
     pub(crate) fn with_binary_path_for_tests(path: impl Into<String>) -> Self {
-        TEST_CODEX_BINARY_OVERRIDE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("codex binary override lock poisoned")
-            .replace(path.into());
+        TEST_CODEX_BINARY_OVERRIDE.with(|slot| {
+            slot.borrow_mut().replace(path.into());
+        });
         Self
     }
 }
 
 #[cfg(test)]
-static TEST_CODEX_BINARY_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static TEST_CODEX_BINARY_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 #[cfg(all(test, unix))]
 pub(crate) fn clear_test_codex_binary_override() {
-    if let Some(slot) = TEST_CODEX_BINARY_OVERRIDE.get() {
-        *slot.lock().expect("codex binary override lock poisoned") = None;
-    }
+    TEST_CODEX_BINARY_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 fn codex_binary_path() -> String {
     #[cfg(test)]
-    if let Some(slot) = TEST_CODEX_BINARY_OVERRIDE.get()
-        && let Some(path) = slot
-            .lock()
-            .expect("codex binary override lock poisoned")
-            .clone()
-    {
+    if let Some(path) = TEST_CODEX_BINARY_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return path;
     }
 

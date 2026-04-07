@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     io::{BufReader, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
@@ -9,26 +11,25 @@ use std::{
 pub(crate) struct ClaudeCliBackend;
 
 #[cfg(test)]
-static TEST_CLAUDE_BINARY_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static TEST_CLAUDE_BINARY_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 #[cfg(all(test, unix))]
 impl ClaudeCliBackend {
     pub(crate) fn with_binary_path_for_tests(path: impl Into<String>) -> Self {
-        TEST_CLAUDE_BINARY_OVERRIDE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("claude binary override lock poisoned")
-            .replace(path.into());
+        TEST_CLAUDE_BINARY_OVERRIDE.with(|slot| {
+            slot.borrow_mut().replace(path.into());
+        });
         Self
     }
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn clear_test_claude_binary_override() {
-    if let Some(slot) = TEST_CLAUDE_BINARY_OVERRIDE.get() {
-        *slot.lock().expect("claude binary override lock poisoned") = None;
-    }
+    TEST_CLAUDE_BINARY_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 impl ChatModelBackend for ClaudeCliBackend {
@@ -256,12 +257,7 @@ impl ChatModelBackend for ClaudeCliBackend {
 
 fn claude_binary_path() -> String {
     #[cfg(test)]
-    if let Some(slot) = TEST_CLAUDE_BINARY_OVERRIDE.get()
-        && let Some(path) = slot
-            .lock()
-            .expect("claude binary override lock poisoned")
-            .clone()
-    {
+    if let Some(path) = TEST_CLAUDE_BINARY_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return path;
     }
 

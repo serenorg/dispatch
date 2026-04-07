@@ -92,9 +92,7 @@ fn write_executable_script(path: &std::path::Path, content: &str) {
 }
 
 #[cfg(unix)]
-struct CodexBackendTestGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
+struct CodexBackendTestGuard {}
 
 #[cfg(unix)]
 impl Drop for CodexBackendTestGuard {
@@ -107,13 +105,7 @@ impl Drop for CodexBackendTestGuard {
 
 #[cfg(unix)]
 fn lock_codex_backend_test() -> CodexBackendTestGuard {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    CodexBackendTestGuard {
-        _guard: LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("codex backend test lock poisoned"),
-    }
+    CodexBackendTestGuard {}
 }
 
 fn start_test_a2a_server_with_options(options: TestA2aServerOptions) -> TestA2aServer {

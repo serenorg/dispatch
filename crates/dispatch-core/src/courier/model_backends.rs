@@ -1,5 +1,7 @@
 use super::*;
 #[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::{
     io::BufRead,
@@ -48,17 +50,14 @@ fn request_timeout(request: &ModelRequest) -> Option<Duration> {
 }
 
 #[cfg(test)]
-static TEST_ENV_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static TEST_ENV_OVERRIDES: RefCell<BTreeMap<String, Option<String>>> =
+        RefCell::new(BTreeMap::new());
+}
 
 fn env_var(name: &str) -> Result<String, std::env::VarError> {
     #[cfg(test)]
-    if let Some(overrides) = TEST_ENV_OVERRIDES.get()
-        && let Some(value) = overrides
-            .lock()
-            .expect("test env override lock poisoned")
-            .get(name)
-            .cloned()
+    if let Some(value) = TEST_ENV_OVERRIDES.with(|overrides| overrides.borrow().get(name).cloned())
     {
         return value.ok_or(std::env::VarError::NotPresent);
     }
@@ -68,21 +67,18 @@ fn env_var(name: &str) -> Result<String, std::env::VarError> {
 
 #[cfg(test)]
 pub(crate) fn set_test_env_override(name: &str, value: Option<&str>) {
-    TEST_ENV_OVERRIDES
-        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("test env override lock poisoned")
-        .insert(name.to_string(), value.map(ToString::to_string));
+    TEST_ENV_OVERRIDES.with(|overrides| {
+        overrides
+            .borrow_mut()
+            .insert(name.to_string(), value.map(ToString::to_string));
+    });
 }
 
 #[cfg(test)]
 pub(crate) fn clear_test_env_override(name: &str) {
-    if let Some(overrides) = TEST_ENV_OVERRIDES.get() {
-        overrides
-            .lock()
-            .expect("test env override lock poisoned")
-            .remove(name);
-    }
+    TEST_ENV_OVERRIDES.with(|overrides| {
+        overrides.borrow_mut().remove(name);
+    });
 }
 
 pub(super) fn model_option_value<'a>(request: &'a ModelRequest, key: &str) -> Option<&'a str> {
