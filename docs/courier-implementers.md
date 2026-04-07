@@ -227,7 +227,7 @@ Use precise language when you document or market an external courier.
 
 Good compatibility claims look like:
 
-- "supports Dispatch parcel schema `https://schema.dispatch.run/parcel.v1.json`"
+- "supports Dispatch parcel schema `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`"
 - "passes `dispatch courier conformance` against Dispatch v0.x.y"
 - "supports `dispatch/native` parcels for `chat`, `job`, and `heartbeat`, but not `dispatch/wasm`"
 

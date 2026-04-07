@@ -19,7 +19,7 @@ fn repo_schema_is_readable() {
 
     assert_eq!(
         schema.get("$id").and_then(serde_json::Value::as_str),
-        Some("https://schema.dispatch.run/parcel.v1.json"),
+        Some("https://serenorg.github.io/dispatch/schemas/parcel.v1.json"),
         "schema $id should match the published parcel schema URL"
     );
     assert_eq!(
@@ -28,7 +28,7 @@ fn repo_schema_is_readable() {
             .and_then(|properties| properties.get("$schema"))
             .and_then(|schema_property| schema_property.get("const"))
             .and_then(serde_json::Value::as_str),
-        Some("https://schema.dispatch.run/parcel.v1.json"),
+        Some("https://serenorg.github.io/dispatch/schemas/parcel.v1.json"),
         "manifest $schema property should require the published parcel schema URL"
     );
     assert_eq!(

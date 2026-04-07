@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const PARCEL_SCHEMA_URL: &str = "https://schema.dispatch.run/parcel.v1.json";
+pub const PARCEL_SCHEMA_URL: &str = "https://serenorg.github.io/dispatch/schemas/parcel.v1.json";
 pub const PARCEL_FORMAT_VERSION: u32 = 1;
 pub const DISPATCH_WASM_ABI: &str = dispatch_wasm_abi::ABI;
 

@@ -4,7 +4,7 @@ Dispatch publishes a JSON Schema for every supported parcel manifest format.
 
 Current published schema:
 
-- schema URL: `https://schema.dispatch.run/parcel.v1.json`
+- schema URL: `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`
 - canonical copy: [`schemas/parcel.v1.json`](../schemas/parcel.v1.json)
 - current `format_version`: `1`
 
@@ -13,6 +13,7 @@ Current published schema:
 Dispatch keeps one tracked copy of the current parcel schema in the repo:
 
 - `schemas/parcel.v1.json` is the canonical schema checked into the repo
+- GitHub Pages publishes that tracked copy at `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`
 
 ## Compatibility Rules
 
@@ -30,7 +31,7 @@ Courier compatibility rules:
 
 Reference implementation policy:
 
-- the Dispatch reference implementation currently supports exactly `https://schema.dispatch.run/parcel.v1.json`
+- the Dispatch reference implementation currently supports exactly `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`
 - the Dispatch reference implementation currently supports exactly `format_version: 1`
 
 ## Stability Promise
@@ -65,5 +66,6 @@ When Dispatch introduces a new parcel manifest version:
 2. Update the manifest constants and parser/build/courier support for the new schema URL and `format_version`.
 3. Update the compatibility docs and any release notes to state which versions the reference implementation supports.
 4. Keep old schema files published and loadable by URL even after newer versions exist.
+5. Publish the tracked `schemas/` directory to GitHub Pages so the schema URL stays dereferenceable.
 
 Dispatch should not reuse an old schema URL for a new format.

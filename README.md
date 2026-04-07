@@ -352,7 +352,7 @@ A built parcel contains:
 - `context/` - packaged build content referenced by the `Agentfile`
 - `signatures/<key_id>.json` - detached Ed25519 signatures (optional)
 
-The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json).
+The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json), published at `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`.
 Schema publication and compatibility policy live in [`docs/schema-compatibility.md`](docs/schema-compatibility.md).
 
 Packaged eval files live under `context/` with the other authored inputs. A minimal eval file looks like:

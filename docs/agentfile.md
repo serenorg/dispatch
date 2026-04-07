@@ -343,21 +343,26 @@ TOOLS TOOLS.md
 
 #### `HEARTBEAT`
 
-Declares scheduled or recurring execution semantics. `HEARTBEAT` requires
-`ENTRYPOINT heartbeat`.
+Packages the heartbeat instruction file used by the `heartbeat` entrypoint.
+`HEARTBEAT` requires `ENTRYPOINT heartbeat`.
 
 ```dockerfile
-HEARTBEAT EVERY 30s FILE HEARTBEAT.md
-HEARTBEAT CRON "*/5 * * * *" FILE HEARTBEAT.md
+HEARTBEAT FILE HEARTBEAT.md
 ```
+
+Current behavior:
+
+- `HEARTBEAT` packages the referenced markdown file into the parcel as heartbeat instructions
+- `HEARTBEAT` itself does not schedule the service
+- use `SCHEDULE ...` and/or `dispatch serve --interval-ms ...` to control when heartbeat runs fire
 
 #### `SCHEDULE`
 
 Declares an additional cron wake schedule for `dispatch serve`.
 
 ```dockerfile
-SCHEDULE "*/5 * * * *"
-SCHEDULE "0 */1 * * *"
+SCHEDULE "*/5 * * * * * *"
+SCHEDULE "0 0 */1 * * * *"
 ```
 
 Semantics:
@@ -366,6 +371,7 @@ Semantics:
 - preserved in the built parcel manifest
 - merged with any runtime `dispatch serve --schedule ...` flags
 - currently only used when the parcel is authored with `ENTRYPOINT heartbeat`
+- docs and built-in examples use the seconds-aware cron form accepted by the current runtime
 
 #### `MEMORY`
 

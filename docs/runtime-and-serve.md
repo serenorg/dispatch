@@ -267,12 +267,13 @@ expression.
 
 Schedules can originate from:
 
-- CLI flag: `dispatch serve <path> --schedule "*/5 * * * *"`
+- CLI flag: `dispatch serve <path> --schedule "*/5 * * * * * *"`
 - Agentfile declaration: `SCHEDULE "<cron>"`
 - Runtime API: if Dispatch ever exposes a control socket
 
 The current implementation supports CLI flags and parcel-authored `SCHEDULE`
 directives. Runtime APIs remain a later follow-on.
+The built-in examples use the seconds-aware cron form accepted by the current runtime.
 
 ## Ingress Sources
 
