@@ -8,7 +8,7 @@ use std::{
     process::Child,
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod anthropic;
@@ -141,21 +141,39 @@ pub(super) fn recv_line_with_timeout(
     timeout_error: CourierError,
     disconnect_error: CourierError,
 ) -> Result<Option<(usize, String)>, CourierError> {
-    let recv_result = match timeout {
-        Some(timeout) => match receiver.recv_timeout(timeout) {
-            Ok(result) => Ok(result),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                Err(timeout_error)
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(disconnect_error),
-        },
-        None => receiver.recv().map_err(|_| disconnect_error),
-    }?;
+    let timeout_deadline = timeout.and_then(|value| Instant::now().checked_add(value));
+    loop {
+        let wait_for = timeout_deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50))
+            })
+            .unwrap_or_else(|| Duration::from_millis(50));
 
-    recv_result
-        .map(Some)
-        .map_err(CourierError::ModelBackendRequest)
+        let recv_result = match receiver.recv_timeout(wait_for) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if child
+                    .try_wait()
+                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+                if timeout_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let _ = child.kill();
+                    return Err(timeout_error);
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(disconnect_error),
+        };
+
+        return recv_result
+            .map(Some)
+            .map_err(CourierError::ModelBackendRequest);
+    }
 }
 
 fn generate_with_noop_events(

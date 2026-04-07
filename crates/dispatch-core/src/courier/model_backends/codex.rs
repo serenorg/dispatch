@@ -10,7 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(not(unix))]
 use std::process::ChildStdin;
 
 #[cfg(unix)]
@@ -265,10 +264,13 @@ impl CodexThreadState {
 }
 
 enum CodexIo {
-    #[cfg(not(unix))]
-    Pipes { stdin: ChildStdin },
+    Pipes {
+        stdin: ChildStdin,
+    },
     #[cfg(unix)]
-    Pty { stdin: File },
+    Pty {
+        stdin: File,
+    },
 }
 
 impl CodexProcess {
@@ -290,15 +292,15 @@ impl CodexProcess {
 
         #[cfg(unix)]
         {
-            Self::spawn_with_pty(command)
+            if should_spawn_codex_with_pipes() {
+                Self::spawn_with_pipes(command)
+            } else {
+                Self::spawn_with_pty(command)
+            }
         }
 
         #[cfg(not(unix))]
         {
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
             Self::spawn_with_pipes(command)
         }
     }
@@ -369,7 +371,6 @@ impl CodexProcess {
         }))
     }
 
-    #[cfg(not(unix))]
     fn spawn_with_pipes(mut command: Command) -> Result<Option<Self>, CourierError> {
         command
             .stdin(Stdio::piped())
@@ -726,32 +727,20 @@ impl CodexProcess {
     fn write_message(&mut self, value: serde_json::Value) -> Result<(), CourierError> {
         let encoded = serde_json::to_vec(&value)
             .map_err(|error| CourierError::ModelBackendResponse(error.to_string()))?;
-        match &mut self.io {
-            #[cfg(not(unix))]
-            CodexIo::Pipes { stdin, .. } => {
-                stdin
-                    .write_all(&encoded)
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-                stdin
-                    .write_all(b"\n")
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-                stdin
-                    .flush()
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))
-            }
+        let writer: &mut dyn Write = match &mut self.io {
+            CodexIo::Pipes { stdin, .. } => stdin,
             #[cfg(unix)]
-            CodexIo::Pty { stdin, .. } => {
-                stdin
-                    .write_all(&encoded)
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-                stdin
-                    .write_all(b"\n")
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
-                stdin
-                    .flush()
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))
-            }
-        }
+            CodexIo::Pty { stdin, .. } => stdin,
+        };
+        writer
+            .write_all(&encoded)
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?;
+        writer
+            .flush()
+            .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))
     }
 
     fn read_message(
@@ -814,6 +803,22 @@ impl CodexProcess {
                 ),
             );
         }
+    }
+}
+
+#[cfg(unix)]
+fn should_spawn_codex_with_pipes() -> bool {
+    #[cfg(test)]
+    {
+        // Tests substitute a shell script for the real `codex app-server` binary.
+        // That fake process does not behave like the real server under a PTY, so
+        // use pipes for the override while keeping PTY transport for actual Codex.
+        TEST_CODEX_BINARY_OVERRIDE.with(|slot| slot.borrow().is_some())
+    }
+
+    #[cfg(not(test))]
+    {
+        false
     }
 }
 
