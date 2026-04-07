@@ -107,18 +107,15 @@ where
         .build()
         .header("content-type", "application/json");
     request = apply_a2a_auth_headers(tool, request, env_lookup)?;
-    let response = request.send_json(payload).map_err(|error| {
-        if error.to_string().to_ascii_lowercase().contains("timeout") {
-            CourierError::ToolTimedOut {
-                tool: tool.alias.clone(),
-                timeout: timeout_label.unwrap_or("TOOL").to_string(),
-            }
-        } else {
-            CourierError::A2aToolRequest {
-                tool: tool.alias.clone(),
-                message: error.to_string(),
-            }
-        }
+    let response = request.send_json(payload).map_err(|error| match error {
+        ureq::Error::Timeout(_) => CourierError::ToolTimedOut {
+            tool: tool.alias.clone(),
+            timeout: timeout_label.unwrap_or("TOOL").to_string(),
+        },
+        other => CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: other.to_string(),
+        },
     })?;
     read_a2a_json_response(response, &tool.alias)
 }
@@ -170,12 +167,16 @@ where
         .timeout_global(timeout)
         .build();
     request = apply_a2a_auth_headers(tool, request, &mut env_lookup)?;
-    let response = request
-        .call()
-        .map_err(|error| CourierError::A2aToolRequest {
+    let response = request.call().map_err(|error| match error {
+        ureq::Error::Timeout(_) => CourierError::ToolTimedOut {
             tool: tool.alias.clone(),
-            message: error.to_string(),
-        })?;
+            timeout: "TOOL".to_string(),
+        },
+        other => CourierError::A2aToolRequest {
+            tool: tool.alias.clone(),
+            message: other.to_string(),
+        },
+    })?;
     let status = response.status();
     if status.is_success() {
         let mut response = response;

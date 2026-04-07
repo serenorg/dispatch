@@ -468,14 +468,14 @@ ENTRYPOINT job
 #[test]
 fn native_courier_enforces_tool_timeout_for_a2a_tools() {
     let server = start_test_a2a_server_with_options(TestA2aServerOptions {
-        response_delay: Duration::from_millis(200),
+        response_delay: Duration::from_secs(5),
         ..Default::default()
     });
     let test_parcel = build_test_parcel(
         &format!(
             "\
 FROM dispatch/native:latest
-TIMEOUT TOOL 50ms
+TIMEOUT TOOL 200ms
 TOOL A2A broker URL {}
 ENTRYPOINT job
 ",
@@ -558,7 +558,7 @@ fn native_courier_times_out_polling_non_completed_a2a_tasks() {
         &format!(
             "\
 FROM dispatch/native:latest
-TIMEOUT TOOL 75ms
+TIMEOUT TOOL 200ms
 TOOL A2A broker URL {}
 ENTRYPOINT job
 ",
