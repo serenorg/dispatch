@@ -387,14 +387,14 @@ fn catalog_name(entry: &CourierCatalogEntry) -> &str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
     fn install_courier_plugin_round_trips_registry() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let script_path = dir.path().join("dispatch-courier-demo.sh");
         fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();

@@ -27,7 +27,7 @@ static TEST_PLUGIN_BINARY_OVERRIDES: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, String>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn clear_test_plugin_binary_override(provider: &str) {
     if let Some(slot) = TEST_PLUGIN_BINARY_OVERRIDES.get() {
         slot.lock()

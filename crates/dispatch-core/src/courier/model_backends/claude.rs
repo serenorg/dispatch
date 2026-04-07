@@ -12,7 +12,7 @@ pub(crate) struct ClaudeCliBackend;
 static TEST_CLAUDE_BINARY_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ClaudeCliBackend {
     pub(crate) fn with_binary_path_for_tests(path: impl Into<String>) -> Self {
         TEST_CLAUDE_BINARY_OVERRIDE
@@ -24,7 +24,7 @@ impl ClaudeCliBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn clear_test_claude_binary_override() {
     if let Some(slot) = TEST_CLAUDE_BINARY_OVERRIDE.get() {
         *slot.lock().expect("claude binary override lock poisoned") = None;

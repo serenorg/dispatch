@@ -23,6 +23,7 @@ mod mounts;
 mod native_chat;
 mod native_runtime;
 mod parcel;
+#[cfg(unix)]
 mod plugin;
 mod state;
 mod wasm;
@@ -90,10 +91,12 @@ fn write_executable_script(path: &std::path::Path, content: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[cfg(unix)]
 struct CodexBackendTestGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
+#[cfg(unix)]
 impl Drop for CodexBackendTestGuard {
     fn drop(&mut self) {
         clear_test_codex_binary_override();
@@ -102,6 +105,7 @@ impl Drop for CodexBackendTestGuard {
     }
 }
 
+#[cfg(unix)]
 fn lock_codex_backend_test() -> CodexBackendTestGuard {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     CodexBackendTestGuard {
@@ -399,6 +403,7 @@ fn build_test_plugin_courier(
     )
 }
 
+#[cfg(unix)]
 fn build_test_counting_plugin_courier(
     dir: &tempfile::TempDir,
     digest: &str,
@@ -430,6 +435,7 @@ fn build_test_counting_plugin_courier(
     )
 }
 
+#[cfg(unix)]
 fn build_test_slow_plugin_courier(dir: &tempfile::TempDir, digest: &str) -> JsonlCourierPlugin {
     let plugin_path = dir.path().join("slow-plugin.sh");
     let script = format!(
@@ -452,6 +458,7 @@ fn build_test_slow_plugin_courier(dir: &tempfile::TempDir, digest: &str) -> Json
     })
 }
 
+#[cfg(unix)]
 fn build_test_shutdown_plugin_courier(
     dir: &tempfile::TempDir,
     digest: &str,

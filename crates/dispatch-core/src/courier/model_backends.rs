@@ -22,10 +22,10 @@ pub(super) use anthropic::parse_anthropic_streaming_events;
 #[cfg(test)]
 pub(super) use anthropic::{anthropic_max_tokens, anthropic_messages, extract_anthropic_output};
 pub(crate) use claude::ClaudeCliBackend;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use claude::clear_test_claude_binary_override;
 pub(crate) use codex::CodexAppServerBackend;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use codex::clear_test_codex_binary_override;
 use gemini::GeminiGenerateContentBackend;
 #[cfg(test)]
@@ -40,7 +40,7 @@ pub(super) use openai::{
     parse_openai_chat_completions_streaming_events, parse_openai_streaming_events,
 };
 pub(crate) use plugin::PluginModelBackend;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use plugin::clear_test_plugin_binary_override;
 
 fn request_timeout(request: &ModelRequest) -> Option<Duration> {

@@ -88,7 +88,7 @@ impl ChatModelBackend for CodexAppServerBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl CodexAppServerBackend {
     pub(crate) fn with_binary_path_for_tests(path: impl Into<String>) -> Self {
         TEST_CODEX_BINARY_OVERRIDE
@@ -104,7 +104,7 @@ impl CodexAppServerBackend {
 static TEST_CODEX_BINARY_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn clear_test_codex_binary_override() {
     if let Some(slot) = TEST_CODEX_BINARY_OVERRIDE.get() {
         *slot.lock().expect("codex binary override lock poisoned") = None;
