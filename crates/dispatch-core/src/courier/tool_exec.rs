@@ -6,6 +6,7 @@ use super::{
 };
 use crate::manifest::TimeoutSpec;
 use std::{
+    io::ErrorKind,
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -209,6 +210,28 @@ pub(super) fn apply_session_run_elapsed(session: &mut CourierSession, started_at
     session.elapsed_ms = session.elapsed_ms.saturating_add(elapsed_ms);
 }
 
+fn write_tool_input(
+    tool: &LocalToolSpec,
+    child: &mut Child,
+    input: Option<&str>,
+) -> Result<(), CourierError> {
+    if let Some(input) = input
+        && let Some(stdin) = child.stdin.as_mut()
+    {
+        use std::io::Write as _;
+        if let Err(source) = stdin.write_all(input.as_bytes())
+            && source.kind() != ErrorKind::BrokenPipe
+        {
+            return Err(CourierError::WriteToolInput {
+                tool: tool.alias.clone(),
+                source,
+            });
+        }
+    }
+    drop(child.stdin.take());
+    Ok(())
+}
+
 // Execute a tool whose spec has already been resolved. Callers are responsible
 // for validating required secrets before calling this function.
 fn execute_local_tool(
@@ -269,18 +292,7 @@ where
         source,
     })?;
 
-    if let Some(input) = input
-        && let Some(stdin) = child.stdin.as_mut()
-    {
-        use std::io::Write as _;
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|source| CourierError::WriteToolInput {
-                tool: tool.alias.clone(),
-                source,
-            })?;
-    }
-    drop(child.stdin.take());
+    write_tool_input(tool, &mut child, input)?;
 
     let output = wait_for_tool_output(
         child,
@@ -360,18 +372,7 @@ pub(super) fn execute_local_tool_in_docker(
         source,
     })?;
 
-    if let Some(input) = input
-        && let Some(stdin) = child.stdin.as_mut()
-    {
-        use std::io::Write as _;
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|source| CourierError::WriteToolInput {
-                tool: tool.alias.clone(),
-                source,
-            })?;
-    }
-    drop(child.stdin.take());
+    write_tool_input(tool, &mut child, input)?;
 
     let output = wait_for_tool_output(
         child,

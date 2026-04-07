@@ -154,7 +154,7 @@ ENTRYPOINT chat
 ",
         &[
             ("components/assistant.wat", "(component)"),
-            ("tools/demo.sh", "printf 'direct-tool-ok'"),
+            ("tools/demo.sh", "exec 0<&-\nprintf 'direct-tool-ok'"),
         ],
     );
     let courier = WasmCourier::new().unwrap();
