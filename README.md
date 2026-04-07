@@ -240,60 +240,62 @@ The reference WASM courier keeps a bounded in-process component cache keyed by c
 
 ## Getting Started
 
+The commands below assume `dispatch` is installed and on your `PATH`. For local development from this repository, install the CLI with `cargo install --path crates/dispatch-cli --locked`.
+
 Build and run the reference examples:
 
 ```bash
 # Lint an Agentfile
-cargo run -- parcel lint examples/parcels/basic
-cargo run -- parcel lint examples/parcels/wasm-reference
-cargo run -- parcel lint examples/skills/file-analyst
+dispatch parcel lint examples/parcels/basic
+dispatch parcel lint examples/parcels/wasm-reference
+dispatch parcel lint examples/skills/file-analyst
 
 # Build a parcel
-cargo run -- parcel build examples/parcels/basic
-cargo run -- parcel build examples/parcels/wasm-reference
-cargo run -- parcel build examples/skills/file-analyst
+dispatch parcel build examples/parcels/basic
+dispatch parcel build examples/parcels/wasm-reference
+dispatch parcel build examples/skills/file-analyst
 
 # Run packaged evals
-cargo run -- parcel eval examples/parcels/basic
-cargo run -- parcel eval examples/parcels/basic --courier native
-cargo run -- parcel eval examples/skills/file-analyst --courier native
+dispatch parcel eval examples/parcels/basic
+dispatch parcel eval examples/parcels/basic --courier native
+dispatch parcel eval examples/skills/file-analyst --courier native
 
 # Inspect a built parcel
-cargo run -- parcel inspect examples/parcels/basic/.dispatch/parcels/<digest>
-cargo run -- parcel inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
+dispatch parcel inspect examples/parcels/basic/.dispatch/parcels/<digest>
+dispatch parcel inspect examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm
 
 # Verify parcel integrity
-cargo run -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest>
+dispatch parcel verify examples/parcels/basic/.dispatch/parcels/<digest>
 
 # Sign a parcel
-cargo run -- parcel keygen --key-id release --output-dir .dispatch/keys
-cargo run -- parcel sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
-cargo run -- parcel verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
+dispatch parcel keygen --key-id release --output-dir .dispatch/keys
+dispatch parcel sign examples/parcels/basic/.dispatch/parcels/<digest> --secret-key .dispatch/keys/release.dispatch-secret.json
+dispatch parcel verify examples/parcels/basic/.dispatch/parcels/<digest> --public-key .dispatch/keys/release.dispatch-public.json
 
 # Run a parcel (native courier, requires LLM_API_KEY or provider env vars)
-cargo run -- run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
-cargo run -- run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
+dispatch run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
+dispatch run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
 
 # Run a skill bundle directly without authoring an Agentfile
-cargo run -- skill validate examples/skills/file-analyst/skills/file-analyst
-cargo run -- skill run examples/skills/file-analyst/skills/file-analyst --list-tools
-cargo run -- skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5-mini --provider openai --chat "Summarize this repository."
+dispatch skill validate examples/skills/file-analyst/skills/file-analyst
+dispatch skill run examples/skills/file-analyst/skills/file-analyst --list-tools
+dispatch skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5.4-mini --provider openai --chat "Summarize this repository."
 
 # Run a WASM parcel
-cargo run -- run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
+dispatch run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
 
 # Run a heartbeat
-cargo run -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
+dispatch run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --heartbeat
 
 # Test the Codex backend (requires `codex app-server` access)
-cargo run -- parcel lint examples/parcels/codex
-cargo run -- parcel build examples/parcels/codex
-cargo run -- run examples/parcels/codex/.dispatch/parcels/<digest> --chat "Say hello in one sentence."
-cargo run -- run examples/parcels/codex/.dispatch/parcels/<digest> --interactive
+dispatch parcel lint examples/parcels/codex
+dispatch parcel build examples/parcels/codex
+dispatch run examples/parcels/codex/.dispatch/parcels/<digest> --chat "Say hello in one sentence."
+dispatch run examples/parcels/codex/.dispatch/parcels/<digest> --interactive
 
 # List and invoke tools
-cargo run -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
-cargo run -- run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
+dispatch run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --list-tools
+dispatch run examples/parcels/heartbeat-monitor/.dispatch/parcels/<digest> --tool poll_mentions
 
 # Push/pull to a depot
 dispatch depot push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
@@ -304,43 +306,53 @@ dispatch depot push examples/parcels/basic/.dispatch/parcels/<digest> https://de
 dispatch depot pull https://depot.example.com::acme/basic:0.1.0
 dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --public-key .dispatch/keys/release.dispatch-public.json
 dispatch depot pull https://depot.example.com::acme/basic:0.1.0 --trust-policy trust-policy.toml
+
+# Docker-style aliases for parcel operations
+dispatch build examples/parcels/basic
+# `dispatch images` is shorthand for `dispatch image ls`
+dispatch images examples/parcels/basic
+dispatch image ls examples/parcels/basic
+dispatch image build examples/parcels/basic
+dispatch image inspect examples/parcels/basic/.dispatch/parcels/<digest>
+dispatch image push examples/parcels/basic/.dispatch/parcels/<digest> file:///tmp/dispatch-depot::acme/basic:0.1.0
+dispatch image pull file:///tmp/dispatch-depot::acme/basic:0.1.0
 ```
 
 Long-lived runtime examples:
 
 ```bash
-# Run directly from source and let Dispatch build/resolve the parcel
-cargo run -- run examples/parcels/codex --chat "Say hello in one sentence."
+# Run directly from a source directory and let Dispatch build/resolve the parcel
+dispatch run examples/parcels/codex --chat "Say hello in one sentence."
 
 # List locally built parcels
-cargo run -- parcel list examples/parcels/basic
-cargo run -- images examples/parcels/basic
+dispatch parcel list examples/parcels/basic
+dispatch images examples/parcels/basic
 
 # Start a detached heartbeat/job run
-cargo run -- run examples/parcels/heartbeat-monitor --heartbeat --detach
+dispatch run examples/parcels/heartbeat-monitor --heartbeat --detach
 
 # Start a long-lived service run for a heartbeat parcel
-cargo run -- serve examples/parcels/heartbeat-monitor --detach
-cargo run -- serve examples/parcels/heartbeat-monitor --schedule "*/5 * * * * * *" --detach
+dispatch serve examples/parcels/heartbeat-monitor --detach
+dispatch serve examples/parcels/heartbeat-monitor --schedule "*/5 * * * * * *" --detach
 
 # Inspect and manage long-lived runs
-cargo run -- ps examples/parcels/heartbeat-monitor
-cargo run -- inspect-run <run-id> examples/parcels/heartbeat-monitor --json
-cargo run -- logs <run-id> examples/parcels/heartbeat-monitor --follow
-cargo run -- wait <run-id> examples/parcels/heartbeat-monitor
-cargo run -- stop <run-id> examples/parcels/heartbeat-monitor
-cargo run -- restart <run-id> examples/parcels/heartbeat-monitor
-cargo run -- rm <run-id> examples/parcels/heartbeat-monitor
+dispatch ps examples/parcels/heartbeat-monitor
+dispatch inspect-run <run-id> examples/parcels/heartbeat-monitor --json
+dispatch logs <run-id> examples/parcels/heartbeat-monitor --follow
+dispatch wait <run-id> examples/parcels/heartbeat-monitor
+dispatch stop <run-id> examples/parcels/heartbeat-monitor
+dispatch restart <run-id> examples/parcels/heartbeat-monitor
+dispatch rm <run-id> examples/parcels/heartbeat-monitor
 
 # Docker-style aliases for the same run-management surface
-cargo run -- container ls examples/parcels/heartbeat-monitor
-cargo run -- container logs <run-id> examples/parcels/heartbeat-monitor
+dispatch container ls examples/parcels/heartbeat-monitor
+dispatch container logs <run-id> examples/parcels/heartbeat-monitor
 ```
 
 Print the parsed AST:
 
 ```bash
-cargo run -- parcel lint examples/parcels/basic --json
+dispatch parcel lint examples/parcels/basic --json
 ```
 
 ## Parcel Format
@@ -453,6 +465,12 @@ heartbeat services.
 - `dispatch ps`, `dispatch logs`, `dispatch wait`, `dispatch stop`,
   `dispatch restart`, `dispatch prune`, `dispatch rm`, and
   `dispatch inspect-run` manage those runs
+- `dispatch build`, `dispatch inspect`, `dispatch pull`, `dispatch push`, and
+  `dispatch images` expose Docker-style top-level aliases for common parcel
+  operations
+- `dispatch images` is shorthand for `dispatch image ls`
+- `dispatch image ...` exposes Docker-style aliases for parcel artifact
+  management commands
 - `dispatch container ...` exposes Docker-style aliases for the same run
   management commands
 
