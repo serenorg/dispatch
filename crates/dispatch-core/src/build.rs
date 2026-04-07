@@ -1101,6 +1101,41 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn build_infers_cmd_runner_for_windows_batch_tools() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("tools")).unwrap();
+        fs::write(
+            dir.path().join("Agentfile"),
+            "FROM dispatch/native:latest\nTOOL LOCAL tools/demo.cmd AS demo\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("tools/demo.cmd"),
+            "@echo off\r\necho ok\r\n",
+        )
+        .unwrap();
+
+        let built = build_agentfile(
+            &dir.path().join("Agentfile"),
+            &BuildOptions {
+                output_root: dir.path().join(".dispatch/parcels"),
+            },
+        )
+        .unwrap();
+
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+        match &parcel.tools[0] {
+            ToolConfig::Local(local) => {
+                assert_eq!(local.alias, "demo");
+                assert_eq!(local.runner.command, "cmd");
+                assert_eq!(local.runner.args, vec!["/C", ".\\tools\\demo.cmd"]);
+            }
+            other => panic!("expected local tool, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_skill_directory_autodetects_dispatch_sidecar_and_sets_entrypoint_default() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");

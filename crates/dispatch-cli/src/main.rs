@@ -1101,17 +1101,16 @@ fn state_command(command: StateCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CliA2aPolicy, CliToolApprovalMode, Command, ContainerCommand, CourierCommand,
-        DepotCommand, EvalArgs, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand,
-        KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs,
-        RestartArgs, SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
-        ValidateSkillArgs, VerifyArgs, WaitArgs,
+        Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand, DepotCommand, EvalArgs,
+        ImageCommand, InspectArgs, InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs,
+        ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs, RestartArgs, SignArgs,
+        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs,
+        VerifyArgs, WaitArgs,
     };
     use clap::Parser;
     use dispatch_core::{
-        BuildOptions, ConversationMessage, CourierPluginExec, CourierPluginManifest,
-        CourierSession, PluginTransport, ToolExitExpectation, ToolRunResult, ToolTextExpectation,
-        build_agentfile,
+        BuildOptions, ConversationMessage, CourierSession, ToolExitExpectation, ToolRunResult,
+        ToolTextExpectation, build_agentfile,
     };
     use std::{
         fs,
@@ -1119,6 +1118,10 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use super::CliToolApprovalMode;
+    #[cfg(unix)]
+    use dispatch_core::{CourierPluginExec, CourierPluginManifest, PluginTransport};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -2540,7 +2543,6 @@ mod tests {
         assert!(error.to_string().contains("signature verification failed"));
     }
 
-    #[cfg(unix)]
     fn build_test_image(root: &Path) -> (std::path::PathBuf, String) {
         let context_dir = root.join("image");
         fs::create_dir_all(&context_dir).unwrap();

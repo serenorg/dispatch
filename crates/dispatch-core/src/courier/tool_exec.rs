@@ -245,7 +245,7 @@ where
 
     let mut command = Command::new(tool.command());
     command.args(tool.args());
-    if tool.command() == packaged_path {
+    if tool.command() == packaged_path || tool.args().iter().any(|arg| arg == packaged_path) {
         command.current_dir(parcel.parcel_dir.join("context"));
     } else {
         command.arg(&tool_path);

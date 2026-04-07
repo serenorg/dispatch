@@ -20,6 +20,22 @@ struct FixtureImage {
     image: dispatch_core::LoadedParcel,
 }
 
+fn demo_tool_relative_path() -> &'static str {
+    if cfg!(windows) {
+        "tools/demo.cmd"
+    } else {
+        "tools/demo.sh"
+    }
+}
+
+fn demo_tool_body() -> &'static str {
+    if cfg!(windows) {
+        "@echo off\r\necho ok\r\n"
+    } else {
+        "#!/bin/sh\ncat >/dev/null\nprintf 'ok\\n'\n"
+    }
+}
+
 fn build_fixture(agentfile: &str, files: &[(&str, &str)]) -> FixtureImage {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("Agentfile"), agentfile).unwrap();
@@ -186,13 +202,19 @@ fn write_test_http_response(writer: &mut TcpStream, status: u16, content_type: &
 #[test]
 fn native_courier_conformance_supports_prompt_tools_and_chat() {
     let fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {} AS demo
 ENTRYPOINT chat
 ",
-        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+            demo_tool_relative_path()
+        ),
+        &[
+            ("SOUL.md", "Soul body"),
+            (demo_tool_relative_path(), demo_tool_body()),
+        ],
     );
     let courier = NativeCourier::default();
 
@@ -253,22 +275,34 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_conformance_supports_job_heartbeat_and_direct_tools() {
     let job_fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {} AS demo
 ENTRYPOINT job
 ",
-        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+            demo_tool_relative_path()
+        ),
+        &[
+            ("SOUL.md", "Soul body"),
+            (demo_tool_relative_path(), demo_tool_body()),
+        ],
     );
     let heartbeat_fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {} AS demo
 ENTRYPOINT heartbeat
 ",
-        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+            demo_tool_relative_path()
+        ),
+        &[
+            ("SOUL.md", "Soul body"),
+            (demo_tool_relative_path(), demo_tool_body()),
+        ],
     );
     let courier = NativeCourier::default();
 
@@ -376,13 +410,19 @@ ENTRYPOINT job
 #[test]
 fn docker_courier_conformance_supports_prompt_tools_and_chat() {
     let fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/docker:latest
 SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {} AS demo
 ENTRYPOINT chat
 ",
-        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+            demo_tool_relative_path()
+        ),
+        &[
+            ("SOUL.md", "Soul body"),
+            (demo_tool_relative_path(), demo_tool_body()),
+        ],
     );
     let courier = DockerCourier::default();
 
@@ -488,22 +528,34 @@ ENTRYPOINT job
 #[test]
 fn docker_courier_conformance_supports_job_heartbeat_and_direct_tools() {
     let job_fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/docker:latest
 SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {} AS demo
 ENTRYPOINT job
 ",
-        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+            demo_tool_relative_path()
+        ),
+        &[
+            ("SOUL.md", "Soul body"),
+            (demo_tool_relative_path(), demo_tool_body()),
+        ],
     );
     let heartbeat_fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/docker:latest
 SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {} AS demo
 ENTRYPOINT heartbeat
 ",
-        &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
+            demo_tool_relative_path()
+        ),
+        &[
+            ("SOUL.md", "Soul body"),
+            (demo_tool_relative_path(), demo_tool_body()),
+        ],
     );
     #[cfg(unix)]
     let docker_bin_dir = tempdir().unwrap();
@@ -582,14 +634,17 @@ cat >/dev/null
 #[test]
 fn conformance_builds_schema_backed_local_tools_into_public_manifest_shape() {
     let fixture = build_fixture(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini PROVIDER openai
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json DESCRIPTION \"Look up a record by id.\"
+TOOL LOCAL {} AS demo SCHEMA schemas/demo.json DESCRIPTION \"Look up a record by id.\"
 ENTRYPOINT chat
 ",
+            demo_tool_relative_path()
+        ),
         &[
-            ("tools/demo.sh", "printf ok"),
+            (demo_tool_relative_path(), demo_tool_body()),
             (
                 "schemas/demo.json",
                 "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"id\": { \"type\": \"string\" }\n  },\n  \"required\": [\"id\"]\n}",

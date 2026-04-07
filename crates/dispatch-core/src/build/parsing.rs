@@ -596,17 +596,34 @@ pub(super) fn infer_runner(packaged_path: &str) -> CommandSpec {
         .and_then(|value| value.to_str())
         .unwrap_or_default();
 
-    let command = match extension {
-        "py" => "python3",
-        "js" => "node",
-        "ts" => "tsx",
-        "sh" => "sh",
-        _ => packaged_path,
-    };
-
-    CommandSpec {
-        command: command.to_string(),
-        args: Vec::new(),
+    match extension {
+        "py" => CommandSpec {
+            command: "python3".to_string(),
+            args: Vec::new(),
+        },
+        "js" => CommandSpec {
+            command: "node".to_string(),
+            args: Vec::new(),
+        },
+        "ts" => CommandSpec {
+            command: "tsx".to_string(),
+            args: Vec::new(),
+        },
+        "sh" => CommandSpec {
+            command: "sh".to_string(),
+            args: Vec::new(),
+        },
+        "cmd" | "bat" => CommandSpec {
+            command: "cmd".to_string(),
+            args: vec![
+                "/C".to_string(),
+                format!(".\\{}", packaged_path.replace('/', "\\")),
+            ],
+        },
+        _ => CommandSpec {
+            command: packaged_path.to_string(),
+            args: Vec::new(),
+        },
     }
 }
 

@@ -55,6 +55,22 @@ struct ConformanceA2aServer {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+fn demo_tool_relative_path() -> &'static str {
+    if cfg!(windows) {
+        "tools/demo.cmd"
+    } else {
+        "tools/demo.sh"
+    }
+}
+
+fn demo_tool_body() -> &'static str {
+    if cfg!(windows) {
+        "@echo off\r\necho ok\r\n"
+    } else {
+        "#!/bin/sh\ncat >/dev/null\nprintf 'ok\\n'\n"
+    }
+}
+
 impl Drop for ConformanceA2aServer {
     fn drop(&mut self) {
         let _ = self.shutdown.send(());
@@ -728,9 +744,10 @@ NAME conformance-{name}\n\
 VERSION 0.1.0\n\
 {component_line}\
 SOUL SOUL.md\n\
-TOOL LOCAL tools/demo.sh AS demo\n\
+TOOL LOCAL {} AS demo\n\
 {extra_lines}\
-ENTRYPOINT {entrypoint}\n"
+ENTRYPOINT {entrypoint}\n",
+            demo_tool_relative_path()
         ),
     )
     .with_context(|| {
@@ -741,10 +758,14 @@ ENTRYPOINT {entrypoint}\n"
     })?;
     fs::write(context_dir.join("SOUL.md"), "Soul body\n")
         .with_context(|| format!("failed to write {}", context_dir.join("SOUL.md").display()))?;
-    fs::write(context_dir.join("tools/demo.sh"), "printf ok\n").with_context(|| {
+    fs::write(
+        context_dir.join(demo_tool_relative_path()),
+        demo_tool_body(),
+    )
+    .with_context(|| {
         format!(
             "failed to write {}",
-            context_dir.join("tools/demo.sh").display()
+            context_dir.join(demo_tool_relative_path()).display()
         )
     })?;
     let built = build_agentfile(
