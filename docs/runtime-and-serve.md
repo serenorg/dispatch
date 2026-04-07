@@ -57,9 +57,9 @@ The current runtime command set is:
 - `dispatch serve <path> --listen <addr>`
 - `dispatch ps`
 - `dispatch logs <run>`
-- `dispatch wait <run>`
-- `dispatch stop <run>`
-- `dispatch restart <run>`
+- `dispatch wait <run> [--timeout-ms <ms>]`
+- `dispatch stop <run> [--grace-period-ms <ms>] [--force]`
+- `dispatch restart <run> [--grace-period-ms <ms>] [--force]`
 - `dispatch prune`
 - `dispatch rm <run>`
 - `dispatch inspect-run <run>`
@@ -69,10 +69,10 @@ Docker-style aliases also make sense on top of the base commands:
 - `dispatch container ls`
 - `dispatch container ps`
 - `dispatch container logs <run>`
-- `dispatch container wait <run>`
+- `dispatch container wait <run> [--timeout-ms <ms>]`
 - `dispatch container inspect <run>`
-- `dispatch container stop <run>`
-- `dispatch container restart <run>`
+- `dispatch container stop <run> [--grace-period-ms <ms>] [--force]`
+- `dispatch container restart <run> [--grace-period-ms <ms>] [--force]`
 - `dispatch container prune`
 - `dispatch container rm <run>`
 
@@ -160,6 +160,12 @@ Instead:
 - `stop` signals the recorded pid/process group
 - `logs` reads the run log
 - status reconciliation happens by checking pid liveness
+
+`dispatch wait` blocks until the run exits and prints its exit code. Use
+`--timeout-ms` if you want it to fail instead of waiting indefinitely.
+
+`dispatch stop` sends a graceful stop first and, unless `--force` is set,
+waits for `--grace-period-ms` before escalating to a forceful kill.
 
 This follows the Podman model rather than Docker's daemon model. The distinction
 matters:

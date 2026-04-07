@@ -316,12 +316,20 @@ pub(crate) fn logs(args: crate::LogsArgs) -> Result<()> {
 pub(crate) fn wait(args: crate::WaitArgs) -> Result<()> {
     let root = crate::resolve_runs_root(&args.path);
     let record_path = resolve_run_prefix(&root, &args.run)?;
+    let deadline = args
+        .timeout_ms
+        .map(|timeout_ms| std::time::Instant::now() + Duration::from_millis(timeout_ms));
     loop {
         let mut record = load_run_record(&record_path)?;
         refresh_run_record(&record_path, &mut record)?;
         if !record.status.is_active() {
             println!("{}", run_exit_code(&record));
             return Ok(());
+        }
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            bail!("timed out waiting for run `{}` to exit", record.run_id);
         }
         thread::sleep(Duration::from_millis(250));
     }
@@ -340,14 +348,11 @@ pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
         );
         return Ok(());
     }
-    let Some(pid) = record.pid else {
+    let Some(_) = record.pid else {
         bail!("run `{}` is missing a process id", record.run_id);
     };
-    if let Some(process_group_id) = record.process_group_id {
-        terminate_process_group(process_group_id, args.force)?;
-    } else {
-        terminate_pid(pid, args.force)?;
-    }
+    let graceful_timeout = Duration::from_millis(args.grace_period_ms);
+    stop_process(&record, args.force, graceful_timeout)?;
     record.status = RunStatus::Stopped;
     record.stopped_at_ms = Some(now_ms());
     record.exit_code = None;
@@ -369,14 +374,17 @@ pub(crate) fn restart(args: crate::RestartArgs) -> Result<()> {
             run: record.run_id.clone(),
             path: args.path.clone(),
             force: args.force,
+            grace_period_ms: args.grace_period_ms,
         })?;
         if let Some(pid) = previous_pid {
-            wait_for_pid_exit(pid, Duration::from_secs(5)).with_context(|| {
-                format!(
-                    "run `{}` did not stop before restart; try again with --force",
-                    record.run_id
-                )
-            })?;
+            wait_for_pid_exit(pid, Duration::from_millis(args.grace_period_ms)).with_context(
+                || {
+                    format!(
+                        "run `{}` did not stop before restart; try again with --force",
+                        record.run_id
+                    )
+                },
+            )?;
         }
         record = load_run_record(&record_path)?;
     }
@@ -428,6 +436,7 @@ pub(crate) fn rm(args: crate::RemoveRunArgs) -> Result<()> {
             run: record.run_id.clone(),
             path: args.path.clone(),
             force: true,
+            grace_period_ms: 0,
         };
         stop(stop_args)?;
         record = load_run_record(&record_path)?;
@@ -1129,6 +1138,33 @@ fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
     bail!("process {pid} is still running")
 }
 
+fn stop_process(record: &RunRecord, force: bool, grace_period: Duration) -> Result<()> {
+    let pid = record
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("run `{}` is missing a process id", record.run_id))?;
+
+    if force {
+        return terminate_record(record, true);
+    }
+
+    terminate_record(record, false)?;
+    if wait_for_pid_exit(pid, grace_period).is_ok() {
+        return Ok(());
+    }
+    terminate_record(record, true)
+}
+
+fn terminate_record(record: &RunRecord, force: bool) -> Result<()> {
+    let pid = record
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("run `{}` is missing a process id", record.run_id))?;
+    if let Some(process_group_id) = record.process_group_id {
+        terminate_process_group(process_group_id, force)
+    } else {
+        terminate_pid(pid, force)
+    }
+}
+
 fn load_run_record(path: &Path) -> Result<RunRecord> {
     let source =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -1815,7 +1851,11 @@ fn terminate_pid(pid: u32, force: bool) -> Result<()> {
     if rc == 0 {
         return Ok(());
     }
-    Err(io::Error::last_os_error()).with_context(|| format!("failed to stop pid {pid}"))
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("failed to stop pid {pid}"))
 }
 
 #[cfg(unix)]
@@ -1825,8 +1865,11 @@ fn terminate_process_group(process_group_id: u32, force: bool) -> Result<()> {
     if rc == 0 {
         return Ok(());
     }
-    Err(io::Error::last_os_error())
-        .with_context(|| format!("failed to stop process group {process_group_id}"))
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("failed to stop process group {process_group_id}"))
 }
 
 #[cfg(not(unix))]

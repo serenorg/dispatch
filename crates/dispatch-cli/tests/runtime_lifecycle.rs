@@ -200,7 +200,11 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
     assert_eq!(inspected["status"], "running");
 
     require_success(
-        run_dispatch(dir.path(), &[], &["stop", &run_id, "."])?,
+        run_dispatch(
+            dir.path(),
+            &[],
+            &["stop", &run_id, ".", "--grace-period-ms", "1"],
+        )?,
         "dispatch stop",
     )?;
     let stopped = wait_for_run_record(&record_path, |record| record["status"] == "stopped")?;
@@ -278,6 +282,51 @@ fn detached_heartbeat_wait_returns_exit_code() -> Result<(), Box<dyn std::error:
     require_success(
         run_dispatch(dir.path(), &[], &["rm", &run_id, ".", "--force"])?,
         "dispatch rm after wait",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn wait_timeout_returns_error_for_active_service() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    write_heartbeat_parcel(dir.path(), &["LISTEN \"127.0.0.1:0\""])?;
+
+    let serve_output = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "serve",
+                ".",
+                "--courier",
+                "native",
+                "--interval-ms",
+                "60000",
+                "--detach",
+            ],
+        )?,
+        "dispatch serve --detach",
+    )?;
+    let run_id = extract_value("Started service ", &serve_output)?;
+
+    let wait_output = run_dispatch(
+        dir.path(),
+        &[],
+        &["wait", &run_id, ".", "--timeout-ms", "100"],
+    )?;
+    let (stdout, stderr) = output_text(&wait_output);
+    assert!(
+        !wait_output.status.success(),
+        "wait unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("timed out waiting for run"),
+        "unexpected wait timeout stderr:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    require_success(
+        run_dispatch(dir.path(), &[], &["rm", &run_id, ".", "--force"])?,
+        "dispatch rm after timed wait",
     )?;
     Ok(())
 }

@@ -62,7 +62,7 @@ enum Command {
         #[command(subcommand)]
         command: ContainerCommand,
     },
-    /// Execute part of a built parcel locally
+    /// Execute part of a parcel locally
     Run(RunArgs),
     /// Run a parcel as a long-lived local service
     Serve(ServeArgs),
@@ -325,6 +325,9 @@ struct WaitArgs {
     /// Path to an Agentfile, directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
+    /// Maximum time to wait before returning an error
+    #[arg(long)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -337,6 +340,9 @@ struct StopArgs {
     /// Forcefully terminate the run
     #[arg(long)]
     force: bool,
+    /// Milliseconds to wait after a graceful stop before forcefully terminating
+    #[arg(long, default_value_t = 5000)]
+    grace_period_ms: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -349,6 +355,9 @@ struct RestartArgs {
     /// Forcefully terminate an active run before restarting it
     #[arg(long)]
     force: bool,
+    /// Milliseconds to wait after a graceful stop before forcefully terminating
+    #[arg(long, default_value_t = 5000)]
+    grace_period_ms: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1711,31 +1720,74 @@ mod tests {
         assert_eq!(path, PathBuf::from("."));
         assert!(follow);
 
-        let wait = Cli::try_parse_from(["dispatch", "wait", "abc123", "examples/demo"]).unwrap();
-        let Command::Wait(WaitArgs { run, path }) = wait.command else {
+        let wait = Cli::try_parse_from([
+            "dispatch",
+            "wait",
+            "abc123",
+            "examples/demo",
+            "--timeout-ms",
+            "1500",
+        ])
+        .unwrap();
+        let Command::Wait(WaitArgs {
+            run,
+            path,
+            timeout_ms,
+        }) = wait.command
+        else {
             panic!("expected wait command");
         };
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("examples/demo"));
+        assert_eq!(timeout_ms, Some(1500));
 
-        let stop = Cli::try_parse_from(["dispatch", "stop", "abc123", "examples/demo", "--force"])
-            .unwrap();
-        let Command::Stop(StopArgs { run, path, force }) = stop.command else {
+        let stop = Cli::try_parse_from([
+            "dispatch",
+            "stop",
+            "abc123",
+            "examples/demo",
+            "--force",
+            "--grace-period-ms",
+            "2500",
+        ])
+        .unwrap();
+        let Command::Stop(StopArgs {
+            run,
+            path,
+            force,
+            grace_period_ms,
+        }) = stop.command
+        else {
             panic!("expected stop command");
         };
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("examples/demo"));
         assert!(force);
+        assert_eq!(grace_period_ms, 2500);
 
-        let restart =
-            Cli::try_parse_from(["dispatch", "restart", "abc123", "examples/demo", "--force"])
-                .unwrap();
-        let Command::Restart(RestartArgs { run, path, force }) = restart.command else {
+        let restart = Cli::try_parse_from([
+            "dispatch",
+            "restart",
+            "abc123",
+            "examples/demo",
+            "--force",
+            "--grace-period-ms",
+            "2500",
+        ])
+        .unwrap();
+        let Command::Restart(RestartArgs {
+            run,
+            path,
+            force,
+            grace_period_ms,
+        }) = restart.command
+        else {
             panic!("expected restart command");
         };
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("examples/demo"));
         assert!(force);
+        assert_eq!(grace_period_ms, 2500);
 
         let prune = Cli::try_parse_from(["dispatch", "prune", "examples/demo", "--force"]).unwrap();
         let Command::Prune(PruneArgs { path, force }) = prune.command else {
@@ -1811,18 +1863,30 @@ mod tests {
         let container_wait =
             Cli::try_parse_from(["dispatch", "container", "wait", "abc123"]).unwrap();
         let Command::Container {
-            command: ContainerCommand::Wait(WaitArgs { run, path }),
+            command:
+                ContainerCommand::Wait(WaitArgs {
+                    run,
+                    path,
+                    timeout_ms,
+                }),
         } = container_wait.command
         else {
             panic!("expected container wait command");
         };
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("."));
+        assert_eq!(timeout_ms, None);
 
         let container_restart =
             Cli::try_parse_from(["dispatch", "container", "restart", "abc123", "--force"]).unwrap();
         let Command::Container {
-            command: ContainerCommand::Restart(RestartArgs { run, path, force }),
+            command:
+                ContainerCommand::Restart(RestartArgs {
+                    run,
+                    path,
+                    force,
+                    grace_period_ms,
+                }),
         } = container_restart.command
         else {
             panic!("expected container restart command");
@@ -1830,6 +1894,7 @@ mod tests {
         assert_eq!(run, "abc123");
         assert_eq!(path, PathBuf::from("."));
         assert!(force);
+        assert_eq!(grace_period_ms, 5000);
     }
 
     #[test]
