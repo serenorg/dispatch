@@ -30,7 +30,7 @@ wasmtime = "43"
 wasmtime-wasi = "43"
 ring = "0.17"
 jsonschema = "0.45"
-rusqlite = "0.37"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tar = "0.4"
 urlencoding = "2"
 toml = "0.9"
