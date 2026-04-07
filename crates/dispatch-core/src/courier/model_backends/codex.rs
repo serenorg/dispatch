@@ -1,6 +1,5 @@
 use super::*;
 use std::{
-    fs::File,
     io::{BufReader, Write},
     path::Path,
     process::{Child, Command, Stdio},
@@ -11,6 +10,9 @@ use std::{
 
 #[cfg(not(unix))]
 use std::process::ChildStdin;
+
+#[cfg(unix)]
+use std::fs::File;
 
 #[cfg(unix)]
 use nix::{
