@@ -157,6 +157,9 @@ struct EvalArgs {
     /// Output directory for built parcels when evaluating an Agentfile source
     #[arg(long)]
     output_dir: Option<PathBuf>,
+    /// Repo-local dataset file that fans out packaged EVAL cases into regression inputs
+    #[arg(long)]
+    dataset: Option<PathBuf>,
     /// How to handle tools declared with `APPROVAL confirm`
     #[arg(long, value_enum)]
     tool_approval: Option<CliToolApprovalMode>,
@@ -846,6 +849,7 @@ fn parcel_command(command: ParcelCommand) -> Result<()> {
             registry,
             json,
             output_dir,
+            dataset,
             tool_approval,
             a2a_allowed_origins,
             a2a_trust_policy,
@@ -853,12 +857,15 @@ fn parcel_command(command: ParcelCommand) -> Result<()> {
             path,
             &courier,
             registry,
-            json,
-            output_dir,
-            resolve_noninteractive_tool_approval_mode(tool_approval),
-            CliA2aPolicy {
-                allowed_origins: a2a_allowed_origins,
-                trust_policy: a2a_trust_policy,
+            eval::EvalOptions {
+                emit_json: json,
+                output_dir,
+                dataset,
+                tool_approval: resolve_noninteractive_tool_approval_mode(tool_approval),
+                policy: CliA2aPolicy {
+                    allowed_origins: a2a_allowed_origins,
+                    trust_policy: a2a_trust_policy,
+                },
             },
         ),
         ParcelCommand::Inspect(InspectArgs {
@@ -1285,6 +1292,8 @@ mod tests {
             ".",
             "--courier",
             "native",
+            "--dataset",
+            "evals/regression.dataset.toml",
             "--a2a-allowed-origins",
             "https://agents.example.com",
             "--a2a-trust-policy",
@@ -1296,6 +1305,7 @@ mod tests {
             panic!("expected parcel command");
         };
         let ParcelCommand::Eval(EvalArgs {
+            dataset,
             a2a_allowed_origins,
             a2a_trust_policy,
             ..
@@ -1303,6 +1313,10 @@ mod tests {
         else {
             panic!("expected parcel eval command");
         };
+        assert_eq!(
+            dataset.as_deref(),
+            Some(Path::new("evals/regression.dataset.toml"))
+        );
         assert_eq!(
             a2a_allowed_origins.as_deref(),
             Some("https://agents.example.com")
@@ -2374,10 +2388,13 @@ mod tests {
             source_dir,
             "demo-eval-plugin",
             Some(registry_path),
-            false,
-            None,
-            CliToolApprovalMode::Never,
-            CliA2aPolicy::default(),
+            crate::eval::EvalOptions {
+                emit_json: false,
+                output_dir: None,
+                dataset: None,
+                tool_approval: CliToolApprovalMode::Never,
+                policy: CliA2aPolicy::default(),
+            },
         )
         .unwrap();
     }
@@ -2407,10 +2424,13 @@ mod tests {
             source_dir,
             "demo-eval-plugin-mismatch",
             Some(registry_path),
-            false,
-            None,
-            CliToolApprovalMode::Never,
-            CliA2aPolicy::default(),
+            crate::eval::EvalOptions {
+                emit_json: false,
+                output_dir: None,
+                dataset: None,
+                tool_approval: CliToolApprovalMode::Never,
+                policy: CliA2aPolicy::default(),
+            },
         )
         .unwrap_err();
 

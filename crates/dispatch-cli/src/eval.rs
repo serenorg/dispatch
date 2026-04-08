@@ -2,14 +2,16 @@ use anyhow::{Context, Result, bail};
 use dispatch_core::eval::{ToolA2aEndpointExpectation, ToolSchemaExpectation};
 use dispatch_core::{
     BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest, DockerCourier,
-    EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier, ResolvedCourier, TestSpec,
-    ToolConfig, ToolExitExpectation, ToolInvocation, ToolRunResult, ToolTextExpectation,
-    WasmCourier, load_parcel, load_parcel_evals, load_parcel_tests, resolve_courier,
+    EvalDatasetDocument, EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier,
+    ResolvedCourier, TestSpec, ToolConfig, ToolExitExpectation, ToolInvocation, ToolRunResult,
+    ToolTextExpectation, WasmCourier, load_eval_dataset, load_parcel, load_parcel_evals,
+    load_parcel_tests, resolve_courier,
 };
 use futures::executor::block_on;
 use jsonschema::Validator;
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -31,30 +33,43 @@ struct EvalCaseResult {
 struct EvalReport {
     parcel_digest: String,
     courier: String,
+    dataset: Option<String>,
     results: Vec<EvalCaseResult>,
 }
+
+pub(crate) struct EvalOptions {
+    pub emit_json: bool,
+    pub output_dir: Option<PathBuf>,
+    pub dataset: Option<PathBuf>,
+    pub tool_approval: crate::CliToolApprovalMode,
+    pub policy: crate::CliA2aPolicy,
+}
+
+type LoadedEvalCases = (Vec<(String, EvalSpec)>, Option<String>);
 
 pub(crate) fn eval(
     path: PathBuf,
     courier_name: &str,
     registry: Option<PathBuf>,
-    emit_json: bool,
-    output_dir: Option<PathBuf>,
-    tool_approval: crate::CliToolApprovalMode,
-    policy: crate::CliA2aPolicy,
+    options: EvalOptions,
 ) -> Result<()> {
-    crate::with_cli_a2a_policy(policy, || {
-        crate::with_cli_tool_approval(tool_approval, || {
-            let parcel = load_or_build_parcel_for_eval(path, output_dir)?;
+    crate::with_cli_a2a_policy(options.policy, || {
+        crate::with_cli_tool_approval(options.tool_approval, || {
+            let parcel = load_or_build_parcel_for_eval(path, options.output_dir)?;
             match resolve_courier(courier_name, registry.as_deref())? {
-                ResolvedCourier::Builtin(courier) => {
-                    eval_with_builtin_courier(courier, &parcel, courier_name, emit_json)
-                }
+                ResolvedCourier::Builtin(courier) => eval_with_builtin_courier(
+                    courier,
+                    &parcel,
+                    courier_name,
+                    options.emit_json,
+                    options.dataset.as_deref(),
+                ),
                 ResolvedCourier::Plugin(plugin) => eval_with_courier(
                     JsonlCourierPlugin::new(plugin),
                     &parcel,
                     courier_name,
-                    emit_json,
+                    options.emit_json,
+                    options.dataset.as_deref(),
                 ),
             }
         })
@@ -77,17 +92,30 @@ fn eval_with_builtin_courier(
     parcel: &LoadedParcel,
     courier_name: &str,
     emit_json: bool,
+    dataset: Option<&Path>,
 ) -> Result<()> {
     match courier {
-        BuiltinCourier::Native => {
-            eval_with_courier(NativeCourier::default(), parcel, courier_name, emit_json)
-        }
-        BuiltinCourier::Docker => {
-            eval_with_courier(DockerCourier::default(), parcel, courier_name, emit_json)
-        }
-        BuiltinCourier::Wasm => {
-            eval_with_courier(WasmCourier::new()?, parcel, courier_name, emit_json)
-        }
+        BuiltinCourier::Native => eval_with_courier(
+            NativeCourier::default(),
+            parcel,
+            courier_name,
+            emit_json,
+            dataset,
+        ),
+        BuiltinCourier::Docker => eval_with_courier(
+            DockerCourier::default(),
+            parcel,
+            courier_name,
+            emit_json,
+            dataset,
+        ),
+        BuiltinCourier::Wasm => eval_with_courier(
+            WasmCourier::new()?,
+            parcel,
+            courier_name,
+            emit_json,
+            dataset,
+        ),
     }
 }
 
@@ -96,8 +124,9 @@ fn eval_with_courier<R: CourierBackend>(
     parcel: &LoadedParcel,
     courier_name: &str,
     emit_json: bool,
+    dataset: Option<&Path>,
 ) -> Result<()> {
-    let evals = load_parcel_evals(parcel).context("failed to load parcel evals")?;
+    let (evals, dataset_label) = load_eval_cases(parcel, dataset)?;
     let tests = load_parcel_tests(parcel);
     if evals.is_empty() && tests.is_empty() {
         bail!("parcel does not declare any EVAL files or TEST cases");
@@ -115,6 +144,7 @@ fn eval_with_courier<R: CourierBackend>(
     let report = EvalReport {
         parcel_digest: parcel.config.digest.clone(),
         courier: courier_name.to_string(),
+        dataset: dataset_label,
         results,
     };
 
@@ -129,6 +159,55 @@ fn eval_with_courier<R: CourierBackend>(
     } else {
         bail!("eval failed")
     }
+}
+
+fn load_eval_cases(parcel: &LoadedParcel, dataset: Option<&Path>) -> Result<LoadedEvalCases> {
+    let evals = load_parcel_evals(parcel).context("failed to load parcel evals")?;
+    let Some(dataset_path) = dataset else {
+        return Ok((evals, None));
+    };
+    let dataset_doc = load_eval_dataset(dataset_path)
+        .with_context(|| format!("failed to load eval dataset {}", dataset_path.display()))?;
+    let expanded = apply_eval_dataset(evals, &dataset_doc)?;
+    Ok((expanded, Some(dataset_path.display().to_string())))
+}
+
+fn apply_eval_dataset(
+    evals: Vec<(String, EvalSpec)>,
+    dataset: &EvalDatasetDocument,
+) -> Result<Vec<(String, EvalSpec)>> {
+    let mut indexed = BTreeMap::new();
+    for (packaged_path, spec) in evals {
+        let key = (packaged_path.clone(), spec.name.clone());
+        if indexed.insert(key.clone(), spec).is_some() {
+            bail!(
+                "dataset fanout requires unique packaged eval keys, but `{}` case `{}` appeared more than once",
+                key.0,
+                key.1
+            );
+        }
+    }
+
+    let mut expanded = Vec::with_capacity(dataset.cases.len());
+    for case in &dataset.cases {
+        let Some(base_spec) = indexed.get(&(case.source.clone(), case.case.clone())) else {
+            bail!(
+                "dataset case `{}` references missing packaged eval `{}` case `{}`",
+                case.name,
+                case.source,
+                case.case
+            );
+        };
+        let mut spec = base_spec.clone();
+        spec.name = case.name.clone();
+        spec.input = case.input.clone();
+        if let Some(entrypoint) = &case.entrypoint {
+            spec.entrypoint = Some(entrypoint.clone());
+        }
+        expanded.push((case.source.clone(), spec));
+    }
+
+    Ok(expanded)
 }
 
 fn run_eval_case<R: CourierBackend>(
@@ -729,6 +808,131 @@ mod tests {
     }
 
     #[test]
+    fn load_eval_cases_applies_dataset_file() {
+        let (dir, parcel) = build_eval_parcel(
+            concat!(
+                "FROM dispatch/native:latest\n",
+                "EVAL evals/smoke.eval\n",
+                "ENTRYPOINT chat\n",
+            ),
+            &[("evals/smoke.eval", "name = \"smoke\"\ninput = \"base\"\n")],
+        );
+        let dataset_path = dir.path().join("regression.dataset.toml");
+        fs::write(
+            &dataset_path,
+            concat!(
+                "version = 1\n\n",
+                "[[cases]]\n",
+                "name = \"dataset-smoke\"\n",
+                "source = \"evals/smoke.eval\"\n",
+                "case = \"smoke\"\n",
+                "input = \"dataset input\"\n",
+            ),
+        )
+        .unwrap();
+
+        let (evals, dataset_label) = load_eval_cases(&parcel, Some(&dataset_path)).unwrap();
+
+        assert_eq!(
+            dataset_label.as_deref(),
+            Some(dataset_path.to_str().unwrap())
+        );
+        assert_eq!(evals.len(), 1);
+        assert_eq!(evals[0].0, "evals/smoke.eval");
+        assert_eq!(evals[0].1.name, "dataset-smoke");
+        assert_eq!(evals[0].1.input, "dataset input");
+    }
+
+    #[test]
+    fn apply_eval_dataset_overrides_input_and_entrypoint() {
+        let expanded = apply_eval_dataset(
+            vec![(
+                "evals/smoke.eval".to_string(),
+                EvalSpec {
+                    name: "smoke".to_string(),
+                    input: "base".to_string(),
+                    entrypoint: Some("chat".to_string()),
+                    expects_tool: Some("system_time".to_string()),
+                    expects_text: None,
+                    expects_text_exact: None,
+                    expects_text_not_contains: None,
+                    expects_tool_count: None,
+                    expects_tools: Vec::new(),
+                    expects_no_tool: false,
+                    expects_tool_stdout_contains: None,
+                    expects_tool_stdout_matches_schema: None,
+                    expects_tool_stderr_contains: None,
+                    expects_tool_exit_code: None,
+                    expects_a2a_endpoint: None,
+                    expects_error_contains: None,
+                },
+            )],
+            &EvalDatasetDocument {
+                version: 1,
+                cases: vec![dispatch_core::EvalDatasetCase {
+                    name: "utc-smoke".to_string(),
+                    source: "evals/smoke.eval".to_string(),
+                    case: "smoke".to_string(),
+                    input: "what time is it in UTC?".to_string(),
+                    entrypoint: Some("job".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].0, "evals/smoke.eval");
+        assert_eq!(expanded[0].1.name, "utc-smoke");
+        assert_eq!(expanded[0].1.input, "what time is it in UTC?");
+        assert_eq!(expanded[0].1.entrypoint.as_deref(), Some("job"));
+        assert_eq!(expanded[0].1.expects_tool.as_deref(), Some("system_time"));
+    }
+
+    #[test]
+    fn apply_eval_dataset_rejects_missing_packaged_case() {
+        let error = apply_eval_dataset(
+            vec![(
+                "evals/smoke.eval".to_string(),
+                EvalSpec {
+                    name: "smoke".to_string(),
+                    input: "base".to_string(),
+                    entrypoint: Some("chat".to_string()),
+                    expects_tool: None,
+                    expects_text: None,
+                    expects_text_exact: None,
+                    expects_text_not_contains: None,
+                    expects_tool_count: None,
+                    expects_tools: Vec::new(),
+                    expects_no_tool: false,
+                    expects_tool_stdout_contains: None,
+                    expects_tool_stdout_matches_schema: None,
+                    expects_tool_stderr_contains: None,
+                    expects_tool_exit_code: None,
+                    expects_a2a_endpoint: None,
+                    expects_error_contains: None,
+                },
+            )],
+            &EvalDatasetDocument {
+                version: 1,
+                cases: vec![dispatch_core::EvalDatasetCase {
+                    name: "missing".to_string(),
+                    source: "evals/other.eval".to_string(),
+                    case: "missing".to_string(),
+                    input: "hello".to_string(),
+                    entrypoint: None,
+                }],
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("references missing packaged eval `evals/other.eval` case `missing`")
+        );
+    }
+
+    #[test]
     fn apply_eval_expectations_validates_tool_stdout_against_schema() {
         let (_dir, parcel) = build_eval_parcel(
             concat!(
@@ -884,7 +1088,7 @@ mod tests {
     fn eval_with_courier_accepts_test_only_parcels() {
         let (_dir, parcel) = build_tool_test_parcel(smoke_test_tool_success_body());
 
-        let outcome = eval_with_courier(NativeCourier::default(), &parcel, "native", true);
+        let outcome = eval_with_courier(NativeCourier::default(), &parcel, "native", true, None);
 
         assert!(outcome.is_ok(), "{outcome:?}");
     }

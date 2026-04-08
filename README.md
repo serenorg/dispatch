@@ -399,6 +399,20 @@ Tool result assertions can be either a plain value or a tool-scoped object, so m
 `expects_no_tool = true` can be used for cases that should complete without invoking any tool.
 `expects_tool_stdout_matches_schema` validates JSON stdout from a tool against a packaged JSON schema file, and `expects_a2a_endpoint` asserts that an A2A tool alias resolved to the expected declared endpoint.
 
+For larger regression suites, keep the assertions inside packaged `EVAL` files and fan them out with a repo-local dataset:
+
+```toml
+version = 1
+
+[[cases]]
+name = "utc-smoke"
+source = "evals/smoke.eval"
+case = "smoke"
+input = "What time is it in UTC?"
+```
+
+Run it with `dispatch parcel eval . --dataset evals/regression.dataset.toml`. Dataset cases keep the packaged eval assertions and only override the input plus an optional entrypoint.
+
 Parcel format compatibility:
 
 - `load_parcel` validates `manifest.json` against the bundled Dispatch JSON Schema before parsing

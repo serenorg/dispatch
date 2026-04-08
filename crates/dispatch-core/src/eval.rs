@@ -45,6 +45,23 @@ pub struct EvalSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalDatasetDocument {
+    #[serde(default = "default_eval_dataset_version")]
+    pub version: u32,
+    pub cases: Vec<EvalDatasetCase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalDatasetCase {
+    pub name: String,
+    pub source: String,
+    pub case: String,
+    pub input: String,
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ToolTextExpectation {
     Contains(String),
@@ -86,6 +103,26 @@ pub enum EvalError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to read eval dataset `{path}`: {source}")]
+    ReadDataset {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse eval dataset `{path}`: {source}")]
+    ParseDataset {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("eval dataset `{path}` has unsupported version `{version}`")]
+    UnsupportedDatasetVersion { path: String, version: u32 },
+}
+
+const EVAL_DATASET_VERSION: u32 = 1;
+
+fn default_eval_dataset_version() -> u32 {
+    EVAL_DATASET_VERSION
 }
 
 pub fn load_parcel_evals(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)>, EvalError> {
@@ -121,6 +158,25 @@ pub fn load_parcel_evals(parcel: &LoadedParcel) -> Result<Vec<(String, EvalSpec)
 
 pub fn load_parcel_tests(parcel: &LoadedParcel) -> Vec<TestSpec> {
     parcel.config.tests.clone()
+}
+
+pub fn load_eval_dataset(path: &std::path::Path) -> Result<EvalDatasetDocument, EvalError> {
+    let source = fs::read_to_string(path).map_err(|source| EvalError::ReadDataset {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let dataset: EvalDatasetDocument =
+        toml::from_str(&source).map_err(|source| EvalError::ParseDataset {
+            path: path.display().to_string(),
+            source,
+        })?;
+    if dataset.version != EVAL_DATASET_VERSION {
+        return Err(EvalError::UnsupportedDatasetVersion {
+            path: path.display().to_string(),
+            version: dataset.version,
+        });
+    }
+    Ok(dataset)
 }
 
 #[cfg(test)]
@@ -316,5 +372,33 @@ mod tests {
                 tool: "demo".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn load_eval_dataset_supports_case_overrides() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("regression.dataset.toml");
+        fs::write(
+            &path,
+            concat!(
+                "version = 1\n\n",
+                "[[cases]]\n",
+                "name = \"dataset-smoke\"\n",
+                "source = \"evals/smoke.eval\"\n",
+                "case = \"smoke\"\n",
+                "input = \"hello\"\n",
+                "entrypoint = \"job\"\n",
+            ),
+        )
+        .unwrap();
+
+        let dataset = load_eval_dataset(&path).unwrap();
+
+        assert_eq!(dataset.cases.len(), 1);
+        assert_eq!(dataset.cases[0].name, "dataset-smoke");
+        assert_eq!(dataset.cases[0].source, "evals/smoke.eval");
+        assert_eq!(dataset.cases[0].case, "smoke");
+        assert_eq!(dataset.cases[0].input, "hello");
+        assert_eq!(dataset.cases[0].entrypoint.as_deref(), Some("job"));
     }
 }

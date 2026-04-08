@@ -816,6 +816,24 @@ dispatch parcel eval <parcel-or-source> --courier wasm
 dispatch parcel eval <parcel-or-source> --tool-approval never
 ```
 
+To reuse the same packaged assertions against a larger local corpus, pass a repo-local dataset file:
+
+```toml
+version = 1
+
+[[cases]]
+name = "utc-smoke"
+source = "evals/smoke.eval"
+case = "smoke"
+input = "What time is it in UTC?"
+```
+
+```bash
+dispatch parcel eval <parcel-or-source> --dataset evals/regression.dataset.toml
+```
+
+Dataset cases reference packaged eval cases by `source` and `case`, keep the packaged assertions, and only override `input` plus an optional `entrypoint`.
+
 #### `TEST`
 
 Packages a direct tool smoke test that `dispatch parcel eval` executes through the selected
