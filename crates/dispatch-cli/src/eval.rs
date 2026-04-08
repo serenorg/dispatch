@@ -13,6 +13,7 @@ use jsonschema::Validator;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -36,7 +37,15 @@ struct EvalReport {
     parcel_digest: String,
     courier: String,
     dataset: Option<String>,
+    summary: EvalSummary,
     results: Vec<EvalCaseResult>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct EvalSummary {
+    total: usize,
+    passed: usize,
+    failed: usize,
 }
 
 pub(crate) struct EvalOptions {
@@ -166,10 +175,17 @@ fn eval_with_courier<R: CourierBackend>(
             spec,
         )
     }));
+    let passed_count = results.iter().filter(|r| r.passed).count();
+    let total_count = results.len();
     let report = EvalReport {
         parcel_digest: parcel.config.digest.clone(),
         courier: courier_name.to_string(),
         dataset: dataset_label,
+        summary: EvalSummary {
+            total: total_count,
+            passed: passed_count,
+            failed: total_count - passed_count,
+        },
         results,
     };
 
@@ -956,35 +972,56 @@ pub(crate) fn tool_exit_expectation_satisfied(
 }
 
 fn print_eval_report(report: &EvalReport) {
-    println!(
+    print!("{}", render_eval_report(report));
+}
+
+fn render_eval_report(report: &EvalReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
         "Parcel {} on courier `{}`",
         report.parcel_digest, report.courier
     );
     for result in &report.results {
         let status = if result.passed { "PASS" } else { "FAIL" };
-        println!("{status} {} ({})", result.name, result.packaged_path);
+        let _ = writeln!(
+            output,
+            "{status} {} ({})",
+            result.name, result.packaged_path
+        );
         if !result.tool_calls.is_empty() {
-            println!("tools: {}", result.tool_calls.join(", "));
+            let _ = writeln!(output, "tools: {}", result.tool_calls.join(", "));
         }
         for tool_result in &result.tool_results {
-            println!(
+            let _ = writeln!(
+                output,
                 "tool-result: {} exit={} stdout={} stderr={}",
                 tool_result.tool, tool_result.exit_code, tool_result.stdout, tool_result.stderr
             );
         }
         if !result.assistant_messages.is_empty() {
-            println!("assistant: {}", result.assistant_messages.join(" | "));
+            let _ = writeln!(
+                output,
+                "assistant: {}",
+                result.assistant_messages.join(" | ")
+            );
         }
         if let Some(error) = &result.error {
-            println!("error: {error}");
+            let _ = writeln!(output, "error: {error}");
         }
         if let Some(trace_path) = &result.trace_path {
-            println!("trace: {trace_path}");
+            let _ = writeln!(output, "trace: {trace_path}");
         }
         for failure in &result.failures {
-            println!("failure: {failure}");
+            let _ = writeln!(output, "failure: {failure}");
         }
     }
+    let _ = writeln!(
+        output,
+        "\n{} passed, {} failed, {} total",
+        report.summary.passed, report.summary.failed, report.summary.total
+    );
+    output
 }
 
 #[cfg(test)]
@@ -992,6 +1029,65 @@ mod tests {
     use super::*;
     use dispatch_core::{BuildOptions, build_agentfile};
     use tempfile::tempdir;
+
+    fn sample_eval_report() -> EvalReport {
+        EvalReport {
+            parcel_digest: "abc123".to_string(),
+            courier: "native".to_string(),
+            dataset: Some("regression.dataset.toml".to_string()),
+            summary: EvalSummary {
+                total: 2,
+                passed: 1,
+                failed: 1,
+            },
+            results: vec![
+                EvalCaseResult {
+                    name: "pass-case".to_string(),
+                    packaged_path: "evals/pass.eval".to_string(),
+                    entrypoint: "chat".to_string(),
+                    passed: true,
+                    tool_calls: vec![],
+                    tool_results: vec![],
+                    assistant_messages: vec!["done".to_string()],
+                    failures: vec![],
+                    error: None,
+                    trace_path: Some(
+                        ".dispatch/traces/evals/abc123/pass.dispatch-trace.json".to_string(),
+                    ),
+                },
+                EvalCaseResult {
+                    name: "fail-case".to_string(),
+                    packaged_path: "evals/fail.eval".to_string(),
+                    entrypoint: "chat".to_string(),
+                    passed: false,
+                    tool_calls: vec!["demo".to_string()],
+                    tool_results: vec![],
+                    assistant_messages: vec![],
+                    failures: vec!["expected tool".to_string()],
+                    error: Some("eval failed".to_string()),
+                    trace_path: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn eval_report_json_includes_summary_counts() {
+        let json = serde_json::to_value(sample_eval_report()).unwrap();
+
+        assert_eq!(json["summary"]["total"], 2);
+        assert_eq!(json["summary"]["passed"], 1);
+        assert_eq!(json["summary"]["failed"], 1);
+    }
+
+    #[test]
+    fn render_eval_report_includes_summary_line() {
+        let rendered = render_eval_report(&sample_eval_report());
+
+        assert!(rendered.contains("1 passed, 1 failed, 2 total"));
+        assert!(rendered.contains("PASS pass-case (evals/pass.eval)"));
+        assert!(rendered.contains("FAIL fail-case (evals/fail.eval)"));
+    }
 
     fn smoke_test_tool_path() -> &'static str {
         if cfg!(windows) {
