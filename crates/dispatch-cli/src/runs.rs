@@ -329,7 +329,6 @@ pub(crate) fn wait(args: crate::WaitArgs) -> Result<()> {
         let mut record = load_run_record(&record_path)?;
         refresh_run_record(&record_path, &mut record)?;
         if !record.status.is_active() {
-            normalize_one_shot_terminal_record(&record_path, &mut record)?;
             println!("{}", run_exit_code(&record));
             return Ok(());
         }
@@ -340,23 +339,6 @@ pub(crate) fn wait(args: crate::WaitArgs) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(250));
     }
-}
-
-fn normalize_one_shot_terminal_record(record_path: &Path, record: &mut RunRecord) -> Result<()> {
-    if record.status != RunStatus::Stopped || record.exit_code.is_some() {
-        return Ok(());
-    }
-    if !matches!(
-        record.operation,
-        RunOperation::Job { .. } | RunOperation::Heartbeat { .. }
-    ) {
-        return Ok(());
-    }
-    record.status = RunStatus::Exited;
-    record.exit_code = Some(0);
-    record.last_error = None;
-    record.stopped_at_ms.get_or_insert_with(now_ms);
-    persist_run_record(record_path, record)
 }
 
 pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
@@ -381,6 +363,7 @@ pub(crate) fn stop(args: crate::StopArgs) -> Result<()> {
     record.stopped_at_ms = Some(now_ms());
     record.exit_code = None;
     record.last_error = None;
+    clear_terminal_snapshot(&record_path, true)?;
     persist_run_record(&record_path, &record)?;
     println!("Stopped run {}", record.run_id);
     Ok(())
@@ -414,6 +397,7 @@ pub(crate) fn restart(args: crate::RestartArgs) -> Result<()> {
     }
 
     prepare_record_for_restart(&mut record)?;
+    clear_terminal_snapshot(&record_path, true)?;
     persist_run_record(&record_path, &record)?;
     spawn_detached_runner(&record_path, &record.log_path)?;
     println!("Restarted run {}", record.run_id);
@@ -525,6 +509,7 @@ fn install_shutdown_flag() -> Result<Arc<AtomicBool>> {
 fn internal_run_record(record_path: PathBuf) -> Result<()> {
     let shutdown = install_shutdown_flag()?;
     let mut record = load_run_record(&record_path)?;
+    clear_terminal_snapshot(&record_path, true)?;
     record.pid = Some(std::process::id());
     record.process_group_id = current_process_group_id();
     record.status = RunStatus::Running;
@@ -564,8 +549,9 @@ fn internal_run_record(record_path: PathBuf) -> Result<()> {
     };
     if let Some(mut updated) = reloaded {
         apply_final_run_result(&mut updated, &result);
+        let _ = persist_terminal_snapshot(&record_path, &updated);
         // Best-effort persist: if this fails the pid-liveness reconciliation
-        // in `refresh_run_record` will mark the run as stopped on next read.
+        // in `refresh_run_record` will consume the terminal snapshot.
         let _ = persist_run_record(&record_path, &updated);
     }
     result
@@ -1036,13 +1022,7 @@ fn collect_run_records(root: &Path) -> Result<Vec<RunRecord>> {
     for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
         let entry = entry.with_context(|| format!("failed to inspect {}", root.display()))?;
         let path = entry.path();
-        if !path.is_file()
-            || path.extension().and_then(|ext| ext.to_str()) != Some("json")
-            || path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".session.json"))
-        {
+        if !is_primary_run_record_path(&path) {
             continue;
         }
         let mut record = load_run_record(&path)?;
@@ -1169,13 +1149,7 @@ fn resolve_run_prefix(root: &Path, prefix: &str) -> Result<PathBuf> {
         {
             let entry = entry.with_context(|| format!("failed to inspect {}", root.display()))?;
             let path = entry.path();
-            if !path.is_file()
-                || path.extension().and_then(|ext| ext.to_str()) != Some("json")
-                || path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".session.json"))
-            {
+            if !is_primary_run_record_path(&path) {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -1196,6 +1170,16 @@ fn resolve_run_prefix(root: &Path, prefix: &str) -> Result<PathBuf> {
     }
 }
 
+fn is_primary_run_record_path(path: &Path) -> bool {
+    if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return false;
+    }
+    !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".session.json") || name.ends_with(".final.json"))
+}
+
 fn refresh_run_record(record_path: &Path, record: &mut RunRecord) -> Result<()> {
     if !record.status.is_active() {
         return Ok(());
@@ -1206,8 +1190,13 @@ fn refresh_run_record(record_path: &Path, record: &mut RunRecord) -> Result<()> 
     if pid_is_running(pid) {
         return Ok(());
     }
-    record.status = RunStatus::Stopped;
-    record.stopped_at_ms.get_or_insert_with(now_ms);
+    if let Some(snapshot) = load_terminal_snapshot(record_path)? {
+        *record = snapshot;
+        persist_run_record(record_path, record)?;
+        clear_terminal_snapshot(record_path, true)?;
+        return Ok(());
+    }
+    apply_dead_pid_fallback(record);
     persist_run_record(record_path, record)
 }
 
@@ -1258,6 +1247,10 @@ fn load_run_record(path: &Path) -> Result<RunRecord> {
     serde_json::from_str(&source).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+fn terminal_snapshot_path(record_path: &Path) -> PathBuf {
+    record_path.with_extension("final.json")
+}
+
 fn persist_run_record(path: &Path, record: &RunRecord) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -1276,12 +1269,46 @@ fn persist_run_record(path: &Path, record: &RunRecord) -> Result<()> {
         .with_context(|| format!("failed to persist {}", path.display()))
 }
 
+fn persist_terminal_snapshot(record_path: &Path, record: &RunRecord) -> Result<()> {
+    persist_run_record(&terminal_snapshot_path(record_path), record)
+}
+
+fn load_terminal_snapshot(record_path: &Path) -> Result<Option<RunRecord>> {
+    let snapshot_path = terminal_snapshot_path(record_path);
+    if !snapshot_path.exists() {
+        return Ok(None);
+    }
+    load_run_record(&snapshot_path).map(Some)
+}
+
+fn clear_terminal_snapshot(record_path: &Path, tolerate_missing: bool) -> Result<()> {
+    remove_path(&terminal_snapshot_path(record_path), tolerate_missing)
+}
+
+fn apply_dead_pid_fallback(record: &mut RunRecord) {
+    record.stopped_at_ms.get_or_insert_with(now_ms);
+    match record.operation {
+        RunOperation::Service { .. } => {
+            record.status = RunStatus::Stopped;
+            record.exit_code = None;
+            record.last_error = None;
+        }
+        RunOperation::Job { .. } | RunOperation::Heartbeat { .. } => {
+            record.status = RunStatus::Failed;
+            record.exit_code = Some(1);
+            record.last_error =
+                Some("detached runner exited before recording terminal state".to_string());
+        }
+    }
+}
+
 fn remove_run_artifacts(
     record: &RunRecord,
     tolerate_missing: bool,
     record_path: &Path,
 ) -> Result<()> {
     remove_path(record_path, tolerate_missing)?;
+    clear_terminal_snapshot(record_path, tolerate_missing)?;
     remove_path(&record.log_path, tolerate_missing)?;
     remove_path(&record.session_file, tolerate_missing)?;
     Ok(())
@@ -1342,8 +1369,8 @@ fn format_status(status: &RunStatus) -> &'static str {
 
 fn run_exit_code(record: &RunRecord) -> i32 {
     record.exit_code.unwrap_or(match record.status {
-        RunStatus::Failed => 1,
-        _ => 0,
+        RunStatus::Exited => 0,
+        RunStatus::Starting | RunStatus::Running | RunStatus::Failed | RunStatus::Stopped => 1,
     })
 }
 
@@ -2044,6 +2071,10 @@ mod tests {
         }
     }
 
+    fn nonexistent_test_pid() -> u32 {
+        i32::MAX as u32
+    }
+
     #[test]
     fn resolve_run_prefix_matches_unique_ids() {
         let dir = tempdir().unwrap();
@@ -2206,6 +2237,76 @@ mod tests {
         assert_eq!(record.status, RunStatus::Stopped);
         assert_eq!(record.exit_code, None);
         assert_eq!(record.stopped_at_ms, Some(7));
+    }
+
+    #[test]
+    fn refresh_run_record_applies_terminal_snapshot_for_one_shot_runs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.json");
+        let mut record = sample_run_record(dir.path());
+        record.status = RunStatus::Running;
+        record.pid = Some(nonexistent_test_pid());
+        super::persist_run_record(&path, &record).unwrap();
+
+        let mut terminal = record.clone();
+        terminal.status = RunStatus::Exited;
+        terminal.exit_code = Some(0);
+        terminal.last_error = None;
+        terminal.stopped_at_ms = Some(9);
+        super::persist_terminal_snapshot(&path, &terminal).unwrap();
+
+        super::refresh_run_record(&path, &mut record).unwrap();
+
+        assert_eq!(record.status, RunStatus::Exited);
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.stopped_at_ms, Some(9));
+
+        let persisted = super::load_run_record(&path).unwrap();
+        assert_eq!(persisted.status, RunStatus::Exited);
+        assert_eq!(persisted.exit_code, Some(0));
+        assert!(!super::terminal_snapshot_path(&path).exists());
+    }
+
+    #[test]
+    fn refresh_run_record_marks_dead_one_shot_without_snapshot_failed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.json");
+        let mut record = sample_run_record(dir.path());
+        record.status = RunStatus::Running;
+        record.pid = Some(nonexistent_test_pid());
+        super::persist_run_record(&path, &record).unwrap();
+
+        super::refresh_run_record(&path, &mut record).unwrap();
+
+        assert_eq!(record.status, RunStatus::Failed);
+        assert_eq!(record.exit_code, Some(1));
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("before recording terminal state")
+        );
+    }
+
+    #[test]
+    fn remove_run_artifacts_removes_terminal_snapshot() {
+        let dir = tempdir().unwrap();
+        let record_path = dir.path().join("run.json");
+        let record = sample_run_record(dir.path());
+        let snapshot_path = super::terminal_snapshot_path(&record_path);
+
+        super::persist_run_record(&record_path, &record).unwrap();
+        super::persist_terminal_snapshot(&record_path, &record).unwrap();
+        fs::write(&record.log_path, "log").unwrap();
+        fs::write(&record.session_file, "{}").unwrap();
+
+        super::remove_run_artifacts(&record, false, &record_path).unwrap();
+
+        assert!(!record_path.exists());
+        assert!(!snapshot_path.exists());
+        assert!(!record.log_path.exists());
+        assert!(!record.session_file.exists());
     }
 
     #[test]

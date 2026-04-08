@@ -309,6 +309,11 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
     )?;
     let stopped = wait_for_run_record(&record_path, |record| record["status"] == "stopped")?;
     assert_eq!(stopped["status"], "stopped");
+    let stopped_wait = require_success(
+        run_dispatch(dir.path(), &[], &["wait", &run_id, "."])?,
+        "dispatch wait after stop",
+    )?;
+    assert_eq!(stopped_wait.trim(), "1");
 
     let restart_output = require_success(
         run_dispatch(dir.path(), &[], &["restart", &run_id, ".", "--force"])?,
