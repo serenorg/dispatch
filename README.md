@@ -412,6 +412,7 @@ input = "What time is it in UTC?"
 ```
 
 Run it with `dispatch parcel eval . --dataset evals/regression.dataset.toml`. Dataset cases keep the packaged eval assertions and only override the input plus an optional entrypoint.
+Add `--trace-dir .dispatch/traces` to persist one structured JSON trace per eval/test case under `.dispatch/traces/evals/<parcel-digest>/`.
 
 Parcel format compatibility:
 

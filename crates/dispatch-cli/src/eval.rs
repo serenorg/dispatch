@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::eval::{ToolA2aEndpointExpectation, ToolSchemaExpectation};
 use dispatch_core::{
-    BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest, DockerCourier,
+    BuiltinCourier, CourierBackend, CourierEvent, CourierOperation, CourierRequest,
+    DISPATCH_TRACE_VERSION, DispatchTraceArtifact, DispatchTraceStep, DockerCourier,
     EvalDatasetDocument, EvalSpec, JsonlCourierPlugin, LoadedParcel, NativeCourier,
     ResolvedCourier, TestSpec, ToolConfig, ToolExitExpectation, ToolInvocation, ToolRunResult,
     ToolTextExpectation, WasmCourier, load_eval_dataset, load_parcel, load_parcel_evals,
@@ -27,6 +28,7 @@ struct EvalCaseResult {
     assistant_messages: Vec<String>,
     failures: Vec<String>,
     error: Option<String>,
+    trace_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub(crate) struct EvalOptions {
     pub emit_json: bool,
     pub output_dir: Option<PathBuf>,
     pub dataset: Option<PathBuf>,
+    pub trace_dir: Option<PathBuf>,
     pub tool_approval: crate::CliToolApprovalMode,
     pub policy: crate::CliA2aPolicy,
 }
@@ -63,6 +66,7 @@ pub(crate) fn eval(
                     courier_name,
                     options.emit_json,
                     options.dataset.as_deref(),
+                    options.trace_dir.as_deref(),
                 ),
                 ResolvedCourier::Plugin(plugin) => eval_with_courier(
                     JsonlCourierPlugin::new(plugin),
@@ -70,6 +74,7 @@ pub(crate) fn eval(
                     courier_name,
                     options.emit_json,
                     options.dataset.as_deref(),
+                    options.trace_dir.as_deref(),
                 ),
             }
         })
@@ -93,6 +98,7 @@ fn eval_with_builtin_courier(
     courier_name: &str,
     emit_json: bool,
     dataset: Option<&Path>,
+    trace_dir: Option<&Path>,
 ) -> Result<()> {
     match courier {
         BuiltinCourier::Native => eval_with_courier(
@@ -101,6 +107,7 @@ fn eval_with_builtin_courier(
             courier_name,
             emit_json,
             dataset,
+            trace_dir,
         ),
         BuiltinCourier::Docker => eval_with_courier(
             DockerCourier::default(),
@@ -108,6 +115,7 @@ fn eval_with_builtin_courier(
             courier_name,
             emit_json,
             dataset,
+            trace_dir,
         ),
         BuiltinCourier::Wasm => eval_with_courier(
             WasmCourier::new()?,
@@ -115,6 +123,7 @@ fn eval_with_builtin_courier(
             courier_name,
             emit_json,
             dataset,
+            trace_dir,
         ),
     }
 }
@@ -125,6 +134,7 @@ fn eval_with_courier<R: CourierBackend>(
     courier_name: &str,
     emit_json: bool,
     dataset: Option<&Path>,
+    trace_dir: Option<&Path>,
 ) -> Result<()> {
     let (evals, dataset_label) = load_eval_cases(parcel, dataset)?;
     let tests = load_parcel_tests(parcel);
@@ -134,13 +144,28 @@ fn eval_with_courier<R: CourierBackend>(
 
     let mut results = evals
         .iter()
-        .map(|(packaged_path, spec)| run_eval_case(&courier, parcel, packaged_path, spec))
+        .map(|(packaged_path, spec)| {
+            run_eval_case(
+                &courier,
+                parcel,
+                courier_name,
+                dataset_label.as_deref(),
+                trace_dir,
+                packaged_path,
+                spec,
+            )
+        })
         .collect::<Vec<_>>();
-    results.extend(
-        tests
-            .iter()
-            .map(|spec| run_tool_test_case(&courier, parcel, spec)),
-    );
+    results.extend(tests.iter().map(|spec| {
+        run_tool_test_case(
+            &courier,
+            parcel,
+            courier_name,
+            dataset_label.as_deref(),
+            trace_dir,
+            spec,
+        )
+    }));
     let report = EvalReport {
         parcel_digest: parcel.config.digest.clone(),
         courier: courier_name.to_string(),
@@ -213,14 +238,22 @@ fn apply_eval_dataset(
 fn run_eval_case<R: CourierBackend>(
     courier: &R,
     parcel: &LoadedParcel,
+    courier_name: &str,
+    dataset: Option<&str>,
+    trace_dir: Option<&Path>,
     packaged_path: &str,
     spec: &EvalSpec,
 ) -> EvalCaseResult {
+    let started_at_ms = current_time_ms();
     let entrypoint = spec
         .entrypoint
         .clone()
         .or_else(|| parcel.config.entrypoint.clone())
         .unwrap_or_else(|| "chat".to_string());
+    let mut trace_steps = vec![DispatchTraceStep::Operation {
+        operation: entrypoint.clone(),
+        input: Some(spec.input.clone()),
+    }];
     let mut result = EvalCaseResult {
         name: spec.name.clone(),
         packaged_path: packaged_path.to_string(),
@@ -231,6 +264,7 @@ fn run_eval_case<R: CourierBackend>(
         assistant_messages: Vec::new(),
         failures: Vec::new(),
         error: None,
+        trace_path: None,
     };
 
     let operation = match entrypoint.as_str() {
@@ -250,6 +284,15 @@ fn run_eval_case<R: CourierBackend>(
         other => {
             result.error = Some(format!("unsupported eval entrypoint `{other}`"));
             apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
+            finalize_trace(
+                &mut result,
+                parcel,
+                courier_name,
+                dataset,
+                started_at_ms,
+                trace_dir,
+                trace_steps,
+            );
             return result;
         }
     };
@@ -257,17 +300,45 @@ fn run_eval_case<R: CourierBackend>(
     let session = match block_on(courier.open_session(parcel)) {
         Ok(session) => session,
         Err(error) => {
+            trace_steps.push(DispatchTraceStep::SessionOpen {
+                session_id: None,
+                status: "error".to_string(),
+                error: Some(error.to_string()),
+            });
             result.error = Some(error.to_string());
             apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
+            finalize_trace(
+                &mut result,
+                parcel,
+                courier_name,
+                dataset,
+                started_at_ms,
+                trace_dir,
+                trace_steps,
+            );
             return result;
         }
     };
+    trace_steps.push(DispatchTraceStep::SessionOpen {
+        session_id: Some(session.id.clone()),
+        status: "ok".to_string(),
+        error: None,
+    });
     if session.parcel_digest != parcel.config.digest {
         result.error = Some(format!(
             "courier returned session for parcel {} while evaluating {}",
             session.parcel_digest, parcel.config.digest
         ));
         apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
+        finalize_trace(
+            &mut result,
+            parcel,
+            courier_name,
+            dataset,
+            started_at_ms,
+            trace_dir,
+            trace_steps,
+        );
         return result;
     }
 
@@ -276,11 +347,23 @@ fn run_eval_case<R: CourierBackend>(
         Err(error) => {
             result.error = Some(error.to_string());
             apply_eval_expectations(&mut result, parcel, packaged_path, spec, &[]);
+            finalize_trace(
+                &mut result,
+                parcel,
+                courier_name,
+                dataset,
+                started_at_ms,
+                trace_dir,
+                trace_steps,
+            );
             return result;
         }
     };
     let mut text_observations = Vec::new();
     for event in &response.events {
+        trace_steps.push(DispatchTraceStep::Event {
+            event: event.clone(),
+        });
         match event {
             CourierEvent::ToolCallStarted { invocation, .. } => {
                 result.tool_calls.push(invocation.name.clone());
@@ -304,21 +387,47 @@ fn run_eval_case<R: CourierBackend>(
             response.session.parcel_digest, parcel.config.digest
         ));
         apply_eval_expectations(&mut result, parcel, packaged_path, spec, &text_observations);
+        finalize_trace(
+            &mut result,
+            parcel,
+            courier_name,
+            dataset,
+            started_at_ms,
+            trace_dir,
+            trace_steps,
+        );
         return result;
     }
 
     apply_eval_expectations(&mut result, parcel, packaged_path, spec, &text_observations);
+    finalize_trace(
+        &mut result,
+        parcel,
+        courier_name,
+        dataset,
+        started_at_ms,
+        trace_dir,
+        trace_steps,
+    );
     result
 }
 
 fn run_tool_test_case<R: CourierBackend>(
     courier: &R,
     parcel: &LoadedParcel,
+    courier_name: &str,
+    dataset: Option<&str>,
+    trace_dir: Option<&Path>,
     spec: &TestSpec,
 ) -> EvalCaseResult {
+    let started_at_ms = current_time_ms();
     let (name, expected_tool) = match spec {
         TestSpec::Tool { tool } => (format!("tool:{tool}"), tool.as_str()),
     };
+    let mut trace_steps = vec![DispatchTraceStep::Operation {
+        operation: "tool".to_string(),
+        input: None,
+    }];
     let mut result = EvalCaseResult {
         name,
         packaged_path: parcel.config.source_agentfile.clone(),
@@ -329,22 +438,51 @@ fn run_tool_test_case<R: CourierBackend>(
         assistant_messages: Vec::new(),
         failures: Vec::new(),
         error: None,
+        trace_path: None,
     };
 
     let session = match block_on(courier.open_session(parcel)) {
         Ok(session) => session,
         Err(error) => {
+            trace_steps.push(DispatchTraceStep::SessionOpen {
+                session_id: None,
+                status: "error".to_string(),
+                error: Some(error.to_string()),
+            });
             result.error = Some(error.to_string());
             apply_tool_test_expectations(&mut result, expected_tool);
+            finalize_trace(
+                &mut result,
+                parcel,
+                courier_name,
+                dataset,
+                started_at_ms,
+                trace_dir,
+                trace_steps,
+            );
             return result;
         }
     };
+    trace_steps.push(DispatchTraceStep::SessionOpen {
+        session_id: Some(session.id.clone()),
+        status: "ok".to_string(),
+        error: None,
+    });
     if session.parcel_digest != parcel.config.digest {
         result.error = Some(format!(
             "courier returned session for parcel {} while evaluating {}",
             session.parcel_digest, parcel.config.digest
         ));
         apply_tool_test_expectations(&mut result, expected_tool);
+        finalize_trace(
+            &mut result,
+            parcel,
+            courier_name,
+            dataset,
+            started_at_ms,
+            trace_dir,
+            trace_steps,
+        );
         return result;
     }
 
@@ -364,10 +502,22 @@ fn run_tool_test_case<R: CourierBackend>(
         Err(error) => {
             result.error = Some(error.to_string());
             apply_tool_test_expectations(&mut result, expected_tool);
+            finalize_trace(
+                &mut result,
+                parcel,
+                courier_name,
+                dataset,
+                started_at_ms,
+                trace_dir,
+                trace_steps,
+            );
             return result;
         }
     };
     for event in &response.events {
+        trace_steps.push(DispatchTraceStep::Event {
+            event: event.clone(),
+        });
         match event {
             CourierEvent::ToolCallStarted { invocation, .. } => {
                 result.tool_calls.push(invocation.name.clone());
@@ -388,7 +538,98 @@ fn run_tool_test_case<R: CourierBackend>(
     }
 
     apply_tool_test_expectations(&mut result, expected_tool);
+    finalize_trace(
+        &mut result,
+        parcel,
+        courier_name,
+        dataset,
+        started_at_ms,
+        trace_dir,
+        trace_steps,
+    );
     result
+}
+
+fn finalize_trace(
+    result: &mut EvalCaseResult,
+    parcel: &LoadedParcel,
+    courier: &str,
+    dataset: Option<&str>,
+    started_at_ms: u64,
+    trace_dir: Option<&Path>,
+    steps: Vec<DispatchTraceStep>,
+) {
+    let Some(trace_dir) = trace_dir else {
+        return;
+    };
+    let artifact = DispatchTraceArtifact {
+        version: DISPATCH_TRACE_VERSION,
+        kind: "parcel_eval_case".to_string(),
+        parcel_digest: parcel.config.digest.clone(),
+        courier: courier.to_string(),
+        dataset: dataset.map(ToString::to_string),
+        case_name: result.name.clone(),
+        packaged_path: result.packaged_path.clone(),
+        entrypoint: result.entrypoint.clone(),
+        started_at_ms,
+        finished_at_ms: current_time_ms(),
+        passed: result.passed,
+        failures: result.failures.clone(),
+        error: result.error.clone(),
+        steps,
+    };
+    match write_trace_artifact(trace_dir, &artifact) {
+        Ok(path) => {
+            result.trace_path = Some(path.display().to_string());
+        }
+        Err(error) => {
+            result
+                .failures
+                .push(format!("failed to write trace artifact: {error}"));
+            result.passed = false;
+        }
+    }
+}
+
+fn write_trace_artifact(trace_root: &Path, artifact: &DispatchTraceArtifact) -> Result<PathBuf> {
+    let dir = trace_root.join("evals").join(&artifact.parcel_digest);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create trace directory {}", dir.display()))?;
+    let file_name = format!(
+        "{}-{}.dispatch-trace.json",
+        artifact.started_at_ms,
+        trace_slug(&artifact.case_name)
+    );
+    let path = dir.join(file_name);
+    let body = serde_json::to_string_pretty(artifact)?;
+    fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn trace_slug(value: &str) -> String {
+    let mut slug = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if (ch.is_ascii_whitespace() || ch == '-' || ch == '_') && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "trace".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn apply_tool_test_expectations(result: &mut EvalCaseResult, expected_tool: &str) {
@@ -737,6 +978,9 @@ fn print_eval_report(report: &EvalReport) {
         if let Some(error) = &result.error {
             println!("error: {error}");
         }
+        if let Some(trace_path) = &result.trace_path {
+            println!("trace: {trace_path}");
+        }
         for failure in &result.failures {
             println!("failure: {failure}");
         }
@@ -967,6 +1211,7 @@ mod tests {
             assistant_messages: Vec::new(),
             failures: Vec::new(),
             error: None,
+            trace_path: None,
         };
         let spec = EvalSpec {
             name: "demo".to_string(),
@@ -1016,6 +1261,7 @@ mod tests {
             assistant_messages: Vec::new(),
             failures: Vec::new(),
             error: None,
+            trace_path: None,
         };
         let spec = EvalSpec {
             name: "demo".to_string(),
@@ -1054,6 +1300,9 @@ mod tests {
         let result = run_tool_test_case(
             &NativeCourier::default(),
             &parcel,
+            "native",
+            None,
+            None,
             &TestSpec::Tool {
                 tool: "demo".to_string(),
             },
@@ -1072,6 +1321,9 @@ mod tests {
         let result = run_tool_test_case(
             &NativeCourier::default(),
             &parcel,
+            "native",
+            None,
+            None,
             &TestSpec::Tool {
                 tool: "demo".to_string(),
             },
@@ -1088,8 +1340,46 @@ mod tests {
     fn eval_with_courier_accepts_test_only_parcels() {
         let (_dir, parcel) = build_tool_test_parcel(smoke_test_tool_success_body());
 
-        let outcome = eval_with_courier(NativeCourier::default(), &parcel, "native", true, None);
+        let outcome = eval_with_courier(
+            NativeCourier::default(),
+            &parcel,
+            "native",
+            true,
+            None,
+            None,
+        );
 
         assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    #[test]
+    fn run_tool_test_case_writes_trace_artifact() {
+        let (dir, parcel) = build_tool_test_parcel(smoke_test_tool_success_body());
+        let trace_dir = dir.path().join("traces");
+
+        let result = run_tool_test_case(
+            &NativeCourier::default(),
+            &parcel,
+            "native",
+            Some("evals/regression.dataset.toml"),
+            Some(&trace_dir),
+            &TestSpec::Tool {
+                tool: "demo".to_string(),
+            },
+        );
+
+        assert!(result.passed, "{result:?}");
+        let trace_path = PathBuf::from(result.trace_path.as_ref().unwrap());
+        assert!(trace_path.is_file());
+
+        let artifact: DispatchTraceArtifact =
+            serde_json::from_str(&fs::read_to_string(&trace_path).unwrap()).unwrap();
+        assert_eq!(artifact.kind, "parcel_eval_case");
+        assert_eq!(
+            artifact.dataset.as_deref(),
+            Some("evals/regression.dataset.toml")
+        );
+        assert_eq!(artifact.case_name, "tool:demo");
+        assert!(!artifact.steps.is_empty());
     }
 }

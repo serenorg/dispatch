@@ -833,6 +833,7 @@ dispatch parcel eval <parcel-or-source> --dataset evals/regression.dataset.toml
 ```
 
 Dataset cases reference packaged eval cases by `source` and `case`, keep the packaged assertions, and only override `input` plus an optional `entrypoint`.
+Add `--trace-dir .dispatch/traces` when you want one structured JSON trace artifact per eval/test case for later inspection or regression triage.
 
 #### `TEST`
 

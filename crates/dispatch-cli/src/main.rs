@@ -160,6 +160,9 @@ struct EvalArgs {
     /// Repo-local dataset file that fans out packaged EVAL cases into regression inputs
     #[arg(long)]
     dataset: Option<PathBuf>,
+    /// Write structured eval traces under this directory
+    #[arg(long)]
+    trace_dir: Option<PathBuf>,
     /// How to handle tools declared with `APPROVAL confirm`
     #[arg(long, value_enum)]
     tool_approval: Option<CliToolApprovalMode>,
@@ -850,6 +853,7 @@ fn parcel_command(command: ParcelCommand) -> Result<()> {
             json,
             output_dir,
             dataset,
+            trace_dir,
             tool_approval,
             a2a_allowed_origins,
             a2a_trust_policy,
@@ -861,6 +865,7 @@ fn parcel_command(command: ParcelCommand) -> Result<()> {
                 emit_json: json,
                 output_dir,
                 dataset,
+                trace_dir,
                 tool_approval: resolve_noninteractive_tool_approval_mode(tool_approval),
                 policy: CliA2aPolicy {
                     allowed_origins: a2a_allowed_origins,
@@ -1294,6 +1299,8 @@ mod tests {
             "native",
             "--dataset",
             "evals/regression.dataset.toml",
+            "--trace-dir",
+            ".dispatch/traces",
             "--a2a-allowed-origins",
             "https://agents.example.com",
             "--a2a-trust-policy",
@@ -1306,6 +1313,7 @@ mod tests {
         };
         let ParcelCommand::Eval(EvalArgs {
             dataset,
+            trace_dir,
             a2a_allowed_origins,
             a2a_trust_policy,
             ..
@@ -1317,6 +1325,7 @@ mod tests {
             dataset.as_deref(),
             Some(Path::new("evals/regression.dataset.toml"))
         );
+        assert_eq!(trace_dir.as_deref(), Some(Path::new(".dispatch/traces")));
         assert_eq!(
             a2a_allowed_origins.as_deref(),
             Some("https://agents.example.com")
@@ -2392,6 +2401,7 @@ mod tests {
                 emit_json: false,
                 output_dir: None,
                 dataset: None,
+                trace_dir: None,
                 tool_approval: CliToolApprovalMode::Never,
                 policy: CliA2aPolicy::default(),
             },
@@ -2428,6 +2438,7 @@ mod tests {
                 emit_json: false,
                 output_dir: None,
                 dataset: None,
+                trace_dir: None,
                 tool_approval: CliToolApprovalMode::Never,
                 policy: CliA2aPolicy::default(),
             },

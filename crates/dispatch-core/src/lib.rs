@@ -10,6 +10,7 @@ pub mod plugins;
 pub mod secrets;
 pub mod signing;
 mod skill;
+pub mod trace;
 pub mod trust;
 pub mod validate;
 
@@ -67,6 +68,7 @@ pub use signing::{
     PublicKeyFile, SecretKeyFile, SignatureVerification, SigningError, generate_keypair_files,
     sign_parcel, verify_parcel_signature,
 };
+pub use trace::{DISPATCH_TRACE_VERSION, DispatchTraceArtifact, DispatchTraceStep};
 pub use trust::{
     A2aTrustPolicy, A2aTrustRequirement, A2aTrustRule, PullTrustPolicy, PullTrustRequirement,
     PullTrustRule, TrustPolicyError,
