@@ -4,7 +4,9 @@ use super::{
     check_tool_approval, execute_local_tool_with_env, instruction_heading, process_env_lookup,
     resolve_manifest_path,
 };
-use crate::{manifest::BuiltinToolConfig, skill::strip_skill_frontmatter};
+use crate::{
+    manifest::BuiltinToolConfig, resolve_secret_from_store, skill::strip_skill_frontmatter,
+};
 use jsonschema::Validator;
 use std::{
     collections::BTreeMap,
@@ -378,12 +380,12 @@ pub(super) fn run_local_tool_with_env<F>(
     parcel: &LoadedParcel,
     tool_name: &str,
     input: Option<&str>,
-    env_lookup: F,
+    mut env_lookup: F,
 ) -> Result<ToolRunResult, CourierError>
 where
-    F: FnMut(&str) -> Option<String> + Copy,
+    F: FnMut(&str) -> Option<String>,
 {
-    let tool = resolve_local_tool_with_env(parcel, tool_name, env_lookup)?;
+    let tool = resolve_local_tool_with_env(parcel, tool_name, &mut env_lookup)?;
     if let Some(request) = build_local_tool_approval_request(&tool, input)
         && !check_tool_approval(&request)?
     {
@@ -421,6 +423,33 @@ pub(super) fn validate_required_secrets(parcel: &LoadedParcel) -> Result<(), Cou
     validate_required_secrets_with(parcel, process_env_lookup)
 }
 
+pub(super) fn resolve_parcel_env_with<F>(
+    parcel: &LoadedParcel,
+    name: &str,
+    env_lookup: &mut F,
+) -> Result<Option<String>, CourierError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if let Some(value) = env_lookup(name) {
+        return Ok(Some(value));
+    }
+    if !parcel
+        .config
+        .secrets
+        .iter()
+        .any(|secret| secret.name == name)
+    {
+        return Ok(None);
+    }
+    resolve_secret_from_store(&parcel.parcel_dir, name).map_err(|error| {
+        CourierError::SecretLookup {
+            name: name.to_string(),
+            message: error.to_string(),
+        }
+    })
+}
+
 fn validate_required_secrets_with<F>(
     parcel: &LoadedParcel,
     mut env_lookup: F,
@@ -429,7 +458,9 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     for secret in &parcel.config.secrets {
-        if secret.required && env_lookup(&secret.name).is_none() {
+        if secret.required
+            && resolve_parcel_env_with(parcel, &secret.name, &mut env_lookup)?.is_none()
+        {
             return Err(CourierError::MissingSecret {
                 name: secret.name.clone(),
             });

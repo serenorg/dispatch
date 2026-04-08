@@ -475,6 +475,57 @@ ENTRYPOINT chat
 }
 
 #[test]
+fn run_local_tool_resolves_declared_secret_from_store() {
+    let test_parcel = build_test_parcel(
+        "\
+FROM dispatch/native:latest
+TOOL LOCAL tools/env.sh AS envcheck
+SECRET CAST_VISIBLE_SECRET
+ENTRYPOINT job
+",
+        &[(
+            "tools/env.sh",
+            "printf '%s\\n' \"visible_secret=${CAST_VISIBLE_SECRET:-}\"",
+        )],
+    );
+    crate::init_secret_store(&test_parcel.parcel.parcel_dir, false).unwrap();
+    crate::set_secret(
+        &test_parcel.parcel.parcel_dir,
+        "CAST_VISIBLE_SECRET",
+        "secret-from-store",
+    )
+    .unwrap();
+
+    let result = run_local_tool(&test_parcel.parcel, "envcheck", None).unwrap();
+
+    assert!(result.stdout.contains("visible_secret=secret-from-store"));
+}
+
+#[test]
+fn open_session_accepts_required_secret_from_store() {
+    let test_parcel = build_test_parcel(
+        "\
+FROM dispatch/native:latest
+SECRET CAST_TEST_SECRET_FROM_STORE
+ENTRYPOINT chat
+",
+        &[],
+    );
+    crate::init_secret_store(&test_parcel.parcel.parcel_dir, false).unwrap();
+    crate::set_secret(
+        &test_parcel.parcel.parcel_dir,
+        "CAST_TEST_SECRET_FROM_STORE",
+        "stored-value",
+    )
+    .unwrap();
+    let courier = NativeCourier::default();
+
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
+
+    assert_eq!(session.entrypoint.as_deref(), Some("chat"));
+}
+
+#[test]
 fn run_local_tool_only_forwards_declared_environment() {
     let test_parcel = build_test_parcel(
         "\

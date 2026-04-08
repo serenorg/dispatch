@@ -123,6 +123,8 @@ ENTRYPOINT chat
 `TIMEOUT RUN` is enforced as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes. It does not currently preempt a turn that has already started.
 `TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
 
+`SECRET` values resolve from the environment first and then fall back to a repo-local encrypted store under `.dispatch/secrets`. Use `dispatch secret init .` once per project, `dispatch secret set NAME --value ...` to store values locally, `dispatch secret ls` to inspect stored names, and `dispatch secret rm NAME` to remove one without printing plaintext back to the terminal.
+
 CLI-scoped A2A operator policy overrides are available on:
 
 - `dispatch run`

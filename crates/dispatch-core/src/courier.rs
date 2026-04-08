@@ -181,8 +181,10 @@ pub enum CourierError {
         found: u32,
         supported: u32,
     },
-    #[error("required secret `{name}` is not present in the environment")]
+    #[error("required secret `{name}` is not present in the environment or local secret store")]
     MissingSecret { name: String },
+    #[error("failed to resolve secret `{name}`: {message}")]
+    SecretLookup { name: String, message: String },
     #[error("tool `{tool}` requires APPROVAL confirm")]
     ApprovalRequired { tool: String },
     #[error("tool `{tool}` was denied by the approval handler")]

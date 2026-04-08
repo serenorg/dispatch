@@ -7,6 +7,7 @@ pub mod manifest;
 pub mod parse;
 pub mod plugin_protocol;
 pub mod plugins;
+pub mod secrets;
 pub mod signing;
 mod skill;
 pub mod trust;
@@ -54,6 +55,11 @@ pub use plugins::{
     CourierPluginRegistry, PluginRegistryError, PluginTransport, ResolvedCourier,
     default_courier_registry_path, install_courier_plugin, list_courier_catalog,
     load_courier_registry, resolve_courier,
+};
+pub use secrets::{
+    SecretStoreError, SecretStorePaths, init_secret_store, list_secret_names,
+    maybe_secret_store_paths, remove_secret, resolve_secret_from_store, resolve_secret_with_env,
+    secret_store_paths, set_secret,
 };
 pub use signing::{
     DISPATCH_SIGNATURE_ALGORITHM, GeneratedKeyPair, PARCEL_SIGNATURES_DIR, ParcelSignature,

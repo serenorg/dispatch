@@ -259,14 +259,19 @@ pub(super) fn execute_local_tool_with_env<F>(
     tool: &LocalToolSpec,
     input: Option<&str>,
     run_deadline: Option<Instant>,
-    env_lookup: F,
+    mut env_lookup: F,
 ) -> Result<ToolRunResult, CourierError>
 where
     F: FnMut(&str) -> Option<String>,
 {
     if matches!(tool.target, LocalToolTarget::A2a { .. }) {
         let timeout_spec = effective_timeout_spec(&parcel.config.timeouts, "TOOL", run_deadline)?;
-        return super::a2a::execute_a2a_tool_with_env(tool, input, env_lookup, timeout_spec);
+        return super::a2a::execute_a2a_tool_with_env(
+            tool,
+            input,
+            |name| super::parcel::resolve_parcel_env_with(parcel, name, &mut env_lookup),
+            timeout_spec,
+        );
     }
 
     let packaged_path = tool.packaged_path().expect("local tool path");
@@ -295,7 +300,7 @@ where
     // subprocesses. Only declared ENV vars, the parcel's required secrets, and
     // the minimal system variables needed to locate interpreters are forwarded.
     command.env_clear();
-    for (name, value) in forwarded_tool_env_with(parcel, input, env_lookup) {
+    for (name, value) in forwarded_tool_env_with(parcel, input, env_lookup)? {
         command.env(name, value);
     }
 
@@ -331,10 +336,11 @@ pub(super) fn execute_local_tool_in_docker(
 ) -> Result<ToolRunResult, CourierError> {
     if matches!(tool.target, LocalToolTarget::A2a { .. }) {
         let timeout_spec = effective_timeout_spec(&parcel.config.timeouts, "TOOL", run_deadline)?;
+        let mut env_lookup = process_env_lookup;
         return super::a2a::execute_a2a_tool_with_env(
             tool,
             input,
-            process_env_lookup,
+            |name| super::parcel::resolve_parcel_env_with(parcel, name, &mut env_lookup),
             timeout_spec,
         );
     }
@@ -492,13 +498,14 @@ pub(super) fn denied_tool_run_result(request: &ToolApprovalRequest) -> ToolRunRe
 
 fn forwarded_tool_env(parcel: &LoadedParcel, input: Option<&str>) -> Vec<(String, String)> {
     forwarded_tool_env_with(parcel, input, process_env_lookup)
+        .expect("process environment lookup should not fail")
 }
 
 fn forwarded_tool_env_with<F>(
     parcel: &LoadedParcel,
     input: Option<&str>,
     mut env_lookup: F,
-) -> Vec<(String, String)>
+) -> Result<Vec<(String, String)>, CourierError>
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -512,14 +519,16 @@ where
         env.push((entry.name.clone(), entry.value.clone()));
     }
     for secret in &parcel.config.secrets {
-        if let Some(value) = env_lookup(&secret.name) {
+        if let Some(value) =
+            super::parcel::resolve_parcel_env_with(parcel, &secret.name, &mut env_lookup)?
+        {
             env.push((secret.name.clone(), value));
         }
     }
     if let Some(input) = input {
         env.push(("TOOL_INPUT".to_string(), input.to_string()));
     }
-    env
+    Ok(env)
 }
 
 pub(super) fn effective_llm_timeout_ms(

@@ -562,6 +562,13 @@ SECRET OPENAI_API_KEY
 SECRET DATABASE_URL
 ```
 
+Semantics:
+
+- Dispatch resolves declared secrets from the process environment first
+- if the environment does not provide a declared secret, Dispatch falls back to `.dispatch/secrets`
+- `dispatch secret init .` bootstraps the local encrypted store for one project
+- `dispatch secret set NAME --value ...` stores or updates one local value without placing it in the parcel manifest
+
 #### `LISTEN`
 
 Declares a local listener binding for `dispatch serve`.
@@ -607,7 +614,7 @@ LISTEN_SECRET DISPATCH_WEBHOOK_SECRET
 Semantics:
 
 - the referenced name must also be declared via `SECRET`
-- the secret value is read from the process environment when `dispatch serve` starts
+- the secret value is resolved from the environment first, then `.dispatch/secrets`, when `dispatch serve` starts
 - the secret value is not stored in the parcel manifest or run record
 
 #### `LISTEN_MAX_BODY_BYTES`

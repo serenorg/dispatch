@@ -118,6 +118,32 @@ ENTRYPOINT job
 }
 
 #[test]
+fn native_courier_executes_a2a_tools_with_store_backed_bearer_auth() {
+    let server = start_test_a2a_server_with_options(TestA2aServerOptions {
+        expected_auth: Some("Bearer topsecret".to_string()),
+        ..Default::default()
+    });
+    let test_parcel = build_test_parcel(
+        &format!(
+            "\
+FROM dispatch/native:latest
+SECRET A2A_TOKEN
+TOOL A2A broker URL {} AUTH bearer A2A_TOKEN
+ENTRYPOINT job
+",
+            server.base_url
+        ),
+        &[],
+    );
+    crate::init_secret_store(&test_parcel.parcel.parcel_dir, false).unwrap();
+    crate::set_secret(&test_parcel.parcel.parcel_dir, "A2A_TOKEN", "topsecret").unwrap();
+
+    let result = run_local_tool(&test_parcel.parcel, "broker", Some("hello")).unwrap();
+
+    assert!(result.stdout.contains("echo:hello"));
+}
+
+#[test]
 fn native_courier_executes_a2a_tools_with_header_auth() {
     let server = start_test_a2a_server_with_options(TestA2aServerOptions {
         expected_auth: Some("X-Api-Key: topsecret".to_string()),
@@ -207,7 +233,7 @@ fn native_courier_rejects_a2a_call_when_auth_secret_is_missing() {
         },
     };
 
-    let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None, None).unwrap_err();
+    let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| Ok(None), None).unwrap_err();
     assert!(
         error
             .to_string()
@@ -241,7 +267,7 @@ fn native_courier_rejects_a2a_header_auth_when_secret_is_missing() {
         },
     };
 
-    let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| None, None).unwrap_err();
+    let error = execute_a2a_tool_with_env(&tool, Some("hello"), |_| Ok(None), None).unwrap_err();
     assert!(
         error
             .to_string()
@@ -282,7 +308,7 @@ fn native_courier_rejects_a2a_basic_auth_when_username_secret_is_missing() {
     let error = execute_a2a_tool_with_env(
         &tool,
         Some("hello"),
-        |name| (name == "A2A_PASSWORD").then(|| "topsecret".to_string()),
+        |name| Ok((name == "A2A_PASSWORD").then(|| "topsecret".to_string())),
         None,
     )
     .unwrap_err();
@@ -326,7 +352,7 @@ fn native_courier_rejects_a2a_basic_auth_when_password_secret_is_missing() {
     let error = execute_a2a_tool_with_env(
         &tool,
         Some("hello"),
-        |name| (name == "A2A_USER").then(|| "demo-user".to_string()),
+        |name| Ok((name == "A2A_USER").then(|| "demo-user".to_string())),
         None,
     )
     .unwrap_err();

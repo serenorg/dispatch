@@ -95,13 +95,7 @@ pub(super) fn execute_host_turn(
     )?;
     if let Some(mut request) = requests.first().cloned() {
         let mut remaining_requests = requests.into_iter().skip(1).collect::<Vec<_>>();
-        for secret in &parcel.config.secrets {
-            if secret.required && std::env::var(&secret.name).is_err() {
-                return Err(CourierError::MissingSecret {
-                    name: secret.name.clone(),
-                });
-            }
-        }
+        super::validate_required_secrets(parcel)?;
         const DEFAULT_MAX_TOOL_ROUNDS: u32 = 8;
         let max_tool_rounds =
             configured_tool_round_limit(&parcel.config.limits).unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);

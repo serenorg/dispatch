@@ -98,7 +98,7 @@ fn send_a2a_json_rpc_with_env<F>(
     env_lookup: &mut F,
 ) -> Result<serde_json::Value, CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let mut request = ureq::post(endpoint)
         .config()
@@ -126,7 +126,7 @@ fn resolve_a2a_rpc_endpoint_with_env<F>(
     timeout: Option<Duration>,
 ) -> Result<(String, Option<String>), CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let url = tool
         .endpoint_url()
@@ -280,7 +280,7 @@ fn apply_a2a_auth_headers<State, F>(
     env_lookup: &mut F,
 ) -> Result<ureq::RequestBuilder<State>, CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let Some(auth) = tool.auth() else {
         return Ok(request);
@@ -288,7 +288,7 @@ where
     request = match auth {
         A2aAuthConfig::Bearer { secret_name } => {
             let secret_value =
-                env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                env_lookup(secret_name)?.ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
                     message: "configured A2A bearer auth secret is not available".to_string(),
                 })?;
@@ -299,7 +299,7 @@ where
             secret_name,
         } => {
             let secret_value =
-                env_lookup(secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                env_lookup(secret_name)?.ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
                     message: "configured A2A header auth secret is not available".to_string(),
                 })?;
@@ -310,13 +310,13 @@ where
             password_secret_name,
         } => {
             let username =
-                env_lookup(username_secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                env_lookup(username_secret_name)?.ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
                     message: "configured A2A basic auth username secret is not available"
                         .to_string(),
                 })?;
             let password =
-                env_lookup(password_secret_name).ok_or_else(|| CourierError::A2aToolRequest {
+                env_lookup(password_secret_name)?.ok_or_else(|| CourierError::A2aToolRequest {
                     tool: tool.alias.clone(),
                     message: "configured A2A basic auth password secret is not available"
                         .to_string(),
@@ -430,14 +430,14 @@ fn validate_a2a_url_allowed<F>(
     env_lookup: &mut F,
 ) -> Result<(), CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let parsed = Url::parse(url).map_err(|error| CourierError::A2aToolRequest {
         tool: tool.alias.clone(),
         message: format!("invalid A2A URL `{url}`: {error}"),
     })?;
     validate_a2a_url_security(tool, &parsed)?;
-    let Some(raw_allowlist) = env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS") else {
+    let Some(raw_allowlist) = env_lookup("DISPATCH_A2A_ALLOWED_ORIGINS")? else {
         return validate_a2a_url_trust_policy(tool, &parsed, env_lookup);
     };
     let allowlist = raw_allowlist
@@ -467,7 +467,7 @@ fn validate_a2a_url_trust_policy<F>(
     env_lookup: &mut F,
 ) -> Result<(), CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let Some(requirement) = resolve_a2a_trust_requirement_for_url(tool, parsed, env_lookup)? else {
         return Ok(());
@@ -491,9 +491,9 @@ fn resolve_a2a_trust_requirement_for_url<F>(
     env_lookup: &mut F,
 ) -> Result<Option<A2aTrustRequirement>, CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
-    let Some(policy_path) = env_lookup("DISPATCH_A2A_TRUST_POLICY") else {
+    let Some(policy_path) = env_lookup("DISPATCH_A2A_TRUST_POLICY")? else {
         return Ok(None);
     };
     let policy = A2aTrustPolicy::from_path(Path::new(&policy_path)).map_err(|error| {
@@ -518,7 +518,7 @@ fn resolve_a2a_trust_requirement<F>(
     env_lookup: &mut F,
 ) -> Result<Option<A2aTrustRequirement>, CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let parsed = Url::parse(endpoint).map_err(|error| CourierError::A2aToolRequest {
         tool: tool.alias.clone(),
@@ -651,7 +651,7 @@ fn poll_a2a_task_until_complete<F>(
     env_lookup: &mut F,
 ) -> Result<serde_json::Value, CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     if matches!(a2a_task_state(&initial_result), Some("completed")) {
         return Ok(initial_result);
@@ -733,7 +733,7 @@ fn best_effort_cancel_a2a_task<F>(
     task_id: &str,
     env_lookup: &mut F,
 ) where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
@@ -760,7 +760,7 @@ pub(super) fn execute_a2a_tool_with_env<F>(
     timeout_spec: Option<(&str, Duration)>,
 ) -> Result<ToolRunResult, CourierError>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Result<Option<String>, CourierError>,
 {
     let mut env_lookup = env_lookup;
     let timeout = timeout_spec.map(|(_, duration)| duration);

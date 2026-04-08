@@ -5,6 +5,7 @@ mod inspect;
 mod parcel_ops;
 mod run;
 mod runs;
+mod secret_cmds;
 mod skill_run;
 mod state;
 mod tool_display;
@@ -96,6 +97,11 @@ enum Command {
     State {
         #[command(subcommand)]
         command: StateCommand,
+    },
+    /// Manage repo-local encrypted secrets for Dispatch parcels
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
     },
     #[command(hide = true)]
     Internal {
@@ -740,6 +746,51 @@ enum StateCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SecretCommand {
+    /// Initialize a repo-local encrypted secret store under .dispatch/secrets
+    Init {
+        /// Project root, Agentfile path, or parcel path
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Replace an existing key/store pair
+        #[arg(long)]
+        force: bool,
+        /// Print store paths as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Store or update one secret value
+    Set {
+        /// Secret name declared via `SECRET`
+        name: String,
+        /// Secret value to encrypt into the local store
+        #[arg(long)]
+        value: String,
+        /// Project root, Agentfile path, or parcel path
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Remove one secret from the local store
+    Rm {
+        /// Secret name declared via `SECRET`
+        name: String,
+        /// Project root, Agentfile path, or parcel path
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List stored secret names without printing values
+    #[command(visible_alias = "ls")]
+    List {
+        /// Project root, Agentfile path, or parcel path
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Print the secret name list as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum InternalCommand {
     /// Execute a recorded local run
     RunRecord {
@@ -779,6 +830,7 @@ fn main() -> Result<()> {
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::State { command } => state_command(command),
+        Command::Secret { command } => secret_command(command),
         Command::Internal { command } => runs::internal_command(command),
     }
 }
@@ -1098,14 +1150,23 @@ fn state_command(command: StateCommand) -> Result<()> {
     }
 }
 
+fn secret_command(command: SecretCommand) -> Result<()> {
+    match command {
+        SecretCommand::Init { path, force, json } => secret_cmds::init(path, force, json),
+        SecretCommand::Set { name, value, path } => secret_cmds::set(path, &name, &value),
+        SecretCommand::Rm { name, path } => secret_cmds::rm(path, &name),
+        SecretCommand::List { path, json } => secret_cmds::ls(path, json),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand, DepotCommand, EvalArgs,
         ImageCommand, InspectArgs, InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs,
-        ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs, RestartArgs, SignArgs,
-        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs,
-        VerifyArgs, WaitArgs,
+        ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs, RestartArgs,
+        SecretCommand, SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
+        ValidateSkillArgs, VerifyArgs, WaitArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -1467,6 +1528,50 @@ mod tests {
         assert_eq!(output_dir.as_deref(), Some(Path::new("/tmp/parcels")));
         assert!(public_keys.is_empty());
         assert!(trust_policy.is_none());
+        assert!(json);
+    }
+
+    #[test]
+    fn cli_parses_secret_commands() {
+        let init = Cli::try_parse_from(["dispatch", "secret", "init", ".", "--force"]).unwrap();
+        let Command::Secret { command } = init.command else {
+            panic!("expected secret command");
+        };
+        let SecretCommand::Init { path, force, json } = command else {
+            panic!("expected secret init command");
+        };
+        assert_eq!(path, Path::new("."));
+        assert!(force);
+        assert!(!json);
+
+        let set = Cli::try_parse_from([
+            "dispatch",
+            "secret",
+            "set",
+            "OPENAI_API_KEY",
+            "--value",
+            "secret",
+            "examples/demo",
+        ])
+        .unwrap();
+        let Command::Secret { command } = set.command else {
+            panic!("expected secret command");
+        };
+        let SecretCommand::Set { name, value, path } = command else {
+            panic!("expected secret set command");
+        };
+        assert_eq!(name, "OPENAI_API_KEY");
+        assert_eq!(value, "secret");
+        assert_eq!(path, Path::new("examples/demo"));
+
+        let ls = Cli::try_parse_from(["dispatch", "secret", "ls", "--json"]).unwrap();
+        let Command::Secret { command } = ls.command else {
+            panic!("expected secret command");
+        };
+        let SecretCommand::List { path, json } = command else {
+            panic!("expected secret list command");
+        };
+        assert_eq!(path, Path::new("."));
         assert!(json);
     }
 

@@ -144,6 +144,16 @@ fn env_var(name: &str) -> Result<String, env::VarError> {
     env::var(name)
 }
 
+fn resolve_parcel_secret(
+    parcel: &dispatch_core::LoadedParcel,
+    name: &str,
+) -> Result<Option<String>> {
+    dispatch_core::resolve_secret_with_env(&parcel.parcel_dir, name, |env_name| {
+        env_var(env_name).ok()
+    })
+    .with_context(|| format!("failed to resolve secret `{name}`"))
+}
+
 #[cfg(test)]
 fn set_test_env_override(name: &str, value: Option<&str>) {
     TEST_ENV_OVERRIDES
@@ -950,9 +960,8 @@ fn resolve_service_ingress_config(
     } else if let Some(secret_env) =
         parcel_ingress.and_then(|ingress| ingress.shared_secret_env.as_deref())
     {
-        let secret = env_var(secret_env).with_context(|| {
-            format!("service listener secret `{secret_env}` is not available in the environment")
-        })?;
+        let secret = resolve_parcel_secret(parcel, secret_env)?
+            .with_context(|| format!("service listener secret `{secret_env}` is not available"))?;
         Some(hash_shared_secret(&secret))
     } else {
         None
@@ -2663,6 +2672,53 @@ mod tests {
         );
         assert_eq!(ingress.max_body_bytes, 2048);
         assert_eq!(ingress.max_header_bytes, 8192);
+    }
+
+    #[test]
+    fn resolve_service_ingress_config_reads_store_backed_shared_secret() {
+        let dir = tempdir().unwrap();
+        let parcel = test_parcel(
+            dir.path(),
+            Some(dispatch_core::IngressPolicyConfig {
+                path: Some("/hook".to_string()),
+                methods: vec!["POST".to_string()],
+                shared_secret_env: Some("DISPATCH_WEBHOOK_SECRET_STORE".to_string()),
+                max_body_bytes: None,
+                max_header_bytes: None,
+            }),
+        );
+        dispatch_core::init_secret_store(&parcel.parcel_dir, false).unwrap();
+        dispatch_core::set_secret(
+            &parcel.parcel_dir,
+            "DISPATCH_WEBHOOK_SECRET_STORE",
+            "fromstore",
+        )
+        .unwrap();
+        let args = crate::ServeArgs {
+            path: PathBuf::from("."),
+            courier: "native".to_string(),
+            registry: None,
+            session_file: None,
+            payload: None,
+            interval_ms: 30_000,
+            schedules: Vec::new(),
+            listens: Vec::new(),
+            listen_path: None,
+            listen_methods: Vec::new(),
+            listen_shared_secret: None,
+            listen_max_body_bytes: None,
+            listen_max_header_bytes: None,
+            detach: false,
+            a2a_allowed_origins: None,
+            a2a_trust_policy: None,
+        };
+
+        let ingress = super::resolve_service_ingress_config(&parcel, &args).unwrap();
+
+        assert_eq!(
+            ingress.shared_secret_sha256,
+            Some(super::hash_shared_secret("fromstore"))
+        );
     }
 
     #[test]

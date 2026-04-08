@@ -335,7 +335,7 @@ Auth behavior:
 
 - shared secrets are accepted via `x-dispatch-secret` or `authorization: Bearer ...`
 - parcel-authored shared secrets reference a declared `SECRET` name and are
-  resolved from the environment when `dispatch serve` starts
+  resolved from the environment first and then `.dispatch/secrets` when `dispatch serve` starts
 - the run record stores only the SHA-256 digest of the configured secret
 - forwarded heartbeat payload headers redact auth-bearing headers before they
   reach parcel history/logs
