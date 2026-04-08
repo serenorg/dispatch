@@ -89,6 +89,7 @@ Files:
 - `.dispatch/runs/<run-id>.json`
 - `.dispatch/runs/<run-id>.log`
 - optional `.dispatch/runs/<run-id>.session.json`
+- optional `.dispatch/runs/<run-id>.final.json`
 
 This matches Dispatch's existing local-first storage posture and keeps runtime state
 discoverable next to `.dispatch/parcels` and `.dispatch/state`.
@@ -141,7 +142,8 @@ Detached helper:
 2. open or resume the courier session
 3. execute the operation
 4. write stdout/stderr and run events to the log
-5. update run status and exit metadata
+5. write an authoritative terminal snapshot
+6. update run status and exit metadata
 
 Implementation detail:
 
@@ -159,10 +161,14 @@ Instead:
 - `ps` reads the run registry
 - `stop` signals the recorded pid/process group
 - `logs` reads the run log
-- status reconciliation happens by checking pid liveness
+- status reconciliation happens by checking pid liveness and then consuming a
+  runner-authored terminal snapshot when one exists
 
 `dispatch wait` blocks until the run exits and prints its exit code. Use
 `--timeout-ms` if you want it to fail instead of waiting indefinitely.
+Successful detached one-shot runs return `0`. Explicitly stopped runs and
+one-shot runs whose helper dies before recording a terminal snapshot return
+non-zero.
 
 `dispatch stop` sends a graceful stop first and, unless `--force` is set,
 waits for `--grace-period-ms` before escalating to a forceful kill.
@@ -174,7 +180,7 @@ matters:
 |---|---|---|
 | Process owner | Central daemon owns all containers | Each run is its own process tree |
 | Lifecycle coupling | Daemon restart affects all runs | Runs survive parent CLI exit |
-| State source of truth | Daemon in-memory state | On-disk records + pid liveness |
+| State source of truth | Daemon in-memory state | On-disk records + terminal snapshots + pid liveness |
 | Coordination | Daemon mediates all access | File-level locking or advisory |
 | Complexity | Higher (daemon health, socket auth) | Lower (just processes and files) |
 | Future supervisor path | Already is the supervisor | Supervisor wraps existing records |
@@ -383,9 +389,25 @@ The runtime should validate on-disk records against the actual process table.
 
 At minimum:
 
-- if pid is dead, reconcile status to `exited` or `failed`
+- if pid is dead and a terminal snapshot exists, reconcile from that snapshot
+- if pid is dead and no terminal snapshot exists:
+  - `service` runs reconcile to `stopped`
+  - detached `job`/`heartbeat` runs reconcile to `failed`
 - if the command no longer matches, mark the record stale
 - if a helper survives a parent CLI exit, `ps` should still show it
+
+### Terminal snapshots
+
+Detached helpers write `<run-id>.final.json` before their last best-effort
+persist of the main run record.
+
+That gives the daemonless runtime an authoritative terminal-state handoff:
+
+- if the main run record write succeeds, readers see the terminal state there
+- if the main run record write fails after the helper has already finished,
+  readers can still recover the exact terminal state from `.final.json`
+- `stop`, `restart`, `rm`, and `prune` clear or remove stale snapshots so they
+  cannot be applied to a newly started run
 
 This follows the same broad pattern as local process supervisors that:
 
@@ -468,7 +490,7 @@ template for Dispatch, but each validates or constrains a specific design axis.
 The primary model for Dispatch's daemonless runtime. Each container is a
 standalone process. `podman ps` reads state from disk + process table.
 `podman run --detach` returns immediately. No socket, no daemon health to manage.
-Dispatch's run registry, pid liveness checks, and `dispatch ps` follow this
+Dispatch's run registry, terminal snapshots, pid liveness checks, and `dispatch ps` follow this
 pattern directly.
 
 ### Cloudflare Agents SDK (SQLite-backed scheduling, alarm-based wake)

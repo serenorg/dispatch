@@ -460,6 +460,8 @@ heartbeat services.
 
 - `dispatch run --detach` starts a detached `job` or `heartbeat` run and writes a
   run record under `.dispatch/runs/`
+- detached helpers publish authoritative terminal snapshots so `wait`, `ps`,
+  and `inspect-run` can reconcile exited runs without guessing from dead pids
 - `dispatch serve` starts a long-lived `service` run that can wake from heartbeat
   intervals, persisted cron schedules, and local HTTP ingress
 - `dispatch ps`, `dispatch logs`, `dispatch wait`, `dispatch stop`,
@@ -490,6 +492,10 @@ Service scheduling and ingress can be authored into the parcel:
 CLI `dispatch serve` flags can also provide or override schedules, listeners,
 and ingress policy at runtime. For the full runtime contract, see
 [docs/runtime-and-serve.md](./docs/runtime-and-serve.md).
+
+`dispatch wait` prints the run exit code. Detached one-shot runs that complete
+normally return `0`; explicitly stopped runs and one-shot runs whose helper dies
+before recording terminal state return non-zero.
 
 `dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and run the same synthesis and parcel build that an authored `Agentfile` would use. `dispatch skill validate` stops after that build-time validation, while `dispatch skill run` then delegates to `dispatch run`. This means `validate` surfaces sidecar, frontmatter, packaging, and build errors directly and is suitable for CI, but it is intentionally heavier than a schema-only lint. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 
