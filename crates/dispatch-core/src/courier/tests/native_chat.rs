@@ -209,14 +209,18 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_executes_tool_calls_then_continues_model_turn() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 ENTRYPOINT chat
-",
-        &[("tools/demo.sh", "printf 'tool-output'")],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
     let backend = Arc::new(FakeChatBackend::with_replies(vec![
         Some(ModelReply {
@@ -281,14 +285,18 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_reconstructs_followup_without_response_threading() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 ENTRYPOINT chat
-",
-        &[("tools/demo.sh", "printf 'tool-output'")],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
     let backend = Arc::new(FakeChatBackend::with_replies_without_previous_response_id(
         vec![
@@ -687,15 +695,19 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_executes_schema_tool_calls_as_function_outputs() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
+TOOL LOCAL {tool_path} AS demo SCHEMA schemas/demo.json
 ENTRYPOINT chat
-",
+"
+        ),
         &[
-            ("tools/demo.sh", "printf 'tool-output'"),
+            (tool_path.as_str(), tool_body.as_str()),
             (
                 "schemas/demo.json",
                 "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"query\": { \"type\": \"string\" }\n  },\n  \"required\": [\"query\"]\n}",

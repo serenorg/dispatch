@@ -244,6 +244,29 @@ fn arg_matches_packaged_path(arg: &str, packaged_path: &str) -> bool {
             .is_some_and(|(left, right)| left == right)
 }
 
+fn docker_mount_source(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let raw = path.display().to_string();
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+fn docker_bind_mount_arg(source: &Path, target: &str, readonly: bool) -> String {
+    let mut spec = format!(
+        "type=bind,source={},target={target}",
+        docker_mount_source(source)
+    );
+    if readonly {
+        spec.push_str(",readonly");
+    }
+    spec
+}
+
 // Execute a tool whose spec has already been resolved. Callers are responsible
 // for validating required secrets before calling this function.
 fn execute_local_tool(
@@ -362,7 +385,7 @@ pub(super) fn execute_local_tool_in_docker(
                 path: parcel.parcel_dir.display().to_string(),
                 source,
             })?;
-    let mount_arg = format!("{}:/workspace:ro", parcel_root.display());
+    let mount_arg = docker_bind_mount_arg(&parcel_root, "/workspace", true);
     let mut command = Command::new(&courier.docker_bin);
     command
         .arg("run")
@@ -370,7 +393,7 @@ pub(super) fn execute_local_tool_in_docker(
         .arg("-i")
         .arg("--workdir")
         .arg("/workspace/context")
-        .arg("-v")
+        .arg("--mount")
         .arg(mount_arg);
     for (name, value) in forwarded_tool_env(parcel, input) {
         command.arg("-e").arg(format!("{name}={value}"));
@@ -555,7 +578,10 @@ pub(super) fn configured_llm_timeout_ms(
 
 #[cfg(test)]
 mod tests {
-    use super::arg_matches_packaged_path;
+    #[cfg(windows)]
+    use super::docker_mount_source;
+    use super::{arg_matches_packaged_path, docker_bind_mount_arg};
+    use std::path::Path;
 
     #[test]
     fn arg_matches_packaged_path_accepts_windows_relative_runner_path() {
@@ -576,5 +602,26 @@ mod tests {
             ".\\tools\\other.cmd",
             "tools/demo.cmd"
         ));
+    }
+
+    #[test]
+    fn docker_bind_mount_arg_uses_mount_syntax() {
+        let spec = docker_bind_mount_arg(Path::new("/tmp/dispatch"), "/workspace", true);
+        assert!(spec.starts_with("type=bind,source="));
+        assert!(spec.contains(",target=/workspace"));
+        assert!(spec.ends_with(",readonly"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn docker_mount_source_normalizes_windows_paths() {
+        assert_eq!(
+            docker_mount_source(Path::new(r"\\?\C:\Users\me\dispatch")),
+            "C:/Users/me/dispatch"
+        );
+        assert_eq!(
+            docker_mount_source(Path::new(r"C:\Users\me\dispatch")),
+            "C:/Users/me/dispatch"
+        );
     }
 }

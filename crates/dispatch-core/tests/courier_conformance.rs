@@ -36,6 +36,37 @@ fn demo_tool_body() -> &'static str {
     }
 }
 
+fn docker_demo_tool_relative_path() -> &'static str {
+    "tools/demo.sh"
+}
+
+fn docker_demo_tool_body() -> &'static str {
+    "#!/bin/sh\ncat >/dev/null\nprintf 'ok\\n'\n"
+}
+
+fn build_fake_docker_courier() -> (tempfile::TempDir, DockerCourier) {
+    let dir = tempdir().unwrap();
+    #[cfg(unix)]
+    let docker_bin = dir.path().join("docker");
+    #[cfg(windows)]
+    let docker_bin = dir.path().join("docker.cmd");
+
+    #[cfg(unix)]
+    let script = "\
+#!/bin/sh
+printf 'ok\\n'
+cat >/dev/null
+";
+    #[cfg(windows)]
+    let script = "@echo off\r\necho ok\r\nmore > nul\r\n";
+
+    fs::write(&docker_bin, script).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    (dir, DockerCourier::new(&docker_bin, "python:3.13-alpine"))
+}
+
 fn build_fixture(agentfile: &str, files: &[(&str, &str)]) -> FixtureImage {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("Agentfile"), agentfile).unwrap();
@@ -527,6 +558,8 @@ ENTRYPOINT job
 
 #[test]
 fn docker_courier_conformance_supports_job_heartbeat_and_direct_tools() {
+    let tool_path = docker_demo_tool_relative_path();
+    let tool_body = docker_demo_tool_body();
     let job_fixture = build_fixture(
         &format!(
             "\
@@ -535,12 +568,9 @@ SOUL SOUL.md
 TOOL LOCAL {} AS demo
 ENTRYPOINT job
 ",
-            demo_tool_relative_path()
+            tool_path
         ),
-        &[
-            ("SOUL.md", "Soul body"),
-            (demo_tool_relative_path(), demo_tool_body()),
-        ],
+        &[("SOUL.md", "Soul body"), (tool_path, tool_body)],
     );
     let heartbeat_fixture = build_fixture(
         &format!(
@@ -550,32 +580,11 @@ SOUL SOUL.md
 TOOL LOCAL {} AS demo
 ENTRYPOINT heartbeat
 ",
-            demo_tool_relative_path()
+            tool_path
         ),
-        &[
-            ("SOUL.md", "Soul body"),
-            (demo_tool_relative_path(), demo_tool_body()),
-        ],
+        &[("SOUL.md", "Soul body"), (tool_path, tool_body)],
     );
-    #[cfg(unix)]
-    let docker_bin_dir = tempdir().unwrap();
-    #[cfg(unix)]
-    let courier = {
-        let docker_bin = docker_bin_dir.path().join("docker");
-        fs::write(
-            &docker_bin,
-            "\
-#!/bin/sh
-printf 'ok\\n'
-cat >/dev/null
-",
-        )
-        .unwrap();
-        fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
-        DockerCourier::new(&docker_bin, "python:3.13-alpine")
-    };
-    #[cfg(not(unix))]
-    let courier = DockerCourier::default();
+    let (_docker_bin_dir, courier) = build_fake_docker_courier();
 
     let job_session =
         futures::executor::block_on(courier.open_session(&job_fixture.image)).unwrap();

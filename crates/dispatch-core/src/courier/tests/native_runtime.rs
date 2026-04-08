@@ -209,13 +209,17 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_tool_run_emits_started_and_finished_events() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("{\"ok\":true}");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 ENTRYPOINT job
-",
-        &[("tools/demo.sh", "printf '{\"ok\":true}'")],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
     let courier = NativeCourier::default();
     let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
@@ -237,7 +241,8 @@ ENTRYPOINT job
     assert_eq!(response.session.turn_count, 1);
     assert!(matches!(
         response.events.first(),
-        Some(CourierEvent::ToolCallStarted { command, .. }) if command == "sh"
+        Some(CourierEvent::ToolCallStarted { command, .. })
+            if command == if cfg!(windows) { "cmd" } else { "sh" }
     ));
     assert!(matches!(
         response.events.get(1),
@@ -476,17 +481,18 @@ ENTRYPOINT chat
 
 #[test]
 fn run_local_tool_resolves_declared_secret_from_store() {
+    let tool_path = test_tool_relative_path("env");
+    let tool_body = test_tool_env_body(&[("visible_secret", "CAST_VISIBLE_SECRET")]);
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
-TOOL LOCAL tools/env.sh AS envcheck
+TOOL LOCAL {tool_path} AS envcheck
 SECRET CAST_VISIBLE_SECRET
 ENTRYPOINT job
-",
-        &[(
-            "tools/env.sh",
-            "printf '%s\\n' \"visible_secret=${CAST_VISIBLE_SECRET:-}\"",
-        )],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
     crate::init_secret_store(&test_parcel.parcel.parcel_dir, false).unwrap();
     crate::set_secret(
@@ -527,18 +533,23 @@ ENTRYPOINT chat
 
 #[test]
 fn run_local_tool_only_forwards_declared_environment() {
+    let tool_path = test_tool_relative_path("env");
+    let tool_body = test_tool_env_body(&[
+        ("visible_env", "CAST_VISIBLE_ENV"),
+        ("visible_secret", "CAST_VISIBLE_SECRET"),
+        ("hidden_env", "CAST_HIDDEN_ENV"),
+    ]);
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
-TOOL LOCAL tools/env.sh AS envcheck
+TOOL LOCAL {tool_path} AS envcheck
 ENV CAST_VISIBLE_ENV=visible
 SECRET CAST_VISIBLE_SECRET
 ENTRYPOINT job
-",
-        &[(
-            "tools/env.sh",
-            "printf '%s\\n' \"visible_env=${CAST_VISIBLE_ENV:-}\" \"visible_secret=${CAST_VISIBLE_SECRET:-}\" \"hidden_env=${CAST_HIDDEN_ENV:-}\"",
-        )],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
 
     let host_env = BTreeMap::from([

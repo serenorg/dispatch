@@ -360,6 +360,46 @@ fn build_test_parcel_in_dir(
     }
 }
 
+fn test_tool_relative_path(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("tools/{stem}.cmd")
+    } else {
+        format!("tools/{stem}.sh")
+    }
+}
+
+fn test_tool_print_body(output: &str) -> String {
+    if cfg!(windows) {
+        format!("@echo off\r\necho {output}\r\n")
+    } else {
+        format!("#!/bin/sh\nprintf '{output}'\n")
+    }
+}
+
+fn test_tool_env_body(bindings: &[(&str, &str)]) -> String {
+    if cfg!(windows) {
+        let mut body = String::from("@echo off\r\n");
+        for (label, env_name) in bindings {
+            body.push_str(&format!("echo {label}=%{env_name}%\r\n"));
+        }
+        body
+    } else {
+        let mut body = String::new();
+        for (label, env_name) in bindings {
+            body.push_str(&format!("printf '%s\\n' \"{label}=${{{env_name}:-}}\"\n"));
+        }
+        body
+    }
+}
+
+fn test_tool_close_stdin_and_print_body(output: &str) -> String {
+    if cfg!(windows) {
+        format!("@echo off\r\necho {output}\r\n")
+    } else {
+        format!("#!/bin/sh\nexec 0<&-\nprintf '{output}'\n")
+    }
+}
+
 #[cfg(unix)]
 fn build_test_plugin_courier(
     dir: &tempfile::TempDir,

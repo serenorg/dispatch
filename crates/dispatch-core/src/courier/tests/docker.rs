@@ -175,6 +175,10 @@ ENTRYPOINT job
     assert!(result.stdout.contains("arg3=-i"));
     assert!(result.stdout.contains("arg4=--workdir"));
     assert!(result.stdout.contains("arg5=/workspace/context"));
+    assert!(result.stdout.contains("arg6=--mount"));
+    assert!(result.stdout.contains("type=bind,source="));
+    assert!(result.stdout.contains("target=/workspace"));
+    assert!(result.stdout.contains("readonly"));
     assert!(result.stdout.contains("CAST_VISIBLE_ENV=visible"));
     assert!(result.stdout.contains("TOOL_INPUT={\"ping\":true}"));
     assert!(result.stdout.contains("python:3.13-alpine"));

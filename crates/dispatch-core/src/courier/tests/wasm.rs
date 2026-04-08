@@ -64,18 +64,22 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_executes_reference_guest_chat_with_model_and_tool_imports() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel_with_binary_files(
-        "\
+        &format!(
+            "\
 FROM dispatch/wasm:latest
 COMPONENT components/reference.wasm
 SOUL SOUL.md
 MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 ENTRYPOINT chat
-",
+"
+        ),
         &[
             ("SOUL.md", "Soul body"),
-            ("tools/demo.sh", "printf 'tool-output'"),
+            (tool_path.as_str(), tool_body.as_str()),
         ],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
@@ -145,16 +149,20 @@ ENTRYPOINT chat
 
 #[test]
 fn wasm_courier_supports_direct_tool_invocation() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_close_stdin_and_print_body("direct-tool-ok");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/wasm:latest
 COMPONENT components/assistant.wat
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 ENTRYPOINT chat
-",
+"
+        ),
         &[
             ("components/assistant.wat", "(component)"),
-            ("tools/demo.sh", "exec 0<&-\nprintf 'direct-tool-ok'"),
+            (tool_path.as_str(), tool_body.as_str()),
         ],
     );
     let courier = WasmCourier::new().unwrap();
