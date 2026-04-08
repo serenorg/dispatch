@@ -2,12 +2,11 @@ use anyhow::{Context, Result, bail};
 use atomic_write_file::AtomicWriteFile;
 use chrono::{DateTime, TimeZone, Utc};
 use cron::Schedule;
+use dispatch_process::{
+    TerminationTarget, configure_detached_command, pid_is_running, terminate_target,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -23,11 +22,6 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-#[cfg(windows)]
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 #[cfg(test)]
 static TEST_ENV_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<String>>>> =
@@ -1248,11 +1242,14 @@ fn terminate_record(record: &RunRecord, force: bool) -> Result<()> {
     let pid = record
         .pid
         .ok_or_else(|| anyhow::anyhow!("run `{}` is missing a process id", record.run_id))?;
-    if let Some(process_group_id) = record.process_group_id {
-        terminate_process_group(process_group_id, force)
-    } else {
-        terminate_pid(pid, force)
-    }
+    terminate_target(
+        record
+            .process_group_id
+            .map(TerminationTarget::ProcessGroup)
+            .unwrap_or(TerminationTarget::Pid(pid)),
+        force,
+    )
+    .with_context(|| format!("failed to stop pid {pid}"))
 }
 
 fn load_run_record(path: &Path) -> Result<RunRecord> {
@@ -1323,18 +1320,7 @@ fn spawn_detached_runner(record_path: &Path, log_path: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    #[cfg(windows)]
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            libc::signal(libc::SIGHUP, libc::SIG_IGN);
-            Ok(())
-        });
-    }
+    configure_detached_command(&mut command);
     command.spawn().with_context(|| {
         format!(
             "failed to launch detached runner for {}",
@@ -1924,84 +1910,6 @@ fn write_http_response(
         body.len()
     )
     .context("failed to write ingress response")
-}
-
-#[cfg(unix)]
-fn pid_is_running(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    if rc == 0 {
-        return true;
-    }
-    matches!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(code) if code == libc::EPERM
-    )
-}
-
-#[cfg(not(unix))]
-fn pid_is_running(pid: u32) -> bool {
-    let output = match Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim_start().starts_with('"')
-}
-
-#[cfg(unix)]
-fn terminate_pid(pid: u32, force: bool) -> Result<()> {
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-    let rc = unsafe { libc::kill(pid as i32, signal) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(error).with_context(|| format!("failed to stop pid {pid}"))
-}
-
-#[cfg(unix)]
-fn terminate_process_group(process_group_id: u32, force: bool) -> Result<()> {
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-    let rc = unsafe { libc::kill(-(process_group_id as i32), signal) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(error).with_context(|| format!("failed to stop process group {process_group_id}"))
-}
-
-#[cfg(not(unix))]
-fn terminate_pid(pid: u32, force: bool) -> Result<()> {
-    let mut command = Command::new("taskkill");
-    command.arg("/PID").arg(pid.to_string());
-    if force {
-        command.arg("/F");
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("failed to stop pid {pid}"))?;
-    if status.success() || !force {
-        Ok(())
-    } else {
-        bail!("failed to stop pid {pid}")
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_process_group(process_group_id: u32, force: bool) -> Result<()> {
-    terminate_pid(process_group_id, force)
 }
 
 #[cfg(unix)]

@@ -826,6 +826,7 @@ dependencies = [
  "clap",
  "cron",
  "dispatch-core",
+ "dispatch-process",
  "futures",
  "jsonschema",
  "libc",
@@ -843,6 +844,7 @@ name = "dispatch-core"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dispatch-process",
  "dispatch-wasm-abi",
  "futures",
  "jsonschema",
@@ -872,6 +874,13 @@ dependencies = [
  "dispatch-core",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "dispatch-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

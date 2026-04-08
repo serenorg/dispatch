@@ -11,6 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 dispatch-core = { path = "../dispatch-core" }
+dispatch-process = { path = "../dispatch-process" }
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true

@@ -1,4 +1,5 @@
 use super::*;
+use dispatch_process::{kill_child_and_wait, wait_for_child_timeout};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::{
@@ -6,7 +7,7 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
     sync::mpsc::Receiver,
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -781,19 +782,9 @@ impl CodexProcess {
             .flatten()
             .unwrap_or_else(|| Duration::from_millis(250))
             .min(Duration::from_secs(2));
-        let wait_deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < wait_deadline => {
-                    thread::sleep(Duration::from_millis(10))
-                }
-                Ok(None) | Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-            }
+        match wait_for_child_timeout(&mut child, Some(timeout), Duration::from_millis(10)) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => kill_child_and_wait(&mut child),
         }
         if let Some(stdout_reader) = stdout_reader {
             let _ = join_line_reader(

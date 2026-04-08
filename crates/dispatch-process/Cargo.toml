@@ -1,0 +1,15 @@
+[package]
+name = "dispatch-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared subprocess utilities for Dispatch."
+readme = "../../README.md"
+keywords = ["process", "dispatch"]
+categories = ["development-tools"]
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

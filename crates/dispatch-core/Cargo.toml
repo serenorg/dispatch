@@ -10,6 +10,7 @@ keywords = ["agents", "packaging", "courier", "dispatch"]
 categories = ["development-tools"]
 
 [dependencies]
+dispatch-process = { path = "../dispatch-process" }
 dispatch-wasm-abi = { path = "../dispatch-wasm-abi" }
 futures.workspace = true
 serde.workspace = true

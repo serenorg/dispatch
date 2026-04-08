@@ -1,15 +1,12 @@
 use super::*;
+use dispatch_process::{
+    LineReadResult, RecvLineError, recv_line_with_child_exit, spawn_line_reader,
+};
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::{
-    io::BufRead,
-    process::Child,
-    sync::mpsc::{self, Receiver},
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
-};
+use std::{io::BufRead, process::Child, sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
 
 mod anthropic;
 mod claude;
@@ -101,32 +98,6 @@ pub(super) fn parse_flag_bool(value: &str) -> Option<bool> {
     }
 }
 
-pub(super) type LineReadResult = Result<(usize, String), String>;
-
-pub(super) fn spawn_line_reader<R>(mut reader: R) -> (Receiver<LineReadResult>, JoinHandle<()>)
-where
-    R: BufRead + Send + 'static,
-{
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        loop {
-            let mut line = String::new();
-            let result = reader
-                .read_line(&mut line)
-                .map(|bytes| (bytes, line))
-                .map_err(|error| error.to_string());
-            let done = matches!(result, Ok((0, _)));
-            if sender.send(result).is_err() {
-                break;
-            }
-            if done {
-                break;
-            }
-        }
-    });
-    (receiver, handle)
-}
-
 pub(super) fn join_line_reader(
     handle: JoinHandle<()>,
     panic_error: CourierError,
@@ -141,38 +112,17 @@ pub(super) fn recv_line_with_timeout(
     timeout_error: CourierError,
     disconnect_error: CourierError,
 ) -> Result<Option<(usize, String)>, CourierError> {
-    let timeout_deadline = timeout.and_then(|value| Instant::now().checked_add(value));
-    loop {
-        let wait_for = timeout_deadline
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(50))
-            })
-            .unwrap_or_else(|| Duration::from_millis(50));
-
-        let recv_result = match receiver.recv_timeout(wait_for) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if child
-                    .try_wait()
-                    .map_err(|error| CourierError::ModelBackendRequest(error.to_string()))?
-                    .is_some()
-                {
-                    return Ok(None);
-                }
-                if timeout_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    let _ = child.kill();
-                    return Err(timeout_error);
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(disconnect_error),
-        };
-
-        return recv_result
-            .map(Some)
-            .map_err(CourierError::ModelBackendRequest);
+    match recv_line_with_child_exit(receiver, child, timeout, Duration::from_millis(50)) {
+        Ok(result) => Ok(result),
+        Err(RecvLineError::Timeout) => {
+            let _ = child.kill();
+            Err(timeout_error)
+        }
+        Err(RecvLineError::Disconnected) => Err(disconnect_error),
+        Err(RecvLineError::Read(message)) => Err(CourierError::ModelBackendRequest(message)),
+        Err(RecvLineError::ChildWait(error)) => {
+            Err(CourierError::ModelBackendRequest(error.to_string()))
+        }
     }
 }
 

@@ -5,8 +5,11 @@ use super::{
     process_env_lookup,
 };
 use crate::manifest::TimeoutSpec;
+use dispatch_process::{
+    BrokenPipePolicy, kill_child_and_wait, wait_for_child_timeout, write_child_stdin,
+};
 use std::{
-    io::ErrorKind,
+    path::Path,
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -58,28 +61,19 @@ fn wait_for_tool_output(
     tool: &str,
     timeout_spec: Option<(&str, Duration)>,
 ) -> Result<std::process::Output, CourierError> {
-    if let Some((timeout_label, timeout)) = timeout_spec {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CourierError::ToolTimedOut {
-                        tool: tool.to_string(),
-                        timeout: timeout_label.to_string(),
-                    });
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(source) => {
-                    return Err(CourierError::WaitTool {
-                        tool: tool.to_string(),
-                        source,
-                    });
-                }
-            }
-        }
+    if let Some((timeout_label, timeout)) = timeout_spec
+        && wait_for_child_timeout(&mut child, Some(timeout), Duration::from_millis(10))
+            .map_err(|source| CourierError::WaitTool {
+                tool: tool.to_string(),
+                source,
+            })?
+            .is_none()
+    {
+        kill_child_and_wait(&mut child);
+        return Err(CourierError::ToolTimedOut {
+            tool: tool.to_string(),
+            timeout: timeout_label.to_string(),
+        });
     }
     child
         .wait_with_output()
@@ -215,21 +209,39 @@ fn write_tool_input(
     child: &mut Child,
     input: Option<&str>,
 ) -> Result<(), CourierError> {
-    if let Some(input) = input
-        && let Some(stdin) = child.stdin.as_mut()
-    {
-        use std::io::Write as _;
-        if let Err(source) = stdin.write_all(input.as_bytes())
-            && source.kind() != ErrorKind::BrokenPipe
-        {
-            return Err(CourierError::WriteToolInput {
-                tool: tool.alias.clone(),
-                source,
-            });
+    write_child_stdin(child, input.map(str::as_bytes), BrokenPipePolicy::Ignore).map_err(|source| {
+        CourierError::WriteToolInput {
+            tool: tool.alias.clone(),
+            source,
         }
+    })
+}
+
+fn runner_already_references_packaged_path(tool: &LocalToolSpec, packaged_path: &str) -> bool {
+    if tool.command() == packaged_path {
+        return true;
     }
-    drop(child.stdin.take());
-    Ok(())
+    tool.args()
+        .iter()
+        .any(|arg| arg_matches_packaged_path(arg, packaged_path))
+}
+
+fn arg_matches_packaged_path(arg: &str, packaged_path: &str) -> bool {
+    if arg == packaged_path {
+        return true;
+    }
+
+    let normalized_arg = arg
+        .trim_start_matches("./")
+        .trim_start_matches(".\\")
+        .replace('\\', "/");
+    let normalized_packaged = packaged_path.replace('\\', "/");
+
+    normalized_arg == normalized_packaged
+        || Path::new(&normalized_arg)
+            .file_name()
+            .zip(Path::new(&normalized_packaged).file_name())
+            .is_some_and(|(left, right)| left == right)
 }
 
 // Execute a tool whose spec has already been resolved. Callers are responsible
@@ -268,7 +280,7 @@ where
 
     let mut command = Command::new(tool.command());
     command.args(tool.args());
-    if tool.command() == packaged_path || tool.args().iter().any(|arg| arg == packaged_path) {
+    if runner_already_references_packaged_path(tool, packaged_path) {
         command.current_dir(parcel.parcel_dir.join("context"));
     } else {
         command.arg(&tool_path);
@@ -360,7 +372,7 @@ pub(super) fn execute_local_tool_in_docker(
     command.arg(&courier.helper_image);
     command.arg(tool.command());
     command.args(tool.args());
-    if tool.command() != packaged_path {
+    if !runner_already_references_packaged_path(tool, packaged_path) {
         command.arg(packaged_path);
     }
     command.stdin(Stdio::piped());
@@ -530,4 +542,30 @@ pub(super) fn configured_llm_timeout_ms(
 ) -> Result<Option<u64>, CourierError> {
     configured_timeout_duration(timeouts, "LLM")
         .map(|timeout| timeout.map(|duration| duration.as_millis() as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arg_matches_packaged_path;
+
+    #[test]
+    fn arg_matches_packaged_path_accepts_windows_relative_runner_path() {
+        assert!(arg_matches_packaged_path(
+            ".\\tools\\demo.cmd",
+            "tools/demo.cmd"
+        ));
+    }
+
+    #[test]
+    fn arg_matches_packaged_path_accepts_exact_packaged_path() {
+        assert!(arg_matches_packaged_path("tools/demo.sh", "tools/demo.sh"));
+    }
+
+    #[test]
+    fn arg_matches_packaged_path_rejects_different_tool() {
+        assert!(!arg_matches_packaged_path(
+            ".\\tools\\other.cmd",
+            "tools/demo.cmd"
+        ));
+    }
 }

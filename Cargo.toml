@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/dispatch-process",
     "crates/dispatch-core",
     "crates/dispatch-cli",
     "crates/dispatch-courier-echo",

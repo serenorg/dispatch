@@ -1,3 +1,4 @@
+use dispatch_process::run_command_with_file_capture;
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, kill},
@@ -73,42 +74,19 @@ fn run_dispatch(
     let capture_dir = tempdir()?;
     let stdout_path = capture_dir.path().join("stdout.txt");
     let stderr_path = capture_dir.path().join("stderr.txt");
-    let stdout_file = fs::File::create(&stdout_path)?;
-    let stderr_file = fs::File::create(&stderr_path)?;
     let mut command = Command::new(&dispatch_bin);
-    command
-        .current_dir(cwd)
-        .args(args)
-        .stdout(stdout_file)
-        .stderr(stderr_file);
+    command.current_dir(cwd).args(args);
     for (name, value) in envs {
         command.env(name, value);
     }
-
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "`{}` {:?} timed out after 15s",
-                dispatch_bin.display(),
-                args
-            )
-            .into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-
-    Ok(std::process::Output {
-        status,
-        stdout: fs::read(stdout_path)?,
-        stderr: fs::read(stderr_path)?,
-    })
+    run_command_with_file_capture(
+        &mut command,
+        &stdout_path,
+        &stderr_path,
+        Duration::from_secs(15),
+        Duration::from_millis(50),
+    )
+    .map_err(Into::into)
 }
 
 fn output_text(output: &std::process::Output) -> (String, String) {
