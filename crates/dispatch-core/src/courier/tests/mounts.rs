@@ -1,4 +1,5 @@
 use super::*;
+use std::path::MAIN_SEPARATOR;
 
 #[test]
 fn builtin_mounts_scope_session_state_per_session_and_memory_per_parcel() {
@@ -24,10 +25,11 @@ ENTRYPOINT chat
     let second_memory_db = mount_path(&second_session, MountKind::Memory, "sqlite");
     let first_artifacts = mount_path(&first_session, MountKind::Artifacts, "local");
     let second_artifacts = mount_path(&second_session, MountKind::Artifacts, "local");
+    let sessions_segment = format!("{sep}sessions{sep}", sep = MAIN_SEPARATOR);
 
     assert_ne!(first_session_db, second_session_db);
-    assert!(first_session_db.contains("/sessions/"));
-    assert!(second_session_db.contains("/sessions/"));
+    assert!(first_session_db.contains(&sessions_segment));
+    assert!(second_session_db.contains(&sessions_segment));
     assert_eq!(first_memory_db, second_memory_db);
     assert!(first_memory_db.ends_with("memory.sqlite"));
     assert_eq!(first_artifacts, second_artifacts);
