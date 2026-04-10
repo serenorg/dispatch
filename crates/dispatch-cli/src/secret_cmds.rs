@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::{io::Read as _, path::PathBuf};
 
+const MAX_SECRET_STDIN_BYTES: usize = 1024 * 1024;
+
 pub(crate) fn init(path: PathBuf, force: bool, json: bool) -> Result<()> {
     let paths = dispatch_core::init_secret_store(&path, force)?;
     if json {
@@ -58,10 +60,45 @@ pub(crate) fn ls(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn read_secret_value_from_stdin() -> Result<String> {
+    read_secret_value(std::io::stdin())
+}
+
+fn read_secret_value(reader: impl std::io::Read) -> Result<String> {
     let mut value = String::new();
-    std::io::stdin().read_to_string(&mut value)?;
+    let limit = (MAX_SECRET_STDIN_BYTES as u64) + 1;
+    reader.take(limit).read_to_string(&mut value)?;
+    if value.len() > MAX_SECRET_STDIN_BYTES {
+        anyhow::bail!(
+            "stdin secret value exceeds maximum size of {} bytes",
+            MAX_SECRET_STDIN_BYTES
+        );
+    }
     while matches!(value.chars().last(), Some('\n' | '\r')) {
         value.pop();
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_secret_value;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_secret_value_trims_trailing_newlines() {
+        let value = read_secret_value(Cursor::new("secret-value\r\n")).expect("value");
+        assert_eq!(value, "secret-value");
+    }
+
+    #[test]
+    fn read_secret_value_rejects_oversized_input() {
+        let oversized = "x".repeat(super::MAX_SECRET_STDIN_BYTES + 1);
+        let error = read_secret_value(Cursor::new(oversized)).expect_err("oversized stdin");
+        assert!(
+            error
+                .to_string()
+                .contains("stdin secret value exceeds maximum size"),
+            "unexpected error: {error}"
+        );
+    }
 }
