@@ -2,6 +2,28 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.2.0] - 2026-04-10
+
+Security and hardening release.
+
+### Security
+
+- Signing secret key files are now written with restricted permissions (0600 on Unix)
+- HTTP depot tag reads are bounded to 1 MiB
+- HTTP depot blob reads are bounded to 512 MiB
+- HTTP depot error-body reads are bounded to 64 KiB
+- `dispatch secret set` now supports `--value-stdin` to avoid exposing secrets in argv and shell history
+- Local tools no longer inherit `HOME` from the host environment
+- Parcels declaring `NETWORK` rules are rejected until courier enforcement is implemented
+- Secret stdin input via `--value-stdin` is capped at 1 MiB
+
+### Changed
+
+- Replaced direct `libc` calls with `nix` wrappers for Unix process operations; only the `pre_exec` detach closure retains raw `libc` for async-signal-safety
+- Secret store temp-file writes use unique per-process paths to prevent collisions
+- Detached-run liveness checks now use process-group liveness when a distinct stored process group ID is tracked
+- Signing key writes use atomic temp-file paths with per-process uniqueness
+
 ## [0.1.0] - 2026-04-09
 
 First public release.
