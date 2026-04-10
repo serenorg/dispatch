@@ -8,7 +8,6 @@ mod http;
 use http::{pull_http_parcel, push_http_parcel};
 use std::{
     fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -116,6 +115,8 @@ pub enum DepotError {
         status: u16,
         body: String,
     },
+    #[error("response from `{url}` exceeded {limit} bytes")]
+    HttpBodyTooLarge { url: String, limit: usize },
     #[error("walk error for `{path}`: {source}")]
     Walk {
         path: String,

@@ -4,14 +4,18 @@ use ring::{
     signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::io::Write as _;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
 
 pub const DISPATCH_SIGNATURE_ALGORITHM: &str = "ed25519";
 pub const PARCEL_SIGNATURES_DIR: &str = "signatures";
+static SIGNING_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretKeyFile {
@@ -129,8 +133,8 @@ pub fn generate_keypair_files(
 
     let secret_key_path = output_dir.join(format!("{key_id}.dispatch-secret.json"));
     let public_key_path = output_dir.join(format!("{key_id}.dispatch-public.json"));
-    write_json(&secret_key_path, &secret_key)?;
-    write_json(&public_key_path, &public_key)?;
+    write_json(&secret_key_path, &secret_key, SecretFileMode::Restricted)?;
+    write_json(&public_key_path, &public_key, SecretFileMode::Default)?;
 
     Ok(GeneratedKeyPair {
         secret_key_path,
@@ -164,7 +168,7 @@ pub fn sign_parcel(parcel_path: &Path, secret_key_path: &Path) -> Result<PathBuf
             source,
         })?;
     }
-    write_json(&signature_path, &signature)?;
+    write_json(&signature_path, &signature, SecretFileMode::Default)?;
     Ok(signature_path)
 }
 
@@ -244,15 +248,79 @@ where
     })
 }
 
-fn write_json<T>(path: &Path, value: &T) -> Result<(), SigningError>
+#[derive(Clone, Copy)]
+enum SecretFileMode {
+    Default,
+    Restricted,
+}
+
+fn write_json<T>(path: &Path, value: &T, mode: SecretFileMode) -> Result<(), SigningError>
 where
     T: Serialize,
 {
     let body = serde_json::to_string_pretty(value)?;
-    fs::write(path, body).map_err(|source| SigningError::WriteFile {
+    atomic_write_text(path, &body, mode).map_err(|source| SigningError::WriteFile {
         path: path.display().to_string(),
         source,
     })
+}
+
+fn atomic_write_text(
+    path: &Path,
+    contents: &str,
+    mode: SecretFileMode,
+) -> Result<(), std::io::Error> {
+    let temp_path = temporary_write_path(path);
+    write_text_file(&temp_path, contents, mode)?;
+    #[cfg(unix)]
+    {
+        fs::rename(&temp_path, path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::remove_file(path);
+        fs::rename(&temp_path, path)
+    }
+}
+
+fn write_text_file(
+    path: &Path,
+    contents: &str,
+    mode: SecretFileMode,
+) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let unix_mode = match mode {
+            SecretFileMode::Default => 0o644,
+            SecretFileMode::Restricted => 0o600,
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(unix_mode)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        fs::write(path, contents)
+    }
+}
+
+fn temporary_write_path(path: &Path) -> PathBuf {
+    let counter = SIGNING_TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("signing");
+    path.with_file_name(format!(".{file_name}.{pid}.{counter}.tmp"))
 }
 
 fn validate_key_id(key_id: &str) -> Result<(), SigningError> {
@@ -348,5 +416,21 @@ mod tests {
         let verification =
             verify_parcel_signature(&built.parcel_dir, &keys.public_key_path).unwrap();
         assert!(verification.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_keypair_restricts_secret_key_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let keys = generate_keypair_files(&dir.path().join("keys"), "release").unwrap();
+        let mode = fs::metadata(&keys.secret_key_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
     }
 }

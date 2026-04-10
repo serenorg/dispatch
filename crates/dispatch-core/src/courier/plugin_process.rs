@@ -267,3 +267,19 @@ pub(super) fn describe_plugin_response(response: &PluginResponse) -> &'static st
         PluginResponse::Error { .. } => "error",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::read_plugin_response;
+    use crate::plugin_protocol::PluginResponse;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_plugin_response_accepts_eof_terminated_json() {
+        let mut reader = Cursor::new(br#"{"kind":"ok"}"#.to_vec());
+
+        let response = read_plugin_response(&mut reader, "demo").unwrap();
+
+        assert_eq!(response, PluginResponse::Ok);
+    }
+}

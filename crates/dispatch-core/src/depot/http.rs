@@ -1,8 +1,15 @@
 use super::*;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-use std::{fs, io::Cursor};
+use std::{
+    fs,
+    io::{Cursor, Read as _},
+};
 use tar::{Archive, Builder};
+
+const MAX_HTTP_ERROR_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BLOB_BYTES: usize = 512 * 1024 * 1024;
+const MAX_HTTP_TAG_BYTES: usize = 1024 * 1024;
 
 pub(super) fn push_http_parcel(
     parcel: &LoadedParcel,
@@ -65,7 +72,7 @@ pub(super) fn pull_http_parcel(
             source,
         })?;
     let tag_response = ensure_http_success(tag_response, &tag_location)?;
-    let tag_bytes = read_http_body(tag_response, &tag_location)?;
+    let tag_bytes = read_http_body(tag_response, &tag_location, MAX_HTTP_TAG_BYTES)?;
     let tag_record: DepotTagRecord =
         serde_json::from_slice(&tag_bytes).map_err(|source| DepotError::ParseTagRecord {
             path: tag_location.clone(),
@@ -84,7 +91,7 @@ pub(super) fn pull_http_parcel(
             source,
         })?;
     let blob_response = ensure_http_success(blob_response, &blob_location)?;
-    let blob_bytes = read_http_body(blob_response, &blob_location)?;
+    let blob_bytes = read_http_body(blob_response, &blob_location, MAX_HTTP_BLOB_BYTES)?;
 
     let parcel_dir = output_root.join(&tag_record.digest);
     if parcel_dir.exists() {
@@ -222,7 +229,14 @@ fn ensure_http_success(
     if response.status().is_success() {
         return Ok(response);
     }
-    let body = response.body_mut().read_to_string().unwrap_or_default();
+    let body = match read_bounded_bytes(
+        &mut response.body_mut().as_reader(),
+        url,
+        MAX_HTTP_ERROR_BYTES,
+    ) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => "<error body omitted>".to_string(),
+    };
     Err(DepotError::HttpStatus {
         url: url.to_string(),
         status: response.status().as_u16(),
@@ -233,15 +247,103 @@ fn ensure_http_success(
 fn read_http_body(
     mut response: ureq::http::Response<ureq::Body>,
     url: &str,
+    limit: usize,
+) -> Result<Vec<u8>, DepotError> {
+    if response
+        .headers()
+        .get(ureq::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|content_length| content_length > limit as u64)
+    {
+        return Err(DepotError::HttpBodyTooLarge {
+            url: url.to_string(),
+            limit,
+        });
+    }
+    let mut reader = response.body_mut().as_reader();
+    read_bounded_bytes(&mut reader, url, limit)
+}
+
+fn read_bounded_bytes(
+    reader: &mut dyn std::io::Read,
+    url: &str,
+    limit: usize,
 ) -> Result<Vec<u8>, DepotError> {
     let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
+    reader
+        .take((limit as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| DepotError::ReadFile {
             path: url.to_string(),
             source,
         })?;
+    if bytes.len() > limit {
+        return Err(DepotError::HttpBodyTooLarge {
+            url: url.to_string(),
+            limit,
+        });
+    }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_HTTP_ERROR_BYTES, ensure_http_success, read_bounded_bytes, read_http_body};
+    use crate::DepotError;
+    use std::io::Cursor;
+    use ureq::{Body, http::Response};
+
+    #[test]
+    fn read_bounded_bytes_rejects_oversized_payloads() {
+        let mut reader = Cursor::new(vec![b'x'; 9]);
+
+        let error = read_bounded_bytes(&mut reader, "http://example.test/blob", 8).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DepotError::HttpBodyTooLarge { limit, .. } if limit == 8
+        ));
+    }
+
+    #[test]
+    fn read_bounded_bytes_accepts_payloads_within_limit() {
+        let mut reader = Cursor::new(b"hello".to_vec());
+
+        let body = read_bounded_bytes(&mut reader, "http://example.test/blob", 8).unwrap();
+
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn read_http_body_rejects_content_length_over_limit() {
+        let response = Response::builder()
+            .status(200)
+            .header("content-length", "9")
+            .body(Body::builder().data("ignored"))
+            .unwrap();
+
+        let error = read_http_body(response, "http://example.test/blob", 8).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DepotError::HttpBodyTooLarge { limit, .. } if limit == 8
+        ));
+    }
+
+    #[test]
+    fn ensure_http_success_truncates_large_error_bodies() {
+        let oversized = vec![b'x'; MAX_HTTP_ERROR_BYTES + 1];
+        let response = Response::builder()
+            .status(500)
+            .body(Body::builder().data(oversized))
+            .unwrap();
+
+        let error = ensure_http_success(response, "http://example.test/blob").unwrap_err();
+
+        assert!(matches!(
+            error,
+            DepotError::HttpStatus { ref body, .. } if body == "<error body omitted>"
+        ));
+    }
 }
