@@ -1950,8 +1950,9 @@ fn write_http_response(
 
 #[cfg(unix)]
 fn current_process_group_id() -> Option<u32> {
-    let pgid = unsafe { libc::getpgid(0) };
-    if pgid < 0 { None } else { Some(pgid as u32) }
+    nix::unistd::getpgid(None)
+        .ok()
+        .map(|pgid| pgid.as_raw() as u32)
 }
 
 #[cfg(not(unix))]

@@ -13,3 +13,4 @@ categories = ["development-tools"]
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+nix = { workspace = true, features = ["process", "signal"] }

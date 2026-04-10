@@ -12,6 +12,12 @@ use std::{
 compile_error!("dispatch-process currently supports only Unix and Windows targets");
 
 #[cfg(unix)]
+use nix::{
+    errno::Errno,
+    sys::signal::{Signal, kill, killpg},
+    unistd::Pid,
+};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -49,6 +55,10 @@ pub fn configure_detached_command(command: &mut Command) {
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
+    // SAFETY: pre_exec runs after fork and before exec. Only raw libc calls are
+    // used here because this closure must stay in the async-signal-safe post-fork
+    // context until exec. setsid() creates a new session so the child survives
+    // parent terminal closure, and signal() ignores SIGHUP for detached children.
     #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
@@ -105,14 +115,10 @@ pub fn kill_child_and_wait(child: &mut Child) {
 
 #[cfg(unix)]
 pub fn pid_is_running(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    if rc == 0 {
-        return true;
+    match kill(Pid::from_raw(pid as i32), None::<Signal>) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(_) => false,
     }
-    matches!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(code) if code == libc::EPERM
-    )
 }
 
 #[cfg(windows)]
@@ -133,20 +139,21 @@ pub fn pid_is_running(pid: u32) -> bool {
 
 #[cfg(unix)]
 pub fn terminate_target(target: TerminationTarget, force: bool) -> io::Result<()> {
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-    let process = match target {
-        TerminationTarget::Pid(pid) => pid as i32,
-        TerminationTarget::ProcessGroup(process_group_id) => -(process_group_id as i32),
+    let signal = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
     };
-    let rc = unsafe { libc::kill(process, signal) };
-    if rc == 0 {
-        return Ok(());
+    let result = match target {
+        TerminationTarget::Pid(pid) => kill(Pid::from_raw(pid as i32), signal),
+        TerminationTarget::ProcessGroup(process_group_id) => {
+            killpg(Pid::from_raw(process_group_id as i32), signal)
+        }
+    };
+    match result {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(error)
 }
 
 #[cfg(windows)]

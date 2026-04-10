@@ -829,7 +829,6 @@ dependencies = [
  "dispatch-process",
  "futures",
  "jsonschema",
- "libc",
  "nix 0.31.2",
  "serde",
  "serde_json",
@@ -881,6 +880,7 @@ name = "dispatch-process"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nix 0.31.2",
 ]
 
 [[package]]
