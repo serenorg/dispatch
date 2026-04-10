@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::{io::Read as _, path::PathBuf};
 
 pub(crate) fn init(path: PathBuf, force: bool, json: bool) -> Result<()> {
     let paths = dispatch_core::init_secret_store(&path, force)?;
@@ -22,8 +22,15 @@ pub(crate) fn init(path: PathBuf, force: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn set(path: PathBuf, name: &str, value: &str) -> Result<()> {
-    let paths = dispatch_core::set_secret(&path, name, value)?;
+pub(crate) fn set(path: PathBuf, name: &str, value: Option<&str>, value_stdin: bool) -> Result<()> {
+    let value = if let Some(value) = value {
+        value.to_string()
+    } else if value_stdin {
+        read_secret_value_from_stdin()?
+    } else {
+        unreachable!("clap enforces that either --value or --value-stdin is provided");
+    };
+    let paths = dispatch_core::set_secret(&path, name, &value)?;
     println!("Stored secret `{name}` in {}", paths.secrets_dir.display());
     Ok(())
 }
@@ -48,4 +55,13 @@ pub(crate) fn ls(path: PathBuf, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_secret_value_from_stdin() -> Result<String> {
+    let mut value = String::new();
+    std::io::stdin().read_to_string(&mut value)?;
+    while matches!(value.chars().last(), Some('\n' | '\r')) {
+        value.pop();
+    }
+    Ok(value)
 }

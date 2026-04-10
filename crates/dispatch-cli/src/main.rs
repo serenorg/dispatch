@@ -770,8 +770,15 @@ enum SecretCommand {
         /// Secret name declared via `SECRET`
         name: String,
         /// Secret value to encrypt into the local store
-        #[arg(long)]
-        value: String,
+        #[arg(
+            long,
+            conflicts_with = "value_stdin",
+            required_unless_present = "value_stdin"
+        )]
+        value: Option<String>,
+        /// Read the secret value from stdin instead of command-line arguments
+        #[arg(long, conflicts_with = "value", required_unless_present = "value")]
+        value_stdin: bool,
         /// Project root, Agentfile path, or parcel path
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -1165,7 +1172,12 @@ fn state_command(command: StateCommand) -> Result<()> {
 fn secret_command(command: SecretCommand) -> Result<()> {
     match command {
         SecretCommand::Init { path, force, json } => secret_cmds::init(path, force, json),
-        SecretCommand::Set { name, value, path } => secret_cmds::set(path, &name, &value),
+        SecretCommand::Set {
+            name,
+            value,
+            value_stdin,
+            path,
+        } => secret_cmds::set(path, &name, value.as_deref(), value_stdin),
         SecretCommand::Rm { name, path } => secret_cmds::rm(path, &name),
         SecretCommand::List { path, json } => secret_cmds::ls(path, json),
     }
@@ -1580,12 +1592,44 @@ mod tests {
         let Command::Secret { command } = set.command else {
             panic!("expected secret command");
         };
-        let SecretCommand::Set { name, value, path } = command else {
+        let SecretCommand::Set {
+            name,
+            value,
+            value_stdin,
+            path,
+        } = command
+        else {
             panic!("expected secret set command");
         };
         assert_eq!(name, "OPENAI_API_KEY");
-        assert_eq!(value, "secret");
+        assert_eq!(value.as_deref(), Some("secret"));
+        assert!(!value_stdin);
         assert_eq!(path, Path::new("examples/demo"));
+
+        let set_stdin = Cli::try_parse_from([
+            "dispatch",
+            "secret",
+            "set",
+            "OPENAI_API_KEY",
+            "--value-stdin",
+        ])
+        .unwrap();
+        let Command::Secret { command } = set_stdin.command else {
+            panic!("expected secret command");
+        };
+        let SecretCommand::Set {
+            name,
+            value,
+            value_stdin,
+            path,
+        } = command
+        else {
+            panic!("expected secret set command");
+        };
+        assert_eq!(name, "OPENAI_API_KEY");
+        assert_eq!(value, None);
+        assert!(value_stdin);
+        assert_eq!(path, Path::new("."));
 
         let ls = Cli::try_parse_from(["dispatch", "secret", "ls", "--json"]).unwrap();
         let Command::Secret { command } = ls.command else {

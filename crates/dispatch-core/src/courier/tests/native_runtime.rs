@@ -558,6 +558,7 @@ ENTRYPOINT job
             "secret-value".to_string(),
         ),
         ("CAST_HIDDEN_ENV".to_string(), "hidden-value".to_string()),
+        ("HOME".to_string(), "/home/secret".to_string()),
     ]);
 
     let result = run_local_tool_with_env(&test_parcel.parcel, "envcheck", None, |name| {
@@ -569,4 +570,5 @@ ENTRYPOINT job
     assert!(result.stdout.contains("visible_secret=secret-value"));
     assert!(result.stdout.contains("hidden_env="));
     assert!(!result.stdout.contains("hidden_env=hidden-value"));
+    assert!(!result.stdout.contains("/home/secret"));
 }

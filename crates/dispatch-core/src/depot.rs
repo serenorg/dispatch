@@ -511,7 +511,7 @@ mod tests {
     use crate::{BuildOptions, BuiltParcel, ParcelManifest, build_agentfile, verify_parcel};
     use std::{
         collections::HashMap,
-        io::{BufRead, BufReader, Write},
+        io::{BufRead, BufReader, Read, Write},
         net::{TcpListener, TcpStream},
         sync::mpsc,
         thread,

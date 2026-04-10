@@ -533,7 +533,7 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     let mut env = Vec::new();
-    for var in ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"] {
+    for var in ["PATH", "TMPDIR", "TEMP", "TMP"] {
         if let Some(value) = env_lookup(var) {
             env.push((var.to_string(), value));
         }
