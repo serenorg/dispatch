@@ -3,17 +3,18 @@ use super::*;
 #[test]
 fn native_courier_enforces_tool_timeout_for_local_tools() {
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 TIMEOUT TOOL 50ms
-TOOL LOCAL tools/slow.py AS slow USING python3 -u
+TOOL LOCAL {} AS slow
 ENTRYPOINT job
 ",
+            test_tool_relative_path("slow")
+        ),
         &[(
-            "tools/slow.py",
-            "import time\n\
-time.sleep(0.2)\n\
-print('done')\n",
+            &test_tool_relative_path("slow"),
+            &test_tool_sleep_and_print_body(200, "done"),
         )],
     );
 
@@ -27,17 +28,18 @@ print('done')\n",
 #[test]
 fn native_courier_caps_tool_timeout_by_remaining_run_budget() {
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 TIMEOUT RUN 100ms
-TOOL LOCAL tools/slow.py AS slow USING python3 -u
+TOOL LOCAL {} AS slow
 ENTRYPOINT job
 ",
+            test_tool_relative_path("slow")
+        ),
         &[(
-            "tools/slow.py",
-            "import time\n\
-time.sleep(0.2)\n\
-print('done')\n",
+            &test_tool_relative_path("slow"),
+            &test_tool_sleep_and_print_body(200, "done"),
         )],
     );
     let courier = NativeCourier::default();
@@ -58,7 +60,6 @@ print('done')\n",
         },
     ))
     .unwrap_err();
-
     assert!(matches!(
         error,
         CourierError::ToolTimedOut { ref tool, ref timeout }

@@ -400,6 +400,17 @@ fn test_tool_close_stdin_and_print_body(output: &str) -> String {
     }
 }
 
+fn test_tool_sleep_and_print_body(duration_ms: u64, output: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "@echo off\r\npowershell -NoProfile -Command \"Start-Sleep -Milliseconds {duration_ms}\"\r\necho {output}\r\n"
+        )
+    } else {
+        let seconds = (duration_ms as f64) / 1000.0;
+        format!("#!/bin/sh\nsleep {seconds:.3}\nprintf '{output}'\n")
+    }
+}
+
 #[cfg(unix)]
 fn build_test_plugin_courier(
     dir: &tempfile::TempDir,
