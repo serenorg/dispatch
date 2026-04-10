@@ -3,7 +3,8 @@ use atomic_write_file::AtomicWriteFile;
 use chrono::{DateTime, TimeZone, Utc};
 use cron::Schedule;
 use dispatch_process::{
-    TerminationTarget, configure_detached_command, pid_is_running, terminate_target,
+    TerminationTarget, configure_detached_command, pid_is_running, process_group_is_running,
+    terminate_target,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -394,14 +395,17 @@ pub(crate) fn restart(args: crate::RestartArgs) -> Result<()> {
             grace_period_ms: args.grace_period_ms,
         })?;
         if let Some(pid) = previous_pid {
-            wait_for_pid_exit(pid, Duration::from_millis(args.grace_period_ms)).with_context(
-                || {
-                    format!(
-                        "run `{}` did not stop before restart; try again with --force",
-                        record.run_id
-                    )
-                },
-            )?;
+            wait_for_pid_exit(
+                pid,
+                record.process_group_id,
+                Duration::from_millis(args.grace_period_ms),
+            )
+            .with_context(|| {
+                format!(
+                    "run `{}` did not stop before restart; try again with --force",
+                    record.run_id
+                )
+            })?;
         }
         record = load_run_record(&record_path)?;
     }
@@ -1196,7 +1200,7 @@ fn refresh_run_record(record_path: &Path, record: &mut RunRecord) -> Result<()> 
     let Some(pid) = record.pid else {
         return Ok(());
     };
-    if pid_is_running(pid) {
+    if process_is_running(pid, record.process_group_id) {
         return Ok(());
     }
     if let Some(snapshot) = load_terminal_snapshot(record_path)? {
@@ -1209,10 +1213,10 @@ fn refresh_run_record(record_path: &Path, record: &mut RunRecord) -> Result<()> 
     persist_run_record(record_path, record)
 }
 
-fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
+fn wait_for_pid_exit(pid: u32, process_group_id: Option<u32>, timeout: Duration) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if !pid_is_running(pid) {
+        if !process_is_running(pid, process_group_id) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
@@ -1230,10 +1234,20 @@ fn stop_process(record: &RunRecord, force: bool, grace_period: Duration) -> Resu
     }
 
     terminate_record(record, false)?;
-    if wait_for_pid_exit(pid, grace_period).is_ok() {
+    if wait_for_pid_exit(pid, record.process_group_id, grace_period).is_ok() {
         return Ok(());
     }
     terminate_record(record, true)
+}
+
+fn process_is_running(pid: u32, process_group_id: Option<u32>) -> bool {
+    if let Some(process_group_id) = process_group_id
+        && process_group_id != pid
+        && process_group_is_running(process_group_id)
+    {
+        return true;
+    }
+    pid_is_running(pid)
 }
 
 fn terminate_record(record: &RunRecord, force: bool) -> Result<()> {
@@ -2297,6 +2311,24 @@ mod tests {
                 .unwrap_or_default()
                 .contains("before recording terminal state")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_run_record_keeps_active_record_when_process_group_is_alive() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.json");
+        let mut record = sample_run_record(dir.path());
+        record.status = RunStatus::Running;
+        record.pid = Some(nonexistent_test_pid());
+        record.process_group_id = super::current_process_group_id();
+        super::persist_run_record(&path, &record).unwrap();
+
+        super::refresh_run_record(&path, &mut record).unwrap();
+
+        assert_eq!(record.status, RunStatus::Running);
+        assert_eq!(record.exit_code, None);
+        assert!(record.last_error.is_none());
     }
 
     #[test]

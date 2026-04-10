@@ -8,6 +8,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use thiserror::Error;
 
@@ -16,6 +17,7 @@ const SECRET_STORE_FILE: &str = "store.dispatch-secrets.json";
 const SECRET_KEY_FILE: &str = "key";
 const SECRET_STORE_VERSION: u32 = 1;
 const SECRET_KEY_BYTES: usize = 32;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretStorePaths {
@@ -412,7 +414,7 @@ fn decrypt_envelope(
 }
 
 fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> {
-    let temp_path = path.with_extension("tmp");
+    let temp_path = temporary_write_path(path);
     fs::write(&temp_path, contents)?;
     #[cfg(unix)]
     {
@@ -423,6 +425,16 @@ fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> 
         let _ = fs::remove_file(path);
         fs::rename(&temp_path, path)
     }
+}
+
+fn temporary_write_path(path: &Path) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("store");
+    path.with_file_name(format!(".{file_name}.{pid}.{counter}.tmp"))
 }
 
 fn set_secret_key_permissions(path: &Path) -> Result<(), std::io::Error> {
@@ -506,5 +518,16 @@ mod tests {
         let mode = fs::metadata(&paths.key_path).unwrap().permissions().mode() & 0o777;
 
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn temporary_write_path_is_unique_per_call() {
+        let path = Path::new("/tmp/store.dispatch-secrets.json");
+        let first = temporary_write_path(path);
+        let second = temporary_write_path(path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), path.parent());
+        assert_eq!(second.parent(), path.parent());
     }
 }

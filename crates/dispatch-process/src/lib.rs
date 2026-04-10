@@ -121,6 +121,14 @@ pub fn pid_is_running(pid: u32) -> bool {
     }
 }
 
+#[cfg(unix)]
+pub fn process_group_is_running(process_group_id: u32) -> bool {
+    match killpg(Pid::from_raw(process_group_id as i32), None::<Signal>) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
 #[cfg(windows)]
 pub fn pid_is_running(pid: u32) -> bool {
     let output = match Command::new("tasklist")
@@ -135,6 +143,11 @@ pub fn pid_is_running(pid: u32) -> bool {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout.trim_start().starts_with('"')
+}
+
+#[cfg(windows)]
+pub fn process_group_is_running(process_group_id: u32) -> bool {
+    pid_is_running(process_group_id)
 }
 
 #[cfg(unix)]
