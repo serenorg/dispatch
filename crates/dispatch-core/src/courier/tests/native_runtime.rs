@@ -111,6 +111,28 @@ ENTRYPOINT chat
 }
 
 #[test]
+fn native_courier_rejects_unenforced_network_rules() {
+    let test_parcel = build_test_parcel(
+        "\
+FROM dispatch/native:latest
+NETWORK allow api.example.com
+ENTRYPOINT chat
+",
+        &[],
+    );
+    let courier = NativeCourier::default();
+
+    let error =
+        futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CourierError::UnsupportedNetworkPolicy { courier, action, target }
+            if courier == "native" && action == "allow" && target == "api.example.com"
+    ));
+}
+
+#[test]
 fn native_courier_prompt_run_emits_events_and_increments_turns() {
     let test_parcel = build_test_parcel(
         "\

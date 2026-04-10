@@ -1,7 +1,7 @@
 use crate::{
     manifest::{
         A2aAuthScheme, A2aEndpointMode, InstructionKind, ModelReference, MountConfig, MountKind,
-        ParcelManifest, ToolApprovalPolicy, ToolConfig, ToolRiskLevel,
+        NetworkRule, ParcelManifest, ToolApprovalPolicy, ToolConfig, ToolRiskLevel,
     },
     plugin_protocol::{PluginRequest, PluginResponse},
     plugins::CourierPluginManifest,
@@ -198,6 +198,14 @@ pub enum CourierError {
         courier: String,
         kind: MountKind,
         driver: String,
+    },
+    #[error(
+        "courier `{courier}` does not enforce NETWORK {action} {target}; NETWORK rules are parsed but not yet enforced by this courier"
+    )]
+    UnsupportedNetworkPolicy {
+        courier: String,
+        action: String,
+        target: String,
     },
     #[error("failed to start tool `{tool}`: {source}")]
     SpawnTool {
@@ -1375,7 +1383,11 @@ impl CourierBackend for DockerCourier {
         parcel: &LoadedParcel,
     ) -> impl Future<Output = Result<(), CourierError>> + Send {
         let reference = parcel.config.courier.reference().to_string();
-        async move { validate_courier_reference("docker", CourierKind::Docker, &reference) }
+        let network = parcel.config.network.clone();
+        async move {
+            validate_courier_reference("docker", CourierKind::Docker, &reference)?;
+            ensure_network_rules_supported("docker", &network)
+        }
     }
 
     fn inspect(
@@ -1398,6 +1410,7 @@ impl CourierBackend for DockerCourier {
         };
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
+            ensure_network_rules_supported("docker", &parcel.config.network)?;
             Ok(inspection)
         }
     }
@@ -1411,6 +1424,7 @@ impl CourierBackend for DockerCourier {
         let entrypoint = parcel.config.entrypoint.clone();
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
+            ensure_network_rules_supported("docker", &parcel.config.network)?;
             validate_required_secrets(parcel)?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let session_id = format!("docker-{parcel_digest}-{sequence}");
@@ -1446,6 +1460,7 @@ impl CourierBackend for DockerCourier {
                 CourierKind::Docker,
                 parcel.config.courier.reference(),
             )?;
+            ensure_network_rules_supported("docker", &parcel.config.network)?;
             ensure_session_matches_parcel(parcel, &session)?;
             ensure_operation_matches_entrypoint(&session, &operation)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
@@ -1626,6 +1641,7 @@ impl CourierBackend for JsonlCourierPlugin {
         let courier = self.clone();
         let parcel_dir = canonical_parcel_dir(parcel);
         async move {
+            ensure_network_rules_supported(&courier.manifest.name, &parcel.config.network)?;
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::ValidateParcel { parcel_dir })? {
                 PluginResponse::Ok => Ok(()),
@@ -1648,6 +1664,7 @@ impl CourierBackend for JsonlCourierPlugin {
         let courier = self.clone();
         let parcel_dir = canonical_parcel_dir(parcel);
         async move {
+            ensure_network_rules_supported(&courier.manifest.name, &parcel.config.network)?;
             let parcel_dir = parcel_dir?;
             match courier.plugin_request(PluginRequest::Inspect { parcel_dir })? {
                 PluginResponse::Inspection { inspection } => Ok(inspection),
@@ -1670,6 +1687,7 @@ impl CourierBackend for JsonlCourierPlugin {
         let courier = self.clone();
         let parcel_dir = canonical_parcel_dir(parcel);
         async move {
+            ensure_network_rules_supported(&courier.manifest.name, &parcel.config.network)?;
             validate_required_secrets(parcel)?;
             let capabilities = courier.capabilities().await?;
             ensure_mounts_supported(
@@ -1709,6 +1727,7 @@ impl CourierBackend for JsonlCourierPlugin {
         let operation = request.operation;
         let session = request.session;
         async move {
+            ensure_network_rules_supported(&courier.manifest.name, &parcel.config.network)?;
             ensure_session_matches_parcel(parcel, &session)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
             if consumes_run_budget {
@@ -1997,6 +2016,7 @@ impl CourierBackend for WasmCourier {
                 CourierKind::Wasm,
                 parcel.config.courier.reference(),
             )?;
+            ensure_network_rules_supported("wasm", &parcel.config.network)?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
             let _ = load_wasm_component(&engine, &component_cache, &parcel, &component_path)?;
@@ -2017,6 +2037,7 @@ impl CourierBackend for WasmCourier {
                 CourierKind::Wasm,
                 parcel.config.courier.reference(),
             )?;
+            ensure_network_rules_supported("wasm", &parcel.config.network)?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
             let _ = load_wasm_component(&engine, &component_cache, &parcel, &component_path)?;
@@ -2049,6 +2070,7 @@ impl CourierBackend for WasmCourier {
                 CourierKind::Wasm,
                 parcel.config.courier.reference(),
             )?;
+            ensure_network_rules_supported("wasm", &parcel.config.network)?;
             validate_required_secrets(&parcel)?;
             let component_path = resolve_wasm_component_path(&parcel)?;
             validate_wasm_component_metadata(&parcel)?;
@@ -2089,6 +2111,7 @@ impl CourierBackend for WasmCourier {
                 CourierKind::Wasm,
                 parcel.config.courier.reference(),
             )?;
+            ensure_network_rules_supported("wasm", &parcel.config.network)?;
             ensure_session_matches_parcel(&parcel, &session)?;
             validate_wasm_component_metadata(&parcel)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
@@ -2251,7 +2274,11 @@ impl CourierBackend for StubCourier {
         let courier_id = self.courier_id;
         let kind = self.kind;
         let reference = parcel.config.courier.reference().to_string();
-        async move { validate_courier_reference(courier_id, kind, &reference) }
+        let network = parcel.config.network.clone();
+        async move {
+            validate_courier_reference(courier_id, kind, &reference)?;
+            ensure_network_rules_supported(courier_id, &network)
+        }
     }
 
     fn inspect(
@@ -2276,6 +2303,7 @@ impl CourierBackend for StubCourier {
         };
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;
+            ensure_network_rules_supported(courier_id, &parcel.config.network)?;
             Ok(inspection)
         }
     }
@@ -2291,6 +2319,7 @@ impl CourierBackend for StubCourier {
         let entrypoint = parcel.config.entrypoint.clone();
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;
+            ensure_network_rules_supported(courier_id, &parcel.config.network)?;
             validate_required_secrets(parcel)?;
             ensure_mounts_supported(courier_id, parcel.config.mounts.as_slice(), &[])?;
             let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2322,6 +2351,7 @@ impl CourierBackend for StubCourier {
 
         async move {
             validate_courier_reference(&courier_id, kind, &reference)?;
+            ensure_network_rules_supported(&courier_id, &parcel.config.network)?;
             ensure_session_matches_parcel(parcel, &session)?;
             let consumes_run_budget = operation_counts_toward_run_budget(&operation);
             if consumes_run_budget {
@@ -2415,7 +2445,22 @@ fn validate_native_parcel(parcel: &LoadedParcel) -> Result<(), CourierError> {
         "native",
         CourierKind::Native,
         parcel.config.courier.reference(),
-    )
+    )?;
+    ensure_network_rules_supported("native", &parcel.config.network)
+}
+
+fn ensure_network_rules_supported(
+    courier: &str,
+    network_rules: &[NetworkRule],
+) -> Result<(), CourierError> {
+    let Some(rule) = network_rules.first() else {
+        return Ok(());
+    };
+    Err(CourierError::UnsupportedNetworkPolicy {
+        courier: courier.to_string(),
+        action: rule.action.clone(),
+        target: rule.target.clone(),
+    })
 }
 
 fn instruction_heading(kind: InstructionKind) -> &'static str {

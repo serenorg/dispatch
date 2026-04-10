@@ -49,6 +49,30 @@ ENTRYPOINT chat
 
 #[test]
 #[cfg(unix)]
+fn jsonl_plugin_courier_rejects_unenforced_network_rules() {
+    let test_parcel = build_test_parcel(
+        "\
+FROM dispatch/custom:latest
+NETWORK allow api.example.com
+ENTRYPOINT chat
+",
+        &[],
+    );
+    let (courier, _) =
+        build_test_plugin_courier(&test_parcel._dir, &test_parcel.parcel.config.digest, false);
+
+    let error =
+        futures::executor::block_on(courier.validate_parcel(&test_parcel.parcel)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CourierError::UnsupportedNetworkPolicy { courier, action, target }
+            if courier == "demo-plugin" && action == "allow" && target == "api.example.com"
+    ));
+}
+
+#[test]
+#[cfg(unix)]
 fn jsonl_plugin_courier_surfaces_structured_errors() {
     let test_parcel = build_test_parcel(
         "\
