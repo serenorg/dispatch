@@ -29,10 +29,11 @@ pub use channel_plugin_protocol::{
     IngressState, RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
 };
 pub use channel_plugins::{
-    ChannelCatalogEntry, ChannelPluginCallError, ChannelPluginExec, ChannelPluginManifest,
-    ChannelPluginRegistry, call_channel_plugin, default_channel_registry_path,
-    install_channel_plugin, list_channel_catalog, load_channel_registry, resolve_channel_plugin,
-    validate_channel_plugin_manifest,
+    ChannelCatalogEntry, ChannelIngressEndpoint, ChannelIngressTrust, ChannelPluginCallError,
+    ChannelPluginExec, ChannelPluginIngress, ChannelPluginManifest, ChannelPluginRegistry,
+    call_channel_plugin, default_channel_registry_path, install_channel_plugin,
+    list_channel_catalog, load_channel_registry, resolve_channel_plugin,
+    resolve_channel_plugin_for_ingress, validate_channel_plugin_manifest,
 };
 // Keep the crate root focused on the primary parcel/courier entrypoints.
 // Lower-level courier modeling types remain available under `dispatch_core::courier`.

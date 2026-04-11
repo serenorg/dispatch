@@ -649,8 +649,8 @@ enum ChannelCommand {
     },
     /// Send a structured ingress_event request to an installed channel plugin
     Ingress {
-        /// Channel plugin name
-        name: String,
+        /// Channel plugin name; if omitted, Dispatch resolves it from path and method
+        name: Option<String>,
         /// Raw JSON for the plugin-specific channel config object
         #[arg(long, conflicts_with = "config_file")]
         config_json: Option<String>,
@@ -685,6 +685,47 @@ enum ChannelCommand {
         #[arg(long)]
         received_at: Option<String>,
         /// Print the full plugin response as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+    /// Bind an HTTP listener and forward requests to one installed channel plugin
+    Listen {
+        /// Channel plugin name
+        name: String,
+        /// Raw JSON for the plugin-specific channel config object
+        #[arg(long, conflicts_with = "config_file")]
+        config_json: Option<String>,
+        /// Path to a JSON file containing the plugin-specific channel config object
+        #[arg(long, conflicts_with = "config_json")]
+        config_file: Option<PathBuf>,
+        /// Listen address in HOST:PORT form
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+        /// Optional parcel or Agentfile path to execute for each inbound event
+        #[arg(long)]
+        parcel: Option<PathBuf>,
+        /// Courier backend to use when `--parcel` is set
+        #[arg(long = "courier", default_value = "native")]
+        courier: String,
+        /// Override the courier plugin registry path used with `--parcel`
+        #[arg(long = "courier-registry")]
+        courier_registry: Option<PathBuf>,
+        /// Root directory for per-conversation session files when `--parcel` is set
+        #[arg(long = "session-root")]
+        session_root: Option<PathBuf>,
+        /// How to handle tools declared with `APPROVAL confirm` during parcel execution
+        #[arg(long, value_enum)]
+        tool_approval: Option<CliToolApprovalMode>,
+        /// Deliver assistant replies back through the channel plugin when possible
+        #[arg(long)]
+        deliver_replies: bool,
+        /// Exit after the first handled request
+        #[arg(long)]
+        once: bool,
+        /// Print emitted events as JSON instead of a short summary
         #[arg(long)]
         json: bool,
         /// Override the channel plugin registry path

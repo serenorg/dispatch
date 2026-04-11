@@ -101,6 +101,14 @@ pub enum PluginRegistryError {
     UnknownCourier { name: String },
     #[error("channel plugin `{name}` is not installed")]
     UnknownChannel { name: String },
+    #[error("no installed channel plugin matches ingress {method} {path}")]
+    NoChannelIngressMatch { method: String, path: String },
+    #[error("multiple installed channel plugins match ingress {method} {path}: {names:?}")]
+    AmbiguousChannelIngressMatch {
+        method: String,
+        path: String,
+        names: Vec<String>,
+    },
     #[error(
         "courier plugin manifest `{path}` references an executable path that is invalid: {message}"
     )]

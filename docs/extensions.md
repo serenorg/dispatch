@@ -73,6 +73,9 @@ dispatch channel install path/to/channel-plugin.json
 dispatch channel ls
 dispatch channel inspect <name>
 dispatch channel call <name> --request-json '{"kind":"capabilities"}'
+dispatch channel ingress --path /telegram/updates --header X-Telegram-Bot-Api-Secret-Token=... --body-file update.json
+dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json
+dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json --parcel ./Agentfile --session-root ./.dispatch/channel-sessions --deliver-replies
 ```
 
 ## Extension manifest format
@@ -213,10 +216,15 @@ Each response from the plugin is a single JSON line:
 When the host receives a webhook POST for a channel:
 
 1. Host sends `ingress_event` with the raw HTTP payload
-2. Plugin validates the signature (unless `trust_verified` is true)
-3. Plugin parses the platform-specific payload
-4. Plugin responds with normalized `InboundEventEnvelope`s
-5. Host returns the optional `callback_reply` to the webhook caller
+2. Host may validate a declared host-managed trust policy and set `trust_verified`
+3. Plugin validates the signature only when `trust_verified` is false
+4. Plugin parses the platform-specific payload
+5. Plugin responds with normalized `InboundEventEnvelope`s
+6. Host returns the optional `callback_reply` to the webhook caller
+
+Installed channel manifests may also retain ingress endpoint declarations so
+the host can match a request path and method before forwarding the payload to
+the plugin.
 
 ### Status frame kinds
 

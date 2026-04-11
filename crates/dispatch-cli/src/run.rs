@@ -23,6 +23,35 @@ pub(crate) fn run(args: crate::RunArgs) -> Result<()> {
     run_into(args, &mut output)
 }
 
+pub(crate) fn execute_chat_turn(
+    path: PathBuf,
+    courier_name: String,
+    registry: Option<PathBuf>,
+    session_file: Option<PathBuf>,
+    input: String,
+    tool_approval: crate::CliToolApprovalMode,
+    a2a_policy: crate::CliA2aPolicy,
+) -> Result<dispatch_core::CourierResponse> {
+    crate::with_cli_a2a_policy(a2a_policy, || {
+        crate::with_cli_tool_approval(tool_approval, || {
+            match resolve_courier(&courier_name, registry.as_deref())? {
+                ResolvedCourier::Builtin(courier) => execute_chat_turn_with_builtin_courier(
+                    courier,
+                    path,
+                    session_file.as_deref(),
+                    input,
+                ),
+                ResolvedCourier::Plugin(plugin) => execute_chat_turn_with_courier(
+                    dispatch_core::JsonlCourierPlugin::new(plugin),
+                    path,
+                    session_file.as_deref(),
+                    input,
+                ),
+            }
+        })
+    })
+}
+
 pub(crate) fn run_into(args: crate::RunArgs, output: &mut impl io::Write) -> Result<()> {
     let policy = crate::CliA2aPolicy {
         allowed_origins: args.exec.a2a_allowed_origins.clone(),
@@ -39,6 +68,25 @@ pub(crate) fn run_into(args: crate::RunArgs, output: &mut impl io::Write) -> Res
     })
 }
 
+fn execute_chat_turn_with_builtin_courier(
+    courier: BuiltinCourier,
+    path: PathBuf,
+    session_file: Option<&Path>,
+    input: String,
+) -> Result<dispatch_core::CourierResponse> {
+    match courier {
+        BuiltinCourier::Native => {
+            execute_chat_turn_with_courier(NativeCourier::default(), path, session_file, input)
+        }
+        BuiltinCourier::Docker => {
+            execute_chat_turn_with_courier(DockerCourier::default(), path, session_file, input)
+        }
+        BuiltinCourier::Wasm => {
+            execute_chat_turn_with_courier(WasmCourier::new()?, path, session_file, input)
+        }
+    }
+}
+
 fn run_with_builtin_courier(
     courier: BuiltinCourier,
     args: crate::RunArgs,
@@ -49,6 +97,26 @@ fn run_with_builtin_courier(
         BuiltinCourier::Docker => run_with_courier(DockerCourier::default(), args, output),
         BuiltinCourier::Wasm => run_with_courier(WasmCourier::new()?, args, output),
     }
+}
+
+fn execute_chat_turn_with_courier<R: CourierBackend>(
+    courier: R,
+    path: PathBuf,
+    session_file: Option<&Path>,
+    input: String,
+) -> Result<dispatch_core::CourierResponse> {
+    let parcel = load_or_build_parcel_for_run(path)?;
+    let session = load_or_open_session(&courier, &parcel, session_file)?;
+    let response = block_on(courier.run(
+        &parcel,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat { input },
+        },
+    ))
+    .with_context(|| "failed to execute chat turn")?;
+    persist_session(session_file, &response.session)?;
+    Ok(response)
 }
 
 fn run_with_courier<R: CourierBackend>(

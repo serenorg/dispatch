@@ -1,18 +1,24 @@
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use dispatch_core::{
-    ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse, IngressPayload,
+    ChannelIngressEndpoint, ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse,
+    CourierEvent, DeliveryReceipt, InboundEventEnvelope, IngressCallbackReply, IngressPayload,
     call_channel_plugin, default_channel_registry_path, install_channel_plugin,
-    list_channel_catalog, resolve_channel_plugin,
+    list_channel_catalog, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
+    io::{BufRead, BufReader, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 struct ChannelIngressArgs<'a> {
-    name: &'a str,
+    name: Option<&'a str>,
     config_json: Option<&'a str>,
     config_file: Option<&'a Path>,
     method: &'a str,
@@ -39,6 +45,32 @@ struct IngressRequestParts<'a> {
     endpoint_id: Option<String>,
     trust_verified: bool,
     received_at: Option<String>,
+}
+
+struct ChannelListenArgs<'a> {
+    name: &'a str,
+    config_json: Option<&'a str>,
+    config_file: Option<&'a Path>,
+    listen: &'a str,
+    parcel: Option<&'a Path>,
+    courier: &'a str,
+    courier_registry: Option<&'a Path>,
+    session_root: Option<&'a Path>,
+    tool_approval: Option<crate::CliToolApprovalMode>,
+    deliver_replies: bool,
+    once: bool,
+    emit_json: bool,
+    registry: Option<&'a Path>,
+}
+
+struct ChannelParcelBridge {
+    parcel_path: PathBuf,
+    parcel_digest: String,
+    courier: String,
+    courier_registry: Option<PathBuf>,
+    session_root: PathBuf,
+    tool_approval: crate::CliToolApprovalMode,
+    deliver_replies: bool,
 }
 
 pub(crate) fn channel_command(command: crate::ChannelCommand) -> Result<()> {
@@ -81,7 +113,7 @@ pub(crate) fn channel_command(command: crate::ChannelCommand) -> Result<()> {
             json,
             registry,
         } => channel_ingress(ChannelIngressArgs {
-            name: &name,
+            name: name.as_deref(),
             config_json: config_json.as_deref(),
             config_file: config_file.as_deref(),
             method: &method,
@@ -95,6 +127,35 @@ pub(crate) fn channel_command(command: crate::ChannelCommand) -> Result<()> {
             received_at,
             registry: registry.as_deref(),
             emit_json: json,
+        }),
+        crate::ChannelCommand::Listen {
+            name,
+            config_json,
+            config_file,
+            listen,
+            parcel,
+            courier,
+            courier_registry,
+            session_root,
+            tool_approval,
+            deliver_replies,
+            once,
+            json,
+            registry,
+        } => channel_listen(ChannelListenArgs {
+            name: &name,
+            config_json: config_json.as_deref(),
+            config_file: config_file.as_deref(),
+            listen: &listen,
+            parcel: parcel.as_deref(),
+            courier: &courier,
+            courier_registry: courier_registry.as_deref(),
+            session_root: session_root.as_deref(),
+            tool_approval,
+            deliver_replies,
+            once,
+            emit_json: json,
+            registry: registry.as_deref(),
         }),
     }
 }
@@ -114,9 +175,14 @@ fn channel_ls(registry: Option<&Path>, emit_json: bool) -> Result<()> {
 
     for entry in catalog {
         let platform = entry.platform.as_deref().unwrap_or("-");
+        let ingress = if entry.ingress_paths.is_empty() {
+            "-".to_string()
+        } else {
+            entry.ingress_paths.join(",")
+        };
         println!(
-            "{}\t{}\tprotocol-v{}/{:?}\t{}",
-            entry.name, platform, entry.protocol_version, entry.transport, entry.command
+            "{}\t{}\tprotocol-v{}/{:?}\t{}\t{}",
+            entry.name, platform, entry.protocol_version, entry.transport, ingress, entry.command
         );
     }
 
@@ -160,7 +226,10 @@ fn channel_call(
 }
 
 fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
-    let plugin = resolve_channel_plugin(args.name, args.registry)?;
+    let plugin = match args.name {
+        Some(name) => resolve_channel_plugin(name, args.registry)?,
+        None => resolve_channel_plugin_for_ingress(args.method, args.path, args.registry)?,
+    };
     let config = load_json_value(args.config_json, args.config_file, "channel config")?;
     let request = build_ingress_request(IngressRequestParts {
         config,
@@ -176,7 +245,52 @@ fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
     })?;
     let response = call_channel_plugin(&plugin, request)?;
 
+    if args.name.is_none() && !args.emit_json {
+        println!("Resolved Plugin: {}", plugin.name);
+    }
+
     print_channel_response(response, args.emit_json)
+}
+
+fn channel_listen(args: ChannelListenArgs<'_>) -> Result<()> {
+    let plugin = resolve_channel_plugin(args.name, args.registry)?;
+    let config = load_json_value(args.config_json, args.config_file, "channel config")?;
+    let parcel_bridge = prepare_channel_parcel_bridge(
+        args.parcel,
+        args.courier,
+        args.courier_registry,
+        args.session_root,
+        args.tool_approval,
+        args.deliver_replies,
+    )?;
+    let listener = TcpListener::bind(args.listen)
+        .with_context(|| format!("failed to bind {}", args.listen))?;
+    println!("Listening on {}", listener.local_addr()?);
+    if let Some(parcel_bridge) = &parcel_bridge {
+        println!(
+            "Parcel bridge: {} via {} (sessions under {})",
+            parcel_bridge.parcel_path.display(),
+            parcel_bridge.courier,
+            parcel_bridge.session_root.display()
+        );
+    }
+
+    loop {
+        let (stream, remote_addr) = listener.accept().context("failed to accept connection")?;
+        handle_channel_listener_connection(
+            &plugin,
+            &config,
+            stream,
+            remote_addr,
+            parcel_bridge.as_ref(),
+            args.emit_json,
+        )?;
+        if args.once {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> Result<()> {
@@ -261,6 +375,23 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedHttpRequest {
+    method: String,
+    target: String,
+    path: String,
+    query: Option<String>,
+    headers: BTreeMap<String, String>,
+    body: Option<String>,
+}
+
+#[derive(Debug)]
+struct IngressTrustFailure {
+    status_code: u16,
+    status_text: &'static str,
+    message: String,
+}
+
 fn load_request(
     request_json: Option<&str>,
     request_file: Option<&Path>,
@@ -343,6 +474,669 @@ fn parse_key_value_pairs(entries: &[String], field_name: &str) -> Result<BTreeMa
     Ok(values)
 }
 
+fn handle_channel_listener_connection(
+    plugin: &ChannelPluginManifest,
+    config: &Value,
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    parcel_bridge: Option<&ChannelParcelBridge>,
+    emit_json: bool,
+) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("failed to configure ingress read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .context("failed to configure ingress write timeout")?;
+    let mut writer = stream
+        .try_clone()
+        .context("failed to clone ingress connection")?;
+    let mut reader = BufReader::new(stream);
+    let request = match parse_http_request(&mut reader, 1024 * 1024, 64 * 1024) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_http_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                Some("text/plain; charset=utf-8"),
+                &format!("invalid request: {error}\n"),
+            );
+        }
+    };
+
+    let matched_endpoint =
+        match plugin_match_ingress_endpoint(plugin, &request.method, &request.path) {
+            Some(endpoint) => endpoint,
+            None => {
+                return write_http_response(
+                    &mut writer,
+                    404,
+                    "Not Found",
+                    Some("text/plain; charset=utf-8"),
+                    "request did not match an installed ingress endpoint\n",
+                );
+            }
+        };
+    let trust_verified = match verify_host_managed_ingress_trust(plugin, &request.headers) {
+        Ok(verified) => verified,
+        Err(error) => {
+            return write_http_response(
+                &mut writer,
+                error.status_code,
+                error.status_text,
+                Some("text/plain; charset=utf-8"),
+                &format!("{}\n", error.message),
+            );
+        }
+    };
+
+    let response = call_channel_plugin(
+        plugin,
+        ChannelPluginRequest::IngressEvent {
+            config: config.clone(),
+            payload: IngressPayload {
+                endpoint_id: Some(format!("{}:{}", plugin.name, matched_endpoint.path)),
+                method: request.method.clone(),
+                path: request.path.clone(),
+                headers: request.headers.clone(),
+                query: parse_query_string(request.query.as_deref()),
+                body: request.body.clone().unwrap_or_default(),
+                trust_verified,
+                received_at: Some(Utc::now().to_rfc3339()),
+            },
+        },
+    );
+
+    match response {
+        Ok(ChannelPluginResponse::IngressEventsReceived {
+            events,
+            callback_reply,
+        }) => {
+            let parcel_runs = if let Some(parcel_bridge) = parcel_bridge {
+                execute_channel_parcel_runs(plugin, parcel_bridge, config, &events)?
+            } else {
+                Vec::new()
+            };
+            if emit_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "plugin": plugin.name,
+                        "events": events,
+                        "parcel_runs": parcel_runs,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Ingress {} {} from {} -> {} event(s)",
+                    request.method,
+                    request.path,
+                    remote_addr,
+                    events.len()
+                );
+                for parcel_run in &parcel_runs {
+                    println!(
+                        "Parcel {} -> {}",
+                        parcel_run.event_id,
+                        parcel_run.session_file.display()
+                    );
+                    if let Some(delivery) = &parcel_run.delivery {
+                        println!(
+                            "Delivered reply: {} -> {}",
+                            delivery.message_id, delivery.conversation_id
+                        );
+                    }
+                    if !parcel_run.output.is_empty() {
+                        print!("{}", parcel_run.output);
+                    }
+                }
+            }
+
+            let reply = callback_reply.unwrap_or(IngressCallbackReply {
+                status: 200,
+                content_type: Some("text/plain; charset=utf-8".to_string()),
+                body: String::new(),
+            });
+            write_http_response(
+                &mut writer,
+                reply.status,
+                http_status_text(reply.status),
+                reply.content_type.as_deref(),
+                &reply.body,
+            )
+        }
+        Ok(ChannelPluginResponse::Error { error }) => write_http_response(
+            &mut writer,
+            502,
+            "Bad Gateway",
+            Some("text/plain; charset=utf-8"),
+            &format!("channel plugin error {}: {}\n", error.code, error.message),
+        ),
+        Ok(other) => write_http_response(
+            &mut writer,
+            502,
+            "Bad Gateway",
+            Some("text/plain; charset=utf-8"),
+            &format!(
+                "channel plugin returned unexpected response variant for ingress: {:?}\n",
+                response_kind(&other)
+            ),
+        ),
+        Err(error) => write_http_response(
+            &mut writer,
+            502,
+            "Bad Gateway",
+            Some("text/plain; charset=utf-8"),
+            &format!("failed to call channel plugin: {error}\n"),
+        ),
+    }
+}
+
+fn plugin_match_ingress_endpoint<'a>(
+    plugin: &'a ChannelPluginManifest,
+    method: &str,
+    path: &str,
+) -> Option<&'a ChannelIngressEndpoint> {
+    plugin.ingress.as_ref()?.endpoints.iter().find(|endpoint| {
+        endpoint.path == path
+            && (endpoint.methods.is_empty()
+                || endpoint
+                    .methods
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(method)))
+    })
+}
+
+fn verify_host_managed_ingress_trust(
+    plugin: &ChannelPluginManifest,
+    headers: &BTreeMap<String, String>,
+) -> Result<bool, IngressTrustFailure> {
+    let Some(ingress) = &plugin.ingress else {
+        return Ok(false);
+    };
+    let Some(trust) = &ingress.trust else {
+        return Ok(false);
+    };
+    if !trust.host_managed {
+        return Ok(false);
+    }
+
+    match trust.mode.as_str() {
+        "shared_secret_header" => {
+            let header_name = trust.header_name.as_deref().ok_or_else(|| IngressTrustFailure {
+                status_code: 500,
+                status_text: "Internal Server Error",
+                message: format!(
+                    "channel plugin `{}` declares host-managed shared_secret_header trust without header_name",
+                    plugin.name
+                ),
+            })?;
+            let secret_name = trust.secret_name.as_deref().ok_or_else(|| IngressTrustFailure {
+                status_code: 500,
+                status_text: "Internal Server Error",
+                message: format!(
+                    "channel plugin `{}` declares host-managed shared_secret_header trust without secret_name",
+                    plugin.name
+                ),
+            })?;
+            let header_key = header_name.to_ascii_lowercase();
+            let actual_secret = headers
+                .get(&header_key)
+                .ok_or_else(|| IngressTrustFailure {
+                    status_code: 403,
+                    status_text: "Forbidden",
+                    message: format!("missing required ingress trust header {header_name}"),
+                })?;
+            let expected_secret = std::env::var(secret_name).map_err(|_| IngressTrustFailure {
+                status_code: 500,
+                status_text: "Internal Server Error",
+                message: format!("host-managed ingress trust secret {secret_name} is not set"),
+            })?;
+            if actual_secret != &expected_secret {
+                return Err(IngressTrustFailure {
+                    status_code: 403,
+                    status_text: "Forbidden",
+                    message: format!("ingress trust header {header_name} did not match"),
+                });
+            }
+            Ok(true)
+        }
+        other => Err(IngressTrustFailure {
+            status_code: 500,
+            status_text: "Internal Server Error",
+            message: format!(
+                "channel plugin `{}` declares unsupported host-managed ingress trust mode `{other}`",
+                plugin.name
+            ),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ChannelParcelRunResult {
+    event_id: String,
+    session_file: PathBuf,
+    output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<DeliveryReceipt>,
+}
+
+fn prepare_channel_parcel_bridge(
+    parcel: Option<&Path>,
+    courier: &str,
+    courier_registry: Option<&Path>,
+    session_root: Option<&Path>,
+    tool_approval: Option<crate::CliToolApprovalMode>,
+    deliver_replies: bool,
+) -> Result<Option<ChannelParcelBridge>> {
+    let Some(parcel) = parcel else {
+        return Ok(None);
+    };
+
+    let loaded = crate::run::load_or_build_parcel_for_run(parcel.to_path_buf())?;
+    let session_root = match session_root {
+        Some(root) => root.to_path_buf(),
+        None => env::current_dir()
+            .context("failed to resolve current working directory")?
+            .join(".dispatch/channel-sessions"),
+    };
+
+    Ok(Some(ChannelParcelBridge {
+        parcel_path: loaded.parcel_dir.clone(),
+        parcel_digest: loaded.config.digest.clone(),
+        courier: courier.to_string(),
+        courier_registry: courier_registry.map(PathBuf::from),
+        session_root,
+        tool_approval: crate::resolve_noninteractive_tool_approval_mode(tool_approval),
+        deliver_replies,
+    }))
+}
+
+fn execute_channel_parcel_runs(
+    plugin: &ChannelPluginManifest,
+    parcel_bridge: &ChannelParcelBridge,
+    config: &Value,
+    events: &[InboundEventEnvelope],
+) -> Result<Vec<ChannelParcelRunResult>> {
+    let mut results = Vec::with_capacity(events.len());
+    for event in events {
+        let session_file = channel_event_session_file(parcel_bridge, plugin, event);
+        let input = render_inbound_event_chat_input(plugin, event)?;
+        let response = crate::run::execute_chat_turn(
+            parcel_bridge.parcel_path.clone(),
+            parcel_bridge.courier.clone(),
+            parcel_bridge.courier_registry.clone(),
+            Some(session_file.clone()),
+            input,
+            parcel_bridge.tool_approval,
+            crate::CliA2aPolicy::default(),
+        )?;
+        let mut output = Vec::new();
+        crate::run::print_courier_events(&mut output, &response.events)?;
+        let delivery = if parcel_bridge.deliver_replies {
+            if let Some(reply_text) = extract_assistant_reply(&response.events) {
+                deliver_channel_reply(plugin, event, config, &reply_text)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        results.push(ChannelParcelRunResult {
+            event_id: event.event_id.clone(),
+            session_file,
+            output: String::from_utf8_lossy(&output).into_owned(),
+            delivery,
+        });
+    }
+    Ok(results)
+}
+
+fn channel_event_session_file(
+    parcel_bridge: &ChannelParcelBridge,
+    plugin: &ChannelPluginManifest,
+    event: &InboundEventEnvelope,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(plugin.name.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(parcel_bridge.parcel_digest.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(event.platform.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(event.conversation.id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(
+        event
+            .conversation
+            .thread_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    parcel_bridge
+        .session_root
+        .join(&plugin.name)
+        .join(format!("{}.session.json", &digest[..24]))
+}
+
+fn render_inbound_event_chat_input(
+    plugin: &ChannelPluginManifest,
+    event: &InboundEventEnvelope,
+) -> Result<String> {
+    let event_json = serde_json::to_string_pretty(event)?;
+    Ok(format!(
+        "Dispatch inbound channel event\nplugin: {}\nplatform: {}\nevent_type: {}\nconversation_id: {}\nthread_id: {}\nactor_id: {}\nactor_name: {}\nmessage_id: {}\ncontent_type: {}\n\nUser message:\n{}\n\nRaw event JSON:\n{}\n",
+        plugin.name,
+        event.platform,
+        event.event_type,
+        event.conversation.id,
+        event.conversation.thread_id.as_deref().unwrap_or(""),
+        event.actor.id,
+        event
+            .actor
+            .display_name
+            .as_deref()
+            .or(event.actor.username.as_deref())
+            .unwrap_or(""),
+        event.message.id,
+        event.message.content_type,
+        event.message.content,
+        event_json
+    ))
+}
+
+fn extract_assistant_reply(events: &[CourierEvent]) -> Option<String> {
+    let mut streamed = String::new();
+    let mut latest_message = None;
+    for event in events {
+        match event {
+            CourierEvent::TextDelta { content } => streamed.push_str(content),
+            CourierEvent::Message { role, content } if role == "assistant" => {
+                latest_message = Some(content.clone());
+            }
+            _ => {}
+        }
+    }
+    if !streamed.is_empty() {
+        Some(streamed)
+    } else {
+        latest_message
+    }
+}
+
+fn deliver_channel_reply(
+    plugin: &ChannelPluginManifest,
+    event: &InboundEventEnvelope,
+    config: &Value,
+    reply_text: &str,
+) -> Result<Option<DeliveryReceipt>> {
+    let Some(message) = build_channel_reply_message(plugin, event, reply_text) else {
+        return Ok(None);
+    };
+
+    let response = call_channel_plugin(
+        plugin,
+        ChannelPluginRequest::Deliver {
+            config: config.clone(),
+            message,
+        },
+    )?;
+    match response {
+        ChannelPluginResponse::Delivered { delivery } => Ok(Some(delivery)),
+        ChannelPluginResponse::Error { error } => bail!(
+            "channel plugin error {} while delivering reply: {}",
+            error.code,
+            error.message
+        ),
+        other => bail!(
+            "channel plugin returned unexpected response variant for delivery: {}",
+            response_kind(&other)
+        ),
+    }
+}
+
+fn build_channel_reply_message(
+    plugin: &ChannelPluginManifest,
+    event: &InboundEventEnvelope,
+    reply_text: &str,
+) -> Option<Value> {
+    let platform = plugin
+        .platform
+        .as_deref()
+        .unwrap_or(event.platform.as_str());
+    let mut message = serde_json::Map::new();
+    message.insert("content".to_string(), Value::String(reply_text.to_string()));
+
+    match platform {
+        "telegram" => {
+            message.insert(
+                "chat_id".to_string(),
+                Value::String(event.conversation.id.clone()),
+            );
+            if let Ok(message_id) = event.message.id.parse::<i64>() {
+                message.insert(
+                    "reply_to_message_id".to_string(),
+                    Value::Number(message_id.into()),
+                );
+            }
+            if let Some(thread_id) = event.conversation.thread_id.as_deref()
+                && let Ok(thread_id) = thread_id.parse::<i64>()
+            {
+                message.insert(
+                    "message_thread_id".to_string(),
+                    Value::Number(thread_id.into()),
+                );
+            }
+        }
+        "slack" => {
+            message.insert(
+                "channel_id".to_string(),
+                Value::String(event.conversation.id.clone()),
+            );
+            if let Some(thread_id) = event.conversation.thread_id.as_deref() {
+                message.insert(
+                    "thread_ts".to_string(),
+                    Value::String(thread_id.to_string()),
+                );
+            }
+        }
+        "discord" => {
+            message.insert(
+                "channel_id".to_string(),
+                Value::String(event.conversation.id.clone()),
+            );
+            if let Some(thread_id) = event.conversation.thread_id.as_deref() {
+                message.insert(
+                    "thread_id".to_string(),
+                    Value::String(thread_id.to_string()),
+                );
+            }
+            message.insert(
+                "reply_to_message_id".to_string(),
+                Value::String(event.message.id.clone()),
+            );
+        }
+        "whatsapp" => {
+            message.insert(
+                "to_number".to_string(),
+                Value::String(event.conversation.id.clone()),
+            );
+            message.insert(
+                "reply_to_message_id".to_string(),
+                Value::String(event.message.id.clone()),
+            );
+        }
+        "twilio_sms" => {
+            message.insert(
+                "to_number".to_string(),
+                Value::String(event.conversation.id.clone()),
+            );
+        }
+        "webhook" => {
+            message.insert(
+                "conversation_id".to_string(),
+                Value::String(event.conversation.id.clone()),
+            );
+        }
+        _ => return None,
+    }
+
+    Some(Value::Object(message))
+}
+
+fn parse_query_string(query: Option<&str>) -> BTreeMap<String, String> {
+    let mut parsed = BTreeMap::new();
+    for pair in query.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = match pair.split_once('=') {
+            Some((name, value)) => (name, value),
+            None => (pair, ""),
+        };
+        if !name.is_empty() {
+            parsed.insert(name.to_string(), value.to_string());
+        }
+    }
+    parsed
+}
+
+fn parse_http_request(
+    reader: &mut impl BufRead,
+    max_body_bytes: usize,
+    max_header_bytes: usize,
+) -> Result<ParsedHttpRequest> {
+    let mut request_line = String::new();
+    let read = reader
+        .read_line(&mut request_line)
+        .context("failed to read request line")?;
+    if read == 0 {
+        bail!("empty request");
+    }
+    let mut header_bytes = request_line.len();
+    if header_bytes > max_header_bytes {
+        bail!("request headers exceed {max_header_bytes} bytes");
+    }
+    let request_line = request_line.trim_end();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_ascii_uppercase();
+    let target = parts.next().unwrap_or_default().to_string();
+    let version = parts.next().unwrap_or_default();
+    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/") {
+        bail!("malformed request line `{request_line}`");
+    }
+
+    let mut headers = BTreeMap::new();
+    let mut content_length = 0usize;
+    loop {
+        let mut header_line = String::new();
+        reader
+            .read_line(&mut header_line)
+            .context("failed to read request header")?;
+        header_bytes += header_line.len();
+        if header_bytes > max_header_bytes {
+            bail!("request headers exceed {max_header_bytes} bytes");
+        }
+        let header_line = header_line.trim_end();
+        if header_line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = header_line.split_once(':') else {
+            bail!("malformed header `{header_line}`");
+        };
+        let header_name = name.trim().to_ascii_lowercase();
+        let header_value = value.trim().to_string();
+        if header_name == "content-length" {
+            content_length = header_value
+                .parse::<usize>()
+                .with_context(|| format!("invalid content-length `{header_value}`"))?;
+        }
+        if header_name == "transfer-encoding" {
+            bail!("transfer-encoding is not supported");
+        }
+        headers.insert(header_name, header_value);
+    }
+
+    if content_length > max_body_bytes {
+        bail!("request body exceeds {max_body_bytes} bytes");
+    }
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .context("failed to read request body")?;
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (target.clone(), None),
+    };
+
+    Ok(ParsedHttpRequest {
+        method,
+        target,
+        path,
+        query,
+        headers,
+        body: if body.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&body).into_owned())
+        },
+    })
+}
+
+fn write_http_response(
+    writer: &mut impl Write,
+    status_code: u16,
+    status_text: &str,
+    content_type: Option<&str>,
+    body: &str,
+) -> Result<()> {
+    let content_type = content_type.unwrap_or("text/plain; charset=utf-8");
+    write!(
+        writer,
+        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .context("failed to write ingress response")
+}
+
+fn http_status_text(status_code: u16) -> &'static str {
+    match status_code {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        _ => "OK",
+    }
+}
+
+fn response_kind(response: &ChannelPluginResponse) -> &'static str {
+    match response {
+        ChannelPluginResponse::Capabilities { .. } => "capabilities",
+        ChannelPluginResponse::Configured { .. } => "configured",
+        ChannelPluginResponse::Health { .. } => "health",
+        ChannelPluginResponse::IngressStarted { .. } => "ingress_started",
+        ChannelPluginResponse::IngressStopped { .. } => "ingress_stopped",
+        ChannelPluginResponse::IngressEventsReceived { .. } => "ingress_events_received",
+        ChannelPluginResponse::Delivered { .. } => "delivered",
+        ChannelPluginResponse::Pushed { .. } => "pushed",
+        ChannelPluginResponse::StatusAccepted { .. } => "status_accepted",
+        ChannelPluginResponse::Error { .. } => "error",
+    }
+}
+
 fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
     println!("Name: {}", plugin.name);
     println!("Version: {}", plugin.version);
@@ -355,6 +1149,32 @@ fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
     if let Some(platform) = &plugin.platform {
         println!("Platform: {platform}");
     }
+    if let Some(ingress) = &plugin.ingress {
+        if !ingress.endpoints.is_empty() {
+            println!("Ingress Endpoints:");
+            for endpoint in &ingress.endpoints {
+                let methods = if endpoint.methods.is_empty() {
+                    "*".to_string()
+                } else {
+                    endpoint.methods.join(",")
+                };
+                println!(
+                    "  {} [{}] host_managed={}",
+                    endpoint.path, methods, endpoint.host_managed
+                );
+            }
+        }
+        if let Some(trust) = &ingress.trust {
+            println!("Ingress Trust: {}", trust.mode);
+            if let Some(header_name) = &trust.header_name {
+                println!("Trust Header: {header_name}");
+            }
+            if let Some(secret_name) = &trust.secret_name {
+                println!("Trust Secret: {secret_name}");
+            }
+            println!("Trust Host Managed: {}", trust.host_managed);
+        }
+    }
     if let Some(description) = &plugin.description {
         println!("Description: {description}");
     }
@@ -363,6 +1183,8 @@ fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dispatch_core::{ChannelIngressTrust, ChannelPluginIngress, ChannelPluginManifest};
+    use std::io::Cursor;
 
     #[test]
     fn parse_key_value_pairs_accepts_repeated_cli_entries() {
@@ -421,5 +1243,291 @@ mod tests {
         );
         assert_eq!(payload.endpoint_id.as_deref(), Some("endpoint-1"));
         assert!(payload.trust_verified);
+    }
+
+    #[test]
+    fn parse_query_string_extracts_pairs() {
+        let query = parse_query_string(Some("conversation_id=abc&thread_id=42&flag"));
+
+        assert_eq!(
+            query.get("conversation_id").map(String::as_str),
+            Some("abc")
+        );
+        assert_eq!(query.get("thread_id").map(String::as_str), Some("42"));
+        assert_eq!(query.get("flag").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn parse_http_request_reads_request_line_headers_and_body() {
+        let request = b"POST /hook?conversation_id=abc HTTP/1.1\r\nContent-Length: 5\r\nX-Test: value\r\n\r\nhello";
+        let parsed = parse_http_request(&mut Cursor::new(&request[..]), 1024, 1024)
+            .expect("parse http request");
+
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/hook");
+        assert_eq!(parsed.query.as_deref(), Some("conversation_id=abc"));
+        assert_eq!(parsed.body.as_deref(), Some("hello"));
+        assert_eq!(
+            parsed.headers.get("x-test").map(String::as_str),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn plugin_match_ingress_endpoint_respects_method_and_path() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-webhook".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: dispatch_core::plugins::PluginTransport::Jsonl,
+            description: None,
+            exec: dispatch_core::ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("webhook".to_string()),
+            ingress: Some(dispatch_core::ChannelPluginIngress {
+                endpoints: vec![dispatch_core::ChannelIngressEndpoint {
+                    path: "/webhook/inbound".to_string(),
+                    methods: vec!["POST".to_string()],
+                    host_managed: true,
+                }],
+                trust: None,
+            }),
+            installed_sha256: None,
+        };
+
+        assert!(plugin_match_ingress_endpoint(&plugin, "POST", "/webhook/inbound").is_some());
+        assert!(plugin_match_ingress_endpoint(&plugin, "GET", "/webhook/inbound").is_none());
+        assert!(plugin_match_ingress_endpoint(&plugin, "POST", "/other").is_none());
+    }
+
+    #[test]
+    fn verify_host_managed_ingress_trust_accepts_matching_shared_secret_header() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: dispatch_core::plugins::PluginTransport::Jsonl,
+            description: None,
+            exec: dispatch_core::ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: Some(ChannelPluginIngress {
+                endpoints: vec![dispatch_core::ChannelIngressEndpoint {
+                    path: "/telegram/updates".to_string(),
+                    methods: vec!["POST".to_string()],
+                    host_managed: true,
+                }],
+                trust: Some(ChannelIngressTrust {
+                    mode: "shared_secret_header".to_string(),
+                    header_name: Some("X-Telegram-Bot-Api-Secret-Token".to_string()),
+                    secret_name: Some("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET".to_string()),
+                    host_managed: true,
+                }),
+            }),
+            installed_sha256: None,
+        };
+        let headers = BTreeMap::from([(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "expected-secret".to_string(),
+        )]);
+
+        unsafe {
+            std::env::set_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET", "expected-secret");
+        }
+        let verified = verify_host_managed_ingress_trust(&plugin, &headers)
+            .expect("host-managed ingress trust should verify");
+        unsafe {
+            std::env::remove_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET");
+        }
+
+        assert!(verified);
+    }
+
+    #[test]
+    fn verify_host_managed_ingress_trust_rejects_mismatched_shared_secret_header() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: dispatch_core::plugins::PluginTransport::Jsonl,
+            description: None,
+            exec: dispatch_core::ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: Some(ChannelPluginIngress {
+                endpoints: vec![dispatch_core::ChannelIngressEndpoint {
+                    path: "/telegram/updates".to_string(),
+                    methods: vec!["POST".to_string()],
+                    host_managed: true,
+                }],
+                trust: Some(ChannelIngressTrust {
+                    mode: "shared_secret_header".to_string(),
+                    header_name: Some("X-Telegram-Bot-Api-Secret-Token".to_string()),
+                    secret_name: Some("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET".to_string()),
+                    host_managed: true,
+                }),
+            }),
+            installed_sha256: None,
+        };
+        let headers = BTreeMap::from([(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "wrong-secret".to_string(),
+        )]);
+
+        unsafe {
+            std::env::set_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET", "expected-secret");
+        }
+        let error = verify_host_managed_ingress_trust(&plugin, &headers)
+            .expect_err("mismatched host-managed ingress trust should fail");
+        unsafe {
+            std::env::remove_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET");
+        }
+
+        assert_eq!(error.status_code, 403);
+        assert!(error.message.contains("did not match"));
+    }
+
+    #[test]
+    fn channel_event_session_file_is_stable_for_same_thread() {
+        let parcel_bridge = ChannelParcelBridge {
+            parcel_path: PathBuf::from("/tmp/parcel"),
+            parcel_digest: "digest-123".to_string(),
+            courier: "native".to_string(),
+            courier_registry: None,
+            session_root: PathBuf::from("/tmp/channel-sessions"),
+            tool_approval: crate::CliToolApprovalMode::Never,
+            deliver_replies: false,
+        };
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: dispatch_core::plugins::PluginTransport::Jsonl,
+            description: None,
+            exec: dispatch_core::ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: None,
+            installed_sha256: None,
+        };
+        let event = sample_inbound_event();
+
+        let first = channel_event_session_file(&parcel_bridge, &plugin, &event);
+        let second = channel_event_session_file(&parcel_bridge, &plugin, &event);
+
+        assert_eq!(first, second);
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".session.json"))
+        );
+    }
+
+    #[test]
+    fn render_inbound_event_chat_input_includes_message_and_context() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: dispatch_core::plugins::PluginTransport::Jsonl,
+            description: None,
+            exec: dispatch_core::ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let rendered =
+            render_inbound_event_chat_input(&plugin, &sample_inbound_event()).expect("render");
+
+        assert!(rendered.contains("plugin: channel-telegram"));
+        assert!(rendered.contains("conversation_id: chat-123"));
+        assert!(rendered.contains("User message:\nhello from telegram"));
+        assert!(rendered.contains("\"event_id\": \"evt-1\""));
+    }
+
+    #[test]
+    fn extract_assistant_reply_prefers_streamed_deltas() {
+        let reply = extract_assistant_reply(&[
+            CourierEvent::TextDelta {
+                content: "hello ".to_string(),
+            },
+            CourierEvent::TextDelta {
+                content: "world".to_string(),
+            },
+            CourierEvent::Done,
+        ]);
+
+        assert_eq!(reply.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn build_channel_reply_message_maps_telegram_fields() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: dispatch_core::plugins::PluginTransport::Jsonl,
+            description: None,
+            exec: dispatch_core::ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let message = build_channel_reply_message(&plugin, &sample_inbound_event(), "reply text")
+            .expect("telegram reply message");
+
+        assert_eq!(message["content"], "reply text");
+        assert_eq!(message["chat_id"], "chat-123");
+        assert_eq!(message["reply_to_message_id"], 1);
+        assert_eq!(message["message_thread_id"], 7);
+    }
+
+    fn sample_inbound_event() -> InboundEventEnvelope {
+        InboundEventEnvelope {
+            event_id: "evt-1".to_string(),
+            platform: "telegram".to_string(),
+            event_type: "message".to_string(),
+            received_at: "2026-04-11T00:00:00Z".to_string(),
+            conversation: dispatch_core::InboundConversationRef {
+                id: "chat-123".to_string(),
+                kind: "private".to_string(),
+                thread_id: Some("7".to_string()),
+                parent_message_id: None,
+            },
+            actor: dispatch_core::InboundActor {
+                id: "user-1".to_string(),
+                display_name: Some("Alice".to_string()),
+                username: Some("alice".to_string()),
+                is_bot: false,
+                metadata: BTreeMap::new(),
+            },
+            message: dispatch_core::InboundMessage {
+                id: "1".to_string(),
+                content: "hello from telegram".to_string(),
+                content_type: "text/plain".to_string(),
+                reply_to_message_id: None,
+                attachments: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+            account_id: None,
+            metadata: BTreeMap::new(),
+        }
     }
 }

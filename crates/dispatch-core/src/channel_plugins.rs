@@ -41,7 +41,37 @@ pub struct ChannelPluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<ChannelPluginIngress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelPluginIngress {
+    #[serde(default)]
+    pub endpoints: Vec<ChannelIngressEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<ChannelIngressTrust>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelIngressEndpoint {
+    pub path: String,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub host_managed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelIngressTrust {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    #[serde(default)]
+    pub host_managed: bool,
 }
 
 /// The on-disk channel-plugin.json format shipped alongside channel plugin
@@ -85,6 +115,38 @@ struct OnDiskCapabilities {
 struct OnDiskChannelCapability {
     #[serde(default)]
     platform: Option<String>,
+    #[serde(default)]
+    allowed_paths: Vec<String>,
+    #[serde(default)]
+    ingress: Option<OnDiskChannelIngress>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OnDiskChannelIngress {
+    #[serde(default)]
+    endpoints: Vec<OnDiskChannelIngressEndpoint>,
+    #[serde(default)]
+    trust: Option<OnDiskChannelIngressTrust>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OnDiskChannelIngressEndpoint {
+    path: String,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    host_managed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OnDiskChannelIngressTrust {
+    mode: String,
+    #[serde(default)]
+    header_name: Option<String>,
+    #[serde(default)]
+    secret_name: Option<String>,
+    #[serde(default)]
+    host_managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -100,6 +162,7 @@ pub struct ChannelCatalogEntry {
     pub protocol_version: u32,
     pub transport: PluginTransport,
     pub platform: Option<String>,
+    pub ingress_paths: Vec<String>,
     pub command: String,
     pub args: Vec<String>,
 }
@@ -195,6 +258,11 @@ pub fn install_channel_plugin(
         .as_ref()
         .and_then(|c| c.channel.as_ref())
         .and_then(|ch| ch.platform.clone());
+    let ingress = on_disk
+        .capabilities
+        .as_ref()
+        .and_then(|c| c.channel.as_ref())
+        .and_then(extract_channel_ingress);
 
     let mut manifest = ChannelPluginManifest {
         name: on_disk.name,
@@ -204,6 +272,7 @@ pub fn install_channel_plugin(
         description: on_disk.description,
         exec: on_disk.entrypoint,
         platform,
+        ingress,
         installed_sha256: None,
     };
 
@@ -259,6 +328,17 @@ pub fn list_channel_catalog(
             protocol_version: plugin.protocol_version,
             transport: plugin.transport,
             platform: plugin.platform,
+            ingress_paths: plugin
+                .ingress
+                .as_ref()
+                .map(|ingress| {
+                    ingress
+                        .endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
             command: plugin.exec.command,
             args: plugin.exec.args,
         })
@@ -280,6 +360,33 @@ pub fn resolve_channel_plugin(
         .ok_or_else(|| PluginRegistryError::UnknownChannel {
             name: name.to_string(),
         })
+}
+
+pub fn resolve_channel_plugin_for_ingress(
+    method: &str,
+    path: &str,
+    registry_path: Option<&Path>,
+) -> Result<ChannelPluginManifest, PluginRegistryError> {
+    let registry = load_channel_registry(registry_path)?;
+    let method = method.to_ascii_uppercase();
+    let mut matches = registry
+        .plugins
+        .into_iter()
+        .filter(|plugin| plugin_matches_ingress(plugin, &method, path))
+        .collect::<Vec<_>>();
+
+    match matches.len() {
+        0 => Err(PluginRegistryError::NoChannelIngressMatch {
+            method,
+            path: path.to_string(),
+        }),
+        1 => Ok(matches.remove(0)),
+        _ => Err(PluginRegistryError::AmbiguousChannelIngressMatch {
+            method,
+            path: path.to_string(),
+            names: matches.into_iter().map(|plugin| plugin.name).collect(),
+        }),
+    }
 }
 
 pub fn call_channel_plugin(
@@ -436,6 +543,25 @@ pub fn validate_channel_plugin_manifest(
             message: "exec.command must not be empty".to_string(),
         });
     }
+    if let Some(ingress) = &manifest.ingress {
+        for endpoint in &ingress.endpoints {
+            if endpoint.path.trim().is_empty() {
+                return Err(PluginRegistryError::InvalidManifest {
+                    path: path.display().to_string(),
+                    message: "ingress endpoint path must not be empty".to_string(),
+                });
+            }
+            if !endpoint.path.starts_with('/') {
+                return Err(PluginRegistryError::InvalidManifest {
+                    path: path.display().to_string(),
+                    message: format!(
+                        "ingress endpoint path `{}` must start with /",
+                        endpoint.path
+                    ),
+                });
+            }
+        }
+    }
 
     Ok(())
 }
@@ -448,6 +574,74 @@ impl OnDiskManifestKind {
             Self::Connector => "connector",
         }
     }
+}
+
+fn extract_channel_ingress(channel: &OnDiskChannelCapability) -> Option<ChannelPluginIngress> {
+    let mut endpoints = channel
+        .ingress
+        .as_ref()
+        .map(|ingress| {
+            ingress
+                .endpoints
+                .iter()
+                .map(|endpoint| ChannelIngressEndpoint {
+                    path: endpoint.path.clone(),
+                    methods: endpoint
+                        .methods
+                        .iter()
+                        .map(|method| method.to_ascii_uppercase())
+                        .collect(),
+                    host_managed: endpoint.host_managed,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if endpoints.is_empty() {
+        endpoints = channel
+            .allowed_paths
+            .iter()
+            .map(|path| ChannelIngressEndpoint {
+                path: path.clone(),
+                methods: vec!["POST".to_string()],
+                host_managed: true,
+            })
+            .collect();
+    }
+
+    if endpoints.is_empty() {
+        return None;
+    }
+
+    let trust = channel
+        .ingress
+        .as_ref()
+        .and_then(|ingress| ingress.trust.as_ref())
+        .map(|trust| ChannelIngressTrust {
+            mode: trust.mode.clone(),
+            header_name: trust.header_name.clone(),
+            secret_name: trust.secret_name.clone(),
+            host_managed: trust.host_managed,
+        });
+
+    Some(ChannelPluginIngress { endpoints, trust })
+}
+
+fn plugin_matches_ingress(plugin: &ChannelPluginManifest, method: &str, path: &str) -> bool {
+    plugin
+        .ingress
+        .as_ref()
+        .map(|ingress| {
+            ingress.endpoints.iter().any(|endpoint| {
+                endpoint.path == path
+                    && (endpoint.methods.is_empty()
+                        || endpoint
+                            .methods
+                            .iter()
+                            .any(|allowed| allowed.eq_ignore_ascii_case(method)))
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(all(test, unix))]
@@ -483,7 +677,23 @@ mod tests {
 }},
 "capabilities": {{
     "channel": {{
-        "platform": "telegram"
+        "platform": "telegram",
+        "allowed_paths": ["/telegram/updates"],
+        "ingress": {{
+            "endpoints": [
+                {{
+                    "path": "/telegram/updates",
+                    "methods": ["POST"],
+                    "host_managed": true
+                }}
+            ],
+            "trust": {{
+                "mode": "shared_secret_header",
+                "header_name": "X-Telegram-Bot-Api-Secret-Token",
+                "secret_name": "TELEGRAM_WEBHOOK_SECRET",
+                "host_managed": true
+            }}
+        }}
     }}
 }}
 }}"#,
@@ -502,6 +712,20 @@ mod tests {
         assert_eq!(registry.plugins[0].name, "telegram-bridge");
         assert_eq!(registry.plugins[0].transport, PluginTransport::Jsonl);
         assert_eq!(registry.plugins[0].platform.as_deref(), Some("telegram"));
+        let ingress = registry.plugins[0]
+            .ingress
+            .as_ref()
+            .expect("ingress metadata should be preserved");
+        assert_eq!(ingress.endpoints.len(), 1);
+        assert_eq!(ingress.endpoints[0].path, "/telegram/updates");
+        assert_eq!(ingress.endpoints[0].methods, vec!["POST".to_string()]);
+        assert_eq!(
+            ingress
+                .trust
+                .as_ref()
+                .and_then(|trust| trust.header_name.as_deref()),
+            Some("X-Telegram-Bot-Api-Secret-Token")
+        );
         assert!(registry.plugins[0].installed_sha256.is_some());
     }
 
@@ -531,7 +755,8 @@ mod tests {
 }},
 "capabilities": {{
     "channel": {{
-        "platform": "slack"
+        "platform": "slack",
+        "allowed_paths": ["/slack/events"]
     }}
 }}
 }}"#,
@@ -544,6 +769,122 @@ mod tests {
         let resolved = resolve_channel_plugin("slack-bridge", Some(&registry_path)).unwrap();
         assert_eq!(resolved.name, "slack-bridge");
         assert_eq!(resolved.platform.as_deref(), Some("slack"));
+        assert_eq!(
+            resolved
+                .ingress
+                .as_ref()
+                .and_then(|ingress| ingress.endpoints.first())
+                .map(|endpoint| endpoint.path.as_str()),
+            Some("/slack/events")
+        );
+    }
+
+    #[test]
+    fn resolve_channel_plugin_for_ingress_matches_installed_route() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-webhook.sh");
+        fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        let manifest_path = dir.path().join("channel-plugin.json");
+        let registry_path = dir.path().join("channels.json");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+"kind": "channel",
+"name": "webhook-demo",
+"version": "0.1.0",
+"protocol": "jsonl",
+"protocol_version": 1,
+"entrypoint": {{
+    "command": "{}",
+    "args": []
+}},
+"capabilities": {{
+    "channel": {{
+        "platform": "webhook",
+        "allowed_paths": ["/webhook/inbound"]
+    }}
+}}
+}}"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+
+        install_channel_plugin(&manifest_path, Some(&registry_path)).unwrap();
+        let resolved =
+            resolve_channel_plugin_for_ingress("POST", "/webhook/inbound", Some(&registry_path))
+                .unwrap();
+        assert_eq!(resolved.name, "webhook-demo");
+    }
+
+    #[test]
+    fn resolve_channel_plugin_for_ingress_rejects_ambiguous_routes() {
+        let registry = ChannelPluginRegistry {
+            plugins: vec![
+                ChannelPluginManifest {
+                    name: "one".to_string(),
+                    version: "0.1.0".to_string(),
+                    protocol_version: 1,
+                    transport: PluginTransport::Jsonl,
+                    description: None,
+                    exec: ChannelPluginExec {
+                        command: "/usr/bin/true".to_string(),
+                        args: vec![],
+                    },
+                    platform: Some("telegram".to_string()),
+                    ingress: Some(ChannelPluginIngress {
+                        endpoints: vec![ChannelIngressEndpoint {
+                            path: "/shared".to_string(),
+                            methods: vec!["POST".to_string()],
+                            host_managed: true,
+                        }],
+                        trust: None,
+                    }),
+                    installed_sha256: None,
+                },
+                ChannelPluginManifest {
+                    name: "two".to_string(),
+                    version: "0.1.0".to_string(),
+                    protocol_version: 1,
+                    transport: PluginTransport::Jsonl,
+                    description: None,
+                    exec: ChannelPluginExec {
+                        command: "/usr/bin/true".to_string(),
+                        args: vec![],
+                    },
+                    platform: Some("slack".to_string()),
+                    ingress: Some(ChannelPluginIngress {
+                        endpoints: vec![ChannelIngressEndpoint {
+                            path: "/shared".to_string(),
+                            methods: vec!["POST".to_string()],
+                            host_managed: true,
+                        }],
+                        trust: None,
+                    }),
+                    installed_sha256: None,
+                },
+            ],
+        };
+        let dir = tempdir().unwrap();
+        let registry_path = dir.path().join("channels.json");
+        fs::write(
+            &registry_path,
+            serde_json::to_string_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+
+        let error = resolve_channel_plugin_for_ingress("POST", "/shared", Some(&registry_path))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginRegistryError::AmbiguousChannelIngressMatch { ref names, .. }
+                if names == &vec!["one".to_string(), "two".to_string()]
+        ));
     }
 
     #[test]
@@ -572,6 +913,7 @@ mod tests {
                 args: vec![],
             },
             platform: None,
+            ingress: None,
             installed_sha256: None,
         };
         let error = validate_channel_plugin_manifest(&manifest_path, &manifest).unwrap_err();
@@ -596,6 +938,7 @@ mod tests {
                 args: vec![],
             },
             platform: None,
+            ingress: None,
             installed_sha256: None,
         };
         let error = validate_channel_plugin_manifest(&manifest_path, &manifest).unwrap_err();
@@ -711,6 +1054,7 @@ printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","pl
                 args: vec![],
             },
             platform: Some("telegram".to_string()),
+            ingress: None,
             installed_sha256: None,
         };
 
@@ -750,6 +1094,7 @@ printf '%s\n' 'not-json'
                 args: vec![],
             },
             platform: None,
+            ingress: None,
             installed_sha256: None,
         };
 
@@ -789,6 +1134,7 @@ exit 7
                 args: vec![],
             },
             platform: None,
+            ingress: None,
             installed_sha256: None,
         };
 
