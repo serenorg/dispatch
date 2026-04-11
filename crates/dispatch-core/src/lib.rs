@@ -26,7 +26,8 @@ pub use channel_plugin_protocol::{
     ChannelPluginRequestEnvelope, ChannelPluginResponse, ChannelPolicy, ConfiguredChannel,
     DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
     InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
-    IngressState, RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
+    IngressState, OutboundAttachment, OutboundMessageEnvelope, RuntimeStateSnapshot,
+    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
 };
 pub use channel_plugins::{
     ChannelCatalogEntry, ChannelIngressEndpoint, ChannelIngressTrust, ChannelPluginCallError,

@@ -312,6 +312,29 @@ pub struct InboundAttachment {
     pub extras: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboundMessageEnvelope {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<OutboundAttachment>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    pub name: String,
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -412,5 +435,28 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed: ChannelPluginResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn outbound_message_envelope_round_trips_json() {
+        let envelope = OutboundMessageEnvelope {
+            content: "reply text".to_string(),
+            content_type: Some("text/plain".to_string()),
+            attachments: vec![OutboundAttachment {
+                name: "notes.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                data_base64: None,
+                url: Some("https://example.com/notes.txt".to_string()),
+                storage_key: None,
+            }],
+            metadata: BTreeMap::from([
+                ("conversation_id".to_string(), "chat-123".to_string()),
+                ("thread_id".to_string(), "7".to_string()),
+            ]),
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: OutboundMessageEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, envelope);
     }
 }

@@ -3,8 +3,9 @@ use chrono::Utc;
 use dispatch_core::{
     ChannelIngressEndpoint, ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse,
     CourierEvent, DeliveryReceipt, InboundEventEnvelope, IngressCallbackReply, IngressPayload,
-    call_channel_plugin, default_channel_registry_path, install_channel_plugin,
-    list_channel_catalog, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
+    OutboundMessageEnvelope, call_channel_plugin, default_channel_registry_path,
+    install_channel_plugin, list_channel_catalog, resolve_channel_plugin,
+    resolve_channel_plugin_for_ingress,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -878,9 +879,8 @@ fn deliver_channel_reply(
     config: &Value,
     reply_text: &str,
 ) -> Result<Option<DeliveryReceipt>> {
-    let Some(message) = build_channel_reply_message(plugin, event, reply_text) else {
-        return Ok(None);
-    };
+    let message = serde_json::to_value(build_channel_reply_message(event, reply_text))
+        .context("failed to serialize channel reply envelope")?;
 
     let response = call_channel_plugin(
         plugin,
@@ -904,92 +904,22 @@ fn deliver_channel_reply(
 }
 
 fn build_channel_reply_message(
-    plugin: &ChannelPluginManifest,
     event: &InboundEventEnvelope,
     reply_text: &str,
-) -> Option<Value> {
-    let platform = plugin
-        .platform
-        .as_deref()
-        .unwrap_or(event.platform.as_str());
-    let mut message = serde_json::Map::new();
-    message.insert("content".to_string(), Value::String(reply_text.to_string()));
-
-    match platform {
-        "telegram" => {
-            message.insert(
-                "chat_id".to_string(),
-                Value::String(event.conversation.id.clone()),
-            );
-            if let Ok(message_id) = event.message.id.parse::<i64>() {
-                message.insert(
-                    "reply_to_message_id".to_string(),
-                    Value::Number(message_id.into()),
-                );
-            }
-            if let Some(thread_id) = event.conversation.thread_id.as_deref()
-                && let Ok(thread_id) = thread_id.parse::<i64>()
-            {
-                message.insert(
-                    "message_thread_id".to_string(),
-                    Value::Number(thread_id.into()),
-                );
-            }
-        }
-        "slack" => {
-            message.insert(
-                "channel_id".to_string(),
-                Value::String(event.conversation.id.clone()),
-            );
-            if let Some(thread_id) = event.conversation.thread_id.as_deref() {
-                message.insert(
-                    "thread_ts".to_string(),
-                    Value::String(thread_id.to_string()),
-                );
-            }
-        }
-        "discord" => {
-            message.insert(
-                "channel_id".to_string(),
-                Value::String(event.conversation.id.clone()),
-            );
-            if let Some(thread_id) = event.conversation.thread_id.as_deref() {
-                message.insert(
-                    "thread_id".to_string(),
-                    Value::String(thread_id.to_string()),
-                );
-            }
-            message.insert(
-                "reply_to_message_id".to_string(),
-                Value::String(event.message.id.clone()),
-            );
-        }
-        "whatsapp" => {
-            message.insert(
-                "to_number".to_string(),
-                Value::String(event.conversation.id.clone()),
-            );
-            message.insert(
-                "reply_to_message_id".to_string(),
-                Value::String(event.message.id.clone()),
-            );
-        }
-        "twilio_sms" => {
-            message.insert(
-                "to_number".to_string(),
-                Value::String(event.conversation.id.clone()),
-            );
-        }
-        "webhook" => {
-            message.insert(
-                "conversation_id".to_string(),
-                Value::String(event.conversation.id.clone()),
-            );
-        }
-        _ => return None,
+) -> OutboundMessageEnvelope {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("conversation_id".to_string(), event.conversation.id.clone());
+    if let Some(thread_id) = event.conversation.thread_id.as_deref() {
+        metadata.insert("thread_id".to_string(), thread_id.to_string());
     }
+    metadata.insert("reply_to_message_id".to_string(), event.message.id.clone());
 
-    Some(Value::Object(message))
+    OutboundMessageEnvelope {
+        content: reply_text.to_string(),
+        content_type: Some("text/plain".to_string()),
+        attachments: Vec::new(),
+        metadata,
+    }
 }
 
 fn parse_query_string(query: Option<&str>) -> BTreeMap<String, String> {
@@ -1474,29 +1404,27 @@ mod tests {
     }
 
     #[test]
-    fn build_channel_reply_message_maps_telegram_fields() {
-        let plugin = ChannelPluginManifest {
-            name: "channel-telegram".to_string(),
-            version: "0.1.0".to_string(),
-            protocol_version: 1,
-            transport: dispatch_core::plugins::PluginTransport::Jsonl,
-            description: None,
-            exec: dispatch_core::ChannelPluginExec {
-                command: "/usr/bin/true".to_string(),
-                args: vec![],
-            },
-            platform: Some("telegram".to_string()),
-            ingress: None,
-            installed_sha256: None,
-        };
+    fn build_channel_reply_message_uses_standard_routing_metadata() {
+        let message = build_channel_reply_message(&sample_inbound_event(), "reply text");
 
-        let message = build_channel_reply_message(&plugin, &sample_inbound_event(), "reply text")
-            .expect("telegram reply message");
-
-        assert_eq!(message["content"], "reply text");
-        assert_eq!(message["chat_id"], "chat-123");
-        assert_eq!(message["reply_to_message_id"], 1);
-        assert_eq!(message["message_thread_id"], 7);
+        assert_eq!(message.content, "reply text");
+        assert_eq!(message.content_type.as_deref(), Some("text/plain"));
+        assert!(message.attachments.is_empty());
+        assert_eq!(
+            message.metadata.get("conversation_id").map(String::as_str),
+            Some("chat-123")
+        );
+        assert_eq!(
+            message.metadata.get("thread_id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            message
+                .metadata
+                .get("reply_to_message_id")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     fn sample_inbound_event() -> InboundEventEnvelope {
