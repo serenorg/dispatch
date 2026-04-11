@@ -12,7 +12,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     io::{self, BufReader, IsTerminal, Read as _, Seek as _, SeekFrom, Write as _},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -1676,7 +1676,7 @@ fn execute_service_ingress(
                         record,
                         listener_state,
                         stream,
-                        remote_addr.to_string(),
+                        remote_addr,
                         ingress,
                         output,
                     )?;
@@ -1704,7 +1704,7 @@ fn handle_service_connection(
     record: &RunRecord,
     listener: &RunListener,
     stream: TcpStream,
-    remote_addr: String,
+    remote_addr: SocketAddr,
     ingress: &ServiceIngressConfig,
     output: &mut impl io::Write,
 ) -> Result<()> {
@@ -1746,7 +1746,7 @@ fn handle_service_connection(
                     .unwrap_or(listener.listen_addr.as_str())
             )?;
             let payload =
-                serde_json::to_string(&request_payload_envelope(listener, &remote_addr, &request))?;
+                serde_json::to_string(&request_payload_envelope(listener, remote_addr, &request))?;
             match execute_service_heartbeat(record, Some(payload.as_str()), output) {
                 Ok(()) => write_http_response(
                     &mut writer,
@@ -1773,7 +1773,7 @@ fn handle_service_connection(
 
 fn request_payload_envelope(
     listener: &RunListener,
-    remote_addr: &str,
+    remote_addr: SocketAddr,
     request: &ParsedHttpRequest,
 ) -> ServiceIngressEnvelope {
     ServiceIngressEnvelope {
@@ -2639,7 +2639,7 @@ mod tests {
                 requests_handled: 0,
                 last_request_at_ms: None,
             },
-            "127.0.0.1:50000",
+            "127.0.0.1:50000".parse().unwrap(),
             &super::ParsedHttpRequest {
                 method: "POST".to_string(),
                 target: "/hook".to_string(),
