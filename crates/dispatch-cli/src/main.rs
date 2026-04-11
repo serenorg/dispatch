@@ -647,6 +647,50 @@ enum ChannelCommand {
         #[arg(long)]
         registry: Option<PathBuf>,
     },
+    /// Send a structured ingress_event request to an installed channel plugin
+    Ingress {
+        /// Channel plugin name
+        name: String,
+        /// Raw JSON for the plugin-specific channel config object
+        #[arg(long, conflicts_with = "config_file")]
+        config_json: Option<String>,
+        /// Path to a JSON file containing the plugin-specific channel config object
+        #[arg(long, conflicts_with = "config_json")]
+        config_file: Option<PathBuf>,
+        /// HTTP method to forward to the plugin
+        #[arg(long, default_value = "POST")]
+        method: String,
+        /// Request path to forward to the plugin
+        #[arg(long)]
+        path: String,
+        /// HTTP header in NAME=VALUE form; may be repeated
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
+        /// Query parameter in NAME=VALUE form; may be repeated
+        #[arg(long = "query", value_name = "NAME=VALUE")]
+        query: Vec<String>,
+        /// Raw request body text
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Path to a file containing the raw request body
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        /// Optional host-assigned endpoint id
+        #[arg(long)]
+        endpoint_id: Option<String>,
+        /// Mark the ingress payload as already trust-verified by the host
+        #[arg(long)]
+        trust_verified: bool,
+        /// Explicit received_at timestamp to forward to the plugin
+        #[arg(long)]
+        received_at: Option<String>,
+        /// Print the full plugin response as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

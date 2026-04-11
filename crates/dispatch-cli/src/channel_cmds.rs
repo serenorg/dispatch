@@ -1,13 +1,45 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::{
-    ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse, call_channel_plugin,
-    default_channel_registry_path, install_channel_plugin, list_channel_catalog,
-    resolve_channel_plugin,
+    ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse, IngressPayload,
+    call_channel_plugin, default_channel_registry_path, install_channel_plugin,
+    list_channel_catalog, resolve_channel_plugin,
 };
+use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
+
+struct ChannelIngressArgs<'a> {
+    name: &'a str,
+    config_json: Option<&'a str>,
+    config_file: Option<&'a Path>,
+    method: &'a str,
+    path: &'a str,
+    headers: &'a [String],
+    query: &'a [String],
+    body: Option<&'a str>,
+    body_file: Option<&'a Path>,
+    endpoint_id: Option<String>,
+    trust_verified: bool,
+    received_at: Option<String>,
+    registry: Option<&'a Path>,
+    emit_json: bool,
+}
+
+struct IngressRequestParts<'a> {
+    config: Value,
+    method: &'a str,
+    path: &'a str,
+    headers: &'a [String],
+    query: &'a [String],
+    body: Option<&'a str>,
+    body_file: Option<&'a Path>,
+    endpoint_id: Option<String>,
+    trust_verified: bool,
+    received_at: Option<String>,
+}
 
 pub(crate) fn channel_command(command: crate::ChannelCommand) -> Result<()> {
     match command {
@@ -33,6 +65,37 @@ pub(crate) fn channel_command(command: crate::ChannelCommand) -> Result<()> {
             registry.as_deref(),
             json,
         ),
+        crate::ChannelCommand::Ingress {
+            name,
+            config_json,
+            config_file,
+            method,
+            path,
+            headers,
+            query,
+            body,
+            body_file,
+            endpoint_id,
+            trust_verified,
+            received_at,
+            json,
+            registry,
+        } => channel_ingress(ChannelIngressArgs {
+            name: &name,
+            config_json: config_json.as_deref(),
+            config_file: config_file.as_deref(),
+            method: &method,
+            path: &path,
+            headers: &headers,
+            query: &query,
+            body: body.as_deref(),
+            body_file: body_file.as_deref(),
+            endpoint_id,
+            trust_verified,
+            received_at,
+            registry: registry.as_deref(),
+            emit_json: json,
+        }),
     }
 }
 
@@ -93,6 +156,30 @@ fn channel_call(
     let request = load_request(request_json, request_file)?;
     let response = call_channel_plugin(&plugin, request)?;
 
+    print_channel_response(response, emit_json)
+}
+
+fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
+    let plugin = resolve_channel_plugin(args.name, args.registry)?;
+    let config = load_json_value(args.config_json, args.config_file, "channel config")?;
+    let request = build_ingress_request(IngressRequestParts {
+        config,
+        method: args.method,
+        path: args.path,
+        headers: args.headers,
+        query: args.query,
+        body: args.body,
+        body_file: args.body_file,
+        endpoint_id: args.endpoint_id,
+        trust_verified: args.trust_verified,
+        received_at: args.received_at,
+    })?;
+    let response = call_channel_plugin(&plugin, request)?;
+
+    print_channel_response(response, args.emit_json)
+}
+
+fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> Result<()> {
     if emit_json {
         println!("{}", serde_json::to_string_pretty(&response)?);
         return Ok(());
@@ -192,6 +279,70 @@ fn load_request(
     }
 }
 
+fn load_json_value(
+    value_json: Option<&str>,
+    value_file: Option<&Path>,
+    description: &str,
+) -> Result<Value> {
+    match (value_json, value_file) {
+        (Some(_), Some(_)) => bail!("use either inline JSON or a file for {description}, not both"),
+        (None, None) => Ok(json!({})),
+        (Some(value_json), None) => serde_json::from_str(value_json)
+            .with_context(|| format!("failed to parse {description} JSON")),
+        (None, Some(value_file)) => {
+            let body = fs::read_to_string(value_file)
+                .with_context(|| format!("failed to read {}", value_file.display()))?;
+            serde_json::from_str(&body)
+                .with_context(|| format!("failed to parse {}", value_file.display()))
+        }
+    }
+}
+
+fn build_ingress_request(parts: IngressRequestParts<'_>) -> Result<ChannelPluginRequest> {
+    let headers = parse_key_value_pairs(parts.headers, "header")?;
+    let query = parse_key_value_pairs(parts.query, "query")?;
+    let body = load_body(parts.body, parts.body_file)?;
+
+    Ok(ChannelPluginRequest::IngressEvent {
+        config: parts.config,
+        payload: IngressPayload {
+            endpoint_id: parts.endpoint_id,
+            method: parts.method.to_string(),
+            path: parts.path.to_string(),
+            headers,
+            query,
+            body,
+            trust_verified: parts.trust_verified,
+            received_at: parts.received_at,
+        },
+    })
+}
+
+fn load_body(body: Option<&str>, body_file: Option<&Path>) -> Result<String> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => bail!("use either --body or --body-file, not both"),
+        (None, None) => Ok(String::new()),
+        (Some(body), None) => Ok(body.to_string()),
+        (None, Some(body_file)) => fs::read_to_string(body_file)
+            .with_context(|| format!("failed to read {}", body_file.display())),
+    }
+}
+
+fn parse_key_value_pairs(entries: &[String], field_name: &str) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for entry in entries {
+        let Some((name, value)) = entry.split_once('=') else {
+            bail!("{field_name} entry `{entry}` must use NAME=VALUE");
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("{field_name} entry `{entry}` must have a non-empty name");
+        }
+        values.insert(name.to_string(), value.to_string());
+    }
+    Ok(values)
+}
+
 fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
     println!("Name: {}", plugin.name);
     println!("Version: {}", plugin.version);
@@ -206,5 +357,69 @@ fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
     }
     if let Some(description) = &plugin.description {
         println!("Description: {description}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_value_pairs_accepts_repeated_cli_entries() {
+        let values = parse_key_value_pairs(
+            &[
+                "Content-Type=application/json".to_string(),
+                "X-Test=value".to_string(),
+            ],
+            "header",
+        )
+        .expect("parse key value pairs");
+
+        assert_eq!(
+            values.get("Content-Type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(values.get("X-Test").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn parse_key_value_pairs_rejects_missing_separator() {
+        let error = parse_key_value_pairs(&["Content-Type".to_string()], "header").unwrap_err();
+        assert!(error.to_string().contains("must use NAME=VALUE"));
+    }
+
+    #[test]
+    fn build_ingress_request_defaults_to_empty_body_and_config() {
+        let request = build_ingress_request(IngressRequestParts {
+            config: json!({}),
+            method: "POST",
+            path: "/hook",
+            headers: &["Content-Type=application/json".to_string()],
+            query: &["conversation_id=abc".to_string()],
+            body: None,
+            body_file: None,
+            endpoint_id: Some("endpoint-1".to_string()),
+            trust_verified: true,
+            received_at: Some("2026-04-11T00:00:00Z".to_string()),
+        })
+        .expect("build ingress request");
+
+        let ChannelPluginRequest::IngressEvent { config, payload } = request else {
+            panic!("expected ingress request");
+        };
+        assert_eq!(config, json!({}));
+        assert_eq!(payload.method, "POST");
+        assert_eq!(payload.path, "/hook");
+        assert_eq!(payload.body, "");
+        assert_eq!(
+            payload.headers.get("Content-Type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            payload.query.get("conversation_id").map(String::as_str),
+            Some("abc")
+        );
+        assert_eq!(payload.endpoint_id.as_deref(), Some("endpoint-1"));
+        assert!(payload.trust_verified);
     }
 }
