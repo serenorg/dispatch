@@ -1,3 +1,4 @@
+mod channel_cmds;
 mod conformance;
 mod courier_cmds;
 mod eval;
@@ -92,6 +93,11 @@ enum Command {
     Courier {
         #[command(subcommand)]
         command: CourierCommand,
+    },
+    /// Manage installed channel plugins
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommand,
     },
     /// Manage parcel-scoped built-in courier state
     State {
@@ -595,6 +601,38 @@ enum CourierCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ChannelCommand {
+    /// List installed channel plugins
+    Ls {
+        /// Print full channel catalog as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+    /// Inspect an installed channel plugin
+    Inspect {
+        /// Channel plugin name
+        name: String,
+        /// Print full channel entry as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+    /// Install a channel plugin manifest into the local registry
+    Install {
+        /// Path to a channel plugin manifest JSON file
+        manifest: PathBuf,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ContainerCommand {
     /// List active and completed local runs
     #[command(visible_alias = "ls", alias = "ps")]
@@ -842,6 +880,7 @@ fn main() -> Result<()> {
             SkillCommand::Run(args) => skill_run::run_skill(*args),
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
+        Command::Channel { command } => channel_cmds::channel_command(command),
         Command::State { command } => state_command(command),
         Command::Secret { command } => secret_command(command),
         Command::Internal { command } => runs::internal_command(command),

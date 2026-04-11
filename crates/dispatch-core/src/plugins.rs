@@ -99,6 +99,8 @@ pub enum PluginRegistryError {
     BuiltinNameConflict { name: String },
     #[error("courier `{name}` is not installed")]
     UnknownCourier { name: String },
+    #[error("channel plugin `{name}` is not installed")]
+    UnknownChannel { name: String },
     #[error(
         "courier plugin manifest `{path}` references an executable path that is invalid: {message}"
     )]
@@ -324,7 +326,7 @@ fn validate_plugin_manifest(
     Ok(())
 }
 
-fn resolve_plugin_exec_path(
+pub(crate) fn resolve_plugin_exec_path(
     manifest_path: &Path,
     command: &str,
 ) -> Result<PathBuf, PluginRegistryError> {
@@ -362,7 +364,7 @@ fn resolve_plugin_exec_path(
     Ok(canonical)
 }
 
-fn hash_file_sha256(path: &Path) -> Result<String, PluginRegistryError> {
+pub(crate) fn hash_file_sha256(path: &Path) -> Result<String, PluginRegistryError> {
     let body = fs::read(path).map_err(|source| PluginRegistryError::ReadFile {
         path: path.display().to_string(),
         source,
@@ -370,7 +372,7 @@ fn hash_file_sha256(path: &Path) -> Result<String, PluginRegistryError> {
     Ok(encode_hex(Sha256::digest(body)))
 }
 
-fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
+pub(crate) fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

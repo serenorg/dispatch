@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod build;
+pub mod channel_plugins;
 pub mod courier;
 pub mod depot;
 pub mod eval;
@@ -18,6 +19,11 @@ pub use ast::{Instruction, ParsedAgentfile, Value};
 pub use build::{
     BuildError, BuildOptions, BuiltParcel, ParcelLock, VerificationReport, build_agentfile,
     verify_parcel,
+};
+pub use channel_plugins::{
+    ChannelCatalogEntry, ChannelPluginExec, ChannelPluginManifest, ChannelPluginRegistry,
+    default_channel_registry_path, install_channel_plugin, list_channel_catalog,
+    load_channel_registry, resolve_channel_plugin, validate_channel_plugin_manifest,
 };
 // Keep the crate root focused on the primary parcel/courier entrypoints.
 // Lower-level courier modeling types remain available under `dispatch_core::courier`.
