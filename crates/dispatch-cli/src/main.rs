@@ -630,6 +630,23 @@ enum ChannelCommand {
         #[arg(long)]
         registry: Option<PathBuf>,
     },
+    /// Invoke an installed channel plugin with a raw protocol request
+    Call {
+        /// Channel plugin name
+        name: String,
+        /// Raw JSON for the inner channel request object
+        #[arg(long, conflicts_with = "request_file")]
+        request_json: Option<String>,
+        /// Path to a JSON file containing the inner channel request object
+        #[arg(long, conflicts_with = "request_json")]
+        request_file: Option<PathBuf>,
+        /// Print the full plugin response as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

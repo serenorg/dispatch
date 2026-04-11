@@ -1,11 +1,18 @@
-use crate::plugins::{
-    PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path,
+use crate::{
+    channel_plugin_protocol::{
+        CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelPluginRequest, ChannelPluginRequestEnvelope,
+        ChannelPluginResponse,
+    },
+    plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
+use thiserror::Error;
 
 const CHANNEL_REGISTRY_RELATIVE_PATH: &str = ".config/dispatch/channels.json";
 
@@ -95,6 +102,42 @@ pub struct ChannelCatalogEntry {
     pub platform: Option<String>,
     pub command: String,
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ChannelPluginCallError {
+    #[error("failed to spawn channel plugin `{channel}`: {source}")]
+    SpawnPlugin {
+        channel: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write request to channel plugin `{channel}`: {source}")]
+    WritePluginRequest {
+        channel: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read response from channel plugin `{channel}`: {source}")]
+    ReadPluginResponse {
+        channel: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to wait for channel plugin `{channel}`: {source}")]
+    WaitPlugin {
+        channel: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("channel plugin `{channel}` protocol error: {message}")]
+    PluginProtocol { channel: String, message: String },
+    #[error("channel plugin `{channel}` exited with status {status}: {stderr}")]
+    PluginExit {
+        channel: String,
+        status: i32,
+        stderr: String,
+    },
 }
 
 pub fn default_channel_registry_path() -> Result<PathBuf, PluginRegistryError> {
@@ -239,6 +282,114 @@ pub fn resolve_channel_plugin(
         })
 }
 
+pub fn call_channel_plugin(
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    let mut command = Command::new(&manifest.exec.command);
+    command
+        .args(&manifest.exec.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|source| ChannelPluginCallError::SpawnPlugin {
+            channel: manifest.name.clone(),
+            source,
+        })?;
+
+    {
+        let mut stdin =
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
+                    channel: manifest.name.clone(),
+                    message: "channel plugin stdin was not captured".to_string(),
+                })?;
+        serde_json::to_writer(
+            &mut stdin,
+            &ChannelPluginRequestEnvelope {
+                protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                request,
+            },
+        )
+        .map_err(|source| ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: format!("failed to serialize channel plugin request: {source}"),
+        })?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|source| ChannelPluginCallError::WritePluginRequest {
+                channel: manifest.name.clone(),
+                source,
+            })?;
+        stdin
+            .flush()
+            .map_err(|source| ChannelPluginCallError::WritePluginRequest {
+                channel: manifest.name.clone(),
+                source,
+            })?;
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: "channel plugin stdout was not captured".to_string(),
+        })?;
+    let mut stdout = BufReader::new(stdout);
+    let mut line = String::new();
+    let bytes = stdout.read_line(&mut line).map_err(|source| {
+        ChannelPluginCallError::ReadPluginResponse {
+            channel: manifest.name.clone(),
+            source,
+        }
+    })?;
+    if bytes == 0 {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: "channel plugin produced no response".to_string(),
+        });
+    }
+    let response =
+        serde_json::from_str::<ChannelPluginResponse>(line.trim_end()).map_err(|source| {
+            ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: format!("invalid channel plugin JSON: {source}"),
+            }
+        })?;
+
+    let mut stderr = String::new();
+    if let Some(mut stderr_pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        stderr_pipe.read_to_string(&mut stderr).map_err(|source| {
+            ChannelPluginCallError::ReadPluginResponse {
+                channel: manifest.name.clone(),
+                source,
+            }
+        })?;
+    }
+    let status = child
+        .wait()
+        .map_err(|source| ChannelPluginCallError::WaitPlugin {
+            channel: manifest.name.clone(),
+            source,
+        })?;
+    if status.success() {
+        return Ok(response);
+    }
+
+    Err(ChannelPluginCallError::PluginExit {
+        channel: manifest.name.clone(),
+        status: status.code().unwrap_or(-1),
+        stderr: stderr.trim().to_string(),
+    })
+}
+
 pub fn validate_channel_plugin_manifest(
     path: &Path,
     manifest: &ChannelPluginManifest,
@@ -299,7 +450,7 @@ mod tests {
     fn install_channel_plugin_round_trips_registry() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
-        let script_path = dir.path().join("dispatch-channel-demo.sh");
+        let script_path = dir.path().join("channel-demo.sh");
         fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
         let mut permissions = fs::metadata(&script_path).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -349,7 +500,7 @@ mod tests {
     fn resolve_channel_plugin_finds_installed() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
-        let script_path = dir.path().join("dispatch-channel-slack.sh");
+        let script_path = dir.path().join("channel-slack.sh");
         fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
         let mut permissions = fs::metadata(&script_path).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -449,7 +600,7 @@ mod tests {
     fn install_channel_plugin_accepts_exec_alias() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
-        let script_path = dir.path().join("dispatch-channel-exec-alias.sh");
+        let script_path = dir.path().join("channel-exec-alias.sh");
         fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
         let mut permissions = fs::metadata(&script_path).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -520,6 +671,83 @@ mod tests {
         assert!(matches!(
             error,
             PluginRegistryError::InvalidManifest { message, .. } if message.contains("kind must be `channel`")
+        ));
+    }
+
+    #[test]
+    fn call_channel_plugin_reads_capabilities_response() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-capabilities.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "telegram-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            installed_sha256: None,
+        };
+
+        let response = call_channel_plugin(&manifest, ChannelPluginRequest::Capabilities).unwrap();
+        let ChannelPluginResponse::Capabilities { capabilities } = response else {
+            panic!("unexpected response variant");
+        };
+        assert_eq!(capabilities.plugin_id, "telegram");
+        assert!(capabilities.accepts_status_frames);
+    }
+
+    #[test]
+    fn call_channel_plugin_rejects_invalid_json() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-invalid-json.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+printf '%s\n' 'not-json'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "invalid-json-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: None,
+            installed_sha256: None,
+        };
+
+        let error = call_channel_plugin(&manifest, ChannelPluginRequest::Capabilities).unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { message, .. } if message.contains("invalid channel plugin JSON")
         ));
     }
 }
