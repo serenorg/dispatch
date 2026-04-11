@@ -102,12 +102,17 @@ fn channel_call(
         ChannelPluginResponse::Capabilities { capabilities } => {
             println!("Plugin ID: {}", capabilities.plugin_id);
             println!("Platform: {}", capabilities.platform);
-            println!("Ingress Modes: {}", capabilities.ingress_modes.join(", "));
+            let modes: Vec<String> = capabilities
+                .ingress_modes
+                .iter()
+                .map(|m| format!("{m:?}"))
+                .collect();
+            println!("Ingress Modes: {}", modes.join(", "));
             println!(
                 "Outbound Types: {}",
                 capabilities.outbound_message_types.join(", ")
             );
-            println!("Threading: {}", capabilities.threading_model);
+            println!("Threading: {:?}", capabilities.threading_model);
             println!("Accepts Push: {}", capabilities.accepts_push);
             println!("Accepts Status: {}", capabilities.accepts_status_frames);
         }

@@ -23,10 +23,10 @@ pub use build::{
 };
 pub use channel_plugin_protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPluginRequest,
-    ChannelPluginRequestEnvelope, ChannelPluginResponse, ConfiguredChannel, DeliveryReceipt,
-    HealthReport, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
-    InboundMessage, IngressCallbackReply, IngressPayload, IngressState, RuntimeStateSnapshot,
-    StatusAcceptance, StatusFrame,
+    ChannelPluginRequestEnvelope, ChannelPluginResponse, ChannelPolicy, ConfiguredChannel,
+    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
+    IngressState, RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
 };
 pub use channel_plugins::{
     ChannelCatalogEntry, ChannelPluginCallError, ChannelPluginExec, ChannelPluginManifest,

@@ -349,19 +349,6 @@ pub fn call_channel_plugin(
             source,
         }
     })?;
-    if bytes == 0 {
-        return Err(ChannelPluginCallError::PluginProtocol {
-            channel: manifest.name.clone(),
-            message: "channel plugin produced no response".to_string(),
-        });
-    }
-    let response =
-        serde_json::from_str::<ChannelPluginResponse>(line.trim_end()).map_err(|source| {
-            ChannelPluginCallError::PluginProtocol {
-                channel: manifest.name.clone(),
-                message: format!("invalid channel plugin JSON: {source}"),
-            }
-        })?;
 
     let mut stderr = String::new();
     if let Some(mut stderr_pipe) = child.stderr.take() {
@@ -378,6 +365,28 @@ pub fn call_channel_plugin(
         .map_err(|source| ChannelPluginCallError::WaitPlugin {
             channel: manifest.name.clone(),
             source,
+        })?;
+    if bytes == 0 {
+        if status.success() {
+            return Err(ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: "channel plugin produced no response".to_string(),
+            });
+        }
+
+        return Err(ChannelPluginCallError::PluginExit {
+            channel: manifest.name.clone(),
+            status: status.code().unwrap_or(-1),
+            stderr: stderr.trim().to_string(),
+        });
+    }
+
+    let response =
+        serde_json::from_str::<ChannelPluginResponse>(line.trim_end()).map_err(|source| {
+            ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: format!("invalid channel plugin JSON: {source}"),
+            }
         })?;
     if status.success() {
         return Ok(response);
@@ -748,6 +757,47 @@ printf '%s\n' 'not-json'
         assert!(matches!(
             error,
             ChannelPluginCallError::PluginProtocol { message, .. } if message.contains("invalid channel plugin JSON")
+        ));
+    }
+
+    #[test]
+    fn call_channel_plugin_surfaces_nonzero_exit_without_response() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-no-response.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+printf '%s\n' 'plugin failed before replying' >&2
+exit 7
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "no-response-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: None,
+            installed_sha256: None,
+        };
+
+        let error = call_channel_plugin(&manifest, ChannelPluginRequest::Capabilities).unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginExit {
+                status, ref stderr, ..
+            } if status == 7 && stderr.contains("plugin failed before replying")
         ));
     }
 }

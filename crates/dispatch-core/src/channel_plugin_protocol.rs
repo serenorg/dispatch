@@ -4,6 +4,31 @@ use std::collections::BTreeMap;
 
 pub const CHANNEL_PLUGIN_PROTOCOL_VERSION: u32 = 1;
 
+/// Well-known status frame kinds for the Dispatch channel protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusKind {
+    /// Agent is working on a response.
+    Processing,
+    /// Agent finished and the response has been (or will be) delivered.
+    Completed,
+    /// Agent processing was cancelled or timed out.
+    Cancelled,
+    /// A host-visible operation started (extension invocation, courier handoff).
+    OperationStarted,
+    /// A host-visible operation finished.
+    OperationFinished,
+    /// An action requires operator/user approval before proceeding.
+    ApprovalNeeded,
+    /// Informational status text to relay to the conversation.
+    Info,
+    /// Channel is actively delivering a message to the platform.
+    Delivering,
+    /// An extension requires the end-user to authenticate.
+    AuthRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChannelPluginRequestEnvelope {
     pub protocol_version: u32,
@@ -53,7 +78,7 @@ pub enum ChannelPluginResponse {
         capabilities: ChannelCapabilities,
     },
     Configured {
-        configuration: ConfiguredChannel,
+        configuration: Box<ConfiguredChannel>,
     },
     Health {
         health: HealthReport,
@@ -89,13 +114,36 @@ pub struct PluginErrorPayload {
     pub message: String,
 }
 
+/// How a channel organizes conversations and replies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ThreadingModel {
+    ChatOrTopic,
+    ChannelOrThread,
+    ChatOrThread,
+    PhoneNumber,
+    CallerDefined,
+}
+
+/// How a channel receives inbound events from the platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IngressMode {
+    Webhook,
+    EventsWebhook,
+    InteractionWebhook,
+    Polling,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelCapabilities {
     pub plugin_id: String,
     pub platform: String,
-    pub ingress_modes: Vec<String>,
+    pub ingress_modes: Vec<IngressMode>,
     pub outbound_message_types: Vec<String>,
-    pub threading_model: String,
+    pub threading_model: ThreadingModel,
     pub attachment_support: bool,
     pub reply_verification_support: bool,
     pub account_scoped_config: bool,
@@ -130,7 +178,7 @@ pub struct HealthReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngressState {
-    pub mode: String,
+    pub mode: IngressMode,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -183,7 +231,7 @@ pub struct StatusAcceptance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusFrame {
-    pub kind: String,
+    pub kind: StatusKind,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
@@ -307,13 +355,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enum_wire_names_use_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&StatusKind::OperationStarted).unwrap(),
+            "\"operation_started\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ThreadingModel::ChannelOrThread).unwrap(),
+            "\"channel_or_thread\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IngressMode::InteractionWebhook).unwrap(),
+            "\"interaction_webhook\""
+        );
+    }
+
+    #[test]
     fn request_round_trips_json() {
         let request = ChannelPluginRequestEnvelope {
             protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             request: ChannelPluginRequest::Status {
                 config: serde_json::json!({ "bot_token_env": "TOKEN" }),
                 update: StatusFrame {
-                    kind: "processing".to_string(),
+                    kind: StatusKind::Processing,
                     message: "working".to_string(),
                     conversation_id: Some("chat-1".to_string()),
                     thread_id: None,
@@ -333,9 +397,9 @@ mod tests {
             capabilities: ChannelCapabilities {
                 plugin_id: "telegram".to_string(),
                 platform: "telegram".to_string(),
-                ingress_modes: vec!["webhook".to_string()],
+                ingress_modes: vec![IngressMode::Webhook],
                 outbound_message_types: vec!["text".to_string()],
-                threading_model: "chat_or_topic".to_string(),
+                threading_model: ThreadingModel::ChatOrTopic,
                 attachment_support: false,
                 reply_verification_support: true,
                 account_scoped_config: true,
