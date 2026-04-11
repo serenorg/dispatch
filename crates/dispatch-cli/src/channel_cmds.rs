@@ -433,6 +433,7 @@ fn load_json_value(
 fn build_ingress_request(parts: IngressRequestParts<'_>) -> Result<ChannelPluginRequest> {
     let headers = parse_key_value_pairs(parts.headers, "header")?;
     let query = parse_key_value_pairs(parts.query, "query")?;
+    let raw_query = (!parts.query.is_empty()).then(|| parts.query.join("&"));
     let body = load_body(parts.body, parts.body_file)?;
 
     Ok(ChannelPluginRequest::IngressEvent {
@@ -443,6 +444,7 @@ fn build_ingress_request(parts: IngressRequestParts<'_>) -> Result<ChannelPlugin
             path: parts.path.to_string(),
             headers,
             query,
+            raw_query,
             body,
             trust_verified: parts.trust_verified,
             received_at: parts.received_at,
@@ -542,6 +544,7 @@ fn handle_channel_listener_connection(
                 path: request.path.clone(),
                 headers: request.headers.clone(),
                 query: parse_query_string(request.query.as_deref()),
+                raw_query: request.query.clone(),
                 body: request.body.clone().unwrap_or_default(),
                 trust_verified,
                 received_at: Some(Utc::now().to_rfc3339()),
@@ -1171,6 +1174,7 @@ mod tests {
             payload.query.get("conversation_id").map(String::as_str),
             Some("abc")
         );
+        assert_eq!(payload.raw_query.as_deref(), Some("conversation_id=abc"));
         assert_eq!(payload.endpoint_id.as_deref(), Some("endpoint-1"));
         assert!(payload.trust_verified);
     }

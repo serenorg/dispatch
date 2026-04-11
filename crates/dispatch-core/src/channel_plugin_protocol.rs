@@ -196,6 +196,8 @@ pub struct IngressPayload {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub query: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_query: Option<String>,
     #[serde(default)]
     pub body: String,
     #[serde(default)]
@@ -435,6 +437,59 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed: ChannelPluginResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn ingress_request_round_trips_with_raw_query() {
+        let request = ChannelPluginRequestEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: ChannelPluginRequest::IngressEvent {
+                config: serde_json::json!({ "channel": "twilio_sms" }),
+                payload: IngressPayload {
+                    endpoint_id: Some("channel-twilio-sms:/twilio/sms".to_string()),
+                    method: "POST".to_string(),
+                    path: "/twilio/sms".to_string(),
+                    headers: BTreeMap::from([(
+                        "X-Twilio-Signature".to_string(),
+                        "signature".to_string(),
+                    )]),
+                    query: BTreeMap::from([("foo".to_string(), "bar".to_string())]),
+                    raw_query: Some("foo=bar&baz=qux".to_string()),
+                    body: "Body=hello".to_string(),
+                    trust_verified: false,
+                    received_at: Some("2026-04-12T00:00:00Z".to_string()),
+                },
+            },
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: ChannelPluginRequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn ingress_request_defaults_missing_raw_query_to_none() {
+        let json = serde_json::json!({
+            "protocol_version": CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            "request": {
+                "kind": "ingress_event",
+                "config": { "channel": "webhook" },
+                "payload": {
+                    "method": "POST",
+                    "path": "/hook",
+                    "headers": {},
+                    "query": {},
+                    "body": "",
+                    "trust_verified": true
+                }
+            }
+        });
+
+        let parsed: ChannelPluginRequestEnvelope = serde_json::from_value(json).unwrap();
+        let ChannelPluginRequest::IngressEvent { payload, .. } = parsed.request else {
+            panic!("expected ingress_event request");
+        };
+        assert_eq!(payload.raw_query, None);
     }
 
     #[test]
