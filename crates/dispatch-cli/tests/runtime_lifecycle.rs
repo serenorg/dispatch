@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::{
     fs,
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -172,6 +172,64 @@ fn http_request_with_retry(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn reserve_loopback_addr() -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?.to_string();
+    drop(listener);
+    Ok(addr)
+}
+
+fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+read line
+printf '%s\n' '{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}'
+"#,
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "webhook",
+            "allowed_paths": ["/hook"]
+        }}
+    }}
+}}"#,
+            script_path.display()
+        ),
+    )?;
+
+    Ok(manifest_path)
 }
 
 #[cfg(unix)]
@@ -359,6 +417,74 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
         )
         .exists()
     );
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args([
+            "channel",
+            "listen",
+            "channel-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--json",
+            "--registry",
+            registry_path
+                .to_str()
+                .ok_or("registry path is not valid UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook?conversation_id=abc HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )?;
+    assert!(response.starts_with("HTTP/1.1 202 Accepted"));
+    assert!(response.ends_with("accepted\n"));
+
+    let output = child.wait_with_output()?;
+    let stdout = require_success(output, "dispatch channel listen --once")?;
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in output:\n{stdout}"))?;
+    let event_output: Value = serde_json::from_str(json_line)?;
+    assert_eq!(event_output["plugin"], "channel-test");
+    assert_eq!(event_output["events"][0]["event_id"], "evt-1");
+    assert_eq!(event_output["parcel_runs"], Value::Array(Vec::new()));
 
     Ok(())
 }
