@@ -722,6 +722,108 @@ fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn channel_inspect_json_reports_plugin_and_fixed_timeout() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "inspect",
+                "channel-test",
+                "--json",
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel inspect --json",
+    )?;
+
+    let inspected: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(inspected["plugin"]["name"], "channel-test");
+    assert_eq!(inspected["plugin"]["platform"], "webhook");
+    assert_eq!(inspected["call_timeout_ms"], 30_000);
+    assert_eq!(inspected["call_timeout_display"], "30s");
+
+    Ok(())
+}
+
+#[test]
+fn channel_inspect_text_reports_fixed_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "inspect",
+                "channel-test",
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel inspect",
+    )?;
+
+    assert!(stdout.contains("Name: channel-test"));
+    assert!(stdout.contains("Platform: webhook"));
+    assert!(stdout.contains("Call Timeout: 30s"));
+
+    Ok(())
+}
+
+#[test]
 fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
