@@ -49,7 +49,7 @@ fn request_timeout(request: &ModelRequest) -> Option<Duration> {
 #[cfg(test)]
 thread_local! {
     static TEST_ENV_OVERRIDES: RefCell<BTreeMap<String, Option<String>>> =
-        RefCell::new(BTreeMap::new());
+        const { RefCell::new(BTreeMap::new()) };
 }
 
 fn env_var(name: &str) -> Result<String, std::env::VarError> {
