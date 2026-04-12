@@ -232,6 +232,80 @@ printf '%s\n' '{"kind":"ingress_events_received","events":[{"event_id":"evt-1","
     Ok(manifest_path)
 }
 
+fn write_trusted_channel_test_plugin(
+    dir: &Path,
+    secret_name: &str,
+    log_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("trusted-channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            r#"#!/bin/sh
+echo invoked >> "{}"
+read line
+printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+"#,
+            log_path.display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-trusted-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Trusted test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "webhook",
+            "ingress": {{
+                "endpoints": [
+                    {{
+                        "path": "/hook",
+                        "methods": ["POST"],
+                        "host_managed": true
+                    }}
+                ],
+                "trust": {{
+                    "mode": "shared_secret_header",
+                    "header_name": "X-Dispatch-Secret",
+                    "secret_name": "{}",
+                    "host_managed": true
+                }}
+            }}
+        }}
+    }}
+}}"#,
+            script_path.display(),
+            secret_name
+        ),
+    )?;
+
+    Ok(manifest_path)
+}
+
 #[cfg(unix)]
 #[test]
 fn detached_service_persists_terminal_status_after_sigterm()
@@ -485,6 +559,75 @@ fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::e
     assert_eq!(event_output["plugin"], "channel-test");
     assert_eq!(event_output["events"][0]["event_id"], "evt-1");
     assert_eq!(event_output["parcel_runs"], Value::Array(Vec::new()));
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let invocation_log = dir.path().join("plugin-invocations.log");
+    let manifest_path = write_trusted_channel_test_plugin(
+        dir.path(),
+        "DISPATCH_TEST_CHANNEL_SECRET",
+        &invocation_log,
+    )?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .env("DISPATCH_TEST_CHANNEL_SECRET", "expected-secret")
+        .args([
+            "channel",
+            "listen",
+            "channel-trusted-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--registry",
+            registry_path
+                .to_str()
+                .ok_or("registry path is not valid UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nX-Dispatch-Secret: wrong-secret\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )?;
+    assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+    assert!(response.contains("did not match"));
+
+    let output = child.wait_with_output()?;
+    let _ = require_success(output, "dispatch channel listen --once")?;
+    assert!(
+        !invocation_log.exists(),
+        "plugin should not have been invoked"
+    );
 
     Ok(())
 }
