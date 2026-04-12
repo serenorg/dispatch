@@ -27,6 +27,9 @@ pub enum StatusKind {
     Delivering,
     /// An extension requires the end-user to authenticate.
     AuthRequired,
+    /// A newer peer sent a status kind this build does not recognize yet.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,6 +127,8 @@ pub enum ThreadingModel {
     ChatOrThread,
     PhoneNumber,
     CallerDefined,
+    #[serde(other)]
+    Unknown,
 }
 
 /// How a channel receives inbound events from the platform.
@@ -135,6 +140,8 @@ pub enum IngressMode {
     EventsWebhook,
     InteractionWebhook,
     Polling,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -393,6 +400,19 @@ mod tests {
             serde_json::to_string(&IngressMode::InteractionWebhook).unwrap(),
             "\"interaction_webhook\""
         );
+    }
+
+    #[test]
+    fn unknown_enum_values_fall_back() {
+        let status_kind: StatusKind = serde_json::from_str("\"future_status_kind\"").unwrap();
+        assert_eq!(status_kind, StatusKind::Unknown);
+
+        let threading_model: ThreadingModel =
+            serde_json::from_str("\"future_threading_model\"").unwrap();
+        assert_eq!(threading_model, ThreadingModel::Unknown);
+
+        let ingress_mode: IngressMode = serde_json::from_str("\"future_ingress_mode\"").unwrap();
+        assert_eq!(ingress_mode, IngressMode::Unknown);
     }
 
     #[test]
