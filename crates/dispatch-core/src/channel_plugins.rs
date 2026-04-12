@@ -1,12 +1,15 @@
 use crate::{
     channel_plugin_protocol::{
         CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelPluginRequest, ChannelPluginRequestEnvelope,
-        ChannelPluginResponse,
+        ChannelPluginResponse, InboundEventEnvelope, OutboundMessageEnvelope,
     },
+    courier::CourierEvent,
     plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
@@ -506,6 +509,104 @@ pub fn call_channel_plugin(
     })
 }
 
+pub fn channel_event_session_file(
+    session_root: &Path,
+    plugin_name: &str,
+    parcel_digest: &str,
+    event: &InboundEventEnvelope,
+) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(plugin_name.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(parcel_digest.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(event.platform.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(event.conversation.id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(
+        event
+            .conversation
+            .thread_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    session_root
+        .join(plugin_name)
+        .join(format!("{}.session.json", &digest[..24]))
+}
+
+pub fn render_inbound_event_chat_input(
+    plugin_name: &str,
+    event: &InboundEventEnvelope,
+) -> Result<String, serde_json::Error> {
+    let event_json = serde_json::to_string_pretty(event)?;
+    Ok(format!(
+        "Dispatch inbound channel event\nplugin: {}\nplatform: {}\nevent_type: {}\nconversation_id: {}\nthread_id: {}\nactor_id: {}\nactor_name: {}\nmessage_id: {}\ncontent_type: {}\n\nUser message:\n{}\n\nRaw event JSON:\n{}\n",
+        plugin_name,
+        event.platform,
+        event.event_type,
+        event.conversation.id,
+        event.conversation.thread_id.as_deref().unwrap_or(""),
+        event.actor.id,
+        event
+            .actor
+            .display_name
+            .as_deref()
+            .or(event.actor.username.as_deref())
+            .unwrap_or(""),
+        event.message.id,
+        event.message.content_type,
+        event.message.content,
+        event_json
+    ))
+}
+
+pub fn extract_assistant_reply(events: &[CourierEvent]) -> Option<String> {
+    let mut streamed = String::new();
+    let mut latest_message = None;
+    for event in events {
+        match event {
+            CourierEvent::TextDelta { content } => streamed.push_str(content),
+            CourierEvent::Message { role, content } if role == "assistant" => {
+                latest_message = Some(content.clone());
+            }
+            _ => {}
+        }
+    }
+    if !streamed.is_empty() {
+        Some(streamed)
+    } else {
+        latest_message
+    }
+}
+
+pub fn build_channel_reply_message(
+    event: &InboundEventEnvelope,
+    reply_text: &str,
+) -> OutboundMessageEnvelope {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("conversation_id".to_string(), event.conversation.id.clone());
+    if let Some(thread_id) = event.conversation.thread_id.as_deref() {
+        metadata.insert("thread_id".to_string(), thread_id.to_string());
+    }
+    metadata.insert("reply_to_message_id".to_string(), event.message.id.clone());
+
+    OutboundMessageEnvelope {
+        content: reply_text.to_string(),
+        content_type: Some("text/plain".to_string()),
+        attachments: Vec::new(),
+        metadata,
+    }
+}
+
 pub fn validate_channel_plugin_manifest(
     path: &Path,
     manifest: &ChannelPluginManifest,
@@ -647,6 +748,9 @@ fn plugin_matches_ingress(plugin: &ChannelPluginManifest, method: &str, path: &s
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::channel_plugin_protocol::{
+        InboundActor, InboundConversationRef, InboundEventEnvelope, InboundMessage,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -1145,5 +1249,113 @@ exit 7
                 status, ref stderr, ..
             } if status == 7 && stderr.contains("plugin failed before replying")
         ));
+    }
+
+    #[test]
+    fn channel_event_session_file_is_stable_for_same_thread() {
+        let event = sample_inbound_event();
+
+        let first = channel_event_session_file(
+            Path::new("/tmp/channel-sessions"),
+            "channel-telegram",
+            "digest-123",
+            &event,
+        );
+        let second = channel_event_session_file(
+            Path::new("/tmp/channel-sessions"),
+            "channel-telegram",
+            "digest-123",
+            &event,
+        );
+
+        assert_eq!(first, second);
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".session.json"))
+        );
+    }
+
+    #[test]
+    fn render_inbound_event_chat_input_includes_message_and_context() {
+        let rendered = render_inbound_event_chat_input("channel-telegram", &sample_inbound_event())
+            .expect("render");
+
+        assert!(rendered.contains("plugin: channel-telegram"));
+        assert!(rendered.contains("conversation_id: chat-123"));
+        assert!(rendered.contains("User message:\nhello from telegram"));
+        assert!(rendered.contains("\"event_id\": \"evt-1\""));
+    }
+
+    #[test]
+    fn extract_assistant_reply_prefers_streamed_deltas() {
+        let reply = extract_assistant_reply(&[
+            CourierEvent::TextDelta {
+                content: "hello ".to_string(),
+            },
+            CourierEvent::TextDelta {
+                content: "world".to_string(),
+            },
+            CourierEvent::Done,
+        ]);
+
+        assert_eq!(reply.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn build_channel_reply_message_includes_reply_metadata() {
+        let message = build_channel_reply_message(&sample_inbound_event(), "reply text");
+
+        assert_eq!(message.content, "reply text");
+        assert_eq!(message.content_type.as_deref(), Some("text/plain"));
+        assert!(message.attachments.is_empty());
+        assert_eq!(
+            message.metadata.get("conversation_id").map(String::as_str),
+            Some("chat-123")
+        );
+        assert_eq!(
+            message.metadata.get("thread_id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            message
+                .metadata
+                .get("reply_to_message_id")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    fn sample_inbound_event() -> InboundEventEnvelope {
+        InboundEventEnvelope {
+            event_id: "evt-1".to_string(),
+            platform: "telegram".to_string(),
+            event_type: "message".to_string(),
+            received_at: "2026-04-11T00:00:00Z".to_string(),
+            conversation: InboundConversationRef {
+                id: "chat-123".to_string(),
+                kind: "private".to_string(),
+                thread_id: Some("7".to_string()),
+                parent_message_id: None,
+            },
+            actor: InboundActor {
+                id: "user-1".to_string(),
+                display_name: Some("Alice".to_string()),
+                username: Some("alice".to_string()),
+                is_bot: false,
+                metadata: BTreeMap::new(),
+            },
+            message: InboundMessage {
+                id: "1".to_string(),
+                content: "hello from telegram".to_string(),
+                content_type: "text/plain".to_string(),
+                reply_to_message_id: None,
+                attachments: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+            account_id: None,
+            metadata: BTreeMap::new(),
+        }
     }
 }
