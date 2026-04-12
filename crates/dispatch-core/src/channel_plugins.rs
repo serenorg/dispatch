@@ -206,6 +206,13 @@ pub enum ChannelPluginCallError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelIngressTrustFailure {
+    pub status_code: u16,
+    pub status_text: &'static str,
+    pub message: String,
+}
+
 pub fn default_channel_registry_path() -> Result<PathBuf, PluginRegistryError> {
     let home = std::env::var_os("HOME").ok_or(PluginRegistryError::MissingHome)?;
     Ok(PathBuf::from(home).join(CHANNEL_REGISTRY_RELATIVE_PATH))
@@ -729,20 +736,97 @@ fn extract_channel_ingress(channel: &OnDiskChannelCapability) -> Option<ChannelP
 }
 
 fn plugin_matches_ingress(plugin: &ChannelPluginManifest, method: &str, path: &str) -> bool {
-    plugin
-        .ingress
-        .as_ref()
-        .map(|ingress| {
-            ingress.endpoints.iter().any(|endpoint| {
-                endpoint.path == path
-                    && (endpoint.methods.is_empty()
-                        || endpoint
-                            .methods
-                            .iter()
-                            .any(|allowed| allowed.eq_ignore_ascii_case(method)))
-            })
-        })
-        .unwrap_or(false)
+    match_channel_ingress_endpoint(plugin, method, path).is_some()
+}
+
+pub fn match_channel_ingress_endpoint<'a>(
+    plugin: &'a ChannelPluginManifest,
+    method: &str,
+    path: &str,
+) -> Option<&'a ChannelIngressEndpoint> {
+    plugin.ingress.as_ref()?.endpoints.iter().find(|endpoint| {
+        endpoint.path == path
+            && (endpoint.methods.is_empty()
+                || endpoint
+                    .methods
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(method)))
+    })
+}
+
+pub fn verify_host_managed_ingress_trust(
+    plugin: &ChannelPluginManifest,
+    headers: &BTreeMap<String, String>,
+) -> Result<bool, ChannelIngressTrustFailure> {
+    let Some(ingress) = &plugin.ingress else {
+        return Ok(false);
+    };
+    let Some(trust) = &ingress.trust else {
+        return Ok(false);
+    };
+    if !trust.host_managed {
+        return Ok(false);
+    }
+
+    match trust.mode.as_str() {
+        "shared_secret_header" => {
+            let header_name =
+                trust
+                    .header_name
+                    .as_deref()
+                    .ok_or_else(|| ChannelIngressTrustFailure {
+                        status_code: 500,
+                        status_text: "Internal Server Error",
+                        message: format!(
+                            "channel plugin `{}` declares host-managed shared_secret_header trust without header_name",
+                            plugin.name
+                        ),
+                    })?;
+            let secret_name =
+                trust
+                    .secret_name
+                    .as_deref()
+                    .ok_or_else(|| ChannelIngressTrustFailure {
+                        status_code: 500,
+                        status_text: "Internal Server Error",
+                        message: format!(
+                            "channel plugin `{}` declares host-managed shared_secret_header trust without secret_name",
+                            plugin.name
+                        ),
+                    })?;
+            let header_key = header_name.to_ascii_lowercase();
+            let actual_secret =
+                headers
+                    .get(&header_key)
+                    .ok_or_else(|| ChannelIngressTrustFailure {
+                        status_code: 403,
+                        status_text: "Forbidden",
+                        message: format!("missing required ingress trust header {header_name}"),
+                    })?;
+            let expected_secret =
+                std::env::var(secret_name).map_err(|_| ChannelIngressTrustFailure {
+                    status_code: 500,
+                    status_text: "Internal Server Error",
+                    message: format!("host-managed ingress trust secret {secret_name} is not set"),
+                })?;
+            if actual_secret != &expected_secret {
+                return Err(ChannelIngressTrustFailure {
+                    status_code: 403,
+                    status_text: "Forbidden",
+                    message: format!("ingress trust header {header_name} did not match"),
+                });
+            }
+            Ok(true)
+        }
+        other => Err(ChannelIngressTrustFailure {
+            status_code: 500,
+            status_text: "Internal Server Error",
+            message: format!(
+                "channel plugin `{}` declares unsupported host-managed ingress trust mode `{other}`",
+                plugin.name
+            ),
+        }),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1325,6 +1409,126 @@ exit 7
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn match_channel_ingress_endpoint_respects_method_and_path() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-webhook".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("webhook".to_string()),
+            ingress: Some(ChannelPluginIngress {
+                endpoints: vec![ChannelIngressEndpoint {
+                    path: "/webhook/inbound".to_string(),
+                    methods: vec!["POST".to_string()],
+                    host_managed: true,
+                }],
+                trust: None,
+            }),
+            installed_sha256: None,
+        };
+
+        assert!(match_channel_ingress_endpoint(&plugin, "POST", "/webhook/inbound").is_some());
+        assert!(match_channel_ingress_endpoint(&plugin, "GET", "/webhook/inbound").is_none());
+        assert!(match_channel_ingress_endpoint(&plugin, "POST", "/other").is_none());
+    }
+
+    #[test]
+    fn verify_host_managed_ingress_trust_accepts_matching_shared_secret_header() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: Some(ChannelPluginIngress {
+                endpoints: vec![ChannelIngressEndpoint {
+                    path: "/telegram/updates".to_string(),
+                    methods: vec!["POST".to_string()],
+                    host_managed: true,
+                }],
+                trust: Some(ChannelIngressTrust {
+                    mode: "shared_secret_header".to_string(),
+                    header_name: Some("X-Telegram-Bot-Api-Secret-Token".to_string()),
+                    secret_name: Some("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET".to_string()),
+                    host_managed: true,
+                }),
+            }),
+            installed_sha256: None,
+        };
+        let headers = BTreeMap::from([(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "expected-secret".to_string(),
+        )]);
+
+        unsafe {
+            std::env::set_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET", "expected-secret");
+        }
+        let verified = verify_host_managed_ingress_trust(&plugin, &headers)
+            .expect("host-managed ingress trust should verify");
+        unsafe {
+            std::env::remove_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET");
+        }
+
+        assert!(verified);
+    }
+
+    #[test]
+    fn verify_host_managed_ingress_trust_rejects_mismatched_shared_secret_header() {
+        let plugin = ChannelPluginManifest {
+            name: "channel-telegram".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: "/usr/bin/true".to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: Some(ChannelPluginIngress {
+                endpoints: vec![ChannelIngressEndpoint {
+                    path: "/telegram/updates".to_string(),
+                    methods: vec!["POST".to_string()],
+                    host_managed: true,
+                }],
+                trust: Some(ChannelIngressTrust {
+                    mode: "shared_secret_header".to_string(),
+                    header_name: Some("X-Telegram-Bot-Api-Secret-Token".to_string()),
+                    secret_name: Some("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET".to_string()),
+                    host_managed: true,
+                }),
+            }),
+            installed_sha256: None,
+        };
+        let headers = BTreeMap::from([(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "wrong-secret".to_string(),
+        )]);
+
+        unsafe {
+            std::env::set_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET", "expected-secret");
+        }
+        let error = verify_host_managed_ingress_trust(&plugin, &headers)
+            .expect_err("mismatched host-managed ingress trust should fail");
+        unsafe {
+            std::env::remove_var("DISPATCH_TEST_TELEGRAM_WEBHOOK_SECRET");
+        }
+
+        assert_eq!(error.status_code, 403);
+        assert!(error.message.contains("did not match"));
     }
 
     fn sample_inbound_event() -> InboundEventEnvelope {
