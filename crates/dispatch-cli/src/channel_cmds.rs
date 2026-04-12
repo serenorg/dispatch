@@ -12,11 +12,10 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{BufRead, BufReader, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::Read,
     path::{Path, PathBuf},
-    time::Duration,
 };
+use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 struct ChannelIngressArgs<'a> {
     name: Option<&'a str>,
@@ -264,9 +263,9 @@ fn channel_listen(args: ChannelListenArgs<'_>) -> Result<()> {
         args.tool_approval,
         args.deliver_replies,
     )?;
-    let listener = TcpListener::bind(args.listen)
-        .with_context(|| format!("failed to bind {}", args.listen))?;
-    println!("Listening on {}", listener.local_addr()?);
+    let server = Server::http(args.listen)
+        .map_err(|error| anyhow::anyhow!("failed to bind {}: {error}", args.listen))?;
+    println!("Listening on {}", server.server_addr());
     if let Some(parcel_bridge) = &parcel_bridge {
         println!(
             "Parcel bridge: {} via {} (sessions under {})",
@@ -277,12 +276,10 @@ fn channel_listen(args: ChannelListenArgs<'_>) -> Result<()> {
     }
 
     loop {
-        let (stream, remote_addr) = listener.accept().context("failed to accept connection")?;
         handle_channel_listener_connection(
             &plugin,
             &config,
-            stream,
-            remote_addr,
+            server.recv().context("failed to accept connection")?,
             parcel_bridge.as_ref(),
             args.emit_json,
         )?;
@@ -473,28 +470,20 @@ fn parse_key_value_pairs(entries: &[String], field_name: &str) -> Result<BTreeMa
 fn handle_channel_listener_connection(
     plugin: &ChannelPluginManifest,
     config: &Value,
-    stream: TcpStream,
-    remote_addr: SocketAddr,
+    mut request: Request,
     parcel_bridge: Option<&ChannelParcelBridge>,
     emit_json: bool,
 ) -> Result<()> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .context("failed to configure ingress read timeout")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .context("failed to configure ingress write timeout")?;
-    let mut writer = stream
-        .try_clone()
-        .context("failed to clone ingress connection")?;
-    let mut reader = BufReader::new(stream);
-    let request = match parse_http_request(&mut reader, 1024 * 1024, 64 * 1024) {
+    let remote_addr = request
+        .remote_addr()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let parsed = match parse_http_request(&mut request, 1024 * 1024) {
         Ok(request) => request,
         Err(error) => {
-            return write_http_response(
-                &mut writer,
+            return respond_http_request(
+                request,
                 400,
-                "Bad Request",
                 Some("text/plain; charset=utf-8"),
                 &format!("invalid request: {error}\n"),
             );
@@ -502,25 +491,23 @@ fn handle_channel_listener_connection(
     };
 
     let matched_endpoint =
-        match match_channel_ingress_endpoint(plugin, &request.method, &request.path) {
+        match match_channel_ingress_endpoint(plugin, &parsed.method, &parsed.path) {
             Some(endpoint) => endpoint,
             None => {
-                return write_http_response(
-                    &mut writer,
+                return respond_http_request(
+                    request,
                     404,
-                    "Not Found",
                     Some("text/plain; charset=utf-8"),
                     "request did not match an installed ingress endpoint\n",
                 );
             }
         };
-    let trust_verified = match verify_host_managed_ingress_trust(plugin, &request.headers) {
+    let trust_verified = match verify_host_managed_ingress_trust(plugin, &parsed.headers) {
         Ok(verified) => verified,
         Err(error) => {
-            return write_http_response(
-                &mut writer,
+            return respond_http_request(
+                request,
                 error.status_code,
-                error.status_text,
                 Some("text/plain; charset=utf-8"),
                 &format!("{}\n", error.message),
             );
@@ -533,12 +520,12 @@ fn handle_channel_listener_connection(
             config: config.clone(),
             payload: IngressPayload {
                 endpoint_id: Some(format!("{}:{}", plugin.name, matched_endpoint.path)),
-                method: request.method.clone(),
-                path: request.path.clone(),
-                headers: request.headers.clone(),
-                query: parse_query_string(request.query.as_deref()),
-                raw_query: request.query.clone(),
-                body: request.body.clone().unwrap_or_default(),
+                method: parsed.method.clone(),
+                path: parsed.path.clone(),
+                headers: parsed.headers.clone(),
+                query: parse_query_string(parsed.query.as_deref()),
+                raw_query: parsed.query.clone(),
+                body: parsed.body.clone().unwrap_or_default(),
                 trust_verified,
                 received_at: Some(Utc::now().to_rfc3339()),
             },
@@ -567,8 +554,8 @@ fn handle_channel_listener_connection(
             } else {
                 println!(
                     "Ingress {} {} from {} -> {} event(s)",
-                    request.method,
-                    request.path,
+                    parsed.method,
+                    parsed.path,
                     remote_addr,
                     events.len()
                 );
@@ -595,35 +582,31 @@ fn handle_channel_listener_connection(
                 content_type: Some("text/plain; charset=utf-8".to_string()),
                 body: String::new(),
             });
-            write_http_response(
-                &mut writer,
+            respond_http_request(
+                request,
                 reply.status,
-                http_status_text(reply.status),
                 reply.content_type.as_deref(),
                 &reply.body,
             )
         }
-        Ok(ChannelPluginResponse::Error { error }) => write_http_response(
-            &mut writer,
+        Ok(ChannelPluginResponse::Error { error }) => respond_http_request(
+            request,
             502,
-            "Bad Gateway",
             Some("text/plain; charset=utf-8"),
             &format!("channel plugin error {}: {}\n", error.code, error.message),
         ),
-        Ok(other) => write_http_response(
-            &mut writer,
+        Ok(other) => respond_http_request(
+            request,
             502,
-            "Bad Gateway",
             Some("text/plain; charset=utf-8"),
             &format!(
                 "channel plugin returned unexpected response variant for ingress: {:?}\n",
                 response_kind(&other)
             ),
         ),
-        Err(error) => write_http_response(
-            &mut writer,
+        Err(error) => respond_http_request(
+            request,
             502,
-            "Bad Gateway",
             Some("text/plain; charset=utf-8"),
             &format!("failed to call channel plugin: {error}\n"),
         ),
@@ -762,73 +745,34 @@ fn parse_query_string(query: Option<&str>) -> BTreeMap<String, String> {
     parsed
 }
 
-fn parse_http_request(
-    reader: &mut impl BufRead,
-    max_body_bytes: usize,
-    max_header_bytes: usize,
-) -> Result<ParsedHttpRequest> {
-    let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
-        .context("failed to read request line")?;
-    if read == 0 {
-        bail!("empty request");
-    }
-    let mut header_bytes = request_line.len();
-    if header_bytes > max_header_bytes {
-        bail!("request headers exceed {max_header_bytes} bytes");
-    }
-    let request_line = request_line.trim_end();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_ascii_uppercase();
-    let target = parts.next().unwrap_or_default().to_string();
-    let version = parts.next().unwrap_or_default();
-    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/") {
-        bail!("malformed request line `{request_line}`");
-    }
-
-    let mut headers = BTreeMap::new();
-    let mut content_length = 0usize;
-    loop {
-        let mut header_line = String::new();
-        reader
-            .read_line(&mut header_line)
-            .context("failed to read request header")?;
-        header_bytes += header_line.len();
-        if header_bytes > max_header_bytes {
-            bail!("request headers exceed {max_header_bytes} bytes");
-        }
-        let header_line = header_line.trim_end();
-        if header_line.is_empty() {
-            break;
-        }
-        let Some((name, value)) = header_line.split_once(':') else {
-            bail!("malformed header `{header_line}`");
-        };
-        let header_name = name.trim().to_ascii_lowercase();
-        let header_value = value.trim().to_string();
-        if header_name == "content-length" {
-            content_length = header_value
-                .parse::<usize>()
-                .with_context(|| format!("invalid content-length `{header_value}`"))?;
-        }
-        if header_name == "transfer-encoding" {
-            bail!("transfer-encoding is not supported");
-        }
-        headers.insert(header_name, header_value);
-    }
-
-    if content_length > max_body_bytes {
-        bail!("request body exceeds {max_body_bytes} bytes");
-    }
-    let mut body = vec![0u8; content_length];
-    reader
-        .read_exact(&mut body)
-        .context("failed to read request body")?;
+fn parse_http_request(request: &mut Request, max_body_bytes: usize) -> Result<ParsedHttpRequest> {
+    let method = request.method().as_str().to_ascii_uppercase();
+    let target = request.url().to_string();
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path.to_string(), Some(query.to_string())),
         None => (target.clone(), None),
     };
+
+    let headers = request
+        .headers()
+        .iter()
+        .map(|header| {
+            (
+                header.field.to_string().to_ascii_lowercase(),
+                header.value.to_string(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take((max_body_bytes as u64) + 1)
+        .read_to_end(&mut body)
+        .context("failed to read request body")?;
+    if body.len() > max_body_bytes {
+        bail!("request body exceeds {max_body_bytes} bytes");
+    }
 
     Ok(ParsedHttpRequest {
         method,
@@ -844,35 +788,22 @@ fn parse_http_request(
     })
 }
 
-fn write_http_response(
-    writer: &mut impl Write,
+fn respond_http_request(
+    request: Request,
     status_code: u16,
-    status_text: &str,
     content_type: Option<&str>,
     body: &str,
 ) -> Result<()> {
-    let content_type = content_type.unwrap_or("text/plain; charset=utf-8");
-    write!(
-        writer,
-        "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .context("failed to write ingress response")
-}
-
-fn http_status_text(status_code: u16) -> &'static str {
-    match status_code {
-        200 => "OK",
-        202 => "Accepted",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        _ => "OK",
+    let mut response =
+        Response::from_string(body.to_string()).with_status_code(StatusCode(status_code));
+    if let Some(content_type) = content_type.or(Some("text/plain; charset=utf-8")) {
+        let header = Header::from_bytes(b"Content-Type", content_type.as_bytes())
+            .map_err(|_| anyhow::anyhow!("failed to build response content-type header"))?;
+        response = response.with_header(header);
     }
+    request
+        .respond(response)
+        .context("failed to write ingress response")
 }
 
 fn response_kind(response: &ChannelPluginResponse) -> &'static str {
@@ -936,7 +867,6 @@ fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn parse_key_value_pairs_accepts_repeated_cli_entries() {
@@ -1008,21 +938,5 @@ mod tests {
         );
         assert_eq!(query.get("thread_id").map(String::as_str), Some("42"));
         assert_eq!(query.get("flag").map(String::as_str), Some(""));
-    }
-
-    #[test]
-    fn parse_http_request_reads_request_line_headers_and_body() {
-        let request = b"POST /hook?conversation_id=abc HTTP/1.1\r\nContent-Length: 5\r\nX-Test: value\r\n\r\nhello";
-        let parsed = parse_http_request(&mut Cursor::new(&request[..]), 1024, 1024)
-            .expect("parse http request");
-
-        assert_eq!(parsed.method, "POST");
-        assert_eq!(parsed.path, "/hook");
-        assert_eq!(parsed.query.as_deref(), Some("conversation_id=abc"));
-        assert_eq!(parsed.body.as_deref(), Some("hello"));
-        assert_eq!(
-            parsed.headers.get("x-test").map(String::as_str),
-            Some("value")
-        );
     }
 }

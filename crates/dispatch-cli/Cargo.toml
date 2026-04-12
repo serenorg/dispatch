@@ -24,6 +24,7 @@ cron.workspace = true
 sha2.workspace = true
 signal-hook.workspace = true
 atomic-write-file.workspace = true
+tiny_http.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["process"] }
