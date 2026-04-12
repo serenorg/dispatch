@@ -306,7 +306,8 @@ pub struct InboundAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub kind: String,
-    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,5 +534,26 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: OutboundMessageEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, envelope);
+    }
+
+    #[test]
+    fn inbound_attachment_omits_missing_url() {
+        let attachment = InboundAttachment {
+            id: Some("telegram-file-id".to_string()),
+            kind: "image".to_string(),
+            url: None,
+            mime_type: Some("image/jpeg".to_string()),
+            size_bytes: Some(2048),
+            name: None,
+            storage_key: Some("telegram:file:telegram-file-id".to_string()),
+            extracted_text: None,
+            extras: BTreeMap::from([("file_unique_id".to_string(), "unique-1".to_string())]),
+        };
+
+        let value = serde_json::to_value(&attachment).unwrap();
+        assert!(value.get("url").is_none());
+
+        let parsed: InboundAttachment = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, attachment);
     }
 }
