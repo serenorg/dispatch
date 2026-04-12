@@ -78,6 +78,8 @@ dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file t
 dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json --parcel ./Agentfile --session-root ./.dispatch/channel-sessions --deliver-replies
 ```
 
+Channel plugin subprocess calls currently use a fixed 30s host-side timeout.
+
 ## Extension manifest format
 
 Both courier and channel plugins use a JSON manifest file that declares

@@ -8,12 +8,14 @@ use dispatch_core::{
     match_channel_ingress_endpoint, render_inbound_event_chat_input, resolve_channel_plugin,
     resolve_channel_plugin_for_ingress, verify_host_managed_ingress_trust,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env, fs,
     io::Read,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
@@ -191,10 +193,18 @@ fn channel_ls(registry: Option<&Path>, emit_json: bool) -> Result<()> {
 
 fn channel_inspect(name: &str, registry: Option<&Path>, emit_json: bool) -> Result<()> {
     let plugin = resolve_channel_plugin(name, registry)?;
+    let call_timeout = Duration::from_secs(30);
     if emit_json {
-        println!("{}", serde_json::to_string_pretty(&plugin)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ChannelInspectView {
+                plugin: &plugin,
+                call_timeout_ms: call_timeout.as_millis(),
+                call_timeout_display: format_duration_literal(call_timeout),
+            })?
+        );
     } else {
-        print_channel_plugin_manifest(&plugin);
+        print_channel_plugin_manifest(&plugin, call_timeout);
     }
     Ok(())
 }
@@ -821,7 +831,14 @@ fn response_kind(response: &ChannelPluginResponse) -> &'static str {
     }
 }
 
-fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
+#[derive(Debug, Serialize)]
+struct ChannelInspectView<'a> {
+    plugin: &'a ChannelPluginManifest,
+    call_timeout_ms: u128,
+    call_timeout_display: String,
+}
+
+fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest, call_timeout: Duration) {
     println!("Name: {}", plugin.name);
     println!("Version: {}", plugin.version);
     println!("Protocol: v{}", plugin.protocol_version);
@@ -862,6 +879,20 @@ fn print_channel_plugin_manifest(plugin: &ChannelPluginManifest) {
     if let Some(description) = &plugin.description {
         println!("Description: {description}");
     }
+    println!("Call Timeout: {}", format_duration_literal(call_timeout));
+}
+
+fn format_duration_literal(duration: Duration) -> String {
+    if duration.subsec_nanos() == 0 {
+        if duration.as_secs().is_multiple_of(60 * 60) {
+            return format!("{}h", duration.as_secs() / (60 * 60));
+        }
+        if duration.as_secs().is_multiple_of(60) {
+            return format!("{}m", duration.as_secs() / 60);
+        }
+        return format!("{}s", duration.as_secs());
+    }
+    format!("{}ms", duration.as_millis())
 }
 
 #[cfg(test)]
@@ -938,5 +969,13 @@ mod tests {
         );
         assert_eq!(query.get("thread_id").map(String::as_str), Some("42"));
         assert_eq!(query.get("flag").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn format_duration_literal_prefers_readable_units() {
+        assert_eq!(format_duration_literal(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_duration_literal(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration_literal(Duration::from_secs(120)), "2m");
+        assert_eq!(format_duration_literal(Duration::from_secs(7200)), "2h");
     }
 }

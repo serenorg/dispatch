@@ -6,19 +6,26 @@ use crate::{
     courier::CourierEvent,
     plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
 };
+use dispatch_process::{
+    RecvLineError, kill_child_and_wait, recv_line_with_child_exit, spawn_line_reader,
+    wait_for_child_timeout,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead as _, BufReader, Read as _, Write as _},
+    io::{BufReader, Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
 const CHANNEL_REGISTRY_RELATIVE_PATH: &str = ".config/dispatch/channels.json";
+const CHANNEL_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_PLUGIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelPluginExec {
@@ -203,6 +210,12 @@ pub enum ChannelPluginCallError {
     PluginExit {
         channel: String,
         status: i32,
+        stderr: String,
+    },
+    #[error("channel plugin `{channel}` timed out after {timeout_ms}ms: {stderr}")]
+    PluginTimedOut {
+        channel: String,
+        timeout_ms: u128,
         stderr: String,
     },
 }
@@ -404,6 +417,15 @@ pub fn call_channel_plugin(
     manifest: &ChannelPluginManifest,
     request: ChannelPluginRequest,
 ) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    call_channel_plugin_with_timeout(manifest, request, CHANNEL_PLUGIN_CALL_TIMEOUT)
+}
+
+fn call_channel_plugin_with_timeout(
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+    timeout: Duration,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    let deadline = Instant::now() + timeout;
     let mut command = Command::new(&manifest.exec.command);
     command
         .args(&manifest.exec.args)
@@ -466,34 +488,76 @@ pub fn call_channel_plugin(
             Ok(stderr)
         })
     });
-    let mut stdout = BufReader::new(stdout);
-    let mut line = String::new();
-    let bytes = stdout.read_line(&mut line).map_err(|source| {
-        ChannelPluginCallError::ReadPluginResponse {
-            channel: manifest.name.clone(),
-            source,
-        }
-    })?;
-
-    let status = child
-        .wait()
-        .map_err(|source| ChannelPluginCallError::WaitPlugin {
-            channel: manifest.name.clone(),
-            source,
-        })?;
-    let stderr = match stderr_reader {
-        Some(reader) => reader
-            .join()
-            .map_err(|_| ChannelPluginCallError::PluginProtocol {
+    let (stdout_receiver, stdout_reader) = spawn_line_reader(BufReader::new(stdout));
+    let (bytes, line) = match recv_line_with_child_exit(
+        &stdout_receiver,
+        &mut child,
+        Some(remaining_channel_plugin_timeout(deadline)),
+        CHANNEL_PLUGIN_POLL_INTERVAL,
+    ) {
+        Ok(Some((bytes, line))) => (bytes, line),
+        Ok(None) => (0, String::new()),
+        Err(RecvLineError::Timeout) => {
+            let stderr = timeout_channel_plugin(
+                &mut child,
+                stderr_reader,
+                stdout_reader,
+                manifest.name.as_str(),
+            )?;
+            return Err(ChannelPluginCallError::PluginTimedOut {
                 channel: manifest.name.clone(),
-                message: "channel plugin stderr reader thread panicked".to_string(),
-            })?
-            .map_err(|source| ChannelPluginCallError::ReadPluginResponse {
+                timeout_ms: timeout.as_millis(),
+                stderr,
+            });
+        }
+        Err(RecvLineError::Disconnected) => {
+            return Err(ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: "channel plugin stdout reader disconnected".to_string(),
+            });
+        }
+        Err(RecvLineError::Read(message)) => {
+            return Err(ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: format!("failed to read channel plugin response: {message}"),
+            });
+        }
+        Err(RecvLineError::ChildWait(source)) => {
+            return Err(ChannelPluginCallError::WaitPlugin {
                 channel: manifest.name.clone(),
                 source,
-            })?,
-        None => String::new(),
+            });
+        }
     };
+
+    let status = match wait_for_child_timeout(
+        &mut child,
+        Some(remaining_channel_plugin_timeout(deadline)),
+        CHANNEL_PLUGIN_POLL_INTERVAL,
+    ) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let stderr = timeout_channel_plugin(
+                &mut child,
+                stderr_reader,
+                stdout_reader,
+                manifest.name.as_str(),
+            )?;
+            return Err(ChannelPluginCallError::PluginTimedOut {
+                channel: manifest.name.clone(),
+                timeout_ms: timeout.as_millis(),
+                stderr,
+            });
+        }
+        Err(source) => {
+            return Err(ChannelPluginCallError::WaitPlugin {
+                channel: manifest.name.clone(),
+                source,
+            });
+        }
+    };
+    join_stdout_reader(stdout_reader, manifest.name.as_str())?;
+    let stderr = collect_stderr(stderr_reader, manifest.name.as_str())?;
     if bytes == 0 {
         if status.success() {
             return Err(ChannelPluginCallError::PluginProtocol {
@@ -525,6 +589,52 @@ pub fn call_channel_plugin(
         status: status.code().unwrap_or(-1),
         stderr: stderr.trim().to_string(),
     })
+}
+
+fn remaining_channel_plugin_timeout(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+fn join_stdout_reader(
+    stdout_reader: thread::JoinHandle<()>,
+    channel: &str,
+) -> Result<(), ChannelPluginCallError> {
+    stdout_reader
+        .join()
+        .map_err(|_| ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_string(),
+            message: "channel plugin stdout reader thread panicked".to_string(),
+        })
+}
+
+fn collect_stderr(
+    stderr_reader: Option<thread::JoinHandle<std::io::Result<String>>>,
+    channel: &str,
+) -> Result<String, ChannelPluginCallError> {
+    match stderr_reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| ChannelPluginCallError::PluginProtocol {
+                channel: channel.to_string(),
+                message: "channel plugin stderr reader thread panicked".to_string(),
+            })?
+            .map_err(|source| ChannelPluginCallError::ReadPluginResponse {
+                channel: channel.to_string(),
+                source,
+            }),
+        None => Ok(String::new()),
+    }
+}
+
+fn timeout_channel_plugin(
+    child: &mut std::process::Child,
+    stderr_reader: Option<thread::JoinHandle<std::io::Result<String>>>,
+    stdout_reader: thread::JoinHandle<()>,
+    channel: &str,
+) -> Result<String, ChannelPluginCallError> {
+    kill_child_and_wait(child);
+    join_stdout_reader(stdout_reader, channel)?;
+    collect_stderr(stderr_reader, channel)
 }
 
 pub fn channel_event_session_file(
@@ -1385,6 +1495,95 @@ printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","pl
             panic!("unexpected response variant");
         };
         assert_eq!(capabilities.plugin_id, "telegram");
+    }
+
+    #[test]
+    fn call_channel_plugin_times_out_when_plugin_never_replies() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-hangs-before-response.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+sleep 5
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "hangs-before-response-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: None,
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let error = call_channel_plugin_with_timeout(
+            &manifest,
+            ChannelPluginRequest::Capabilities,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
+        ));
+    }
+
+    #[test]
+    fn call_channel_plugin_times_out_when_plugin_never_exits_after_reply() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-hangs-after-response.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}'
+sleep 5
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "hangs-after-response-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let error = call_channel_plugin_with_timeout(
+            &manifest,
+            ChannelPluginRequest::Capabilities,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
+        ));
     }
 
     #[test]
