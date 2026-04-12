@@ -11,9 +11,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead as _, BufReader, Write as _},
+    io::{BufRead as _, BufReader, Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
 };
 use thiserror::Error;
 
@@ -458,6 +459,13 @@ pub fn call_channel_plugin(
             channel: manifest.name.clone(),
             message: "channel plugin stdout was not captured".to_string(),
         })?;
+    let stderr_reader = child.stderr.take().map(|mut stderr_pipe| {
+        thread::spawn(move || -> std::io::Result<String> {
+            let mut stderr = String::new();
+            stderr_pipe.read_to_string(&mut stderr)?;
+            Ok(stderr)
+        })
+    });
     let mut stdout = BufReader::new(stdout);
     let mut line = String::new();
     let bytes = stdout.read_line(&mut line).map_err(|source| {
@@ -467,22 +475,25 @@ pub fn call_channel_plugin(
         }
     })?;
 
-    let mut stderr = String::new();
-    if let Some(mut stderr_pipe) = child.stderr.take() {
-        use std::io::Read as _;
-        stderr_pipe.read_to_string(&mut stderr).map_err(|source| {
-            ChannelPluginCallError::ReadPluginResponse {
-                channel: manifest.name.clone(),
-                source,
-            }
-        })?;
-    }
     let status = child
         .wait()
         .map_err(|source| ChannelPluginCallError::WaitPlugin {
             channel: manifest.name.clone(),
             source,
         })?;
+    let stderr = match stderr_reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: "channel plugin stderr reader thread panicked".to_string(),
+            })?
+            .map_err(|source| ChannelPluginCallError::ReadPluginResponse {
+                channel: manifest.name.clone(),
+                source,
+            })?,
+        None => String::new(),
+    };
     if bytes == 0 {
         if status.success() {
             return Err(ChannelPluginCallError::PluginProtocol {
@@ -1333,6 +1344,47 @@ exit 7
                 status, ref stderr, ..
             } if status == 7 && stderr.contains("plugin failed before replying")
         ));
+    }
+
+    #[test]
+    fn call_channel_plugin_handles_large_stderr_without_deadlock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-chatty-stderr.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+dd if=/dev/zero bs=131072 count=1 2>/dev/null | tr '\000' x >&2
+printf '\n' >&2
+printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "chatty-stderr-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let response = call_channel_plugin(&manifest, ChannelPluginRequest::Capabilities).unwrap();
+        let ChannelPluginResponse::Capabilities { capabilities } = response else {
+            panic!("unexpected response variant");
+        };
+        assert_eq!(capabilities.plugin_id, "telegram");
     }
 
     #[test]
