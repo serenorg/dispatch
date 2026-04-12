@@ -1,3 +1,7 @@
+use dispatch_core::{
+    BuildOptions, CourierPluginExec, CourierPluginManifest, PluginTransport, build_agentfile,
+    install_courier_plugin,
+};
 use dispatch_process::run_command_with_file_capture;
 #[cfg(unix)]
 use nix::{
@@ -300,6 +304,160 @@ printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{
 }}"#,
             script_path.display(),
             secret_name
+        ),
+    )?;
+
+    Ok(manifest_path)
+}
+
+fn build_chat_test_parcel(root: &Path) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+    let context_dir = root.join("reply-parcel");
+    fs::create_dir_all(&context_dir)?;
+    fs::write(
+        context_dir.join("Agentfile"),
+        "FROM dispatch/native:latest\n\
+NAME reply-fixture\n\
+VERSION 0.1.0\n\
+SKILL SKILL.md\n\
+ENTRYPOINT chat\n",
+    )?;
+    fs::write(context_dir.join("SKILL.md"), "Always reply briefly.\n")?;
+
+    let built = build_agentfile(
+        &context_dir.join("Agentfile"),
+        &BuildOptions {
+            output_root: context_dir.join(".dispatch/parcels"),
+        },
+    )?;
+    Ok((built.parcel_dir, built.digest))
+}
+
+fn install_test_courier_plugin(
+    root: &Path,
+    registry_path: &Path,
+    name: &str,
+    parcel_digest: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_path = root.join("courier-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "set -eu\n",
+                "while IFS= read -r line; do\n",
+                "if printf '%s' \"$line\" | grep -q '\"kind\":\"capabilities\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"capabilities\",\"capabilities\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"validate_parcel\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"ok\"}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"inspect\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"inspection\",\"inspection\":{{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"entrypoint\":\"chat\",\"required_secrets\":[],\"mounts\":[],\"local_tools\":[]}}}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"open_session\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"elapsed_ms\":0,\"history\":[],\"resolved_mounts\":[],\"backend_state\":\"open\"}}}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"run\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"plugin reply\"}}}}'\n",
+                "  printf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"elapsed_ms\":0,\"history\":[{{\"role\":\"assistant\",\"content\":\"plugin reply\"}}],\"resolved_mounts\":[],\"backend_state\":\"done\"}}}}'\n",
+                "else\n",
+                "  printf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}}}'\n",
+                "  exit 1\n",
+                "fi\n",
+                "done\n"
+            ),
+            parcel_digest = parcel_digest
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = root.join("courier-plugin.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&CourierPluginManifest {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: Some("Demo courier plugin for listener tests".to_string()),
+            exec: CourierPluginExec {
+                command: script_path.display().to_string(),
+                args: Vec::new(),
+            },
+            installed_sha256: None,
+        })?,
+    )?;
+
+    install_courier_plugin(&manifest_path, Some(registry_path))?;
+    Ok(())
+}
+
+fn write_reply_channel_test_plugin(
+    dir: &Path,
+    log_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("reply-channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "set -eu\n",
+                "read line\n",
+                "if printf '%s' \"$line\" | grep -q '\"kind\":\"ingress_event\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"ingress_events_received\",\"events\":[{{\"event_id\":\"evt-1\",\"platform\":\"webhook\",\"event_type\":\"message\",\"received_at\":\"2026-04-12T00:00:00Z\",\"conversation\":{{\"id\":\"conv-1\",\"kind\":\"private\",\"thread_id\":\"thread-1\"}},\"actor\":{{\"id\":\"user-1\",\"is_bot\":false,\"metadata\":{{}}}},\"message\":{{\"id\":\"msg-1\",\"content\":\"hello\",\"content_type\":\"text/plain\",\"attachments\":[],\"metadata\":{{}}}},\"metadata\":{{}}}}],\"callback_reply\":{{\"status\":200,\"content_type\":\"text/plain; charset=utf-8\",\"body\":\"ok\\n\"}}}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"deliver\"'; then\n",
+                "  printf '%s\\n' \"$line\" >> \"{}\"\n",
+                "  printf '%s\\n' '{{\"kind\":\"delivered\",\"delivery\":{{\"message_id\":\"delivery-1\",\"conversation_id\":\"conv-1\",\"metadata\":{{\"delivered_by\":\"test\"}}}}}}'\n",
+                "else\n",
+                "  printf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}}}'\n",
+                "  exit 1\n",
+                "fi\n"
+            ),
+            log_path.display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-reply-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Reply test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "webhook",
+            "allowed_paths": ["/hook"]
+        }}
+    }}
+}}"#,
+            script_path.display()
         ),
     )?;
 
@@ -627,6 +785,116 @@ fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
     assert!(
         !invocation_log.exists(),
         "plugin should not have been invoked"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_delivers_replies_through_plugin() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let channel_registry_path = dir.path().join("channels.json");
+    let courier_registry_path = dir.path().join("couriers.json");
+    let delivery_log = dir.path().join("deliver.log");
+    let channel_manifest_path = write_reply_channel_test_plugin(dir.path(), &delivery_log)?;
+    let (parcel_dir, parcel_digest) = build_chat_test_parcel(dir.path())?;
+    install_test_courier_plugin(
+        dir.path(),
+        &courier_registry_path,
+        "listener-test-courier",
+        &parcel_digest,
+    )?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                channel_manifest_path
+                    .to_str()
+                    .ok_or("channel manifest path is not valid UTF-8")?,
+                "--registry",
+                channel_registry_path
+                    .to_str()
+                    .ok_or("channel registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args([
+            "channel",
+            "listen",
+            "channel-reply-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--json",
+            "--parcel",
+            parcel_dir
+                .to_str()
+                .ok_or("parcel path is not valid UTF-8")?,
+            "--courier",
+            "listener-test-courier",
+            "--courier-registry",
+            courier_registry_path
+                .to_str()
+                .ok_or("courier registry path is not valid UTF-8")?,
+            "--deliver-replies",
+            "--registry",
+            channel_registry_path
+                .to_str()
+                .ok_or("channel registry path is not valid UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )?;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+    let output = child.wait_with_output()?;
+    let stdout = require_success(output, "dispatch channel listen --deliver-replies")?;
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in output:\n{stdout}"))?;
+    let event_output: Value = serde_json::from_str(json_line)?;
+    assert_eq!(event_output["plugin"], "channel-reply-test");
+    assert_eq!(event_output["parcel_runs"][0]["event_id"], "evt-1");
+    assert_eq!(
+        event_output["parcel_runs"][0]["delivery"]["message_id"],
+        "delivery-1"
+    );
+
+    let logged_request = fs::read_to_string(&delivery_log)?;
+    let deliver_envelope: Value = serde_json::from_str(logged_request.trim())?;
+    assert_eq!(deliver_envelope["request"]["kind"], "deliver");
+    assert_eq!(
+        deliver_envelope["request"]["message"]["content"],
+        "plugin reply"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["conversation_id"],
+        "conv-1"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["thread_id"],
+        "thread-1"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["reply_to_message_id"],
+        "msg-1"
     );
 
     Ok(())
