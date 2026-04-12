@@ -236,6 +236,64 @@ printf '%s\n' '{"kind":"ingress_events_received","events":[{"event_id":"evt-1","
     Ok(manifest_path)
 }
 
+fn write_logging_channel_test_plugin(
+    dir: &Path,
+    log_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("logging-channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            r#"#!/bin/sh
+read line
+printf '%s\n' "$line" > "{}"
+printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+"#,
+            log_path.display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-query-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Query decoding test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "webhook",
+            "allowed_paths": ["/hook"]
+        }}
+    }}
+}}"#,
+            script_path.display()
+        ),
+    )?;
+
+    Ok(manifest_path)
+}
+
 fn write_trusted_channel_test_plugin(
     dir: &Path,
     secret_name: &str,
@@ -717,6 +775,75 @@ fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::e
     assert_eq!(event_output["plugin"], "channel-test");
     assert_eq!(event_output["events"][0]["event_id"], "evt-1");
     assert_eq!(event_output["parcel_runs"], Value::Array(Vec::new()));
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let request_log = dir.path().join("request.json");
+    let manifest_path = write_logging_channel_test_plugin(dir.path(), &request_log)?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args([
+            "channel",
+            "listen",
+            "channel-query-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--registry",
+            registry_path
+                .to_str()
+                .ok_or("registry path is not valid UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook?subject=hello%20world&name=dispatch%2Bbot&flag HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )?;
+    assert!(response.contains("ok\n"), "unexpected response: {response}");
+
+    let output = child.wait_with_output()?;
+    let _ = require_success(output, "dispatch channel listen query decode --once")?;
+
+    let logged_request: Value = serde_json::from_slice(&fs::read(&request_log)?)?;
+    let payload = &logged_request["request"]["payload"];
+    assert_eq!(
+        payload["raw_query"],
+        "subject=hello%20world&name=dispatch%2Bbot&flag"
+    );
+    assert_eq!(payload["query"]["subject"], "hello world");
+    assert_eq!(payload["query"]["name"], "dispatch+bot");
+    assert_eq!(payload["query"]["flag"], "");
 
     Ok(())
 }

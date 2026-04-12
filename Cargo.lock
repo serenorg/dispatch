@@ -849,6 +849,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tiny_http",
+ "url",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ use std::{
     time::Duration,
 };
 use tiny_http::{Header, Request, Response, Server, StatusCode};
+use url::form_urlencoded;
 
 struct ChannelIngressArgs<'a> {
     name: Option<&'a str>,
@@ -739,20 +740,10 @@ fn deliver_channel_reply(
 }
 
 fn parse_query_string(query: Option<&str>) -> BTreeMap<String, String> {
-    let mut parsed = BTreeMap::new();
-    for pair in query.unwrap_or_default().split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (name, value) = match pair.split_once('=') {
-            Some((name, value)) => (name, value),
-            None => (pair, ""),
-        };
-        if !name.is_empty() {
-            parsed.insert(name.to_string(), value.to_string());
-        }
-    }
-    parsed
+    form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect()
 }
 
 fn parse_http_request(request: &mut Request, max_body_bytes: usize) -> Result<ParsedHttpRequest> {
@@ -961,7 +952,9 @@ mod tests {
 
     #[test]
     fn parse_query_string_extracts_pairs() {
-        let query = parse_query_string(Some("conversation_id=abc&thread_id=42&flag"));
+        let query = parse_query_string(Some(
+            "conversation_id=abc&thread_id=42&flag&subject=hello%20world&name=dispatch%2Bbot",
+        ));
 
         assert_eq!(
             query.get("conversation_id").map(String::as_str),
@@ -969,6 +962,11 @@ mod tests {
         );
         assert_eq!(query.get("thread_id").map(String::as_str), Some("42"));
         assert_eq!(query.get("flag").map(String::as_str), Some(""));
+        assert_eq!(
+            query.get("subject").map(String::as_str),
+            Some("hello world")
+        );
+        assert_eq!(query.get("name").map(String::as_str), Some("dispatch+bot"));
     }
 
     #[test]
