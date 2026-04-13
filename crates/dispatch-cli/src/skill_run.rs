@@ -405,7 +405,7 @@ Read files carefully.\n",
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "entrypoint = \"chat\"\n\
 \n\
 [[tools]]\n\

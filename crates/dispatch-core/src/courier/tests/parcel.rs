@@ -38,10 +38,10 @@ ENTRYPOINT chat
         &[
             (
                 "file-analyst/SKILL.md",
-                "---\nname: file-analyst\ndescription: Analyze files\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nUse the file tools before answering.\n",
+                "---\nname: file-analyst\ndescription: Analyze files\nmetadata:\n  dispatch-manifest: skill.toml\n---\nUse the file tools before answering.\n",
             ),
             (
-                "file-analyst/dispatch.toml",
+                "file-analyst/skill.toml",
                 "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
             ),
             (
@@ -93,7 +93,7 @@ ENTRYPOINT chat
                 "---\nname: file-analyst\ndescription: Analyze files\nallowed-tools:\n  - Bash\n  - Read\n---\nUse the file tools before answering.\n",
             ),
             (
-                "file-analyst/dispatch.toml",
+                "file-analyst/skill.toml",
                 "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
             ),
             (

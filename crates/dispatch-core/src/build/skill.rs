@@ -102,7 +102,7 @@ pub(super) fn process_skill_instruction(
                 );
                 if sidecar.is_auto_detected() {
                     message.push_str(
-                        "; `dispatch.toml` is reserved for skill sidecars and is auto-detected inside skill directories. Rename the file or set `metadata.dispatch-manifest` to an explicit sidecar path."
+                        "; `skill.toml` is reserved for skill sidecars and is auto-detected inside skill directories. Rename the file or set `metadata.dispatch-manifest` to an explicit sidecar path."
                     );
                 }
                 BuildError::Validation(message)
@@ -175,10 +175,10 @@ fn resolve_skill_dispatch_manifest_path(
             resolve_skill_member_path(skill_dir, path)?,
         )));
     }
-    let default = skill_dir.join("dispatch.toml");
+    let default = skill_dir.join("skill.toml");
     if default.is_file() {
         return Ok(Some(SkillDispatchManifestSource::AutoDetected(
-            resolve_skill_member_path(skill_dir, "dispatch.toml")?,
+            resolve_skill_member_path(skill_dir, "skill.toml")?,
         )));
     }
     Ok(None)

@@ -250,8 +250,8 @@ Semantics:
 - `SKILL.md` frontmatter is parsed for Agent Skills metadata and stripped from the prompt text seen by the model for directory-based skill bundles
 - file-based `SKILL path/to/file.md` inputs are left unchanged even if they contain YAML frontmatter
 - the rest of the directory is packaged with the parcel so `scripts/`, `references/`, and `assets/` travel with the skill bundle
-- if the skill directory contains `dispatch.toml`, or `SKILL.md` frontmatter sets `metadata.dispatch-manifest = "..."`, Dispatch loads Dispatch-specific tool metadata from that TOML sidecar and synthesizes those entries into the parcel as normal local tools
-- `dispatch.toml` is a reserved filename inside skill directories; if it exists, Dispatch treats it as the sidecar unless frontmatter points at a different file
+- if the skill directory contains `skill.toml`, or `SKILL.md` frontmatter sets `metadata.dispatch-manifest = "..."`, Dispatch loads Dispatch-specific tool metadata from that TOML sidecar and synthesizes those entries into the parcel as normal local tools
+- `skill.toml` is a reserved filename inside skill directories; if it exists, Dispatch treats it as the sidecar unless frontmatter points at a different file
 - the sidecar may also declare a default `entrypoint = "chat" | "job" | "heartbeat"` when the `Agentfile` does not set `ENTRYPOINT`
 - built parcels preserve skill annotations such as `allowed-tools` as structured lists, and skill-generated tools keep `skill_source` provenance using the skill's canonical `name`
 - `allowed-tools` is currently stored as informational parcel metadata for interoperability and downstream policy engines; the reference courier does not enforce it yet, but `dispatch parcel lint` and `dispatch parcel build` warn about obvious mismatches
@@ -266,7 +266,7 @@ Recommended Agent Skills-compatible layout:
 ```text
 skills/file-analyst/
 |-- SKILL.md
-|-- dispatch.toml
+|-- skill.toml
 |-- scripts/
 |-- references/
 |-- assets/
@@ -280,13 +280,13 @@ Example `SKILL.md`:
 name: file-analyst
 description: Analyze files and directories.
 metadata:
-  dispatch-manifest: dispatch.toml
+  dispatch-manifest: skill.toml
 ---
 
 Use the file tools before answering.
 ```
 
-Example `dispatch.toml`:
+Example `skill.toml`:
 
 ```toml
 entrypoint = "chat"

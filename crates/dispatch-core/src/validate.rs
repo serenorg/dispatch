@@ -283,9 +283,9 @@ fn resolve_skill_dispatch_manifest_path_for_validation(
     if let Some(path) = dispatch_skill_manifest_path(frontmatter) {
         return resolve_skill_member_path_for_validation(skill_dir, path);
     }
-    let default = skill_dir.join("dispatch.toml");
+    let default = skill_dir.join("skill.toml");
     if default.is_file() {
-        return resolve_skill_member_path_for_validation(skill_dir, "dispatch.toml");
+        return resolve_skill_member_path_for_validation(skill_dir, "skill.toml");
     }
     None
 }
@@ -385,7 +385,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();

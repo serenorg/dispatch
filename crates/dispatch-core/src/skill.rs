@@ -218,14 +218,14 @@ mod tests {
     #[test]
     fn parse_skill_markdown_extracts_frontmatter_and_body() {
         let parsed = parse_skill_markdown(
-            "---\nname: file-analyst\ndescription: Analyze files\nlicense: MIT\nmetadata:\n  dispatch-manifest: dispatch.toml\nallowed-tools:\n  - Bash\n---\nBody\n",
+            "---\nname: file-analyst\ndescription: Analyze files\nlicense: MIT\nmetadata:\n  dispatch-manifest: skill.toml\nallowed-tools:\n  - Bash\n---\nBody\n",
         )
         .unwrap();
         assert_eq!(parsed.frontmatter.name, "file-analyst");
         assert_eq!(parsed.frontmatter.license.as_deref(), Some("MIT"));
         assert_eq!(
             dispatch_skill_manifest_path(&parsed.frontmatter),
-            Some("dispatch.toml")
+            Some("skill.toml")
         );
         assert_eq!(
             parsed.frontmatter.allowed_tools.as_deref(),

@@ -15,6 +15,24 @@ Dispatch has first-class install/runtime support for courier plugins and
 channel plugins. Connector bundles are a planned category without a host
 registry or execution model.
 
+## Layering
+
+Dispatch keeps authored parcel source separate from host-managed extension
+inventory.
+
+- `Agentfile` is the canonical authored source for a parcel. It defines the
+  agent's prompt stack, tools, model policy, mounts, and generic runtime
+  intent that should survive build, review, and signing.
+- installed courier plugins and channel plugins are host inventory. They are
+  local runtime capabilities available to an operator on a specific machine or
+  environment.
+- extension install commands do not mutate parcel source. They populate a host
+  registry that runtime commands can resolve by name.
+
+That split is intentional. Courier binaries, channel adapter binaries, webhook
+URLs, and platform credentials are deployment concerns, not parcel build
+inputs.
+
 ## Extension categories
 
 ### Courier plugins
@@ -65,7 +83,7 @@ Reusable tool packages for specific providers (Gmail, GitHub, Google Drive).
 No first-class extension type exists for connector bundles. These remain
 packaged local tools until reuse patterns emerge.
 
-## Installing extensions
+## Managing host extension inventory
 
 ### Courier plugins
 
@@ -89,11 +107,25 @@ dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file t
 dispatch channel poll channel-telegram --config-file telegram-config.json --once
 ```
 
+These commands manage the local host registry, not parcel source. They are the
+operator-facing way to install and inspect runtime extensions that exist
+outside any one parcel.
+
 Channel plugin subprocess calls use a fixed 30s host-side timeout.
 
 `dispatch channel call` forwards the request JSON directly to the plugin. That
 is the most direct way to exercise channel-specific delivery features such as
 attachments without depending on the parcel reply bridge conventions.
+
+`dispatch channel listen` and `dispatch channel poll` are low-level runtime
+commands. They are useful for development, testing, and direct operator
+control, but they are not the canonical authored configuration surface for
+project-specific channel wiring.
+
+Dispatch still needs a separate declarative runtime binding layer for cases
+such as "bind installed channel X to parcel Y with config Z". That binding
+should live outside the `Agentfile` so parcel source stays portable and
+reviewable without embedding local extension inventory details.
 
 ## Extension manifest format
 

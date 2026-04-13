@@ -959,11 +959,11 @@ ENTRYPOINT chat
         fs::create_dir_all(skill_dir.join("schemas")).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: file-analyst\ndescription: Analyze files.\nlicense: MIT\nmetadata:\n  dispatch-manifest: dispatch.toml\n---\nUse the bundled tools.\n",
+            "---\nname: file-analyst\ndescription: Analyze files.\nlicense: MIT\nmetadata:\n  dispatch-manifest: skill.toml\n---\nUse the bundled tools.\n",
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\nrisk = \"low\"\ndescription = \"Read a file\"\n\n[[tools]]\nname = \"find_files\"\nscript = \"scripts/find_files.sh\"\nschema = \"schemas/find_files.json\"\napproval = \"confirm\"\n",
         )
         .unwrap();
@@ -1070,7 +1070,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();
@@ -1136,7 +1136,7 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn build_skill_directory_autodetects_dispatch_sidecar_and_sets_entrypoint_default() {
+    fn build_skill_directory_autodetects_skill_sidecar_and_sets_entrypoint_default() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
         fs::create_dir_all(skill_dir.join("scripts")).unwrap();
@@ -1146,7 +1146,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "entrypoint = \"job\"\n\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();
@@ -1182,7 +1182,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "entrypoint = \"job\"\n\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();
@@ -1218,7 +1218,7 @@ ENTRYPOINT chat
             )
             .unwrap();
             fs::write(
-                skill_dir.join("dispatch.toml"),
+                skill_dir.join("skill.toml"),
                 format!(
                     "entrypoint = \"{entrypoint}\"\n\n[[tools]]\nname = \"{name}_tool\"\nscript = \"scripts/run.sh\"\n"
                 ),
@@ -1259,7 +1259,7 @@ ENTRYPOINT chat
             )
             .unwrap();
             fs::write(
-                skill_dir.join("dispatch.toml"),
+                skill_dir.join("skill.toml"),
                 "[[tools]]\nname = \"shared\"\nscript = \"scripts/run.sh\"\n",
             )
             .unwrap();
@@ -1293,7 +1293,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\nrisk = \"low\"\n",
         )
         .unwrap();
@@ -1346,7 +1346,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\nrisk = \"low\"\n",
         )
         .unwrap();
@@ -1425,7 +1425,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/other.sh\"\n",
         )
         .unwrap();
@@ -1453,7 +1453,7 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn build_reports_reserved_dispatch_toml_on_autodetect_parse_failure() {
+    fn build_reports_reserved_skill_toml_on_autodetect_parse_failure() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -1462,7 +1462,7 @@ ENTRYPOINT chat
             "---\nname: file-analyst\ndescription: Analyze files.\n---\nUse the bundled tools.\n",
         )
         .unwrap();
-        fs::write(skill_dir.join("dispatch.toml"), "this is not toml\n").unwrap();
+        fs::write(skill_dir.join("skill.toml"), "this is not toml\n").unwrap();
         fs::write(
             dir.path().join("Agentfile"),
             "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
@@ -1479,7 +1479,7 @@ ENTRYPOINT chat
 
         let message = error.to_string();
         assert!(message.contains("failed to parse Dispatch skill manifest"));
-        assert!(message.contains("`dispatch.toml` is reserved for skill sidecars"));
+        assert!(message.contains("`skill.toml` is reserved for skill sidecars"));
         assert!(message.contains("metadata.dispatch-manifest"));
     }
 
@@ -1494,7 +1494,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();
@@ -1561,7 +1561,7 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            skill_dir.join("dispatch.toml"),
+            skill_dir.join("skill.toml"),
             "entrypoint = \"unsupported\"\n\n[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();

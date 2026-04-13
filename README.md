@@ -147,11 +147,11 @@ Dispatch supports the [Agent Skills specification](https://agentskills.io/specif
 When `SKILL` points at a directory, Dispatch expects:
 
 - `SKILL.md` for the skill instructions
-- an optional `dispatch.toml` sidecar for Dispatch-executable tool metadata
+- an optional `skill.toml` sidecar for Dispatch-executable tool metadata
 - the rest of the Agent Skills bundle layout such as `scripts/`, `references/`, and `assets/`
 
-`SKILL.md` stays Agent Skills compliant. Dispatch-specific execution metadata lives in `dispatch.toml`, or in a sidecar path referenced by `metadata.dispatch-manifest` in the skill frontmatter.
-`dispatch.toml` is a reserved filename inside skill directories: if it exists, Dispatch will try to load it as the sidecar unless frontmatter points at a different file.
+`SKILL.md` stays Agent Skills compliant. Dispatch-specific execution metadata lives in `skill.toml`, or in a sidecar path referenced by `metadata.dispatch-manifest` in the skill frontmatter.
+`skill.toml` is a reserved filename inside skill directories: if it exists, Dispatch will try to load it as the sidecar unless frontmatter points at a different file.
 If you only want to work with a skill locally, `dispatch skill validate <path>` checks that Dispatch can synthesize a parcel from a `SKILL.md` file or skill bundle directory, and `dispatch skill run <path>` executes that synthesized parcel without requiring an authored `Agentfile`.
 
 Example skill bundle:
@@ -159,7 +159,7 @@ Example skill bundle:
 ```text
 skills/file-analyst/
 |-- SKILL.md
-|-- dispatch.toml
+|-- skill.toml
 |-- scripts/
 |   |-- read_file.sh
 |   \-- find_files.sh
@@ -180,7 +180,7 @@ MODEL claude-sonnet-4-6 PROVIDER anthropic
 ENTRYPOINT chat
 ```
 
-Example `dispatch.toml` sidecar:
+Example `skill.toml` sidecar:
 
 ```toml
 entrypoint = "chat"
@@ -199,7 +199,7 @@ risk = "low"
 description = "Find files matching a pattern."
 ```
 
-Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model for directory-based skill bundles, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. File-based `SKILL path/to/file.md` instructions are left unchanged even if they happen to contain YAML frontmatter. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `dispatch.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but duplicate explicit aliases and conflicting aliases across skills fail the build.
+Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model for directory-based skill bundles, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. File-based `SKILL path/to/file.md` instructions are left unchanged even if they happen to contain YAML frontmatter. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `skill.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but duplicate explicit aliases and conflicting aliases across skills fail the build.
 
 `allowed-tools` is currently preserved as informational metadata for interoperability and downstream policy engines. The reference courier does not enforce it yet, but `dispatch parcel lint` and `dispatch parcel build` warn when a skill's `allowed-tools` entries do not line up with synthesized or declared tool aliases.
 
@@ -544,6 +544,10 @@ For courier implementers:
 - [`crates/dispatch-core/tests/courier_conformance.rs`](crates/dispatch-core/tests/courier_conformance.rs)
 
 Courier registry:
+
+The courier registry is host inventory, not parcel source. `Agentfile` remains
+the canonical authored spec, while `dispatch courier install` records which
+runtime backends are available on a given machine.
 
 - `dispatch parcel lint|build|inspect|verify|keygen|sign` - manage parcel sources, signatures, and built artifacts
 - `dispatch depot push|pull` - move parcels to and from depots
