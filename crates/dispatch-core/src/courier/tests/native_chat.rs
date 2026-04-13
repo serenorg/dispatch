@@ -37,6 +37,64 @@ ENTRYPOINT chat
 }
 
 #[test]
+fn native_courier_chat_emits_first_class_channel_reply_for_tagged_envelope() {
+    let test_parcel = build_test_parcel(
+        "\
+FROM dispatch/native:latest
+MODEL gpt-5-mini
+ENTRYPOINT chat
+",
+        &[],
+    );
+    let structured_reply = serde_json::json!({
+        "kind": "channel_reply",
+        "content": "backend reply",
+        "content_type": "text/plain",
+        "attachments": [{
+            "name": "report.txt",
+            "mime_type": "text/plain",
+            "data_base64": "aGVsbG8="
+        }],
+        "metadata": {
+            "custom": "value"
+        }
+    })
+    .to_string();
+    let backend = Arc::new(FakeChatBackend::with_reply(&structured_reply));
+    let courier = NativeCourier::with_chat_backend(backend);
+    let session = futures::executor::block_on(courier.open_session(&test_parcel.parcel)).unwrap();
+
+    let response = futures::executor::block_on(courier.run(
+        &test_parcel.parcel,
+        CourierRequest {
+            session,
+            operation: CourierOperation::Chat {
+                input: "hello backend".to_string(),
+            },
+        },
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        response.events.first(),
+        Some(CourierEvent::ChannelReply { message })
+            if message.content == "backend reply" && message.attachments.len() == 1
+    ));
+    assert!(
+        !response.events.iter().any(
+            |event| matches!(event, CourierEvent::Message { role, .. } if role == "assistant")
+        )
+    );
+    assert_eq!(
+        response.session.history.last(),
+        Some(&ConversationMessage {
+            role: "assistant".to_string(),
+            content: "backend reply".to_string(),
+        })
+    );
+}
+
+#[test]
 fn native_courier_caps_llm_timeout_by_remaining_run_budget() {
     let test_parcel = build_test_parcel(
         "\

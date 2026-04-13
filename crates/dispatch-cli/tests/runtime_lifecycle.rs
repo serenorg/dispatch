@@ -197,7 +197,21 @@ fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::
         &script_path,
         r#"#!/bin/sh
 read line
-printf '%s\n' '{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}'
+case "$line" in
+    *'"kind":"start_ingress"'*)
+        printf '%s\n' '{"kind":"ingress_started","state":{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{}}}'
+        ;;
+    *'"kind":"stop_ingress"'*)
+        printf '%s\n' '{"kind":"ingress_stopped","state":{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{}}}'
+        ;;
+    *'"kind":"ingress_event"'*)
+        printf '%s\n' '{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}'
+        ;;
+    *)
+        printf '%s\n' '{"kind":"error","error":{"code":"unexpected_request","message":"unhandled request"}}'
+        exit 1
+        ;;
+esac
 "#,
     )?;
     #[cfg(unix)]
@@ -225,7 +239,152 @@ printf '%s\n' '{"kind":"ingress_events_received","events":[{"event_id":"evt-1","
     "capabilities": {{
         "channel": {{
             "platform": "webhook",
+            "allowed_paths": ["/hook"],
+            "delivery": {{
+                "attachment_sources": ["data_base64"]
+            }}
+        }}
+    }}
+}}"#,
+            script_path.display()
+        ),
+    )?;
+
+    Ok(manifest_path)
+}
+
+fn write_lifecycle_channel_test_plugin(
+    dir: &Path,
+    log_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("lifecycle-channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            r#"#!/bin/sh
+read line
+printf '%s\n' "$line" >> "{}"
+case "$line" in
+    *'"kind":"start_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_started","state":{{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{{"phase":"start"}}}}}}'
+        ;;
+    *'"kind":"stop_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{"phase":"stop"}}}}}}'
+        ;;
+    *'"kind":"ingress_event"'*)
+        printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+        ;;
+    *)
+        printf '%s\n' '{{"kind":"error","error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}'
+        ;;
+esac
+"#,
+            log_path.display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-lifecycle-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Lifecycle test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "webhook",
             "allowed_paths": ["/hook"]
+        }}
+    }}
+}}"#,
+            script_path.display()
+        ),
+    )?;
+
+    Ok(manifest_path)
+}
+
+fn write_polling_channel_test_plugin(
+    dir: &Path,
+    log_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("polling-channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            r#"#!/bin/sh
+read line
+printf '%s\n' "$line" >> "{}"
+case "$line" in
+    *'"kind":"start_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}'
+        ;;
+    *'"kind":"poll_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}'
+        ;;
+    *'"kind":"stop_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}'
+        ;;
+    *)
+        printf '%s\n' '{{"kind":"error","error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}'
+        ;;
+esac
+"#,
+            log_path.display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-polling-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Polling test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "telegram",
+            "ingress_modes": ["polling"]
         }}
     }}
 }}"#,
@@ -252,8 +411,22 @@ fn write_logging_channel_test_plugin(
         format!(
             r#"#!/bin/sh
 read line
-printf '%s\n' "$line" > "{}"
-printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+case "$line" in
+    *'"kind":"start_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_started","state":{{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{{}}}}}}'
+        ;;
+    *'"kind":"stop_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{}}}}}}'
+        ;;
+    *'"kind":"ingress_event"'*)
+        printf '%s\n' "$line" > "{}"
+        printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+        ;;
+    *)
+        printf '%s\n' '{{"kind":"error","error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}'
+        exit 1
+        ;;
+esac
 "#,
             log_path.display()
         ),
@@ -310,9 +483,23 @@ fn write_trusted_channel_test_plugin(
         &script_path,
         format!(
             r#"#!/bin/sh
-echo invoked >> "{}"
 read line
-printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+case "$line" in
+    *'"kind":"start_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_started","state":{{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{{}}}}}}'
+        ;;
+    *'"kind":"stop_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{}}}}}}'
+        ;;
+    *'"kind":"ingress_event"'*)
+        echo invoked >> "{}"
+        printf '%s\n' '{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}'
+        ;;
+    *)
+        printf '%s\n' '{{"kind":"error","error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}'
+        exit 1
+        ;;
+esac
 "#,
             log_path.display()
         ),
@@ -396,10 +583,47 @@ fn install_test_courier_plugin(
     name: &str,
     parcel_digest: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    install_test_courier_plugin_with_reply(root, registry_path, name, parcel_digest, "plugin reply")
+}
+
+fn install_test_courier_plugin_with_event(
+    root: &Path,
+    registry_path: &Path,
+    name: &str,
+    parcel_digest: &str,
+    event: Value,
+    history_content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let script_path = root.join("courier-test.sh");
+    let event_json = shell_single_quote_literal(
+        &serde_json::json!({
+            "kind": "event",
+            "event": event,
+        })
+        .to_string(),
+    );
+    let done_json = shell_single_quote_literal(
+        &serde_json::json!({
+            "kind": "done",
+            "session": {
+                "id": "demo-jsonl-session",
+                "parcel_digest": parcel_digest,
+                "entrypoint": "chat",
+                "turn_count": 1,
+                "elapsed_ms": 0,
+                "history": [{
+                    "role": "assistant",
+                    "content": history_content
+                }],
+                "resolved_mounts": [],
+                "backend_state": "done"
+            }
+        })
+        .to_string(),
+    );
     fs::write(
         &script_path,
         format!(
@@ -416,15 +640,17 @@ fn install_test_courier_plugin(
                 "elif printf '%s' \"$line\" | grep -q '\"kind\":\"open_session\"'; then\n",
                 "  printf '%s\\n' '{{\"kind\":\"session\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":0,\"elapsed_ms\":0,\"history\":[],\"resolved_mounts\":[],\"backend_state\":\"open\"}}}}'\n",
                 "elif printf '%s' \"$line\" | grep -q '\"kind\":\"run\"'; then\n",
-                "  printf '%s\\n' '{{\"kind\":\"event\",\"event\":{{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"plugin reply\"}}}}'\n",
-                "  printf '%s\\n' '{{\"kind\":\"done\",\"session\":{{\"id\":\"demo-jsonl-session\",\"parcel_digest\":\"{parcel_digest}\",\"entrypoint\":\"chat\",\"turn_count\":1,\"elapsed_ms\":0,\"history\":[{{\"role\":\"assistant\",\"content\":\"plugin reply\"}}],\"resolved_mounts\":[],\"backend_state\":\"done\"}}}}'\n",
+                "  printf '%s\\n' '{event_json}'\n",
+                "  printf '%s\\n' '{done_json}'\n",
                 "else\n",
                 "  printf '%s\\n' '{{\"kind\":\"error\",\"error\":{{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}}}'\n",
                 "  exit 1\n",
                 "fi\n",
                 "done\n"
             ),
-            parcel_digest = parcel_digest
+            parcel_digest = parcel_digest,
+            event_json = event_json,
+            done_json = done_json,
         ),
     )?;
     #[cfg(unix)]
@@ -455,6 +681,31 @@ fn install_test_courier_plugin(
     Ok(())
 }
 
+fn install_test_courier_plugin_with_reply(
+    root: &Path,
+    registry_path: &Path,
+    name: &str,
+    parcel_digest: &str,
+    assistant_reply: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    install_test_courier_plugin_with_event(
+        root,
+        registry_path,
+        name,
+        parcel_digest,
+        serde_json::json!({
+            "kind": "message",
+            "role": "assistant",
+            "content": assistant_reply
+        }),
+        assistant_reply,
+    )
+}
+
+fn shell_single_quote_literal(value: &str) -> String {
+    value.replace('\'', "'\"'\"'")
+}
+
 fn write_reply_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
@@ -473,7 +724,11 @@ fn write_reply_channel_test_plugin(
                 "#!/bin/sh\n",
                 "set -eu\n",
                 "read line\n",
-                "if printf '%s' \"$line\" | grep -q '\"kind\":\"ingress_event\"'; then\n",
+                "if printf '%s' \"$line\" | grep -q '\"kind\":\"start_ingress\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"ingress_started\",\"state\":{{\"mode\":\"webhook\",\"status\":\"registered\",\"endpoint\":\"https://example.test/hook\",\"metadata\":{{}}}}}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"stop_ingress\"'; then\n",
+                "  printf '%s\\n' '{{\"kind\":\"ingress_stopped\",\"state\":{{\"mode\":\"webhook\",\"status\":\"stopped\",\"endpoint\":\"https://example.test/hook\",\"metadata\":{{}}}}}}'\n",
+                "elif printf '%s' \"$line\" | grep -q '\"kind\":\"ingress_event\"'; then\n",
                 "  printf '%s\\n' '{{\"kind\":\"ingress_events_received\",\"events\":[{{\"event_id\":\"evt-1\",\"platform\":\"webhook\",\"event_type\":\"message\",\"received_at\":\"2026-04-12T00:00:00Z\",\"conversation\":{{\"id\":\"conv-1\",\"kind\":\"private\",\"thread_id\":\"thread-1\"}},\"actor\":{{\"id\":\"user-1\",\"is_bot\":false,\"metadata\":{{}}}},\"message\":{{\"id\":\"msg-1\",\"content\":\"hello\",\"content_type\":\"text/plain\",\"attachments\":[],\"metadata\":{{}}}},\"metadata\":{{}}}}],\"callback_reply\":{{\"status\":200,\"content_type\":\"text/plain; charset=utf-8\",\"body\":\"ok\\n\"}}}}'\n",
                 "elif printf '%s' \"$line\" | grep -q '\"kind\":\"deliver\"'; then\n",
                 "  printf '%s\\n' \"$line\" >> \"{}\"\n",
@@ -849,6 +1104,233 @@ fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dy
 }
 
 #[test]
+fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let lifecycle_log = dir.path().join("lifecycle.log");
+    let manifest_path = write_lifecycle_channel_test_plugin(dir.path(), &lifecycle_log)?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args([
+            "channel",
+            "listen",
+            "channel-lifecycle-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--registry",
+            registry_path
+                .to_str()
+                .ok_or("registry path is not valid UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )?;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+    let output = child.wait_with_output()?;
+    let _ = require_success(output, "dispatch channel listen lifecycle --once")?;
+
+    let logged_requests = fs::read_to_string(&lifecycle_log)?;
+    let request_lines = logged_requests.lines().collect::<Vec<_>>();
+    assert_eq!(
+        request_lines.len(),
+        3,
+        "unexpected lifecycle log:\n{logged_requests}"
+    );
+
+    let start_request: Value = serde_json::from_str(request_lines[0])?;
+    let ingress_request: Value = serde_json::from_str(request_lines[1])?;
+    let stop_request: Value = serde_json::from_str(request_lines[2])?;
+
+    assert_eq!(start_request["request"]["kind"], "start_ingress");
+    assert_eq!(ingress_request["request"]["kind"], "ingress_event");
+    assert_eq!(stop_request["request"]["kind"], "stop_ingress");
+    assert_eq!(stop_request["request"]["state"]["status"], "registered");
+    assert_eq!(
+        stop_request["request"]["state"]["endpoint"],
+        "https://example.test/hook"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn channel_poll_calls_start_poll_and_stop_ingress() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let poll_log = dir.path().join("poll.log");
+    let manifest_path = write_polling_channel_test_plugin(dir.path(), &poll_log)?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "poll",
+                "channel-polling-test",
+                "--once",
+                "--json",
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel poll --once",
+    )?;
+
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in output:\n{stdout}"))?;
+    let poll_output: Value = serde_json::from_str(json_line)?;
+    assert_eq!(poll_output["plugin"], "channel-polling-test");
+    assert_eq!(poll_output["events"][0]["event_id"], "poll-evt-1");
+    assert_eq!(poll_output["state"]["metadata"]["cursor"], "1");
+    assert_eq!(poll_output["poll_after_ms"], 25);
+
+    let logged_requests = fs::read_to_string(&poll_log)?;
+    let request_lines = logged_requests.lines().collect::<Vec<_>>();
+    assert_eq!(
+        request_lines.len(),
+        3,
+        "unexpected poll log:\n{logged_requests}"
+    );
+
+    let start_request: Value = serde_json::from_str(request_lines[0])?;
+    let poll_request: Value = serde_json::from_str(request_lines[1])?;
+    let stop_request: Value = serde_json::from_str(request_lines[2])?;
+
+    assert_eq!(start_request["request"]["kind"], "start_ingress");
+    assert_eq!(poll_request["request"]["kind"], "poll_ingress");
+    assert_eq!(stop_request["request"]["kind"], "stop_ingress");
+    assert_eq!(poll_request["request"]["state"]["metadata"]["cursor"], "0");
+    assert_eq!(stop_request["request"]["state"]["metadata"]["cursor"], "1");
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_rejects_polling_plugins_and_stops_ingress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let poll_log = dir.path().join("poll.log");
+    let manifest_path = write_polling_channel_test_plugin(dir.path(), &poll_log)?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let output = run_dispatch(
+        dir.path(),
+        &[],
+        &[
+            "channel",
+            "listen",
+            "channel-polling-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--registry",
+            registry_path
+                .to_str()
+                .ok_or("registry path is not valid UTF-8")?,
+        ],
+    )?;
+
+    let (stdout, stderr) = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "dispatch channel listen unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("dispatch channel poll"),
+        "stderr did not mention polling guidance\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let logged_requests = fs::read_to_string(&poll_log)?;
+    let request_lines = logged_requests.lines().collect::<Vec<_>>();
+    assert_eq!(
+        request_lines.len(),
+        2,
+        "unexpected poll log:\n{logged_requests}"
+    );
+
+    let start_request: Value = serde_json::from_str(request_lines[0])?;
+    let stop_request: Value = serde_json::from_str(request_lines[1])?;
+    assert_eq!(start_request["request"]["kind"], "start_ingress");
+    assert_eq!(stop_request["request"]["kind"], "stop_ingress");
+
+    Ok(())
+}
+
+#[test]
 fn channel_inspect_json_reports_plugin_and_fixed_timeout() -> Result<(), Box<dyn std::error::Error>>
 {
     let dir = tempdir()?;
@@ -1120,6 +1602,260 @@ fn channel_listen_delivers_replies_through_plugin() -> Result<(), Box<dyn std::e
     assert_eq!(
         deliver_envelope["request"]["message"]["metadata"]["thread_id"],
         "thread-1"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["reply_to_message_id"],
+        "msg-1"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_delivers_structured_channel_reply_envelope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let channel_registry_path = dir.path().join("channels.json");
+    let courier_registry_path = dir.path().join("couriers.json");
+    let delivery_log = dir.path().join("deliver.log");
+    let channel_manifest_path = write_reply_channel_test_plugin(dir.path(), &delivery_log)?;
+    let (parcel_dir, parcel_digest) = build_chat_test_parcel(dir.path())?;
+    let assistant_reply = serde_json::json!({
+        "kind": "channel_reply",
+        "content": "plugin reply with attachment",
+        "content_type": "text/plain",
+        "attachments": [{
+            "name": "report.txt",
+            "mime_type": "text/plain",
+            "data_base64": "aGVsbG8="
+        }],
+        "metadata": {
+            "custom": "value"
+        }
+    })
+    .to_string();
+    install_test_courier_plugin_with_reply(
+        dir.path(),
+        &courier_registry_path,
+        "listener-test-courier",
+        &parcel_digest,
+        &assistant_reply,
+    )?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                channel_manifest_path
+                    .to_str()
+                    .ok_or("channel manifest path is not valid UTF-8")?,
+                "--registry",
+                channel_registry_path
+                    .to_str()
+                    .ok_or("channel registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args([
+            "channel",
+            "listen",
+            "channel-reply-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--json",
+            "--parcel",
+            parcel_dir
+                .to_str()
+                .ok_or("parcel path is not valid UTF-8")?,
+            "--courier",
+            "listener-test-courier",
+            "--courier-registry",
+            courier_registry_path
+                .to_str()
+                .ok_or("courier registry path is not valid UTF-8")?,
+            "--deliver-replies",
+            "--registry",
+            channel_registry_path
+                .to_str()
+                .ok_or("channel registry path is not valid UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )?;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+    let output = child.wait_with_output()?;
+    let stdout = require_success(output, "dispatch channel listen --deliver-replies")?;
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in output:\n{stdout}"))?;
+    let event_output: Value = serde_json::from_str(json_line)?;
+    assert_eq!(event_output["plugin"], "channel-reply-test");
+    assert_eq!(
+        event_output["parcel_runs"][0]["delivery"]["message_id"],
+        "delivery-1"
+    );
+
+    let logged_request = fs::read_to_string(&delivery_log)?;
+    let deliver_envelope: Value = serde_json::from_str(logged_request.trim())?;
+    assert_eq!(deliver_envelope["request"]["kind"], "deliver");
+    assert_eq!(
+        deliver_envelope["request"]["message"]["content"],
+        "plugin reply with attachment"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["attachments"][0]["name"],
+        "report.txt"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["attachments"][0]["data_base64"],
+        "aGVsbG8="
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["custom"],
+        "value"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["conversation_id"],
+        "conv-1"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["thread_id"],
+        "thread-1"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["reply_to_message_id"],
+        "msg-1"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_delivers_first_class_channel_reply_event()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let channel_registry_path = dir.path().join("channels.json");
+    let courier_registry_path = dir.path().join("couriers.json");
+    let delivery_log = dir.path().join("deliver.log");
+    let channel_manifest_path = write_reply_channel_test_plugin(dir.path(), &delivery_log)?;
+    let (parcel_dir, parcel_digest) = build_chat_test_parcel(dir.path())?;
+    install_test_courier_plugin_with_event(
+        dir.path(),
+        &courier_registry_path,
+        "listener-test-courier",
+        &parcel_digest,
+        serde_json::json!({
+            "kind": "channel_reply",
+            "message": {
+                "content": "plugin reply with attachment",
+                "content_type": "text/plain",
+                "attachments": [{
+                    "name": "report.txt",
+                    "mime_type": "text/plain",
+                    "data_base64": "aGVsbG8="
+                }],
+                "metadata": {
+                    "custom": "value"
+                }
+            }
+        }),
+        "plugin reply with attachment",
+    )?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                channel_manifest_path
+                    .to_str()
+                    .ok_or("channel manifest path is not valid UTF-8")?,
+                "--registry",
+                channel_registry_path
+                    .to_str()
+                    .ok_or("channel registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let listen_addr = reserve_loopback_addr()?;
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args([
+            "channel",
+            "listen",
+            "channel-reply-test",
+            "--listen",
+            &listen_addr,
+            "--once",
+            "--json",
+            "--parcel",
+            parcel_dir
+                .to_str()
+                .ok_or("parcel path is not valid UTF-8")?,
+            "--courier",
+            "listener-test-courier",
+            "--courier-registry",
+            courier_registry_path
+                .to_str()
+                .ok_or("courier registry path is not valid UTF-8")?,
+            "--deliver-replies",
+            "--registry",
+            channel_registry_path
+                .to_str()
+                .ok_or("channel registry path is not valid UTF-8")?,
+        ])
+        .spawn()?;
+
+    let request = concat!(
+        "POST /hook HTTP/1.1\r\n",
+        "Host: example.test\r\n",
+        "Content-Type: application/json\r\n",
+        "Content-Length: 17\r\n",
+        "\r\n",
+        "{\"hello\":\"world\"}"
+    );
+    let response = http_request_with_retry(&listen_addr, request)?;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+    let status = child.wait_with_output()?;
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        return Err(format!("dispatch channel listen failed:\n{stderr}").into());
+    }
+
+    let deliver_envelope = wait_for_run_record(&delivery_log, |record| {
+        record["request"]["kind"] == "deliver"
+    })?;
+    assert_eq!(
+        deliver_envelope["request"]["message"]["attachments"][0]["name"],
+        "report.txt"
+    );
+    assert_eq!(
+        deliver_envelope["request"]["message"]["metadata"]["custom"],
+        "value"
     );
     assert_eq!(
         deliver_envelope["request"]["message"]["metadata"]["reply_to_message_id"],

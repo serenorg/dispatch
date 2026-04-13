@@ -37,7 +37,7 @@ Plugins declare the protocol version in their manifest:
 }
 ```
 
-Dispatch currently supports protocol version `1`.
+Dispatch supports protocol version `1`.
 
 ## Request Envelope
 
@@ -52,7 +52,7 @@ Every request uses the same envelope shape:
 }
 ```
 
-Current request kinds:
+Request kinds:
 
 - `capabilities`
 - `validate_parcel`
@@ -68,7 +68,7 @@ For parcel-aware requests, Dispatch passes the absolute built parcel directory i
 
 The key rule is session affinity.
 
-- `capabilities`, `validate_parcel`, and `inspect` may still be handled as one-shot requests
+- `capabilities`, `validate_parcel`, and `inspect` may be handled as one-shot requests
 - `open_session` creates a session and may leave the plugin process running
 - `resume_session` lets Dispatch recreate a persistent plugin process from a previously saved `CourierSession`
 - `run` requests for that session are sent to the same process
@@ -107,6 +107,13 @@ Example `run` stream:
 ```json
 {"kind":"event","event":{"kind":"message","role":"assistant","content":"hello"}}
 {"kind":"done","session":{"id":"remote-worker-<digest>-1","parcel_digest":"<digest>","entrypoint":"chat","turn_count":2,"history":[{"role":"user","content":"hello"},{"role":"assistant","content":"hello"}]}}
+```
+
+Plugins may also emit a first-class structured channel reply event when the
+caller will bridge the courier response back through a channel plugin:
+
+```json
+{"kind":"event","event":{"kind":"channel_reply","message":{"content":"Dispatch attached the report.","content_type":"text/plain","attachments":[{"name":"report.txt","mime_type":"text/plain","data_base64":"aGVsbG8="}],"metadata":{"custom":"value"}}}}
 ```
 
 ## Implementation Guidance

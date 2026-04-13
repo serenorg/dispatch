@@ -4,6 +4,24 @@ use std::collections::BTreeMap;
 
 pub const CHANNEL_PLUGIN_PROTOCOL_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AttachmentSource {
+    DataBase64,
+    Url,
+    StorageKey,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct TaggedChannelReplyEnvelope {
+    kind: String,
+    #[serde(flatten)]
+    reply: OutboundMessageEnvelope,
+}
+
 /// Well-known status frame kinds for the Dispatch channel protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +74,11 @@ pub enum ChannelPluginRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<IngressState>,
     },
+    PollIngress {
+        config: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<IngressState>,
+    },
     IngressEvent {
         config: Value,
         payload: IngressPayload,
@@ -96,6 +119,10 @@ pub enum ChannelPluginResponse {
         events: Vec<InboundEventEnvelope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         callback_reply: Option<IngressCallbackReply>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<IngressState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_after_ms: Option<u64>,
     },
     Delivered {
         delivery: DeliveryReceipt,
@@ -158,6 +185,8 @@ pub struct ChannelCapabilities {
     pub accepts_push: bool,
     #[serde(default)]
     pub accepts_status_frames: bool,
+    #[serde(default)]
+    pub attachment_sources: Vec<AttachmentSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attachment_bytes: Option<u64>,
 }
@@ -333,6 +362,15 @@ pub struct OutboundMessageEnvelope {
     pub metadata: BTreeMap<String, String>,
 }
 
+pub(crate) fn parse_tagged_channel_reply(reply_text: &str) -> Option<OutboundMessageEnvelope> {
+    let tagged = serde_json::from_str::<TaggedChannelReplyEnvelope>(reply_text).ok()?;
+    if tagged.kind == "channel_reply" {
+        Some(tagged.reply)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutboundAttachment {
     pub name: String,
@@ -451,6 +489,7 @@ mod tests {
                 account_scoped_config: true,
                 accepts_push: true,
                 accepts_status_frames: true,
+                attachment_sources: vec![AttachmentSource::DataBase64],
                 max_attachment_bytes: None,
             },
         };
@@ -514,6 +553,45 @@ mod tests {
     }
 
     #[test]
+    fn poll_ingress_request_round_trips_json() {
+        let request = ChannelPluginRequestEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: ChannelPluginRequest::PollIngress {
+                config: serde_json::json!({ "channel": "telegram" }),
+                state: Some(IngressState {
+                    mode: IngressMode::Polling,
+                    status: "running".to_string(),
+                    endpoint: None,
+                    metadata: BTreeMap::from([("cursor".to_string(), "41".to_string())]),
+                }),
+            },
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: ChannelPluginRequestEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn polling_ingress_response_round_trips_json() {
+        let response = ChannelPluginResponse::IngressEventsReceived {
+            events: Vec::new(),
+            callback_reply: None,
+            state: Some(IngressState {
+                mode: IngressMode::Polling,
+                status: "running".to_string(),
+                endpoint: None,
+                metadata: BTreeMap::from([("next_update_id".to_string(), "42".to_string())]),
+            }),
+            poll_after_ms: Some(250),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: ChannelPluginResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, response);
+    }
+
+    #[test]
     fn outbound_message_envelope_round_trips_json() {
         let envelope = OutboundMessageEnvelope {
             content: "reply text".to_string(),
@@ -555,5 +633,19 @@ mod tests {
 
         let parsed: InboundAttachment = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, attachment);
+    }
+
+    #[test]
+    fn attachment_source_round_trips_wire_name() {
+        let value = serde_json::to_string(&AttachmentSource::DataBase64).expect("serialize enum");
+        assert_eq!(value, "\"data_base64\"");
+
+        let parsed: AttachmentSource =
+            serde_json::from_str("\"storage_key\"").expect("deserialize enum");
+        assert_eq!(parsed, AttachmentSource::StorageKey);
+
+        let unknown: AttachmentSource =
+            serde_json::from_str("\"signed_url\"").expect("deserialize enum");
+        assert_eq!(unknown, AttachmentSource::Unknown);
     }
 }

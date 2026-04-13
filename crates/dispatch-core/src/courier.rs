@@ -1,4 +1,5 @@
 use crate::{
+    channel_plugin_protocol::{OutboundMessageEnvelope, parse_tagged_channel_reply},
     manifest::{
         A2aAuthScheme, A2aEndpointMode, InstructionKind, ModelReference, MountConfig, MountKind,
         NetworkRule, ParcelManifest, ToolApprovalPolicy, ToolConfig, ToolRiskLevel,
@@ -737,6 +738,9 @@ pub enum CourierEvent {
         role: String,
         content: String,
     },
+    ChannelReply {
+        message: OutboundMessageEnvelope,
+    },
     TextDelta {
         content: String,
     },
@@ -755,6 +759,13 @@ struct ChatTurnResult {
     events: Vec<CourierEvent>,
     streamed_reply: bool,
     backend_state: Option<String>,
+}
+
+fn normalize_assistant_reply(reply_text: &str) -> (String, Option<OutboundMessageEnvelope>) {
+    match parse_tagged_channel_reply(reply_text) {
+        Some(message) => (message.content.clone(), Some(message)),
+        None => (reply_text.to_string(), None),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1302,16 +1313,24 @@ impl CourierBackend for NativeCourier {
                             run_deadline,
                         },
                     )?;
+                    let (assistant_history_content, channel_reply) =
+                        normalize_assistant_reply(&chat_turn.reply);
                     session.history.push(ConversationMessage {
                         role: "assistant".to_string(),
-                        content: chat_turn.reply.clone(),
+                        content: assistant_history_content,
                     });
                     session.backend_state = chat_turn.backend_state.clone();
                     if !chat_turn.streamed_reply {
-                        chat_turn.events.push(CourierEvent::Message {
-                            role: "assistant".to_string(),
-                            content: chat_turn.reply.clone(),
-                        });
+                        if let Some(message) = channel_reply {
+                            chat_turn
+                                .events
+                                .push(CourierEvent::ChannelReply { message });
+                        } else {
+                            chat_turn.events.push(CourierEvent::Message {
+                                role: "assistant".to_string(),
+                                content: chat_turn.reply.clone(),
+                            });
+                        }
                     }
                     chat_turn.events.push(CourierEvent::Done);
 
@@ -1552,16 +1571,24 @@ impl CourierBackend for DockerCourier {
                             run_deadline,
                         },
                     )?;
+                    let (assistant_history_content, channel_reply) =
+                        normalize_assistant_reply(&chat_turn.reply);
                     session.history.push(ConversationMessage {
                         role: "assistant".to_string(),
-                        content: chat_turn.reply.clone(),
+                        content: assistant_history_content,
                     });
                     session.backend_state = chat_turn.backend_state.clone();
                     if !chat_turn.streamed_reply {
-                        chat_turn.events.push(CourierEvent::Message {
-                            role: "assistant".to_string(),
-                            content: chat_turn.reply.clone(),
-                        });
+                        if let Some(message) = channel_reply {
+                            chat_turn
+                                .events
+                                .push(CourierEvent::ChannelReply { message });
+                        } else {
+                            chat_turn.events.push(CourierEvent::Message {
+                                role: "assistant".to_string(),
+                                content: chat_turn.reply.clone(),
+                            });
+                        }
                     }
                     chat_turn.events.push(CourierEvent::Done);
 
@@ -2419,16 +2446,21 @@ fn run_host_task_operation(
         content: input.clone(),
     });
     let mut turn = execute_host_turn(parcel, &session, &input, mode, context)?;
+    let (assistant_history_content, channel_reply) = normalize_assistant_reply(&turn.reply);
     session.history.push(ConversationMessage {
         role: "assistant".to_string(),
-        content: turn.reply.clone(),
+        content: assistant_history_content,
     });
     session.backend_state = turn.backend_state.clone();
     if !turn.streamed_reply {
-        turn.events.push(CourierEvent::Message {
-            role: "assistant".to_string(),
-            content: turn.reply.clone(),
-        });
+        if let Some(message) = channel_reply {
+            turn.events.push(CourierEvent::ChannelReply { message });
+        } else {
+            turn.events.push(CourierEvent::Message {
+                role: "assistant".to_string(),
+                content: turn.reply.clone(),
+            });
+        }
     }
     turn.events.push(CourierEvent::Done);
 

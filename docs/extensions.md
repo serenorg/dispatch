@@ -6,10 +6,14 @@ Dispatch supports three categories of extensions:
 |---|---|---|
 | Courier plugins | Alternate runtime backends for parcel execution | Stable |
 | Channel plugins | Messaging and webhook transport integrations | Provisional |
-| Connector bundles | Reusable tool/provider packages | Future |
+| Connector bundles | Reusable tool/provider packages | Planned |
 
 Extensions live outside the core repository and communicate with Dispatch over
 JSONL subprocess protocols.
+
+Dispatch has first-class install/runtime support for courier plugins and
+channel plugins. Connector bundles are a planned category without a host
+registry or execution model.
 
 ## Extension categories
 
@@ -43,18 +47,23 @@ A channel plugin implements:
 - `health` - verify connectivity and account identity
 - `start_ingress` / `stop_ingress` - register/deregister webhook endpoints
 - `ingress_event` - parse a raw webhook payload into normalized events
+- `poll_ingress` - fetch inbound events for polling transports
 - `deliver` - send a reply to an existing conversation
 - `push` - send a proactive message (broadcast, alert, scheduled)
 - `status` - relay agent progress to the conversation (typing indicators, etc.)
 
-Examples: Telegram, Discord, Slack, WhatsApp, Twilio SMS, generic
+Examples: Telegram, Discord, Slack, WhatsApp, Signal, Twilio SMS, generic
 webhooks.
 
-### Connector bundles (future)
+Channel plugins vary by platform, but the protocol covers the full inbound and
+outbound lifecycle: configuration, health, ingress setup, webhook forwarding or
+polling, delivery, push, and status frames.
+
+### Connector bundles
 
 Reusable tool packages for specific providers (Gmail, GitHub, Google Drive).
-No first-class extension type exists yet. These remain packaged local tools
-until reuse patterns emerge.
+No first-class extension type exists for connector bundles. These remain
+packaged local tools until reuse patterns emerge.
 
 ## Installing extensions
 
@@ -73,17 +82,27 @@ dispatch channel install path/to/channel-plugin.json
 dispatch channel ls
 dispatch channel inspect <name>
 dispatch channel call <name> --request-json '{"kind":"capabilities"}'
+dispatch channel call channel-telegram --request-file telegram-deliver.json
 dispatch channel ingress --path /telegram/updates --header X-Telegram-Bot-Api-Secret-Token=... --body-file update.json
 dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json
 dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json --parcel ./Agentfile --session-root ./.dispatch/channel-sessions --deliver-replies
+dispatch channel poll channel-telegram --config-file telegram-config.json --once
 ```
 
-Channel plugin subprocess calls currently use a fixed 30s host-side timeout.
+Channel plugin subprocess calls use a fixed 30s host-side timeout.
+
+`dispatch channel call` forwards the request JSON directly to the plugin. That
+is the most direct way to exercise channel-specific delivery features such as
+attachments without depending on the parcel reply bridge conventions.
 
 ## Extension manifest format
 
-Both courier and channel plugins use a JSON manifest file that declares
-metadata, entrypoint, capabilities, and requirements.
+Dispatch has two manifest shapes:
+
+- Courier plugins use a compact `courier-plugin.json` consumed by the courier
+  registry installer.
+- Channel plugins use a richer `channel-plugin.json` that includes bootstrap,
+  auth, capability, ingress, and requirement metadata.
 
 Channel plugin manifest example (`channel-plugin.json`):
 
@@ -112,13 +131,13 @@ Channel plugin manifest example (`channel-plugin.json`):
   "capabilities": {
     "channel": {
       "platform": "telegram",
-      "ingress_modes": ["webhook"],
+      "ingress_modes": ["webhook", "polling"],
       "outbound_message_types": ["text"],
       "threading_model": "chat_or_topic",
-      "attachment_support": false,
+      "attachment_support": true,
       "reply_verification_support": true,
       "account_scoped_config": true,
-      "allow_polling": false,
+      "allow_polling": true,
       "webhook_secret_support": true,
       "allowed_paths": ["/telegram/updates"],
       "ingress": {
@@ -134,6 +153,10 @@ Channel plugin manifest example (`channel-plugin.json`):
           "header_name": "X-Telegram-Bot-Api-Secret-Token",
           "secret_name": "TELEGRAM_WEBHOOK_SECRET",
           "host_managed": true
+        },
+        "polling": {
+          "min_interval_ms": 100,
+          "default_interval_ms": 250
         }
       },
       "delivery": {
@@ -154,6 +177,7 @@ Courier plugin manifest example (`courier-plugin.json`):
 
 ```json
 {
+  "kind": "courier",
   "name": "my-remote-courier",
   "version": "0.1.0",
   "protocol_version": 1,
@@ -165,6 +189,8 @@ Courier plugin manifest example (`courier-plugin.json`):
   }
 }
 ```
+
+The courier `kind` field is optional, but when present it must be `"courier"`.
 
 ## Channel plugin protocol
 
@@ -194,9 +220,37 @@ Each response from the plugin is a single JSON line:
 | `start_ingress` | `config` | Register webhook / begin listening |
 | `stop_ingress` | `config`, `state?` | Deregister webhook / stop listening |
 | `ingress_event` | `config`, `payload` | Parse a raw webhook into events |
+| `poll_ingress` | `config`, `state?` | Fetch inbound events for polling ingress |
 | `deliver` | `config`, `message` | Send reply to existing conversation |
 | `push` | `config`, `message` | Send proactive/broadcast message |
 | `status` | `config`, `update` | Relay agent progress to channel |
+
+`deliver` and `push` share the same outbound message shape:
+
+```json
+{
+  "content": "Dispatch says hello.",
+  "content_type": "text/plain",
+  "attachments": [
+    {
+      "name": "report.txt",
+      "mime_type": "text/plain",
+      "data_base64": "aGVsbG8="
+    }
+  ],
+  "metadata": {
+    "conversation_id": "chat-123",
+    "thread_id": "7",
+    "reply_to_message_id": "1"
+  }
+}
+```
+
+`attachments` is optional. Each attachment may provide one of:
+
+- `data_base64` for inline upload
+- `url` for channels that can fetch media by URL
+- `storage_key` for staged-media flows defined by a specific channel or host
 
 ### Response types
 
@@ -207,7 +261,7 @@ Each response from the plugin is a single JSON line:
 | `health` | `health` | Connectivity report |
 | `ingress_started` | `state` | Webhook registered |
 | `ingress_stopped` | `state` | Webhook deregistered |
-| `ingress_events_received` | `events`, `callback_reply?` | Parsed inbound events |
+| `ingress_events_received` | `events`, `callback_reply?`, `state?`, `poll_after_ms?` | Parsed inbound events |
 | `delivered` | `delivery` | Delivery receipt |
 | `pushed` | `delivery` | Push delivery receipt |
 | `status_accepted` | `status` | Status acknowledgment |
@@ -227,6 +281,76 @@ When the host receives a webhook POST for a channel:
 Installed channel manifests may also retain ingress endpoint declarations so
 the host can match a request path and method before forwarding the payload to
 the plugin.
+
+When using `dispatch channel listen`, the host also sends `start_ingress`
+before entering the HTTP serve loop and sends `stop_ingress` with the last
+reported ingress state when the listener exits cleanly.
+
+Polling channels use a similar lifecycle:
+
+1. Host sends `start_ingress`
+2. Plugin responds with `state.mode = "polling"` and any opaque cursor state
+3. Host loops on `poll_ingress { state? }`
+4. Plugin responds with `events`, updated `state`, and optional `poll_after_ms`
+5. Host sends `stop_ingress` with the last state when polling stops
+
+`callback_reply` is only valid for webhook `ingress_event` handling. Polling
+responses should leave it unset.
+
+### Parcel reply bridge
+
+When `dispatch channel listen ... --deliver-replies` or
+`dispatch channel poll ... --deliver-replies` is used, Dispatch runs the
+configured parcel for each inbound event and then sends the assistant reply
+back through the originating channel.
+
+By default that bridge forwards plain assistant text:
+
+- streamed text deltas and final assistant message text are forwarded
+- reply routing metadata (`conversation_id`, `thread_id`, `reply_to_message_id`)
+  is preserved
+
+Courier plugins can emit a first-class `channel_reply` event directly. Host-backed
+Dispatch couriers also upgrade a tagged JSON assistant reply into the same
+structured event:
+
+```json
+{
+  "kind": "channel_reply",
+  "content": "Dispatch attached the report.",
+  "content_type": "text/plain",
+  "attachments": [
+    {
+      "name": "report.txt",
+      "mime_type": "text/plain",
+      "data_base64": "aGVsbG8="
+    }
+  ],
+  "metadata": {
+    "custom": "value"
+  }
+}
+```
+
+When Dispatch sees `kind = "channel_reply"`:
+
+- `attachments` is forwarded to the channel plugin
+- custom metadata is preserved
+- reply routing metadata from the inbound event still overrides any conflicting
+  values in the assistant payload
+
+When the reply bridge runs under `dispatch channel listen`, Dispatch can also
+stage inline `data_base64` attachments behind a listener-owned URL when the
+target channel only accepts URL-backed media. This requires
+`config.webhook_public_url` so the host can generate a public fetch URL for the
+staged media. Polling channels do not expose that listener-backed staging path,
+so `dispatch channel poll ... --deliver-replies` still requires the reply to use
+an attachment source the channel already accepts directly.
+
+If a workflow needs stricter control over attachment delivery, call the channel
+plugin directly with an explicit `deliver` or `push` request that includes
+`attachments`, or emit the tagged `channel_reply` envelope shown above from the
+parcel.
 
 ### Status frame kinds
 
@@ -256,21 +380,21 @@ Channel plugin manifests may declare:
 - Ingress endpoints they register
 - Platforms they support
 
-Dispatch currently does:
+Dispatch does:
 
 - Subprocess isolation (extensions run as separate processes)
 - Artifact integrity (SHA-256 hash stored at install time)
 - Explicit install into the local channel registry
 
-Dispatch does not yet enforce, at the channel-plugin host layer shown here:
+Dispatch does not enforce, at the channel-plugin host layer shown here:
 
 - Per-plugin network restrictions based on declared domains
 - Per-plugin filesystem sandboxing
 - Automatic secret injection based on manifest requirements
 - Enable/disable or activation state beyond installation
 
-Channel plugins still run out-of-process and do not execute in-process host
-memory, but they currently inherit the normal process environment and OS access
+Channel plugins run out-of-process and do not execute in-process host memory,
+but they inherit the normal process environment and OS access
 of the Dispatch process unless additional runtime isolation is added elsewhere.
 
 ## Repository layout
@@ -287,6 +411,7 @@ dispatch-plugins/
     webhook/        # channel-webhook
     whatsapp/       # channel-whatsapp
     twilio-sms/     # channel-twilio-sms
+    signal/         # channel-signal
   catalog/
     extensions.json
 ```

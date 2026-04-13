@@ -22,7 +22,7 @@ pub use build::{
     verify_parcel,
 };
 pub use channel_plugin_protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPluginRequest,
+    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPluginRequest,
     ChannelPluginRequestEnvelope, ChannelPluginResponse, ChannelPolicy, ConfiguredChannel,
     DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
     InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
@@ -32,12 +32,12 @@ pub use channel_plugin_protocol::{
 pub use channel_plugins::{
     ChannelCatalogEntry, ChannelIngressEndpoint, ChannelIngressTrust, ChannelIngressTrustFailure,
     ChannelPluginCallError, ChannelPluginExec, ChannelPluginIngress, ChannelPluginManifest,
-    ChannelPluginRegistry, build_channel_reply_message, call_channel_plugin,
-    channel_event_session_file, default_channel_registry_path, extract_assistant_reply,
-    install_channel_plugin, list_channel_catalog, load_channel_registry,
-    match_channel_ingress_endpoint, render_inbound_event_chat_input, resolve_channel_plugin,
-    resolve_channel_plugin_for_ingress, validate_channel_plugin_manifest,
-    verify_host_managed_ingress_trust,
+    ChannelPluginRegistry, build_channel_reply_envelope, build_channel_reply_message,
+    call_channel_plugin, channel_event_session_file, default_channel_registry_path,
+    extract_assistant_channel_reply, extract_assistant_reply, install_channel_plugin,
+    list_channel_catalog, load_channel_registry, match_channel_ingress_endpoint,
+    render_inbound_event_chat_input, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
+    validate_channel_plugin_manifest, verify_host_managed_ingress_trust,
 };
 // Keep the crate root focused on the primary parcel/courier entrypoints.
 // Lower-level courier modeling types remain available under `dispatch_core::courier`.

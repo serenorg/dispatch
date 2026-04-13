@@ -34,6 +34,27 @@ pub struct CourierPluginManifest {
     pub installed_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OnDiskCourierManifestKind {
+    Courier,
+    Channel,
+    Connector,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CourierPluginOnDiskManifest {
+    #[serde(default)]
+    kind: Option<OnDiskCourierManifestKind>,
+    name: String,
+    version: String,
+    protocol_version: u32,
+    transport: PluginTransport,
+    #[serde(default)]
+    description: Option<String>,
+    exec: CourierPluginExec,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CourierPluginRegistry {
     #[serde(default)]
@@ -186,11 +207,21 @@ pub fn install_courier_plugin(
             path: manifest_path.display().to_string(),
             source,
         })?;
-    let mut manifest: CourierPluginManifest =
+    let manifest: CourierPluginOnDiskManifest =
         serde_json::from_str(&body).map_err(|source| PluginRegistryError::ParseJson {
             path: manifest_path.display().to_string(),
             source,
         })?;
+    validate_on_disk_plugin_manifest(manifest_path, &manifest)?;
+    let mut manifest = CourierPluginManifest {
+        name: manifest.name,
+        version: manifest.version,
+        protocol_version: manifest.protocol_version,
+        transport: manifest.transport,
+        description: manifest.description,
+        exec: manifest.exec,
+        installed_sha256: None,
+    };
     validate_plugin_manifest(manifest_path, &manifest)?;
 
     if BuiltinCourier::all()
@@ -334,6 +365,35 @@ fn validate_plugin_manifest(
     Ok(())
 }
 
+fn validate_on_disk_plugin_manifest(
+    path: &Path,
+    manifest: &CourierPluginOnDiskManifest,
+) -> Result<(), PluginRegistryError> {
+    if let Some(kind) = &manifest.kind
+        && *kind != OnDiskCourierManifestKind::Courier
+    {
+        return Err(PluginRegistryError::InvalidManifest {
+            path: path.display().to_string(),
+            message: format!(
+                "kind `{}` is invalid for a courier plugin manifest; expected `courier`",
+                kind.as_str()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+impl OnDiskCourierManifestKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Courier => "courier",
+            Self::Channel => "channel",
+            Self::Connector => "connector",
+        }
+    }
+}
+
 pub(crate) fn resolve_plugin_exec_path(
     manifest_path: &Path,
     command: &str,
@@ -417,6 +477,7 @@ mod tests {
             &manifest_path,
             format!(
                 "{{\n\
+\"kind\": \"courier\",\n\
 \"name\": \"demo-plugin\",\n\
 \"version\": \"0.1.0\",\n\
 \"protocol_version\": 1,\n\
@@ -474,6 +535,36 @@ mod tests {
         assert!(matches!(
             error,
             PluginRegistryError::BuiltinNameConflict { name } if name == "docker"
+        ));
+    }
+
+    #[test]
+    fn install_rejects_non_courier_manifest_kind() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("courier-plugin.json");
+        fs::write(
+            &manifest_path,
+            "{\n\
+\"kind\": \"channel\",\n\
+\"name\": \"demo-plugin\",\n\
+\"version\": \"0.1.0\",\n\
+\"protocol_version\": 1,\n\
+\"transport\": \"jsonl\",\n\
+\"description\": \"wrong kind\",\n\
+\"exec\": {\n\
+\"command\": \"./dispatch-courier-demo\",\n\
+\"args\": []\n\
+}\n\
+}",
+        )
+        .unwrap();
+
+        let error = install_courier_plugin(&manifest_path, Some(&dir.path().join("plugins.json")))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginRegistryError::InvalidManifest { message, .. }
+                if message.contains("expected `courier`")
         ));
     }
 }

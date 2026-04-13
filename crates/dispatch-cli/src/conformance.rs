@@ -529,18 +529,19 @@ fn run_courier_conformance_with<R: CourierBackend>(
 }
 
 fn assistant_message_and_done(response: &CourierResponse) -> bool {
-    response
-        .events
-        .iter()
-        .any(|event| matches!(event, CourierEvent::Message { role, .. } if role == "assistant"))
-        && matches!(response.events.last(), Some(CourierEvent::Done))
+    response.events.iter().any(|event| {
+        matches!(event, CourierEvent::Message { role, .. } if role == "assistant")
+            || matches!(event, CourierEvent::ChannelReply { .. })
+    }) && matches!(response.events.last(), Some(CourierEvent::Done))
 }
 
 fn text_output_and_done(response: &CourierResponse) -> bool {
     response.events.iter().any(|event| {
         matches!(
             event,
-            CourierEvent::Message { .. } | CourierEvent::TextDelta { .. }
+            CourierEvent::Message { .. }
+                | CourierEvent::ChannelReply { .. }
+                | CourierEvent::TextDelta { .. }
         )
     }) && matches!(response.events.last(), Some(CourierEvent::Done))
 }
@@ -611,6 +612,11 @@ fn summarize_conformance_response(response: &CourierResponse) -> String {
                     truncate_detail(content)
                 )
             }
+            CourierEvent::ChannelReply { message } => format!(
+                "ChannelReply(content={:?},attachments={})",
+                truncate_detail(&message.content),
+                message.attachments.len()
+            ),
             CourierEvent::TextDelta { content } => {
                 format!("TextDelta({:?})", truncate_detail(content))
             }

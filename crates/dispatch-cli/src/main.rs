@@ -691,6 +691,47 @@ enum ChannelCommand {
         #[arg(long)]
         registry: Option<PathBuf>,
     },
+    /// Poll an installed channel plugin for inbound events
+    Poll {
+        /// Channel plugin name
+        name: String,
+        /// Raw JSON for the plugin-specific channel config object
+        #[arg(long, conflicts_with = "config_file")]
+        config_json: Option<String>,
+        /// Path to a JSON file containing the plugin-specific channel config object
+        #[arg(long, conflicts_with = "config_json")]
+        config_file: Option<PathBuf>,
+        /// Override the plugin-suggested delay between poll cycles in milliseconds
+        #[arg(long = "interval-ms")]
+        interval_ms: Option<u64>,
+        /// Optional parcel or Agentfile path to execute for each inbound event
+        #[arg(long)]
+        parcel: Option<PathBuf>,
+        /// Courier backend to use when `--parcel` is set
+        #[arg(long = "courier", default_value = "native")]
+        courier: String,
+        /// Override the courier plugin registry path used with `--parcel`
+        #[arg(long = "courier-registry")]
+        courier_registry: Option<PathBuf>,
+        /// Root directory for per-conversation session files when `--parcel` is set
+        #[arg(long = "session-root")]
+        session_root: Option<PathBuf>,
+        /// How to handle tools declared with `APPROVAL confirm` during parcel execution
+        #[arg(long, value_enum)]
+        tool_approval: Option<CliToolApprovalMode>,
+        /// Deliver assistant replies back through the channel plugin when possible
+        #[arg(long)]
+        deliver_replies: bool,
+        /// Exit after the first poll cycle
+        #[arg(long)]
+        once: bool,
+        /// Print emitted events as JSON instead of a short summary
+        #[arg(long)]
+        json: bool,
+        /// Override the channel plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
     /// Bind an HTTP listener and forward requests to one installed channel plugin
     Listen {
         /// Channel plugin name
@@ -1327,8 +1368,8 @@ fn secret_command(command: SecretCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand, DepotCommand, EvalArgs,
-        ImageCommand, InspectArgs, InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs,
+        ChannelCommand, Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand, DepotCommand,
+        EvalArgs, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs,
         ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs, RestartArgs,
         SecretCommand, SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
         ValidateSkillArgs, VerifyArgs, WaitArgs,
@@ -2017,6 +2058,69 @@ mod tests {
         assert_eq!(args.listen_max_body_bytes, Some(8192));
         assert_eq!(args.listen_max_header_bytes, Some(4096));
         assert!(args.detach);
+    }
+
+    #[test]
+    fn cli_parses_channel_poll_command() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "channel",
+            "poll",
+            "channel-telegram",
+            "--config-file",
+            "telegram-config.json",
+            "--interval-ms",
+            "1500",
+            "--parcel",
+            "./Agentfile",
+            "--courier",
+            "native",
+            "--session-root",
+            "./.dispatch/channel-sessions",
+            "--deliver-replies",
+            "--once",
+            "--json",
+        ])
+        .unwrap();
+
+        let Command::Channel { command } = cli.command else {
+            panic!("expected channel command");
+        };
+        let ChannelCommand::Poll {
+            name,
+            config_json,
+            config_file,
+            interval_ms,
+            parcel,
+            courier,
+            courier_registry,
+            session_root,
+            tool_approval,
+            deliver_replies,
+            once,
+            json,
+            registry,
+        } = command
+        else {
+            panic!("expected channel poll command");
+        };
+
+        assert_eq!(name, "channel-telegram");
+        assert_eq!(config_json, None);
+        assert_eq!(config_file, Some(PathBuf::from("telegram-config.json")));
+        assert_eq!(interval_ms, Some(1500));
+        assert_eq!(parcel, Some(PathBuf::from("./Agentfile")));
+        assert_eq!(courier, "native");
+        assert_eq!(courier_registry, None);
+        assert_eq!(
+            session_root,
+            Some(PathBuf::from("./.dispatch/channel-sessions"))
+        );
+        assert_eq!(tool_approval, None);
+        assert!(deliver_replies);
+        assert!(once);
+        assert!(json);
+        assert_eq!(registry, None);
     }
 
     #[test]

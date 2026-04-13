@@ -57,7 +57,7 @@ pub struct PluginErrorPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConversationMessage, CourierKind};
+    use crate::{ConversationMessage, CourierKind, OutboundMessageEnvelope};
 
     #[test]
     fn run_request_round_trips_json() {
@@ -129,6 +129,24 @@ mod tests {
                 supports_heartbeat: false,
                 supports_local_tools: false,
                 supports_mounts: Vec::new(),
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: PluginResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn run_event_response_round_trips_channel_reply() {
+        let response = PluginResponse::Event {
+            event: CourierEvent::ChannelReply {
+                message: OutboundMessageEnvelope {
+                    content: "reply text".to_string(),
+                    content_type: Some("text/plain".to_string()),
+                    attachments: Vec::new(),
+                    metadata: Default::default(),
+                },
             },
         };
 

@@ -1,7 +1,8 @@
 use crate::{
     channel_plugin_protocol::{
-        CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelPluginRequest, ChannelPluginRequestEnvelope,
-        ChannelPluginResponse, InboundEventEnvelope, OutboundMessageEnvelope,
+        AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelPluginRequest,
+        ChannelPluginRequestEnvelope, ChannelPluginResponse, InboundEventEnvelope,
+        OutboundMessageEnvelope, parse_tagged_channel_reply,
     },
     courier::CourierEvent,
     plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
@@ -51,6 +52,8 @@ pub struct ChannelPluginManifest {
     pub exec: ChannelPluginExec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    #[serde(default)]
+    pub attachment_sources: Vec<AttachmentSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<ChannelPluginIngress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,7 +132,15 @@ struct OnDiskChannelCapability {
     #[serde(default)]
     allowed_paths: Vec<String>,
     #[serde(default)]
+    delivery: Option<OnDiskChannelDelivery>,
+    #[serde(default)]
     ingress: Option<OnDiskChannelIngress>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OnDiskChannelDelivery {
+    #[serde(default)]
+    attachment_sources: Vec<AttachmentSource>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,6 +298,13 @@ pub fn install_channel_plugin(
         .as_ref()
         .and_then(|c| c.channel.as_ref())
         .and_then(extract_channel_ingress);
+    let attachment_sources = on_disk
+        .capabilities
+        .as_ref()
+        .and_then(|c| c.channel.as_ref())
+        .and_then(|channel| channel.delivery.as_ref())
+        .map(|delivery| delivery.attachment_sources.clone())
+        .unwrap_or_default();
 
     let mut manifest = ChannelPluginManifest {
         name: on_disk.name,
@@ -296,6 +314,7 @@ pub fn install_channel_plugin(
         description: on_disk.description,
         exec: on_disk.entrypoint,
         platform,
+        attachment_sources,
         ingress,
         installed_sha256: None,
     };
@@ -703,6 +722,9 @@ pub fn extract_assistant_reply(events: &[CourierEvent]) -> Option<String> {
     for event in events {
         match event {
             CourierEvent::TextDelta { content } => streamed.push_str(content),
+            CourierEvent::ChannelReply { message } => {
+                latest_message = Some(message.content.clone());
+            }
             CourierEvent::Message { role, content } if role == "assistant" => {
                 latest_message = Some(content.clone());
             }
@@ -716,23 +738,64 @@ pub fn extract_assistant_reply(events: &[CourierEvent]) -> Option<String> {
     }
 }
 
+pub fn extract_assistant_channel_reply(events: &[CourierEvent]) -> Option<OutboundMessageEnvelope> {
+    let mut latest_channel_reply = None;
+    for event in events {
+        if let CourierEvent::ChannelReply { message } = event {
+            latest_channel_reply = Some(message.clone());
+        }
+    }
+    if latest_channel_reply.is_some() {
+        return latest_channel_reply;
+    }
+
+    let reply_text = extract_assistant_reply(events)?;
+    if let Some(tagged_reply) = parse_tagged_channel_reply(&reply_text) {
+        return Some(tagged_reply);
+    }
+
+    Some(OutboundMessageEnvelope {
+        content: reply_text,
+        content_type: Some("text/plain".to_string()),
+        attachments: Vec::new(),
+        metadata: BTreeMap::new(),
+    })
+}
+
 pub fn build_channel_reply_message(
     event: &InboundEventEnvelope,
     reply_text: &str,
 ) -> OutboundMessageEnvelope {
-    let mut metadata = BTreeMap::new();
-    metadata.insert("conversation_id".to_string(), event.conversation.id.clone());
-    if let Some(thread_id) = event.conversation.thread_id.as_deref() {
-        metadata.insert("thread_id".to_string(), thread_id.to_string());
-    }
-    metadata.insert("reply_to_message_id".to_string(), event.message.id.clone());
+    build_channel_reply_envelope(
+        event,
+        OutboundMessageEnvelope {
+            content: reply_text.to_string(),
+            content_type: Some("text/plain".to_string()),
+            attachments: Vec::new(),
+            metadata: BTreeMap::new(),
+        },
+    )
+}
 
-    OutboundMessageEnvelope {
-        content: reply_text.to_string(),
-        content_type: Some("text/plain".to_string()),
-        attachments: Vec::new(),
-        metadata,
+pub fn build_channel_reply_envelope(
+    event: &InboundEventEnvelope,
+    mut message: OutboundMessageEnvelope,
+) -> OutboundMessageEnvelope {
+    if message.content_type.is_none() {
+        message.content_type = Some("text/plain".to_string());
     }
+    message
+        .metadata
+        .insert("conversation_id".to_string(), event.conversation.id.clone());
+    if let Some(thread_id) = event.conversation.thread_id.as_deref() {
+        message
+            .metadata
+            .insert("thread_id".to_string(), thread_id.to_string());
+    }
+    message
+        .metadata
+        .insert("reply_to_message_id".to_string(), event.message.id.clone());
+    message
 }
 
 pub fn validate_channel_plugin_manifest(
@@ -956,7 +1019,13 @@ mod tests {
     use crate::channel_plugin_protocol::{
         InboundActor, InboundConversationRef, InboundEventEnvelope, InboundMessage,
     };
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn install_channel_plugin_round_trips_registry() {
@@ -987,6 +1056,9 @@ mod tests {
 "capabilities": {{
     "channel": {{
         "platform": "telegram",
+        "delivery": {{
+            "attachment_sources": ["data_base64", "url"]
+        }},
         "allowed_paths": ["/telegram/updates"],
         "ingress": {{
             "endpoints": [
@@ -1015,12 +1087,20 @@ mod tests {
         assert_eq!(installed.name, "telegram-bridge");
         assert!(installed.installed_sha256.is_some());
         assert_eq!(installed.platform.as_deref(), Some("telegram"));
+        assert_eq!(
+            installed.attachment_sources,
+            vec![AttachmentSource::DataBase64, AttachmentSource::Url]
+        );
 
         let registry = load_channel_registry(Some(&registry_path)).unwrap();
         assert_eq!(registry.plugins.len(), 1);
         assert_eq!(registry.plugins[0].name, "telegram-bridge");
         assert_eq!(registry.plugins[0].transport, PluginTransport::Jsonl);
         assert_eq!(registry.plugins[0].platform.as_deref(), Some("telegram"));
+        assert_eq!(
+            registry.plugins[0].attachment_sources,
+            vec![AttachmentSource::DataBase64, AttachmentSource::Url]
+        );
         let ingress = registry.plugins[0]
             .ingress
             .as_ref()
@@ -1146,6 +1226,7 @@ mod tests {
                         args: vec![],
                     },
                     platform: Some("telegram".to_string()),
+                    attachment_sources: vec![],
                     ingress: Some(ChannelPluginIngress {
                         endpoints: vec![ChannelIngressEndpoint {
                             path: "/shared".to_string(),
@@ -1167,6 +1248,7 @@ mod tests {
                         args: vec![],
                     },
                     platform: Some("slack".to_string()),
+                    attachment_sources: vec![],
                     ingress: Some(ChannelPluginIngress {
                         endpoints: vec![ChannelIngressEndpoint {
                             path: "/shared".to_string(),
@@ -1222,6 +1304,7 @@ mod tests {
                 args: vec![],
             },
             platform: None,
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1247,6 +1330,7 @@ mod tests {
                 args: vec![],
             },
             platform: None,
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1363,6 +1447,7 @@ printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","pl
                 args: vec![],
             },
             platform: Some("telegram".to_string()),
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1403,6 +1488,7 @@ printf '%s\n' 'not-json'
                 args: vec![],
             },
             platform: None,
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1443,6 +1529,7 @@ exit 7
                 args: vec![],
             },
             platform: None,
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1486,6 +1573,7 @@ printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","pl
                 args: vec![],
             },
             platform: Some("telegram".to_string()),
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1525,6 +1613,51 @@ sleep 5
                 args: vec![],
             },
             platform: None,
+            attachment_sources: vec![],
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let error = call_channel_plugin_with_timeout(
+            &manifest,
+            ChannelPluginRequest::Capabilities,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
+        ));
+    }
+
+    #[test]
+    fn call_channel_plugin_times_out_when_plugin_is_fully_silent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-hangs-silently.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+sleep 5
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "silent-hang-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: None,
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1570,6 +1703,7 @@ sleep 5
                 args: vec![],
             },
             platform: Some("telegram".to_string()),
+            attachment_sources: vec![],
             ingress: None,
             installed_sha256: None,
         };
@@ -1639,6 +1773,111 @@ sleep 5
     }
 
     #[test]
+    fn extract_assistant_channel_reply_parses_tagged_json_envelope() {
+        let reply = extract_assistant_channel_reply(&[CourierEvent::Message {
+            role: "assistant".to_string(),
+            content: serde_json::to_string(&serde_json::json!({
+                "kind": "channel_reply",
+                "content": "reply text",
+                "content_type": "text/plain",
+                "attachments": [{
+                    "name": "report.txt",
+                    "mime_type": "text/plain",
+                    "data_base64": "aGVsbG8="
+                }],
+                "metadata": {
+                    "custom": "value"
+                }
+            }))
+            .expect("serialize channel reply"),
+        }])
+        .expect("assistant reply");
+
+        assert_eq!(reply.content, "reply text");
+        assert_eq!(reply.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(reply.attachments.len(), 1);
+        assert_eq!(reply.attachments[0].name, "report.txt");
+        assert_eq!(
+            reply.attachments[0].data_base64.as_deref(),
+            Some("aGVsbG8=")
+        );
+        assert_eq!(
+            reply.metadata.get("custom").map(String::as_str),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn extract_assistant_channel_reply_prefers_first_class_event() {
+        let reply = extract_assistant_channel_reply(&[
+            CourierEvent::Message {
+                role: "assistant".to_string(),
+                content: "plain fallback".to_string(),
+            },
+            CourierEvent::ChannelReply {
+                message: OutboundMessageEnvelope {
+                    content: "structured reply".to_string(),
+                    content_type: Some("text/plain".to_string()),
+                    attachments: Vec::new(),
+                    metadata: BTreeMap::from([("custom".to_string(), "value".to_string())]),
+                },
+            },
+        ])
+        .expect("assistant reply");
+
+        assert_eq!(reply.content, "structured reply");
+        assert_eq!(
+            reply.metadata.get("custom").map(String::as_str),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn build_channel_reply_envelope_preserves_attachments_and_overwrites_routing() {
+        let message = build_channel_reply_envelope(
+            &sample_inbound_event(),
+            OutboundMessageEnvelope {
+                content: "reply text".to_string(),
+                content_type: None,
+                attachments: vec![crate::channel_plugin_protocol::OutboundAttachment {
+                    name: "report.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    data_base64: Some("aGVsbG8=".to_string()),
+                    url: None,
+                    storage_key: None,
+                }],
+                metadata: BTreeMap::from([
+                    ("custom".to_string(), "value".to_string()),
+                    ("conversation_id".to_string(), "wrong".to_string()),
+                ]),
+            },
+        );
+
+        assert_eq!(message.content, "reply text");
+        assert_eq!(message.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(
+            message.metadata.get("custom").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            message.metadata.get("conversation_id").map(String::as_str),
+            Some("chat-123")
+        );
+        assert_eq!(
+            message.metadata.get("thread_id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            message
+                .metadata
+                .get("reply_to_message_id")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn build_channel_reply_message_includes_reply_metadata() {
         let message = build_channel_reply_message(&sample_inbound_event(), "reply text");
 
@@ -1675,6 +1914,7 @@ sleep 5
                 args: vec![],
             },
             platform: Some("webhook".to_string()),
+            attachment_sources: vec![],
             ingress: Some(ChannelPluginIngress {
                 endpoints: vec![ChannelIngressEndpoint {
                     path: "/webhook/inbound".to_string(),
@@ -1693,6 +1933,7 @@ sleep 5
 
     #[test]
     fn verify_host_managed_ingress_trust_accepts_matching_shared_secret_header() {
+        let _env_guard = env_lock().lock().unwrap();
         let plugin = ChannelPluginManifest {
             name: "channel-telegram".to_string(),
             version: "0.1.0".to_string(),
@@ -1704,6 +1945,7 @@ sleep 5
                 args: vec![],
             },
             platform: Some("telegram".to_string()),
+            attachment_sources: vec![],
             ingress: Some(ChannelPluginIngress {
                 endpoints: vec![ChannelIngressEndpoint {
                     path: "/telegram/updates".to_string(),
@@ -1738,6 +1980,7 @@ sleep 5
 
     #[test]
     fn verify_host_managed_ingress_trust_rejects_mismatched_shared_secret_header() {
+        let _env_guard = env_lock().lock().unwrap();
         let plugin = ChannelPluginManifest {
             name: "channel-telegram".to_string(),
             version: "0.1.0".to_string(),
@@ -1749,6 +1992,7 @@ sleep 5
                 args: vec![],
             },
             platform: Some("telegram".to_string()),
+            attachment_sources: vec![],
             ingress: Some(ChannelPluginIngress {
                 endpoints: vec![ChannelIngressEndpoint {
                     path: "/telegram/updates".to_string(),

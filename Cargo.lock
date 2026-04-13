@@ -834,6 +834,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
+ "base64",
  "chrono",
  "clap",
  "cron",

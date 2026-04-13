@@ -393,6 +393,10 @@ fn run_eval_case<R: CourierBackend>(
                 result.assistant_messages.push(content.clone());
                 text_observations.push(content.clone());
             }
+            CourierEvent::ChannelReply { message } => {
+                result.assistant_messages.push(message.content.clone());
+                text_observations.push(message.content.clone());
+            }
             CourierEvent::TextDelta { content } => text_observations.push(content.clone()),
             _ => {}
         }

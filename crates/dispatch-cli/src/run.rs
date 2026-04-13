@@ -448,6 +448,21 @@ pub(crate) fn print_courier_events(
                 }
                 writeln!(output, "{role}: {content}")?;
             }
+            CourierEvent::ChannelReply { message } => {
+                if streamed_assistant_reply {
+                    continue;
+                }
+                writeln!(output, "assistant: {}", message.content)?;
+                if !message.attachments.is_empty() {
+                    let attachments = message
+                        .attachments
+                        .iter()
+                        .map(|attachment| format!("{} ({})", attachment.name, attachment.mime_type))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(output, "attachments: {attachments}")?;
+                }
+            }
             CourierEvent::TextDelta { content } => {
                 streamed_assistant_reply = true;
                 stream_line_open = true;
