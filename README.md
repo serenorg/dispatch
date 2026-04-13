@@ -549,6 +549,13 @@ The courier registry is host inventory, not parcel source. `Agentfile` remains
 the canonical authored spec, while `dispatch courier install` records which
 runtime backends are available on a given machine.
 
+For project-scoped runtime wiring, use `dispatch.toml` with `dispatch up`.
+That path is separate from `Agentfile`: `Agentfile` defines the parcel, while
+`dispatch.toml` binds parcels to installed channels/couriers and reconciles
+extension manifests into project-local registries under `.dispatch/registries/`.
+Reply delivery through channel bindings requires a parcel; `deliver_replies`
+does not work on a channel-only runtime binding.
+
 - `dispatch parcel lint|build|inspect|verify|keygen|sign` - manage parcel sources, signatures, and built artifacts
 - `dispatch depot push|pull` - move parcels to and from depots
 - `dispatch courier ls` - list built-in backends and installed plugins
@@ -558,7 +565,11 @@ runtime backends are available on a given machine.
 - `dispatch courier conformance <name> --json` - emit the same conformance report as machine-readable JSON
 - `dispatch run --courier <name>` - select a backend by name
 - `dispatch run --registry <path>` - use a non-default courier registry
+- `dispatch up [dispatch.toml]` - reconcile project-local runtime bindings and start configured channel listeners/pollers
 - plugin installation records the executable SHA256; Dispatch checks that digest before each launch
+
+See `examples/runtime/telegram-bot/dispatch.toml` for a concrete
+project-level runtime config example.
 
 ## Mounts
 

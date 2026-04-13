@@ -1,0 +1,16 @@
+parcel = "../../parcels/basic/Agentfile"
+courier = "native"
+
+# Uncomment and adjust this if you want `dispatch up` to reconcile a local
+# plugin manifest into the project-local registry before starting bindings.
+#
+# [[extensions]]
+# manifest = "/absolute/path/to/channel-telegram/channel-plugin.json"
+
+[[channels]]
+name = "telegram"
+plugin = "channel-telegram"
+mode = "listen"
+listen = "127.0.0.1:8787"
+deliver_replies = true
+config_file = "./telegram-config.toml"

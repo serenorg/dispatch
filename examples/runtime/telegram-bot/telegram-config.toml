@@ -1,0 +1,6 @@
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+webhook_endpoint = "/telegram/updates"
+webhook_public_url = "https://example.invalid"
+
+# Set this when the bot uses Telegram's secret-token webhook header.
+# webhook_secret_env = "TELEGRAM_WEBHOOK_SECRET"

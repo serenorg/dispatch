@@ -101,6 +101,29 @@ struct ChannelParcelBridge {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum ChannelRuntimeMode {
+    Listen { listen: String },
+    Poll { interval_ms: Option<u64> },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelRuntimeBindingArgs {
+    pub label: String,
+    pub plugin: String,
+    pub config: Value,
+    pub parcel: Option<PathBuf>,
+    pub courier: String,
+    pub courier_registry: Option<PathBuf>,
+    pub session_root: Option<PathBuf>,
+    pub tool_approval: Option<crate::CliToolApprovalMode>,
+    pub deliver_replies: bool,
+    pub once: bool,
+    pub emit_json: bool,
+    pub registry: Option<PathBuf>,
+    pub mode: ChannelRuntimeMode,
+}
+
+#[derive(Debug, Clone)]
 struct ListenerStagedMedia {
     public_base_url: Option<String>,
     entries: Arc<Mutex<BTreeMap<String, StagedMediaEntry>>>,
@@ -369,7 +392,7 @@ fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
         Some(name) => resolve_channel_plugin(name, args.registry)?,
         None => resolve_channel_plugin_for_ingress(args.method, args.path, args.registry)?,
     };
-    let config = load_json_value(args.config_json, args.config_file, "channel config")?;
+    let config = load_structured_value(args.config_json, args.config_file, "channel config")?;
     let request = build_ingress_request(IngressRequestParts {
         config,
         method: args.method,
@@ -392,219 +415,256 @@ fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
 }
 
 fn channel_poll(args: ChannelPollArgs<'_>) -> Result<()> {
-    let plugin = resolve_channel_plugin(args.name, args.registry)?;
-    let config = load_json_value(args.config_json, args.config_file, "channel config")?;
-    let staged_media = ListenerStagedMedia::from_config(&Value::Null);
-    let parcel_bridge = prepare_channel_parcel_bridge(
-        args.parcel,
-        args.courier,
-        args.courier_registry,
-        args.session_root,
-        args.tool_approval,
-        args.deliver_replies,
-    )?;
-
-    let mut ingress_state = Some(start_channel_listener_ingress(&plugin, &config)?);
-    if !matches!(
-        ingress_state.as_ref().map(|state| &state.mode),
-        Some(IngressMode::Polling)
-    ) {
-        let stop_result = stop_channel_listener_ingress(&plugin, &config, ingress_state.clone());
-        let mode_name = ingress_state
-            .as_ref()
-            .map(|state| format!("{:?}", state.mode))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let run_error = anyhow::anyhow!(
-            "channel plugin `{}` started ingress in {} mode; use `dispatch channel listen` for webhook-style ingress",
-            plugin.name,
-            mode_name
-        );
-        return match stop_result {
-            Ok(()) => Err(run_error),
-            Err(stop_error) => {
-                Err(run_error.context(format!("also failed to stop ingress cleanly: {stop_error}")))
-            }
-        };
-    }
-
-    println!("Polling {}", plugin.name);
-    if let Some(parcel_bridge) = &parcel_bridge {
-        println!(
-            "Parcel bridge: {} via {} (sessions under {})",
-            parcel_bridge.parcel_path.display(),
-            parcel_bridge.courier,
-            parcel_bridge.session_root.display()
-        );
-    }
-
-    let run_result = (|| -> Result<()> {
-        loop {
-            let response = call_channel_plugin(
-                &plugin,
-                ChannelPluginRequest::PollIngress {
-                    config: config.clone(),
-                    state: ingress_state.clone(),
-                },
-            )?;
-
-            match response {
-                ChannelPluginResponse::IngressEventsReceived {
-                    events,
-                    callback_reply,
-                    state,
-                    poll_after_ms,
-                } => {
-                    if callback_reply.is_some() {
-                        bail!(
-                            "channel plugin returned callback_reply for poll_ingress; callback replies are only valid for ingress_event webhook handling"
-                        );
-                    }
-                    if let Some(state) = state {
-                        ingress_state = Some(state);
-                    }
-
-                    let parcel_runs = if let Some(parcel_bridge) = &parcel_bridge {
-                        execute_channel_parcel_runs(
-                            &plugin,
-                            parcel_bridge,
-                            &staged_media,
-                            &config,
-                            &events,
-                        )?
-                    } else {
-                        Vec::new()
-                    };
-
-                    if args.emit_json {
-                        println!(
-                            "{}",
-                            serde_json::to_string(&json!({
-                                "plugin": plugin.name,
-                                "events": events,
-                                "parcel_runs": parcel_runs,
-                                "state": ingress_state,
-                                "poll_after_ms": poll_after_ms,
-                            }))?
-                        );
-                    } else {
-                        println!("Poll {} -> {} event(s)", plugin.name, events.len());
-                        for parcel_run in &parcel_runs {
-                            println!(
-                                "Parcel {} -> {}",
-                                parcel_run.event_id,
-                                parcel_run.session_file.display()
-                            );
-                            if let Some(delivery) = &parcel_run.delivery {
-                                println!(
-                                    "Delivered reply: {} -> {}",
-                                    delivery.message_id, delivery.conversation_id
-                                );
-                            }
-                            if !parcel_run.output.is_empty() {
-                                print!("{}", parcel_run.output);
-                            }
-                        }
-                    }
-
-                    if args.once {
-                        break;
-                    }
-
-                    thread::sleep(Duration::from_millis(resolved_poll_delay_ms(
-                        args.interval_ms,
-                        poll_after_ms,
-                    )));
-                }
-                ChannelPluginResponse::Error { error } => bail!(
-                    "channel plugin error {} while polling ingress: {}",
-                    error.code,
-                    error.message
-                ),
-                other => bail!(
-                    "channel plugin returned unexpected response variant for poll_ingress: {}",
-                    response_kind(&other)
-                ),
-            }
-        }
-
-        Ok(())
-    })();
-
-    let stop_result = stop_channel_listener_ingress(&plugin, &config, ingress_state);
-    match (run_result, stop_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(run_error), Err(stop_error)) => {
-            Err(run_error.context(format!("also failed to stop ingress cleanly: {stop_error}")))
-        }
-    }
+    run_channel_runtime_binding(ChannelRuntimeBindingArgs {
+        label: args.name.to_string(),
+        plugin: args.name.to_string(),
+        config: load_structured_value(args.config_json, args.config_file, "channel config")?,
+        parcel: args.parcel.map(PathBuf::from),
+        courier: args.courier.to_string(),
+        courier_registry: args.courier_registry.map(PathBuf::from),
+        session_root: args.session_root.map(PathBuf::from),
+        tool_approval: args.tool_approval,
+        deliver_replies: args.deliver_replies,
+        once: args.once,
+        emit_json: args.emit_json,
+        registry: args.registry.map(PathBuf::from),
+        mode: ChannelRuntimeMode::Poll {
+            interval_ms: args.interval_ms,
+        },
+    })
 }
 
 fn channel_listen(args: ChannelListenArgs<'_>) -> Result<()> {
-    let plugin = resolve_channel_plugin(args.name, args.registry)?;
-    let config = load_json_value(args.config_json, args.config_file, "channel config")?;
-    let staged_media = ListenerStagedMedia::from_config(&config);
+    run_channel_runtime_binding(ChannelRuntimeBindingArgs {
+        label: args.name.to_string(),
+        plugin: args.name.to_string(),
+        config: load_structured_value(args.config_json, args.config_file, "channel config")?,
+        parcel: args.parcel.map(PathBuf::from),
+        courier: args.courier.to_string(),
+        courier_registry: args.courier_registry.map(PathBuf::from),
+        session_root: args.session_root.map(PathBuf::from),
+        tool_approval: args.tool_approval,
+        deliver_replies: args.deliver_replies,
+        once: args.once,
+        emit_json: args.emit_json,
+        registry: args.registry.map(PathBuf::from),
+        mode: ChannelRuntimeMode::Listen {
+            listen: args.listen.to_string(),
+        },
+    })
+}
+
+pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Result<()> {
+    let plugin = resolve_channel_plugin(&args.plugin, args.registry.as_deref())?;
     let parcel_bridge = prepare_channel_parcel_bridge(
-        args.parcel,
-        args.courier,
-        args.courier_registry,
-        args.session_root,
+        args.parcel.as_deref(),
+        &args.courier,
+        args.courier_registry.as_deref(),
+        args.session_root.as_deref(),
         args.tool_approval,
         args.deliver_replies,
     )?;
-    let server = Server::http(args.listen)
-        .map_err(|error| anyhow::anyhow!("failed to bind {}: {error}", args.listen))?;
-    let ingress_state = start_channel_listener_ingress(&plugin, &config)?;
-    if matches!(ingress_state.mode, IngressMode::Polling) {
-        let stop_result =
-            stop_channel_listener_ingress(&plugin, &config, Some(ingress_state.clone()));
-        let run_error = anyhow::anyhow!(
-            "channel plugin `{}` started ingress in polling mode; use `dispatch channel poll` instead of `dispatch channel listen`",
-            plugin.name
-        );
-        return match stop_result {
-            Ok(()) => Err(run_error),
-            Err(stop_error) => {
-                Err(run_error.context(format!("also failed to stop ingress cleanly: {stop_error}")))
+
+    match args.mode {
+        ChannelRuntimeMode::Poll { interval_ms } => {
+            let staged_media = ListenerStagedMedia::from_config(&Value::Null);
+            let mut ingress_state = Some(start_channel_listener_ingress(&plugin, &args.config)?);
+            if !matches!(
+                ingress_state.as_ref().map(|state| &state.mode),
+                Some(IngressMode::Polling)
+            ) {
+                let stop_result =
+                    stop_channel_listener_ingress(&plugin, &args.config, ingress_state.clone());
+                let mode_name = ingress_state
+                    .as_ref()
+                    .map(|state| format!("{:?}", state.mode))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let run_error = anyhow::anyhow!(
+                    "channel plugin `{}` started ingress in {} mode; use listen bindings for webhook-style ingress",
+                    plugin.name,
+                    mode_name
+                );
+                return match stop_result {
+                    Ok(()) => Err(run_error),
+                    Err(stop_error) => Err(run_error
+                        .context(format!("also failed to stop ingress cleanly: {stop_error}"))),
+                };
             }
-        };
-    }
 
-    println!("Listening on {}", server.server_addr());
-    if let Some(parcel_bridge) = &parcel_bridge {
-        println!(
-            "Parcel bridge: {} via {} (sessions under {})",
-            parcel_bridge.parcel_path.display(),
-            parcel_bridge.courier,
-            parcel_bridge.session_root.display()
-        );
-    }
+            println!("Polling {}", plugin.name);
+            if let Some(parcel_bridge) = &parcel_bridge {
+                println!(
+                    "Parcel bridge: {} via {} (sessions under {})",
+                    parcel_bridge.parcel_path.display(),
+                    parcel_bridge.courier,
+                    parcel_bridge.session_root.display()
+                );
+            }
 
-    let run_result = (|| -> Result<()> {
-        loop {
-            handle_channel_listener_connection(
-                &plugin,
-                &config,
-                server.recv().context("failed to accept connection")?,
-                parcel_bridge.as_ref(),
-                &staged_media,
-                args.emit_json,
-            )?;
-            if args.once {
-                break;
+            let run_result = (|| -> Result<()> {
+                loop {
+                    let response = call_channel_plugin(
+                        &plugin,
+                        ChannelPluginRequest::PollIngress {
+                            config: args.config.clone(),
+                            state: ingress_state.clone(),
+                        },
+                    )?;
+
+                    match response {
+                        ChannelPluginResponse::IngressEventsReceived {
+                            events,
+                            callback_reply,
+                            state,
+                            poll_after_ms,
+                        } => {
+                            if callback_reply.is_some() {
+                                bail!(
+                                    "channel plugin returned callback_reply for poll_ingress; callback replies are only valid for ingress_event webhook handling"
+                                );
+                            }
+                            if let Some(state) = state {
+                                ingress_state = Some(state);
+                            }
+
+                            let parcel_runs = if let Some(parcel_bridge) = &parcel_bridge {
+                                execute_channel_parcel_runs(
+                                    &plugin,
+                                    parcel_bridge,
+                                    &staged_media,
+                                    &args.config,
+                                    &events,
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+
+                            if args.emit_json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(&json!({
+                                        "plugin": plugin.name,
+                                        "events": events,
+                                        "parcel_runs": parcel_runs,
+                                        "state": ingress_state,
+                                        "poll_after_ms": poll_after_ms,
+                                    }))?
+                                );
+                            } else {
+                                println!("Poll {} -> {} event(s)", plugin.name, events.len());
+                                for parcel_run in &parcel_runs {
+                                    println!(
+                                        "Parcel {} -> {}",
+                                        parcel_run.event_id,
+                                        parcel_run.session_file.display()
+                                    );
+                                    if let Some(delivery) = &parcel_run.delivery {
+                                        println!(
+                                            "Delivered reply: {} -> {}",
+                                            delivery.message_id, delivery.conversation_id
+                                        );
+                                    }
+                                    if !parcel_run.output.is_empty() {
+                                        print!("{}", parcel_run.output);
+                                    }
+                                }
+                            }
+
+                            if args.once {
+                                break;
+                            }
+
+                            thread::sleep(Duration::from_millis(resolved_poll_delay_ms(
+                                interval_ms,
+                                poll_after_ms,
+                            )));
+                        }
+                        ChannelPluginResponse::Error { error } => bail!(
+                            "channel plugin error {} while polling ingress: {}",
+                            error.code,
+                            error.message
+                        ),
+                        other => bail!(
+                            "channel plugin returned unexpected response variant for poll_ingress: {}",
+                            response_kind(&other)
+                        ),
+                    }
+                }
+
+                Ok(())
+            })();
+
+            let stop_result = stop_channel_listener_ingress(&plugin, &args.config, ingress_state);
+            match (run_result, stop_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(run_error), Err(stop_error)) => {
+                    Err(run_error
+                        .context(format!("also failed to stop ingress cleanly: {stop_error}")))
+                }
             }
         }
-        Ok(())
-    })();
+        ChannelRuntimeMode::Listen { listen } => {
+            let staged_media = ListenerStagedMedia::from_config(&args.config);
+            let server = Server::http(&listen)
+                .map_err(|error| anyhow::anyhow!("failed to bind {listen}: {error}"))?;
+            let ingress_state = start_channel_listener_ingress(&plugin, &args.config)?;
+            if matches!(ingress_state.mode, IngressMode::Polling) {
+                let stop_result = stop_channel_listener_ingress(
+                    &plugin,
+                    &args.config,
+                    Some(ingress_state.clone()),
+                );
+                let run_error = anyhow::anyhow!(
+                    "channel plugin `{}` started ingress in polling mode; use poll bindings instead of listen bindings",
+                    plugin.name
+                );
+                return match stop_result {
+                    Ok(()) => Err(run_error),
+                    Err(stop_error) => Err(run_error
+                        .context(format!("also failed to stop ingress cleanly: {stop_error}"))),
+                };
+            }
 
-    let stop_result = stop_channel_listener_ingress(&plugin, &config, Some(ingress_state));
-    match (run_result, stop_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(run_error), Err(stop_error)) => {
-            Err(run_error.context(format!("also failed to stop ingress cleanly: {stop_error}")))
+            println!("Listening on {}", server.server_addr());
+            if let Some(parcel_bridge) = &parcel_bridge {
+                println!(
+                    "Parcel bridge: {} via {} (sessions under {})",
+                    parcel_bridge.parcel_path.display(),
+                    parcel_bridge.courier,
+                    parcel_bridge.session_root.display()
+                );
+            }
+
+            let run_result = (|| -> Result<()> {
+                loop {
+                    handle_channel_listener_connection(
+                        &plugin,
+                        &args.config,
+                        server.recv().context("failed to accept connection")?,
+                        parcel_bridge.as_ref(),
+                        &staged_media,
+                        args.emit_json,
+                    )?;
+                    if args.once {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+
+            let stop_result =
+                stop_channel_listener_ingress(&plugin, &args.config, Some(ingress_state));
+            match (run_result, stop_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(run_error), Err(stop_error)) => {
+                    Err(run_error
+                        .context(format!("also failed to stop ingress cleanly: {stop_error}")))
+                }
+            }
         }
     }
 }
@@ -728,7 +788,7 @@ fn load_request(
     }
 }
 
-fn load_json_value(
+fn load_structured_value(
     value_json: Option<&str>,
     value_file: Option<&Path>,
     description: &str,
@@ -738,12 +798,41 @@ fn load_json_value(
         (None, None) => Ok(json!({})),
         (Some(value_json), None) => serde_json::from_str(value_json)
             .with_context(|| format!("failed to parse {description} JSON")),
-        (None, Some(value_file)) => {
-            let body = fs::read_to_string(value_file)
-                .with_context(|| format!("failed to read {}", value_file.display()))?;
-            serde_json::from_str(&body)
-                .with_context(|| format!("failed to parse {}", value_file.display()))
+        (None, Some(value_file)) => load_structured_value_file(value_file, description),
+    }
+}
+
+pub(crate) fn load_structured_value_file(value_file: &Path, description: &str) -> Result<Value> {
+    let body = fs::read_to_string(value_file)
+        .with_context(|| format!("failed to read {}", value_file.display()))?;
+    match value_file.extension().and_then(|value| value.to_str()) {
+        Some("toml") => {
+            let value = toml::from_str::<toml::Value>(&body)
+                .with_context(|| format!("failed to parse {} as TOML", value_file.display()))?;
+            serde_json::to_value(value).with_context(|| {
+                format!(
+                    "failed to convert TOML {} into JSON-compatible {description}",
+                    value_file.display()
+                )
+            })
         }
+        Some("json") => serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse {}", value_file.display())),
+        _ => serde_json::from_str(&body)
+            .or_else(|_| {
+                toml::from_str::<toml::Value>(&body)
+                    .context("TOML parse fallback failed")
+                    .and_then(|value| {
+                        serde_json::to_value(value)
+                            .context("failed to convert TOML into JSON-compatible config")
+                    })
+            })
+            .with_context(|| {
+                format!(
+                    "failed to parse {} as JSON or TOML for {description}",
+                    value_file.display()
+                )
+            }),
     }
 }
 
@@ -970,6 +1059,10 @@ fn prepare_channel_parcel_bridge(
     tool_approval: Option<crate::CliToolApprovalMode>,
     deliver_replies: bool,
 ) -> Result<Option<ChannelParcelBridge>> {
+    if deliver_replies && parcel.is_none() {
+        bail!("reply delivery requires a parcel; set `--parcel` before using `--deliver-replies`");
+    }
+
     let Some(parcel) = parcel else {
         return Ok(None);
     };

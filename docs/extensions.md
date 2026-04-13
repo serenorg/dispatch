@@ -102,9 +102,10 @@ dispatch channel inspect <name>
 dispatch channel call <name> --request-json '{"kind":"capabilities"}'
 dispatch channel call channel-telegram --request-file telegram-deliver.json
 dispatch channel ingress --path /telegram/updates --header X-Telegram-Bot-Api-Secret-Token=... --body-file update.json
-dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json
-dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.json --parcel ./Agentfile --session-root ./.dispatch/channel-sessions --deliver-replies
-dispatch channel poll channel-telegram --config-file telegram-config.json --once
+dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.toml
+dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.toml --parcel ./Agentfile --session-root ./.dispatch/channel-sessions --deliver-replies
+dispatch channel poll channel-telegram --config-file telegram-config.toml --once
+dispatch up
 ```
 
 These commands manage the local host registry, not parcel source. They are the
@@ -122,10 +123,43 @@ commands. They are useful for development, testing, and direct operator
 control, but they are not the canonical authored configuration surface for
 project-specific channel wiring.
 
-Dispatch still needs a separate declarative runtime binding layer for cases
-such as "bind installed channel X to parcel Y with config Z". That binding
-should live outside the `Agentfile` so parcel source stays portable and
-reviewable without embedding local extension inventory details.
+`dispatch up` is the project-level runtime binding command. It reads
+`dispatch.toml`, reconciles declared extension manifests into project-local
+registries under `.dispatch/registries/`, and starts the configured channel
+bindings without mutating the global registries under `~/.config/dispatch/`.
+Use `dispatch up --dry-run` to preview installs and channel bindings without
+mutating registries or starting listeners/pollers.
+
+Minimal `dispatch.toml` example:
+
+```toml
+parcel = "./Agentfile"
+courier = "native"
+
+[[extensions]]
+manifest = "../dispatch-plugins/channels/telegram/channel-plugin.json"
+
+[[channels]]
+plugin = "channel-telegram"
+mode = "listen"
+listen = "127.0.0.1:8787"
+deliver_replies = true
+config_file = "./config/telegram.toml"
+```
+
+Channel binding config files may be JSON or TOML. Inline `config = { ... }`
+tables in `dispatch.toml` are also supported.
+
+`deliver_replies = true` requires a project-level `parcel = "..."` entry or a
+direct `--parcel` argument on the low-level channel commands. Reply delivery
+is a parcel-runtime bridge, not a standalone channel feature.
+
+`[[extensions]]` entries can omit `kind` when the referenced manifest declares
+its own `kind`, or when it uses the conventional `channel-plugin.json` or
+`courier-plugin.json` filename.
+
+A concrete example lives at
+`examples/runtime/telegram-bot/dispatch.toml`.
 
 ## Extension manifest format
 

@@ -4,6 +4,7 @@ mod courier_cmds;
 mod eval;
 mod inspect;
 mod parcel_ops;
+mod project_config;
 mod run;
 mod runs;
 mod secret_cmds;
@@ -68,6 +69,8 @@ enum Command {
     Run(RunArgs),
     /// Run a parcel as a long-lived local service
     Serve(ServeArgs),
+    /// Reconcile and run project runtime bindings from dispatch.toml
+    Up(UpArgs),
     /// List active and completed local runs
     Ps(PsArgs),
     /// Print logs for a local run
@@ -312,6 +315,16 @@ struct ServeArgs {
     /// Apply a structured A2A trust policy file for this command
     #[arg(long)]
     a2a_trust_policy: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct UpArgs {
+    /// Path to a dispatch.toml file or a directory containing one
+    #[arg(default_value = "dispatch.toml")]
+    path: PathBuf,
+    /// Print planned installs and bindings without mutating registries or starting channels
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1010,6 +1023,7 @@ fn main() -> Result<()> {
         Command::Container { command } => container_command(command),
         Command::Run(args) => run::run(args),
         Command::Serve(args) => runs::serve(args),
+        Command::Up(args) => project_config::up(args),
         Command::Ps(args) => runs::ps(args),
         Command::Logs(args) => runs::logs(args),
         Command::Wait(args) => runs::wait(args),
@@ -2121,6 +2135,18 @@ mod tests {
         assert!(once);
         assert!(json);
         assert_eq!(registry, None);
+    }
+
+    #[test]
+    fn cli_parses_up_command() {
+        let cli = Cli::try_parse_from(["dispatch", "up", "./dispatch.toml", "--dry-run"]).unwrap();
+
+        let Command::Up(args) = cli.command else {
+            panic!("expected up command");
+        };
+
+        assert_eq!(args.path, PathBuf::from("./dispatch.toml"));
+        assert!(args.dry_run);
     }
 
     #[test]

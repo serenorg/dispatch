@@ -1035,6 +1035,154 @@ fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn dispatch_up_uses_project_local_channel_registry() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+    let listen_addr = reserve_loopback_addr()?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+[[extensions]]
+manifest = "{}"
+
+[[channels]]
+plugin = "channel-test"
+mode = "listen"
+listen = "{}"
+once = true
+"#,
+            manifest_path.display(),
+            listen_addr,
+        ),
+    )?;
+
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args(["up", "dispatch.toml"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )?;
+    assert!(response.starts_with("HTTP/1.1 202 Accepted"));
+
+    let stdout = require_success(child.wait_with_output()?, "dispatch up")?;
+    assert!(stdout.contains("Installed channel plugin `channel-test`"));
+
+    let registry_path = dir.path().join(".dispatch/registries/channels.json");
+    assert!(registry_path.exists());
+    let registry: Value = serde_json::from_slice(&fs::read(registry_path)?)?;
+    assert_eq!(registry["plugins"][0]["name"], "channel-test");
+
+    Ok(())
+}
+
+#[test]
+fn dispatch_up_loads_channel_toml_config_file() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let request_log = dir.path().join("request.json");
+    let manifest_path = write_logging_channel_test_plugin(dir.path(), &request_log)?;
+    let listen_addr = reserve_loopback_addr()?;
+    fs::write(
+        dir.path().join("channel-config.toml"),
+        r#"
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+
+[delivery]
+mode = "reply"
+"#,
+    )?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+[[extensions]]
+manifest = "{}"
+
+[[channels]]
+plugin = "channel-query-test"
+mode = "listen"
+listen = "{}"
+once = true
+config_file = "./channel-config.toml"
+"#,
+            manifest_path.display(),
+            listen_addr,
+        ),
+    )?;
+
+    let dispatch_bin = dispatch_bin();
+    let child = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args(["up", "dispatch.toml"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let response = http_request_with_retry(
+        &listen_addr,
+        "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )?;
+    assert!(response.contains("ok\n"), "unexpected response: {response}");
+
+    let _ = require_success(child.wait_with_output()?, "dispatch up")?;
+
+    let logged_request: Value = serde_json::from_slice(&fs::read(&request_log)?)?;
+    assert_eq!(
+        logged_request["request"]["config"]["bot_token_env"],
+        "TELEGRAM_BOT_TOKEN"
+    );
+    assert_eq!(
+        logged_request["request"]["config"]["delivery"]["mode"],
+        "reply"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dispatch_up_dry_run_does_not_install_or_start_channels() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempdir()?;
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+[[extensions]]
+manifest = "{}"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+once = true
+"#,
+            manifest_path.display(),
+        ),
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(dir.path(), &[], &["up", "dispatch.toml", "--dry-run"])?,
+        "dispatch up --dry-run",
+    )?;
+
+    assert!(stdout.contains("Dry Run: yes"));
+    assert!(stdout.contains("channel-test"));
+    assert!(
+        !dir.path()
+            .join(".dispatch/registries/channels.json")
+            .exists()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dyn std::error::Error>>
 {
     let dir = tempdir()?;
@@ -1310,7 +1458,7 @@ fn channel_listen_rejects_polling_plugins_and_stops_ingress()
         "dispatch channel listen unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("dispatch channel poll"),
+        stderr.contains("poll") && stderr.contains("instead of listen"),
         "stderr did not mention polling guidance\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
@@ -1607,6 +1755,59 @@ fn channel_listen_delivers_replies_through_plugin() -> Result<(), Box<dyn std::e
         deliver_envelope["request"]["message"]["metadata"]["reply_to_message_id"],
         "msg-1"
     );
+
+    Ok(())
+}
+
+#[test]
+fn channel_listen_rejects_deliver_replies_without_parcel() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let output = run_dispatch(
+        dir.path(),
+        &[],
+        &[
+            "channel",
+            "listen",
+            "channel-test",
+            "--listen",
+            "127.0.0.1:8787",
+            "--deliver-replies",
+            "--registry",
+            registry_path
+                .to_str()
+                .ok_or("registry path is not valid UTF-8")?,
+        ],
+    )?;
+    let (stdout, stderr) = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "dispatch channel listen unexpectedly succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("reply delivery requires a parcel"));
+    assert!(stderr.contains("--parcel"));
 
     Ok(())
 }
