@@ -376,22 +376,19 @@ pub fn build_agentfile(
                 });
                 files.extend(file_record.expand());
             }
-            "MEMORY" => {
-                if instruction.args.len() >= 2 {
-                    let maybe_path = scalar_at(&instruction.args, instruction.args.len() - 1);
-                    if looks_like_path(&maybe_path) {
-                        let resolved_path = resolve_path(&context_dir, &maybe_path)?;
-                        let file_record =
-                            package_path(&context_dir, &resolved_path, &mut packaged)?;
-                        resolved.instructions.push(InstructionConfig {
-                            kind: InstructionKind::Memory,
-                            packaged_path: maybe_path,
-                            sha256: file_record.sha256.clone(),
-                            skill_name: None,
-                            allowed_tools: None,
-                        });
-                        files.extend(file_record.expand());
-                    }
+            "MEMORY" if instruction.args.len() >= 2 => {
+                let maybe_path = scalar_at(&instruction.args, instruction.args.len() - 1);
+                if looks_like_path(&maybe_path) {
+                    let resolved_path = resolve_path(&context_dir, &maybe_path)?;
+                    let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
+                    resolved.instructions.push(InstructionConfig {
+                        kind: InstructionKind::Memory,
+                        packaged_path: maybe_path,
+                        sha256: file_record.sha256.clone(),
+                        skill_name: None,
+                        allowed_tools: None,
+                    });
+                    files.extend(file_record.expand());
                 }
             }
             "HEARTBEAT" => {

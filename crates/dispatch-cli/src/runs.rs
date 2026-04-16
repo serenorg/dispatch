@@ -265,7 +265,7 @@ pub(crate) fn ps(args: crate::PsArgs) -> Result<()> {
         return Ok(());
     }
 
-    runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.started_at_ms));
     for run in runs {
         let name = run.parcel_name.as_deref().unwrap_or("<unknown>");
         let version = run.parcel_version.as_deref().unwrap_or("<unspecified>");
