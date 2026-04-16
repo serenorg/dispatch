@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod build;
+pub mod catalog;
 pub mod channel_plugin_protocol;
 pub mod channel_plugins;
 pub mod courier;
@@ -20,6 +21,13 @@ pub use ast::{Instruction, ParsedAgentfile, Value};
 pub use build::{
     BuildError, BuildOptions, BuiltParcel, ParcelLock, VerificationReport, build_agentfile,
     verify_parcel,
+};
+pub use catalog::{
+    CATALOG_CACHE_DIR, CATALOG_CONFIG_FILE, CATALOG_FETCH_TIMEOUT, CATALOG_MAX_BYTES,
+    CATALOG_SCHEMA_V1, CatalogConfig, CatalogEntry, CatalogError, CatalogExtensionKind,
+    CatalogSearchHit, CatalogSource, ExtensionCatalog, cache_path, default_catalog_cache_dir,
+    default_catalog_config_path, fetch_catalog_body, find_cached_entry, load_cached_catalog,
+    refresh_catalog, search_cached, write_cache,
 };
 pub use channel_plugin_protocol::{
     AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPluginRequest,

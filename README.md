@@ -571,6 +571,37 @@ does not work on a channel-only runtime binding.
 See `examples/runtime/telegram-bot/dispatch.toml` for a concrete
 project-level runtime config example.
 
+### Extension discovery
+
+Third-party couriers and channels live in their own repositories. Dispatch
+discovers them through **catalogs** - JSON index documents at stable URLs,
+analogous to Homebrew taps. Each repo publishes its own catalog at
+`catalog/extensions.json`, users register the catalog URL once, and the
+entries become searchable locally.
+
+```bash
+# Register a catalog (one-time)
+dispatch extension catalog add \
+  https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json
+
+# Populate the local cache
+dispatch extension catalog refresh
+
+# Search and inspect
+dispatch extension search telegram
+dispatch extension show channel-telegram
+```
+
+Catalogs are stored in `~/.config/dispatch/catalogs.toml` and fetched JSON is
+cached under `~/.config/dispatch/catalog-cache/`. Installing a discovered
+plugin still uses the existing `dispatch courier install` /
+`dispatch channel install` commands; install-by-name (Tier 2) and
+capability-based trust (Tier 3) are on the roadmap.
+
+See [`docs/plugin-ecosystem.md`](docs/plugin-ecosystem.md) for the full
+roadmap, including the canonical list of known third-party catalogs and
+guidance for publishing a new one.
+
 ## Mounts
 
 State is not baked into the parcel. Sessions, memory, and artifacts are mounts declared in the `Agentfile`.

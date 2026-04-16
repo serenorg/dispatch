@@ -15,6 +15,10 @@ Dispatch has first-class install/runtime support for courier plugins and
 channel plugins. Connector bundles are a planned category without a host
 registry or execution model.
 
+For discovering third-party extensions published in separate repositories,
+see [Discovery via catalogs](#discovery-via-catalogs) below. The broader
+ecosystem roadmap lives in [`plugin-ecosystem.md`](./plugin-ecosystem.md).
+
 ## Layering
 
 Dispatch keeps authored parcel source separate from host-managed extension
@@ -484,6 +488,65 @@ dispatch-plugins/
 
 Vendor-specific extensions (e.g., seren-cloud courier) live in their own
 repositories.
+
+## Discovery via catalogs
+
+Every plugin in the ecosystem does not live in `dispatch-plugins`. Third-party
+couriers and channels ship in their own repositories
+(e.g. `dispatch-courier-seren-cloud`). Dispatch discovers them through
+**catalogs** — JSON index documents published at stable URLs.
+
+A catalog is just an `extensions.json` document listing entries. The canonical
+example lives at
+`https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json`.
+Any 3rd-party plugin repository can publish the same schema.
+
+### Registering a catalog
+
+```bash
+# Register the main dispatch-plugins catalog
+dispatch extension catalog add \
+  https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json
+
+# Register a vendor-specific catalog
+dispatch extension catalog add \
+  https://raw.githubusercontent.com/serenorg/dispatch-courier-seren-cloud/main/catalog/extensions.json
+
+# See what you have
+dispatch extension catalog ls
+
+# Populate the local cache
+dispatch extension catalog refresh
+```
+
+Catalogs are stored in `~/.config/dispatch/catalogs.toml` and fetched JSON is
+cached under `~/.config/dispatch/catalog-cache/<name>.json`. Cache refresh is
+explicit — search and show read the cache, they do not fetch on every call.
+
+### Searching and inspecting
+
+```bash
+# Free-text search across all cached catalogs
+dispatch extension search telegram
+
+# Filter by kind
+dispatch extension search --kind courier
+
+# JSON output for scripts
+dispatch extension search --json
+
+# Show the full entry for a specific extension
+dispatch extension show seren-cloud
+```
+
+`dispatch extension show` prints the name, version, catalog, description,
+install hint, requirements, and manifest location. Operators still run the
+existing `dispatch courier install` / `dispatch channel install` command with
+the manifest path from the catalog entry.
+
+Tier 1 (this release) stops at discovery. Install-by-name
+(`dispatch extension install <name>`) and capability-based trust are planned;
+see [`plugin-ecosystem.md`](./plugin-ecosystem.md).
 
 ## Design principles
 

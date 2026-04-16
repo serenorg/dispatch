@@ -2,6 +2,7 @@ mod channel_cmds;
 mod conformance;
 mod courier_cmds;
 mod eval;
+mod extension_cmds;
 mod inspect;
 mod parcel_ops;
 mod project_config;
@@ -101,6 +102,11 @@ enum Command {
     Channel {
         #[command(subcommand)]
         command: ChannelCommand,
+    },
+    /// Discover third-party extensions via catalog sources
+    Extension {
+        #[command(subcommand)]
+        command: ExtensionCommand,
     },
     /// Manage parcel-scoped built-in courier state
     State {
@@ -789,6 +795,97 @@ enum ChannelCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ExtensionCommand {
+    /// Manage catalog sources (where plugins come from)
+    Catalog {
+        #[command(subcommand)]
+        command: ExtensionCatalogCommand,
+    },
+    /// Search cached catalogs for extensions matching a query
+    Search {
+        /// Free-text query. Matches name, display name, description, keywords, and tags.
+        /// Omit to list every entry across cached catalogs.
+        query: Option<String>,
+        /// Restrict results to one extension kind
+        #[arg(long)]
+        kind: Option<ExtensionKindFilter>,
+        /// Print matching entries as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the catalog config path (default: ~/.config/dispatch/catalogs.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the catalog cache directory (default: ~/.config/dispatch/catalog-cache)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Show the full entry for an extension by name
+    Show {
+        /// Extension name (e.g. `channel-telegram`)
+        name: String,
+        /// Print the entry as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the catalog config path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the catalog cache directory
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtensionCatalogCommand {
+    /// Register a catalog source
+    Add {
+        /// Catalog JSON URL
+        url: String,
+        /// Short identifier for this catalog (default: derived from URL host)
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the catalog config path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// List registered catalog sources
+    Ls {
+        /// Print catalog sources as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the catalog config path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove a catalog source by name
+    Rm {
+        /// Catalog name (see `dispatch extension catalog ls`)
+        name: String,
+        /// Override the catalog config path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Fetch one or all catalogs into the local cache
+    Refresh {
+        /// Catalog name; omit to refresh every registered catalog
+        name: Option<String>,
+        /// Override the catalog config path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the catalog cache directory
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExtensionKindFilter {
+    Channel,
+    Courier,
+    Connector,
+}
+
+#[derive(Debug, Subcommand)]
 enum ContainerCommand {
     /// List active and completed local runs
     #[command(visible_alias = "ls", alias = "ps")]
@@ -1038,6 +1135,7 @@ fn main() -> Result<()> {
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::Channel { command } => channel_cmds::channel_command(command),
+        Command::Extension { command } => extension_cmds::extension_command(command),
         Command::State { command } => state_command(command),
         Command::Secret { command } => secret_command(command),
         Command::Internal { command } => runs::internal_command(command),
