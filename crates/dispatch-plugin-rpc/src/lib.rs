@@ -173,9 +173,16 @@ mod tests {
 
     #[test]
     fn notification_round_trips_json() {
+        // Matches the shape dispatch-courier-protocol emits for
+        // `courier.event` notifications: params carry the raw event payload
+        // directly, not a wrapped `{ "kind": "event", "event": ... }` object.
         let notification = JsonRpcNotification::new(
             "courier.event",
-            Some(serde_json::json!({ "kind": "event" })),
+            Some(serde_json::json!({
+                "kind": "message",
+                "role": "assistant",
+                "content": "hello",
+            })),
         );
 
         let json = serde_json::to_string(&notification).unwrap();
