@@ -856,10 +856,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch-channel-protocol"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dispatch-core"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "dispatch-channel-protocol",
+ "dispatch-courier-protocol",
  "dispatch-process",
  "dispatch-wasm-abi",
  "futures",
@@ -890,6 +900,15 @@ dependencies = [
  "dispatch-core",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "dispatch-courier-protocol"
+version = "0.3.0"
+dependencies = [
+ "dispatch-channel-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

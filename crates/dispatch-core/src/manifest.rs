@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use dispatch_courier_protocol::{
+    A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, MountConfig, MountKind, ToolApprovalPolicy,
+    ToolRiskLevel,
+};
+
 pub const PARCEL_SCHEMA_URL: &str = "https://serenorg.github.io/dispatch/schemas/parcel.v1.json";
 pub const PARCEL_FORMAT_VERSION: u32 = 1;
 pub const DISPATCH_WASM_ABI: &str = dispatch_wasm_abi::ABI;
@@ -191,21 +196,6 @@ pub enum Visibility {
     Opaque,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MountKind {
-    Session,
-    Memory,
-    Artifacts,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MountConfig {
-    pub kind: MountKind,
-    pub driver: String,
-    pub options: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandSpec {
     pub command: String,
@@ -278,65 +268,6 @@ pub struct A2aToolConfig {
     pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema: Option<ToolInputSchemaRef>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum A2aAuthScheme {
-    Bearer,
-    Header,
-    Basic,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "scheme", rename_all = "snake_case")]
-pub enum A2aAuthConfig {
-    Bearer {
-        secret_name: String,
-    },
-    Header {
-        header_name: String,
-        secret_name: String,
-    },
-    Basic {
-        username_secret_name: String,
-        password_secret_name: String,
-    },
-}
-
-impl A2aAuthConfig {
-    pub fn scheme(&self) -> A2aAuthScheme {
-        match self {
-            Self::Bearer { .. } => A2aAuthScheme::Bearer,
-            Self::Header { .. } => A2aAuthScheme::Header,
-            Self::Basic { .. } => A2aAuthScheme::Basic,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum A2aEndpointMode {
-    Auto,
-    Card,
-    Direct,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolApprovalPolicy {
-    Never,
-    Always,
-    Confirm,
-    Audit,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolRiskLevel {
-    Low,
-    Medium,
-    High,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

@@ -1,11 +1,14 @@
 use crate::{
     channel_plugin_protocol::{OutboundMessageEnvelope, parse_tagged_channel_reply},
-    manifest::{
-        A2aAuthScheme, A2aEndpointMode, InstructionKind, ModelReference, MountConfig, MountKind,
-        NetworkRule, ParcelManifest, ToolApprovalPolicy, ToolConfig, ToolRiskLevel,
-    },
+    manifest::{InstructionKind, ModelReference, NetworkRule, ParcelManifest, ToolConfig},
     plugin_protocol::{PluginRequest, PluginResponse},
     plugins::CourierPluginManifest,
+};
+pub use dispatch_courier_protocol::{
+    A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, ConversationMessage, CourierCapabilities,
+    CourierEvent, CourierInspection, CourierKind, CourierOperation, CourierSession, LocalToolSpec,
+    LocalToolTarget, LocalToolTransport, MountConfig, MountKind, ResolvedMount, ToolApprovalPolicy,
+    ToolApprovalTargetKind, ToolInvocation, ToolRiskLevel, ToolRunResult,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -421,172 +424,12 @@ pub fn with_tool_approval_handler<T>(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalToolTransport {
-    Local,
-    A2a,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "transport", rename_all = "snake_case")]
-pub enum LocalToolTarget {
-    Local {
-        packaged_path: String,
-        command: String,
-        args: Vec<String>,
-    },
-    A2a {
-        endpoint_url: String,
-        endpoint_mode: Option<A2aEndpointMode>,
-        auth: Option<crate::manifest::A2aAuthConfig>,
-        expected_agent_name: Option<String>,
-        expected_card_sha256: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LocalToolSpec {
-    pub alias: String,
-    pub approval: Option<ToolApprovalPolicy>,
-    pub risk: Option<ToolRiskLevel>,
-    pub description: Option<String>,
-    pub input_schema_packaged_path: Option<String>,
-    pub input_schema_sha256: Option<String>,
-    pub skill_source: Option<String>,
-    #[serde(flatten)]
-    pub target: LocalToolTarget,
-}
-
-impl LocalToolSpec {
-    pub fn transport(&self) -> LocalToolTransport {
-        match self.target {
-            LocalToolTarget::Local { .. } => LocalToolTransport::Local,
-            LocalToolTarget::A2a { .. } => LocalToolTransport::A2a,
-        }
-    }
-
-    pub fn packaged_path(&self) -> Option<&str> {
-        match &self.target {
-            LocalToolTarget::Local { packaged_path, .. } => Some(packaged_path.as_str()),
-            LocalToolTarget::A2a { .. } => None,
-        }
-    }
-
-    pub fn command(&self) -> &str {
-        match &self.target {
-            LocalToolTarget::Local { command, .. } => command.as_str(),
-            LocalToolTarget::A2a { .. } => "dispatch-a2a",
-        }
-    }
-
-    pub fn args(&self) -> &[String] {
-        match &self.target {
-            LocalToolTarget::Local { args, .. } => args.as_slice(),
-            LocalToolTarget::A2a { .. } => &[],
-        }
-    }
-
-    pub fn endpoint_url(&self) -> Option<&str> {
-        match &self.target {
-            LocalToolTarget::A2a { endpoint_url, .. } => Some(endpoint_url.as_str()),
-            LocalToolTarget::Local { .. } => None,
-        }
-    }
-
-    pub fn endpoint_mode(&self) -> Option<A2aEndpointMode> {
-        match &self.target {
-            LocalToolTarget::A2a { endpoint_mode, .. } => *endpoint_mode,
-            LocalToolTarget::Local { .. } => None,
-        }
-    }
-
-    pub fn auth(&self) -> Option<&crate::manifest::A2aAuthConfig> {
-        match &self.target {
-            LocalToolTarget::A2a { auth, .. } => auth.as_ref(),
-            LocalToolTarget::Local { .. } => None,
-        }
-    }
-
-    pub fn auth_scheme(&self) -> Option<A2aAuthScheme> {
-        self.auth().map(crate::manifest::A2aAuthConfig::scheme)
-    }
-
-    pub fn auth_username_secret_name(&self) -> Option<&str> {
-        match self.auth() {
-            Some(crate::manifest::A2aAuthConfig::Basic {
-                username_secret_name,
-                ..
-            }) => Some(username_secret_name.as_str()),
-            _ => None,
-        }
-    }
-
-    pub fn auth_password_secret_name(&self) -> Option<&str> {
-        match self.auth() {
-            Some(crate::manifest::A2aAuthConfig::Basic {
-                password_secret_name,
-                ..
-            }) => Some(password_secret_name.as_str()),
-            _ => None,
-        }
-    }
-
-    pub fn expected_agent_name(&self) -> Option<&str> {
-        match &self.target {
-            LocalToolTarget::A2a {
-                expected_agent_name,
-                ..
-            } => expected_agent_name.as_deref(),
-            LocalToolTarget::Local { .. } => None,
-        }
-    }
-
-    pub fn expected_card_sha256(&self) -> Option<&str> {
-        match &self.target {
-            LocalToolTarget::A2a {
-                expected_card_sha256,
-                ..
-            } => expected_card_sha256.as_deref(),
-            LocalToolTarget::Local { .. } => None,
-        }
-    }
-
-    pub fn auth_header_name(&self) -> Option<&str> {
-        match self.auth() {
-            Some(crate::manifest::A2aAuthConfig::Header { header_name, .. }) => {
-                Some(header_name.as_str())
-            }
-            _ => None,
-        }
-    }
-
-    pub fn matches_name(&self, tool_name: &str) -> bool {
-        self.alias == tool_name || self.packaged_path().is_some_and(|path| path == tool_name)
-    }
-
-    pub fn approval_kind(&self) -> ToolApprovalTargetKind {
-        match self.target {
-            LocalToolTarget::Local { .. } => ToolApprovalTargetKind::Local,
-            LocalToolTarget::A2a { .. } => ToolApprovalTargetKind::A2a,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuiltinToolSpec {
     pub capability: String,
     pub approval: Option<ToolApprovalPolicy>,
     pub risk: Option<ToolRiskLevel>,
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolApprovalTargetKind {
-    Local,
-    Builtin,
-    A2a,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -610,141 +453,15 @@ pub struct ToolApprovalRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolRunResult {
-    pub tool: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CourierKind {
-    Native,
-    Docker,
-    Wasm,
-    Custom,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MountRequest {
     pub parcel_digest: String,
     pub spec: MountConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolvedMount {
-    pub kind: MountKind,
-    pub driver: String,
-    pub target_path: String,
-    pub metadata: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolInvocation {
-    pub name: String,
-    pub input: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-/// Courier operations mix side-effecting turns (`chat`, `job`, `heartbeat`,
-/// `invoke_tool`) with read-style queries (`resolve_prompt`,
-/// `list_local_tools`). Callers should treat the latter as parcel inspection
-/// helpers even though they share the same request envelope.
-pub enum CourierOperation {
-    ResolvePrompt,
-    ListLocalTools,
-    InvokeTool { invocation: ToolInvocation },
-    Chat { input: String },
-    Job { payload: String },
-    Heartbeat { payload: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CourierRequest {
     pub session: CourierSession,
     pub operation: CourierOperation,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CourierCapabilities {
-    pub courier_id: String,
-    pub kind: CourierKind,
-    pub supports_chat: bool,
-    pub supports_job: bool,
-    pub supports_heartbeat: bool,
-    pub supports_local_tools: bool,
-    pub supports_mounts: Vec<MountKind>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CourierInspection {
-    pub courier_id: String,
-    pub kind: CourierKind,
-    pub entrypoint: Option<String>,
-    pub required_secrets: Vec<String>,
-    pub mounts: Vec<MountConfig>,
-    pub local_tools: Vec<LocalToolSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CourierSession {
-    pub id: String,
-    pub parcel_digest: String,
-    pub entrypoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub turn_count: u64,
-    #[serde(default)]
-    pub elapsed_ms: u64,
-    pub history: Vec<ConversationMessage>,
-    #[serde(default)]
-    pub resolved_mounts: Vec<ResolvedMount>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_state: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CourierEvent {
-    PromptResolved {
-        text: String,
-    },
-    LocalToolsListed {
-        tools: Vec<LocalToolSpec>,
-    },
-    BackendFallback {
-        backend: String,
-        error: String,
-    },
-    ToolCallStarted {
-        invocation: ToolInvocation,
-        command: String,
-        args: Vec<String>,
-    },
-    ToolCallFinished {
-        result: ToolRunResult,
-    },
-    Message {
-        role: String,
-        content: String,
-    },
-    ChannelReply {
-        message: OutboundMessageEnvelope,
-    },
-    TextDelta {
-        content: String,
-    },
-    Done,
 }
 
 #[derive(Debug, Clone, Serialize)]

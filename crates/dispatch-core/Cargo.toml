@@ -10,6 +10,8 @@ keywords = ["agents", "packaging", "courier", "dispatch"]
 categories = ["development-tools"]
 
 [dependencies]
+dispatch-channel-protocol = { path = "../dispatch-channel-protocol" }
+dispatch-courier-protocol = { path = "../dispatch-courier-protocol" }
 dispatch-process = { path = "../dispatch-process" }
 dispatch-wasm-abi = { path = "../dispatch-wasm-abi" }
 futures.workspace = true

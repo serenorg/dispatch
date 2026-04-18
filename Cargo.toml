@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "crates/dispatch-channel-protocol",
     "crates/dispatch-process",
     "crates/dispatch-core",
     "crates/dispatch-cli",
+    "crates/dispatch-courier-protocol",
     "crates/dispatch-courier-echo",
     "crates/dispatch-wasm-abi",
     "crates/dispatch-wasm-guest-reference",

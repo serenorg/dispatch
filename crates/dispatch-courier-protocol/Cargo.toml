@@ -1,0 +1,15 @@
+[package]
+name = "dispatch-courier-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared courier plugin wire protocol for Dispatch."
+readme = "../../README.md"
+keywords = ["agents", "courier", "plugin", "protocol", "dispatch"]
+categories = ["development-tools"]
+
+[dependencies]
+dispatch-channel-protocol = { path = "../dispatch-channel-protocol" }
+serde.workspace = true
+serde_json.workspace = true
