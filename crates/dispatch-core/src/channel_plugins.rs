@@ -737,10 +737,17 @@ fn should_render_plain_message_chat_input(event: &InboundEventEnvelope) -> bool 
         return false;
     }
 
-    matches!(
-        event.event_type.as_str(),
-        "message" | "message.created" | "message.received"
-    )
+    // Accept the event types that existing channel plugins emit for a user
+    // typing a text message: plain `message`, any `message.*` variant (covers
+    // `created`, `received`, `edited`, `updated`), Telegram `channel_post.*`
+    // posts, and Twilio SMS `incoming_message`. Other event types
+    // (reactions, presence, interactions, etc.) still take the structured
+    // fallback so the courier has enough context to interpret them.
+    let event_type = event.event_type.as_str();
+    event_type == "incoming_message"
+        || event_type == "message"
+        || event_type.starts_with("message.")
+        || event_type.starts_with("channel_post")
 }
 
 pub fn extract_assistant_reply(events: &[CourierEvent]) -> Option<String> {
@@ -1792,6 +1799,28 @@ sleep 5
         assert!(rendered.contains("conversation_id: chat-123"));
         assert!(rendered.contains("User message:\nhello from telegram"));
         assert!(rendered.contains("\"event_id\": \"evt-1\""));
+    }
+
+    #[test]
+    fn render_inbound_event_chat_input_uses_plain_message_for_known_event_type_aliases() {
+        for event_type in [
+            "message",
+            "message.created",
+            "message.received",
+            "message.edited",
+            "message.updated",
+            "channel_post.received",
+            "channel_post.edited",
+            "incoming_message",
+        ] {
+            let mut event = sample_inbound_event();
+            event.event_type = event_type.to_string();
+            let rendered = render_inbound_event_chat_input("channel-test", &event).expect("render");
+            assert_eq!(
+                rendered, "hello from telegram",
+                "event_type `{event_type}` should render as plain text content"
+            );
+        }
     }
 
     #[test]
