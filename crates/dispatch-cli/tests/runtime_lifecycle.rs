@@ -586,6 +586,59 @@ fn install_test_courier_plugin(
     install_test_courier_plugin_with_reply(root, registry_path, name, parcel_digest, "plugin reply")
 }
 
+fn write_test_courier_plugin_manifest(
+    root: &Path,
+    name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = root.join(format!("{name}-courier-plugin"));
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("courier-test.sh");
+    fs::write(
+        &script_path,
+        concat!(
+            "#!/bin/sh\n",
+            "set -eu\n",
+            "while IFS= read -r line; do\n",
+            "if printf '%s' \"$line\" | grep -q '\"kind\":\"capabilities\"'; then\n",
+            "  printf '%s\\n' '{\"kind\":\"capabilities\",\"capabilities\":{\"courier_id\":\"demo-jsonl\",\"kind\":\"custom\",\"supports_chat\":true,\"supports_job\":false,\"supports_heartbeat\":false,\"supports_local_tools\":false,\"supports_mounts\":[]}}'\n",
+            "else\n",
+            "  printf '%s\\n' '{\"kind\":\"error\",\"error\":{\"code\":\"unexpected_request\",\"message\":\"unhandled request\"}}'\n",
+            "  exit 1\n",
+            "fi\n",
+            "done\n"
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("courier-plugin.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&CourierPluginManifest {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: Some("Demo courier plugin for runtime tests".to_string()),
+            exec: CourierPluginExec {
+                command: script_path.display().to_string(),
+                args: Vec::new(),
+            },
+            installed_sha256: None,
+        })?,
+    )?;
+
+    Ok(manifest_path)
+}
+
 fn install_test_courier_plugin_with_event(
     root: &Path,
     registry_path: &Path,
@@ -1174,9 +1227,134 @@ once = true
     assert!(stdout.contains("Dry Run: yes"));
     assert!(stdout.contains("channel-test"));
     assert!(
+        stdout.contains("Courier Status: `native` resolves"),
+        "expected dry-run to report built-in courier resolution; got:\n{stdout}"
+    );
+    assert!(
         !dir.path()
             .join(".dispatch/registries/channels.json")
             .exists()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dispatch_up_dry_run_flags_unresolvable_courier() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let manifest_path = write_channel_test_plugin(dir.path())?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+courier = "ghost-cloud"
+
+[[extensions]]
+manifest = "{}"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+once = true
+"#,
+            manifest_path.display(),
+        ),
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(dir.path(), &[], &["up", "dispatch.toml", "--dry-run"])?,
+        "dispatch up --dry-run",
+    )?;
+
+    assert!(
+        stdout.contains("Courier Status: `ghost-cloud` does not resolve"),
+        "expected dry-run to flag unresolvable courier; got:\n{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dispatch_up_dry_run_only_claims_matching_courier_will_install()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let channel_manifest = write_channel_test_plugin(dir.path())?;
+    let courier_manifest = write_test_courier_plugin_manifest(dir.path(), "different-cloud")?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+courier = "ghost-cloud"
+
+[[extensions]]
+manifest = "{}"
+
+[[extensions]]
+manifest = "{}"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+once = true
+"#,
+            channel_manifest.display(),
+            courier_manifest.display(),
+        ),
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(dir.path(), &[], &["up", "dispatch.toml", "--dry-run"])?,
+        "dispatch up --dry-run",
+    )?;
+
+    assert!(
+        stdout.contains("Courier Status: `ghost-cloud` does not resolve"),
+        "expected dry-run to keep reporting the missing configured courier; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("will be installed via [[extensions]]"),
+        "expected dry-run not to claim an unrelated courier extension satisfies the configured courier; got:\n{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn dispatch_up_dry_run_reports_matching_courier_will_install()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let channel_manifest = write_channel_test_plugin(dir.path())?;
+    let courier_manifest = write_test_courier_plugin_manifest(dir.path(), "ghost-cloud")?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+courier = "ghost-cloud"
+
+[[extensions]]
+manifest = "{}"
+
+[[extensions]]
+manifest = "{}"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+once = true
+"#,
+            channel_manifest.display(),
+            courier_manifest.display(),
+        ),
+    )?;
+
+    let stdout = require_success(
+        run_dispatch(dir.path(), &[], &["up", "dispatch.toml", "--dry-run"])?,
+        "dispatch up --dry-run",
+    )?;
+
+    assert!(
+        stdout.contains("Courier Status: `ghost-cloud` will be installed via [[extensions]]"),
+        "expected dry-run to report that the configured courier will be installed; got:\n{stdout}"
     );
 
     Ok(())

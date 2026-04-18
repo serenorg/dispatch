@@ -47,6 +47,8 @@ struct ExtensionInstallConfig {
 struct ExtensionManifestProbe {
     #[serde(default)]
     kind: Option<ExtensionManifestKind>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -101,6 +103,7 @@ struct ResolvedDispatchProject {
 #[derive(Debug, Clone)]
 struct ResolvedExtensionInstall {
     kind: ExtensionKind,
+    name: String,
     manifest: PathBuf,
 }
 
@@ -160,6 +163,8 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
         }
     }
 
+    print_dry_run_courier_status(project);
+
     if project.channels.is_empty() {
         println!("Channel Bindings: none");
     } else {
@@ -177,6 +182,29 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
                 }
             };
             println!("  - {} via {} ({mode})", binding.label, binding.plugin);
+        }
+    }
+}
+
+fn print_dry_run_courier_status(project: &ResolvedDispatchProject) {
+    match resolve_courier(&project.courier, Some(&project.courier_registry)) {
+        Ok(_) => {
+            println!("Courier Status: `{}` resolves", project.courier);
+        }
+        Err(error) => {
+            if project.extensions.iter().any(|ext| {
+                matches!(ext.kind, ExtensionKind::Courier) && ext.name == project.courier
+            }) {
+                println!(
+                    "Courier Status: `{}` will be installed via [[extensions]] at `dispatch up`",
+                    project.courier
+                );
+            } else {
+                println!(
+                    "Courier Status: `{}` does not resolve ({error})",
+                    project.courier
+                );
+            }
         }
     }
 }
@@ -228,8 +256,10 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
             .into_iter()
             .map(|extension| {
                 let manifest = resolve_relative_path(&root_dir, extension.manifest);
+                let probe = load_extension_manifest_probe(&manifest)?;
                 Ok(ResolvedExtensionInstall {
-                    kind: resolve_extension_kind(manifest.clone(), extension.kind)?,
+                    kind: resolve_extension_kind(&manifest, extension.kind, &probe)?,
+                    name: resolve_extension_name(&manifest, &probe)?,
                     manifest,
                 })
             })
@@ -337,18 +367,21 @@ fn resolve_relative_path(root_dir: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+fn load_extension_manifest_probe(manifest: &Path) -> Result<ExtensionManifestProbe> {
+    let body = fs::read_to_string(manifest)
+        .with_context(|| format!("failed to read extension manifest {}", manifest.display()))?;
+    serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse extension manifest {}", manifest.display()))
+}
+
 fn resolve_extension_kind(
-    manifest: PathBuf,
+    manifest: &Path,
     explicit: Option<ExtensionKind>,
+    probe: &ExtensionManifestProbe,
 ) -> Result<ExtensionKind> {
     if let Some(kind) = explicit {
         return Ok(kind);
     }
-
-    let body = fs::read_to_string(&manifest)
-        .with_context(|| format!("failed to read extension manifest {}", manifest.display()))?;
-    let probe: ExtensionManifestProbe = serde_json::from_str(&body)
-        .with_context(|| format!("failed to parse extension manifest {}", manifest.display()))?;
 
     match probe.kind {
         Some(ExtensionManifestKind::Channel) => Ok(ExtensionKind::Channel),
@@ -366,6 +399,15 @@ fn resolve_extension_kind(
             ),
         },
     }
+}
+
+fn resolve_extension_name(manifest: &Path, probe: &ExtensionManifestProbe) -> Result<String> {
+    probe.name.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "extension manifest `{}` must declare `name`",
+            manifest.display()
+        )
+    })
 }
 
 fn reconcile_extensions(project: &ResolvedDispatchProject) -> Result<()> {
