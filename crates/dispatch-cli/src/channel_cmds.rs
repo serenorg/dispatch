@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use atomic_write_file::AtomicWriteFile;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use dispatch_core::{
@@ -16,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::Read,
+    io::{Read, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -27,6 +28,7 @@ use url::form_urlencoded;
 
 const DEFAULT_CHANNEL_POLL_INTERVAL_MS: u64 = 1_000;
 const DISPATCH_MEDIA_ROUTE_PREFIX: &str = "/_dispatch/media/";
+const CHANNEL_POLL_STATE_DIR: &str = ".dispatch/channel-state";
 
 struct ChannelIngressArgs<'a> {
     name: Option<&'a str>,
@@ -468,6 +470,9 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
     match args.mode {
         ChannelRuntimeMode::Poll { interval_ms } => {
             let staged_media = ListenerStagedMedia::from_config(&Value::Null);
+            let poll_state_path =
+                default_channel_poll_state_path(&args.label, &plugin.name, &args.config)?;
+            let persisted_state = load_channel_poll_state(&poll_state_path)?;
             let mut ingress_state = Some(start_channel_listener_ingress(&plugin, &args.config)?);
             if !matches!(
                 ingress_state.as_ref().map(|state| &state.mode),
@@ -489,6 +494,11 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                     Err(stop_error) => Err(run_error
                         .context(format!("also failed to stop ingress cleanly: {stop_error}"))),
                 };
+            }
+            if let Some(state) = persisted_state
+                && matches!(state.mode, IngressMode::Polling)
+            {
+                ingress_state = Some(state);
             }
 
             println!("Polling {}", plugin.name);
@@ -524,6 +534,7 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                                 );
                             }
                             if let Some(state) = state {
+                                save_channel_poll_state(&poll_state_path, &state)?;
                                 ingress_state = Some(state);
                             }
 
@@ -1502,6 +1513,72 @@ fn format_duration_literal(duration: Duration) -> String {
         return format!("{}s", duration.as_secs());
     }
     format!("{}ms", duration.as_millis())
+}
+
+fn default_channel_poll_state_path(
+    label: &str,
+    plugin_name: &str,
+    config: &Value,
+) -> Result<PathBuf> {
+    let cwd = env::current_dir().context("failed to resolve current working directory")?;
+    let mut config_hasher = Sha256::new();
+    config_hasher.update(
+        serde_json::to_vec(config).context("failed to serialize channel config for poll state")?,
+    );
+    let config_hash = hex_encode(config_hasher.finalize().as_slice());
+    Ok(cwd
+        .join(CHANNEL_POLL_STATE_DIR)
+        .join(plugin_name)
+        .join(format!(
+            "{}-{}.json",
+            sanitize_path_component(label),
+            &config_hash[..16]
+        )))
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '-',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "channel".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn load_channel_poll_state(path: &Path) -> Result<Option<IngressState>> {
+    let body = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+
+    let state = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn save_channel_poll_state(path: &Path, state: &IngressState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let body =
+        serde_json::to_vec_pretty(state).context("failed to serialize channel poll state")?;
+    let mut file = AtomicWriteFile::options()
+        .open(path)
+        .with_context(|| format!("failed to open {} for atomic write", path.display()))?;
+    file.write_all(&body)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.commit()
+        .with_context(|| format!("failed to persist {}", path.display()))
 }
 
 #[cfg(test)]

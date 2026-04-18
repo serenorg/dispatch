@@ -395,6 +395,83 @@ esac
     Ok(manifest_path)
 }
 
+fn write_stateful_polling_channel_test_plugin(
+    dir: &Path,
+    log_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let plugin_dir = dir.join("stateful-polling-channel-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let script_path = plugin_dir.join("channel-test.sh");
+    fs::write(
+        &script_path,
+        format!(
+            r#"#!/bin/sh
+read line
+printf '%s\n' "$line" >> "{}"
+case "$line" in
+    *'"kind":"start_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}'
+        ;;
+    *'"kind":"poll_ingress"'*'"cursor":"1"'*)
+        printf '%s\n' '{{"kind":"ingress_events_received","events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}'
+        ;;
+    *'"kind":"poll_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}'
+        ;;
+    *'"kind":"stop_ingress"'*'"cursor":"2"'*)
+        printf '%s\n' '{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"2"}}}}}}'
+        ;;
+    *'"kind":"stop_ingress"'*)
+        printf '%s\n' '{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}'
+        ;;
+    *)
+        printf '%s\n' '{{"kind":"error","error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}'
+        ;;
+esac
+"#,
+            log_path.display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+    }
+
+    let manifest_path = plugin_dir.join("channel-plugin.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+    "kind": "channel",
+    "name": "channel-polling-stateful-test",
+    "version": "0.1",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "description": "Stateful polling test channel plugin",
+    "entrypoint": {{
+        "command": "{}",
+        "args": []
+    }},
+    "capabilities": {{
+        "channel": {{
+            "platform": "telegram",
+            "ingress_modes": ["polling"]
+        }}
+    }}
+}}"#,
+            script_path.display()
+        ),
+    )?;
+
+    Ok(manifest_path)
+}
+
 fn write_logging_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
@@ -1581,6 +1658,129 @@ fn channel_poll_calls_start_poll_and_stop_ingress() -> Result<(), Box<dyn std::e
     assert_eq!(stop_request["request"]["kind"], "stop_ingress");
     assert_eq!(poll_request["request"]["state"]["metadata"]["cursor"], "0");
     assert_eq!(stop_request["request"]["state"]["metadata"]["cursor"], "1");
+
+    Ok(())
+}
+
+#[test]
+fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let registry_path = dir.path().join("channels.json");
+    let poll_log = dir.path().join("poll.log");
+    let manifest_path = write_stateful_polling_channel_test_plugin(dir.path(), &poll_log)?;
+
+    require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+
+    let first_stdout = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "poll",
+                "channel-polling-stateful-test",
+                "--once",
+                "--json",
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel poll --once (first)",
+    )?;
+    let first_json_line = first_stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in first output:\n{first_stdout}"))?;
+    let first_output: Value = serde_json::from_str(first_json_line)?;
+    assert_eq!(first_output["events"][0]["event_id"], "poll-evt-1");
+    assert_eq!(first_output["state"]["metadata"]["cursor"], "1");
+
+    let second_stdout = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "poll",
+                "channel-polling-stateful-test",
+                "--once",
+                "--json",
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel poll --once (second)",
+    )?;
+    let second_json_line = second_stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in second output:\n{second_stdout}"))?;
+    let second_output: Value = serde_json::from_str(second_json_line)?;
+    assert!(
+        second_output["events"]
+            .as_array()
+            .is_some_and(|events| events.is_empty())
+    );
+    assert_eq!(second_output["state"]["metadata"]["cursor"], "2");
+
+    let logged_requests = fs::read_to_string(&poll_log)?;
+    let request_lines = logged_requests.lines().collect::<Vec<_>>();
+    assert_eq!(
+        request_lines.len(),
+        6,
+        "unexpected stateful poll log:\n{logged_requests}"
+    );
+
+    let first_poll_request: Value = serde_json::from_str(request_lines[1])?;
+    let second_poll_request: Value = serde_json::from_str(request_lines[4])?;
+    assert_eq!(
+        first_poll_request["request"]["state"]["metadata"]["cursor"],
+        "0"
+    );
+    assert_eq!(
+        second_poll_request["request"]["state"]["metadata"]["cursor"],
+        "1"
+    );
+
+    let state_dir = dir
+        .path()
+        .join(".dispatch/channel-state/channel-polling-stateful-test");
+    let state_files = fs::read_dir(&state_dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        state_files.len(),
+        1,
+        "unexpected state files: {state_files:?}"
+    );
+
+    let persisted_state: Value = serde_json::from_str(&fs::read_to_string(&state_files[0])?)?;
+    assert_eq!(persisted_state["metadata"]["cursor"], "2");
 
     Ok(())
 }

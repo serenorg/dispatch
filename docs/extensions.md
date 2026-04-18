@@ -126,6 +126,12 @@ attachments without depending on the parcel reply bridge conventions.
 commands. They are useful for development, testing, and direct operator
 control, but they are not the canonical authored configuration surface for
 project-specific channel wiring.
+For polling channels, Dispatch persists the latest plugin-reported ingress
+state under `.dispatch/channel-state/` in the current working directory so
+repeated `dispatch channel poll --once` runs resume from the last source
+cursor instead of replaying old events. Delete that directory (or the
+specific `<plugin>/<label>-<hash>.json` file) to reset the cursor and
+reprocess events on the next poll.
 
 `dispatch up` is the project-level runtime binding command. It reads
 `dispatch.toml`, reconciles declared extension manifests into project-local
@@ -363,6 +369,11 @@ Polling channels use a similar lifecycle:
 3. Host loops on `poll_ingress { state? }`
 4. Plugin responds with `events`, updated `state`, and optional `poll_after_ms`
 5. Host sends `stop_ingress` with the last state when polling stops
+
+For CLI-driven polling, the host also checkpoints the latest polling state on
+disk between runs. This lets repeated `dispatch channel poll --once` calls
+resume from the last plugin cursor rather than re-fetching previously handled
+events.
 
 `callback_reply` is only valid for webhook `ingress_event` handling. Polling
 responses should leave it unset.
