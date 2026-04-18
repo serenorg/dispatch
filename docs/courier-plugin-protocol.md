@@ -17,6 +17,10 @@ The protocol uses JSON-RPC 2.0 over stdio, framed as newline-delimited JSON.
 - the plugin writes one JSON-RPC message per line to stdout
 - stderr is reserved for human-readable diagnostics and logs
 
+Dispatch does not currently use JSON-RPC batch requests. The host keeps at
+most one request in flight per plugin/session stream and expects each terminal
+response to echo the request `id`.
+
 Dispatch may keep stdin/stdout open across multiple requests for one session.
 
 ## Plugin Manifest

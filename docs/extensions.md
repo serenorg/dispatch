@@ -328,6 +328,10 @@ still one JSON message per line on stdio. JSON-RPC defines the message shape;
 the manifest transport defines how those messages are carried between host and
 plugin.
 
+Dispatch does not currently use JSON-RPC batch requests for channel plugins.
+The host sends one request at a time and expects one terminal response whose
+`id` matches the request.
+
 ### Request types
 
 | Kind | Fields | Purpose |

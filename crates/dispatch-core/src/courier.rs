@@ -73,7 +73,7 @@ pub use self::parcel::{
     resolve_prompt_text, run_local_tool,
 };
 use self::plugin_process::{
-    canonical_parcel_dir, describe_plugin_response, read_plugin_response,
+    canonical_parcel_dir, describe_plugin_response, read_expected_plugin_response,
     read_plugin_run_completion, shutdown_persistent_plugin_process, spawn_plugin_response_reader,
     wait_for_plugin_exit, write_plugin_request,
 };
@@ -660,8 +660,7 @@ struct PersistentPluginProcess {
     child: Child,
     stdin: ChildStdin,
     stderr: ChildStderr,
-    responses: mpsc::Receiver<Result<PluginResponse, CourierError>>,
-    next_request_id: i64,
+    responses: mpsc::Receiver<Result<plugin_process::ParsedPluginResponse, CourierError>>,
 }
 
 #[derive(Clone)]
@@ -1442,12 +1441,12 @@ impl CourierBackend for JsonlCourierPlugin {
             )?;
             let parcel_dir = parcel_dir?;
             let mut process = courier.spawn_persistent_plugin()?;
-            process.write_request(
+            let request_id = process.write_request(
                 courier.manifest.protocol_version,
                 &courier.manifest.name,
                 PluginRequest::OpenSession { parcel_dir },
             )?;
-            match process.read_response(&courier.manifest.name)? {
+            match process.read_response(&courier.manifest.name, &request_id)? {
                 PluginResponse::Session { session } => {
                     courier.store_persistent_process(session.id.clone(), process)?;
                     Ok(session)
@@ -1511,7 +1510,7 @@ impl CourierBackend for JsonlCourierPlugin {
 impl JsonlCourierPlugin {
     fn plugin_request(&self, request: PluginRequest) -> Result<PluginResponse, CourierError> {
         let mut child = self.spawn_plugin()?;
-        write_plugin_request(
+        let request_id = write_plugin_request(
             &mut child,
             &self.manifest.name,
             self.manifest.protocol_version,
@@ -1526,7 +1525,8 @@ impl JsonlCourierPlugin {
                 message: "plugin stdout was not captured".to_string(),
             })?;
         let mut reader = BufReader::new(stdout);
-        let response = read_plugin_response(&mut reader, &self.manifest.name)?;
+        let response =
+            read_expected_plugin_response(&mut reader, &self.manifest.name, &request_id)?;
         wait_for_plugin_exit(child, &self.manifest.name)?;
         Ok(response)
     }
@@ -1583,7 +1583,6 @@ impl JsonlCourierPlugin {
             stdin,
             stderr,
             responses: spawn_plugin_response_reader(stdout, self.manifest.name.clone()),
-            next_request_id: 1,
         })
     }
 
@@ -1634,12 +1633,14 @@ impl JsonlCourierPlugin {
                         "no persistent plugin process exists for session `{session_id}`"
                     ),
                 })?;
-        process.write_request(self.manifest.protocol_version, &self.manifest.name, request)?;
+        let request_id =
+            process.write_request(self.manifest.protocol_version, &self.manifest.name, request)?;
         let mut events = Vec::new();
         match read_plugin_run_completion(
             process,
             &self.manifest.name,
             &session_id,
+            &request_id,
             run_timeout,
             &mut events,
         ) {
@@ -1676,7 +1677,7 @@ impl JsonlCourierPlugin {
         }
 
         let mut process = self.spawn_persistent_plugin()?;
-        process.write_request(
+        let request_id = process.write_request(
             self.manifest.protocol_version,
             &self.manifest.name,
             PluginRequest::ResumeSession {
@@ -1684,7 +1685,7 @@ impl JsonlCourierPlugin {
                 session,
             },
         )?;
-        match process.read_response(&self.manifest.name) {
+        match process.read_response(&self.manifest.name, &request_id) {
             Ok(PluginResponse::Session { session }) => {
                 self.store_persistent_process(session.id.clone(), process)?;
                 Ok(session)

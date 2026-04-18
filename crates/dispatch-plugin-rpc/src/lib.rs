@@ -13,6 +13,17 @@ pub const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub const JSONRPC_INTERNAL_ERROR: i64 = -32603;
 pub const JSONRPC_APPLICATION_ERROR: i64 = -32000;
 
+pub fn standard_error_code_name(code: i64) -> Option<&'static str> {
+    match code {
+        JSONRPC_PARSE_ERROR => Some("parse_error"),
+        JSONRPC_INVALID_REQUEST => Some("invalid_request"),
+        JSONRPC_METHOD_NOT_FOUND => Some("method_not_found"),
+        JSONRPC_INVALID_PARAMS => Some("invalid_params"),
+        JSONRPC_INTERNAL_ERROR => Some("internal_error"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
@@ -201,5 +212,30 @@ mod tests {
 
         let parsed: JsonRpcErrorResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn standard_error_code_names_match_spec() {
+        assert_eq!(
+            standard_error_code_name(JSONRPC_PARSE_ERROR),
+            Some("parse_error")
+        );
+        assert_eq!(
+            standard_error_code_name(JSONRPC_INVALID_REQUEST),
+            Some("invalid_request")
+        );
+        assert_eq!(
+            standard_error_code_name(JSONRPC_METHOD_NOT_FOUND),
+            Some("method_not_found")
+        );
+        assert_eq!(
+            standard_error_code_name(JSONRPC_INVALID_PARAMS),
+            Some("invalid_params")
+        );
+        assert_eq!(
+            standard_error_code_name(JSONRPC_INTERNAL_ERROR),
+            Some("internal_error")
+        );
+        assert_eq!(standard_error_code_name(JSONRPC_APPLICATION_ERROR), None);
     }
 }

@@ -1,7 +1,9 @@
 pub use dispatch_channel_protocol::{OutboundAttachment, OutboundMessageEnvelope};
 use dispatch_plugin_rpc::{
-    JSONRPC_APPLICATION_ERROR, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcSuccessResponse, RequestId, ensure_jsonrpc_version,
+    JSONRPC_APPLICATION_ERROR, JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_PARAMS,
+    JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR, JsonRpcErrorResponse,
+    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcSuccessResponse, RequestId,
+    ensure_jsonrpc_version, standard_error_code_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -474,16 +476,16 @@ pub fn parse_jsonrpc_request(line: &str) -> Result<(RequestId, PluginRequestEnve
 
 pub fn response_to_jsonrpc(id: &RequestId, response: &PluginResponse) -> Result<String, String> {
     let message = match response {
-        PluginResponse::Event { .. } => JsonRpcMessage::Notification(JsonRpcNotification::new(
+        PluginResponse::Event { event } => JsonRpcMessage::Notification(JsonRpcNotification::new(
             COURIER_EVENT_NOTIFICATION_METHOD,
             Some(
-                serde_json::to_value(response)
+                serde_json::to_value(event)
                     .map_err(|source| format!("failed to serialize courier event: {source}"))?,
             ),
         )),
         PluginResponse::Error { error } => JsonRpcMessage::Error(JsonRpcErrorResponse::new(
             Some(id.clone()),
-            JSONRPC_APPLICATION_ERROR,
+            encode_dispatch_error_code(&error.code),
             error.message.clone(),
             Some(serde_json::json!({ "dispatch_error": error })),
         )),
@@ -497,20 +499,26 @@ pub fn response_to_jsonrpc(id: &RequestId, response: &PluginResponse) -> Result<
         .map_err(|source| format!("failed to serialize JSON-RPC message: {source}"))
 }
 
-pub fn parse_jsonrpc_message(line: &str) -> Result<PluginResponse, String> {
+pub fn parse_jsonrpc_message(line: &str) -> Result<(Option<RequestId>, PluginResponse), String> {
     let message: JsonRpcMessage = serde_json::from_str(line)
         .map_err(|source| format!("invalid JSON-RPC message: {source}"))?;
     match message {
         JsonRpcMessage::Response(response) => {
             ensure_jsonrpc_version(&response.jsonrpc)?;
-            serde_json::from_value(response.result)
-                .map_err(|source| format!("invalid courier result payload: {source}"))
+            let id = response.id;
+            let response = serde_json::from_value(response.result)
+                .map_err(|source| format!("invalid courier result payload: {source}"))?;
+            Ok((Some(id), response))
         }
         JsonRpcMessage::Error(error) => {
             ensure_jsonrpc_version(&error.jsonrpc)?;
-            Ok(PluginResponse::Error {
-                error: decode_dispatch_error(error),
-            })
+            let id = error.id.clone();
+            Ok((
+                id,
+                PluginResponse::Error {
+                    error: decode_dispatch_error(error),
+                },
+            ))
         }
         JsonRpcMessage::Notification(notification) => {
             ensure_jsonrpc_version(&notification.jsonrpc)?;
@@ -520,12 +528,13 @@ pub fn parse_jsonrpc_message(line: &str) -> Result<PluginResponse, String> {
                     notification.method
                 ));
             }
-            serde_json::from_value(
+            let event = serde_json::from_value(
                 notification
                     .params
                     .ok_or_else(|| "missing courier event params".to_string())?,
             )
-            .map_err(|source| format!("invalid courier notification payload: {source}"))
+            .map_err(|source| format!("invalid courier notification payload: {source}"))?;
+            Ok((None, PluginResponse::Event { event }))
         }
         JsonRpcMessage::Request(_) => Err("expected JSON-RPC response, got request".to_string()),
     }
@@ -579,9 +588,22 @@ fn decode_dispatch_error(error: JsonRpcErrorResponse) -> PluginErrorPayload {
         .and_then(|data| data.get("dispatch_error"))
         .and_then(|value| serde_json::from_value::<PluginErrorPayload>(value.clone()).ok());
     dispatch_error.unwrap_or_else(|| PluginErrorPayload {
-        code: "jsonrpc_error".to_string(),
+        code: standard_error_code_name(error.error.code)
+            .unwrap_or("jsonrpc_error")
+            .to_string(),
         message: error.error.message,
     })
+}
+
+fn encode_dispatch_error_code(code: &str) -> i64 {
+    match code {
+        "parse_error" => JSONRPC_PARSE_ERROR,
+        "invalid_request" => JSONRPC_INVALID_REQUEST,
+        "method_not_found" | "unsupported_request" => JSONRPC_METHOD_NOT_FOUND,
+        "invalid_params" | "bad_request" => JSONRPC_INVALID_PARAMS,
+        "internal_error" => JSONRPC_INTERNAL_ERROR,
+        _ => JSONRPC_APPLICATION_ERROR,
+    }
 }
 
 #[cfg(test)]
@@ -636,8 +658,26 @@ mod tests {
         };
 
         let json = response_to_jsonrpc(&RequestId::integer(8), &response).unwrap();
-        let parsed = parse_jsonrpc_message(&json).unwrap();
+        let (id, parsed) = parse_jsonrpc_message(&json).unwrap();
+        assert_eq!(id, Some(RequestId::integer(8)));
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn request_rejects_invalid_jsonrpc_version() {
+        let json = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 6,
+            "method": "courier.capabilities",
+            "params": {
+                "protocol_version": COURIER_PLUGIN_PROTOCOL_VERSION,
+                "kind": "capabilities"
+            }
+        });
+
+        let error = parse_jsonrpc_request(&json.to_string())
+            .expect_err("expected invalid JSON-RPC version to fail");
+        assert!(error.contains("expected jsonrpc version 2.0"));
     }
 
     #[test]
@@ -654,7 +694,13 @@ mod tests {
         };
 
         let json = response_to_jsonrpc(&RequestId::integer(9), &response).unwrap();
-        let parsed = parse_jsonrpc_message(&json).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["method"], COURIER_EVENT_NOTIFICATION_METHOD);
+        assert_eq!(value["params"]["kind"], "channel_reply");
+        assert!(value["params"].get("event").is_none());
+
+        let (id, parsed) = parse_jsonrpc_message(&json).unwrap();
+        assert_eq!(id, None);
         assert_eq!(parsed, response);
     }
 
@@ -662,7 +708,11 @@ mod tests {
     fn error_round_trips_jsonrpc() {
         let response = plugin_error("bad_request", "missing parcel_dir");
         let json = response_to_jsonrpc(&RequestId::integer(10), &response).unwrap();
-        let parsed = parse_jsonrpc_message(&json).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["error"]["code"], JSONRPC_INVALID_PARAMS);
+
+        let (id, parsed) = parse_jsonrpc_message(&json).unwrap();
+        assert_eq!(id, Some(RequestId::integer(10)));
         assert_eq!(parsed, response);
     }
 
@@ -675,6 +725,30 @@ mod tests {
                 error: PluginErrorPayload {
                     code: "bad_request".to_string(),
                     message: "missing parcel_dir".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn standard_jsonrpc_error_without_dispatch_payload_uses_named_code() {
+        let json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "error": {
+                "code": JSONRPC_METHOD_NOT_FOUND,
+                "message": "unknown method"
+            }
+        });
+
+        let (id, parsed) = parse_jsonrpc_message(&json.to_string()).unwrap();
+        assert_eq!(id, Some(RequestId::integer(12)));
+        assert_eq!(
+            parsed,
+            PluginResponse::Error {
+                error: PluginErrorPayload {
+                    code: "method_not_found".to_string(),
+                    message: "unknown method".to_string(),
                 },
             }
         );

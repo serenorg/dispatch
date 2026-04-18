@@ -773,10 +773,7 @@ fn install_test_courier_plugin_with_event(
         &serde_json::json!({
             "jsonrpc": "2.0",
             "method": "courier.event",
-            "params": {
-                "kind": "event",
-                "event": event,
-            }
+            "params": event
         })
         .to_string(),
     );

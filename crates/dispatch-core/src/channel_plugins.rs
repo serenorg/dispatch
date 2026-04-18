@@ -467,6 +467,7 @@ fn call_channel_plugin_with_timeout(
         })?;
 
     {
+        let request_id = PluginRequestId::Integer(1);
         let mut stdin =
             child
                 .stdin
@@ -476,7 +477,7 @@ fn call_channel_plugin_with_timeout(
                     message: "channel plugin stdin was not captured".to_string(),
                 })?;
         let rpc_request = request_to_jsonrpc(
-            PluginRequestId::Integer(1),
+            request_id.clone(),
             &ChannelPluginRequestEnvelope {
                 protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
                 request,
@@ -605,12 +606,24 @@ fn call_channel_plugin_with_timeout(
         });
     }
 
-    let response = parse_jsonrpc_response(line.trim_end()).map_err(|message| {
+    let (response_id, response) = parse_jsonrpc_response(line.trim_end()).map_err(|message| {
         ChannelPluginCallError::PluginProtocol {
             channel: manifest.name.clone(),
             message,
         }
     })?;
+    if response_id != PluginRequestId::Integer(1) {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: format!(
+                "channel plugin response id `{}` did not match request id `1`",
+                match response_id {
+                    PluginRequestId::String(value) => format!("\"{value}\""),
+                    PluginRequestId::Integer(value) => value.to_string(),
+                }
+            ),
+        });
+    }
     if status.success() {
         return Ok(response);
     }
@@ -1500,6 +1513,47 @@ printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{\"kind\":\"ca
         };
         assert_eq!(capabilities.plugin_id, "telegram");
         assert!(capabilities.accepts_status_frames);
+    }
+
+    #[test]
+    fn call_channel_plugin_rejects_mismatched_jsonrpc_id() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("channel-mismatched-id.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "telegram-mismatched-id".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: 1,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: Some("telegram".to_string()),
+            attachment_sources: vec![],
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let error = call_channel_plugin(&manifest, ChannelPluginRequest::Capabilities).unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { message, .. }
+                if message.contains("did not match request id")
+        ));
     }
 
     #[test]

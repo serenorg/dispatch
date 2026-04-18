@@ -8,13 +8,15 @@ use crate::plugin_protocol::{
 };
 use std::{io::Write as _, sync::mpsc, time::Duration};
 
+pub(super) type ParsedPluginResponse = (Option<PluginRequestId>, PluginResponse);
+
 pub(super) fn write_plugin_request(
     child: &mut Child,
     courier_name: &str,
     protocol_version: u32,
     request: PluginRequest,
     close_stdin: bool,
-) -> Result<(), CourierError> {
+) -> Result<PluginRequestId, CourierError> {
     let stdin = child
         .stdin
         .as_mut()
@@ -22,17 +24,18 @@ pub(super) fn write_plugin_request(
             courier: courier_name.to_string(),
             message: "plugin stdin was not captured".to_string(),
         })?;
+    let request_id = PluginRequestId::Integer(1);
     write_plugin_request_to(
         stdin,
         courier_name,
-        PluginRequestId::Integer(1),
+        request_id.clone(),
         protocol_version,
         request,
     )?;
     if close_stdin {
         let _ = child.stdin.take();
     }
-    Ok(())
+    Ok(request_id)
 }
 
 pub(super) fn write_plugin_request_to<W: std::io::Write>(
@@ -80,23 +83,24 @@ impl PersistentPluginProcess {
         protocol_version: u32,
         courier_name: &str,
         request: PluginRequest,
-    ) -> Result<(), CourierError> {
-        let request_id = PluginRequestId::Integer(self.next_request_id);
-        self.next_request_id += 1;
+    ) -> Result<PluginRequestId, CourierError> {
+        let request_id = PluginRequestId::Integer(1);
         write_plugin_request_to(
             &mut self.stdin,
             courier_name,
-            request_id,
+            request_id.clone(),
             protocol_version,
             request,
-        )
+        )?;
+        Ok(request_id)
     }
 
     pub(super) fn read_response(
         &mut self,
         courier_name: &str,
+        expected_id: &PluginRequestId,
     ) -> Result<PluginResponse, CourierError> {
-        match self.read_response_timeout(courier_name, None)? {
+        match self.read_response_timeout(courier_name, expected_id, None)? {
             Some(response) => Ok(response),
             None => Err(CourierError::PluginProtocol {
                 courier: courier_name.to_string(),
@@ -108,18 +112,19 @@ impl PersistentPluginProcess {
     pub(super) fn read_response_timeout(
         &mut self,
         courier_name: &str,
+        expected_id: &PluginRequestId,
         timeout: Option<Duration>,
     ) -> Result<Option<PluginResponse>, CourierError> {
         let received = match timeout {
             Some(timeout) => match self.responses.recv_timeout(timeout) {
-                Ok(result) => return result.map(Some),
+                Ok(result) => return map_parsed_plugin_response(result, courier_name, expected_id),
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
                 Err(mpsc::RecvTimeoutError::Disconnected) => None,
             },
             None => self.responses.recv().ok(),
         };
         match received {
-            Some(result) => result.map(Some),
+            Some(result) => map_parsed_plugin_response(result, courier_name, expected_id),
             None => Err(CourierError::PluginProtocol {
                 courier: courier_name.to_string(),
                 message: "plugin produced no response".to_string(),
@@ -131,7 +136,7 @@ impl PersistentPluginProcess {
 pub(super) fn spawn_plugin_response_reader(
     stdout: ChildStdout,
     courier_name: String,
-) -> mpsc::Receiver<Result<PluginResponse, CourierError>> {
+) -> mpsc::Receiver<Result<ParsedPluginResponse, CourierError>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -152,7 +157,7 @@ pub(super) fn spawn_plugin_response_reader(
 pub(super) fn read_plugin_response<R: std::io::BufRead>(
     reader: &mut R,
     courier_name: &str,
-) -> Result<PluginResponse, CourierError> {
+) -> Result<ParsedPluginResponse, CourierError> {
     let mut line = String::new();
     let bytes = reader
         .read_line(&mut line)
@@ -172,16 +177,34 @@ pub(super) fn read_plugin_response<R: std::io::BufRead>(
     })
 }
 
+pub(super) fn read_expected_plugin_response<R: std::io::BufRead>(
+    reader: &mut R,
+    courier_name: &str,
+    expected_id: &PluginRequestId,
+) -> Result<PluginResponse, CourierError> {
+    map_parsed_plugin_response(
+        read_plugin_response(reader, courier_name),
+        courier_name,
+        expected_id,
+    )?
+    .ok_or_else(|| CourierError::PluginProtocol {
+        courier: courier_name.to_string(),
+        message: "plugin produced no response".to_string(),
+    })
+}
+
 pub(super) fn read_plugin_run_completion(
     process: &mut PersistentPluginProcess,
     courier_name: &str,
     session_id: &str,
+    expected_id: &PluginRequestId,
     run_timeout: Option<(String, Duration)>,
     events: &mut Vec<CourierEvent>,
 ) -> Result<CourierSession, CourierError> {
     loop {
         let response = process.read_response_timeout(
             courier_name,
+            expected_id,
             run_timeout.as_ref().map(|(_, duration)| *duration),
         )?;
         let Some(response) = response else {
@@ -221,8 +244,15 @@ pub(super) fn shutdown_persistent_plugin_process(
     courier_name: &str,
     protocol_version: u32,
 ) -> Result<(), CourierError> {
-    let _ = process.write_request(protocol_version, courier_name, PluginRequest::Shutdown);
-    let _ = process.read_response_timeout(courier_name, Some(Duration::from_millis(200)));
+    if let Ok(request_id) =
+        process.write_request(protocol_version, courier_name, PluginRequest::Shutdown)
+    {
+        let _ = process.read_response_timeout(
+            courier_name,
+            &request_id,
+            Some(Duration::from_millis(200)),
+        );
+    }
     let _ = process.stdin.flush();
     if process.child.try_wait().ok().flatten().is_none() {
         let _ = process.child.kill();
@@ -238,6 +268,42 @@ pub(super) fn shutdown_persistent_plugin_process(
             source,
         })?;
     Ok(())
+}
+
+fn map_parsed_plugin_response(
+    result: Result<ParsedPluginResponse, CourierError>,
+    courier_name: &str,
+    expected_id: &PluginRequestId,
+) -> Result<Option<PluginResponse>, CourierError> {
+    let (received_id, response) = result?;
+    if matches!(response, PluginResponse::Event { .. }) {
+        return Ok(Some(response));
+    }
+
+    let Some(received_id) = received_id else {
+        return Err(CourierError::PluginProtocol {
+            courier: courier_name.to_string(),
+            message: "plugin response omitted JSON-RPC id".to_string(),
+        });
+    };
+    if &received_id != expected_id {
+        return Err(CourierError::PluginProtocol {
+            courier: courier_name.to_string(),
+            message: format!(
+                "plugin response id `{}` did not match request id `{}`",
+                format_request_id(&received_id),
+                format_request_id(expected_id)
+            ),
+        });
+    }
+    Ok(Some(response))
+}
+
+fn format_request_id(id: &PluginRequestId) -> String {
+    match id {
+        PluginRequestId::String(value) => format!("\"{value}\""),
+        PluginRequestId::Integer(value) => value.to_string(),
+    }
 }
 
 pub(super) fn wait_for_plugin_exit(
@@ -294,7 +360,8 @@ pub(super) fn describe_plugin_response(response: &PluginResponse) -> &'static st
 
 #[cfg(test)]
 mod tests {
-    use super::read_plugin_response;
+    use super::read_expected_plugin_response;
+    use crate::courier::CourierError;
     use crate::plugin_protocol::{PluginRequestId, PluginResponse, response_to_jsonrpc};
     use std::io::Cursor;
 
@@ -303,8 +370,27 @@ mod tests {
         let line = response_to_jsonrpc(&PluginRequestId::Integer(1), &PluginResponse::Ok).unwrap();
         let mut reader = Cursor::new(line.into_bytes());
 
-        let response = read_plugin_response(&mut reader, "demo").unwrap();
+        let response =
+            read_expected_plugin_response(&mut reader, "demo", &PluginRequestId::Integer(1))
+                .unwrap();
 
         assert_eq!(response, PluginResponse::Ok);
+    }
+
+    #[test]
+    fn read_plugin_response_rejects_mismatched_jsonrpc_id() {
+        let line = response_to_jsonrpc(&PluginRequestId::Integer(2), &PluginResponse::Ok).unwrap();
+        let mut reader = Cursor::new(line.into_bytes());
+
+        let error =
+            read_expected_plugin_response(&mut reader, "demo", &PluginRequestId::Integer(1))
+                .expect_err("expected mismatched id to fail");
+
+        match error {
+            CourierError::PluginProtocol { message, .. } => {
+                assert!(message.contains("did not match request id"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
