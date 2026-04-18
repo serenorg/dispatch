@@ -1,4 +1,4 @@
-use dispatch_channel_protocol::OutboundMessageEnvelope;
+pub use dispatch_channel_protocol::{OutboundAttachment, OutboundMessageEnvelope};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
