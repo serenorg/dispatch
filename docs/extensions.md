@@ -81,6 +81,11 @@ Channel plugins vary by platform, but the protocol covers the full inbound and
 outbound lifecycle: configuration, health, ingress setup, webhook forwarding or
 polling, delivery, push, and status frames.
 
+Dispatch treats `poll_ingress` as a host-facing polling contract, not as a
+statement about the upstream transport. A polling channel plugin may fetch
+events with repeated HTTP requests, or it may open an upstream websocket and
+return the next normalized event when the host polls it.
+
 ### Connector bundles
 
 Reusable tool packages for specific providers (Gmail, GitHub, Google Drive).
@@ -132,6 +137,15 @@ repeated `dispatch channel poll --once` runs resume from the last source
 cursor instead of replaying old events. Delete that directory (or the
 specific `<plugin>/<label>-<hash>.json` file) to reset the cursor and
 reprocess events on the next poll.
+
+Common polling patterns:
+
+- Telegram polling uses the Bot API `getUpdates` HTTP flow.
+- Signal polling uses either upstream HTTP receive (`native` / `normal`) or
+  websocket-backed receive (`json-rpc`) inside the plugin.
+- Slack polling uses Socket Mode: the plugin opens Slack's websocket via
+  `apps.connections.open`, acknowledges each `envelope_id`, and returns the
+  normalized event through `poll_ingress`.
 
 `dispatch up` is the project-level runtime binding command. It reads
 `dispatch.toml`, reconciles declared extension manifests into project-local
