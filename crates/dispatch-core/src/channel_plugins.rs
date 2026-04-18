@@ -1,9 +1,10 @@
 use crate::{
     channel_plugin_protocol::{
-        AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelPluginRequest,
-        ChannelPluginRequestEnvelope, ChannelPluginResponse, InboundEventEnvelope,
-        OutboundMessageEnvelope, PluginRequestId, parse_jsonrpc_response,
-        parse_tagged_channel_reply, request_to_jsonrpc,
+        AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventNotification,
+        ChannelPluginRequest, ChannelPluginRequestEnvelope, ChannelPluginResponse,
+        InboundEventEnvelope, OutboundMessageEnvelope, PluginMessage, PluginNotificationEnvelope,
+        PluginRequestId, parse_jsonrpc_message, parse_jsonrpc_response, parse_tagged_channel_reply,
+        request_to_jsonrpc,
     },
     courier::CourierEvent,
     plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
@@ -15,11 +16,12 @@ use dispatch_process::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::{BufReader, Read as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -239,6 +241,14 @@ pub enum ChannelPluginCallError {
     },
 }
 
+pub struct PersistentChannelPluginProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stderr: Arc<Mutex<String>>,
+    outputs: mpsc::Receiver<Result<PluginMessage, ChannelPluginCallError>>,
+    pending_notifications: VecDeque<PluginNotificationEnvelope<ChannelEventNotification>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelIngressTrustFailure {
     pub status_code: u16,
@@ -446,6 +456,327 @@ pub fn call_channel_plugin(
     call_channel_plugin_with_timeout(manifest, request, CHANNEL_PLUGIN_CALL_TIMEOUT)
 }
 
+impl PersistentChannelPluginProcess {
+    fn write_request(
+        &mut self,
+        manifest: &ChannelPluginManifest,
+        request: ChannelPluginRequest,
+    ) -> Result<PluginRequestId, ChannelPluginCallError> {
+        let request_id = PluginRequestId::Integer(1);
+        write_channel_plugin_request_to(
+            &mut self.stdin,
+            manifest.name.as_str(),
+            request_id.clone(),
+            request,
+        )?;
+        Ok(request_id)
+    }
+}
+
+pub fn spawn_persistent_channel_plugin(
+    manifest: &ChannelPluginManifest,
+) -> Result<PersistentChannelPluginProcess, ChannelPluginCallError> {
+    let mut command = Command::new(&manifest.exec.command);
+    command
+        .args(&manifest.exec.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|source| ChannelPluginCallError::SpawnPlugin {
+            channel: manifest.name.clone(),
+            source,
+        })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: "channel plugin stdin was not captured".to_string(),
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: "channel plugin stdout was not captured".to_string(),
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: "channel plugin stderr was not captured".to_string(),
+        })?;
+
+    Ok(PersistentChannelPluginProcess {
+        child,
+        stdin,
+        stderr: spawn_channel_plugin_stderr_reader(stderr),
+        outputs: spawn_channel_plugin_output_reader(stdout, manifest.name.clone()),
+        pending_notifications: VecDeque::new(),
+    })
+}
+
+pub fn call_persistent_channel_plugin(
+    process: &mut PersistentChannelPluginProcess,
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+    timeout: Duration,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    let deadline = Instant::now() + timeout;
+    let request_id = process.write_request(manifest, request)?;
+
+    while let Some(message) =
+        recv_channel_plugin_message(process, manifest.name.as_str(), Some(deadline))?
+    {
+        match message {
+            PluginMessage::Notification(notification) => {
+                process.pending_notifications.push_back(notification);
+            }
+            PluginMessage::Response { id, response } => {
+                ensure_matching_channel_request_id(manifest.name.as_str(), &request_id, &id)?;
+                return Ok(response);
+            }
+        }
+    }
+
+    // The child is still running after a timeout. Kill it before draining
+    // stderr, otherwise `read_to_string` below blocks waiting for the still-
+    // open stderr pipe to close.
+    kill_child_and_wait(&mut process.child);
+    Err(ChannelPluginCallError::PluginTimedOut {
+        channel: manifest.name.clone(),
+        timeout_ms: timeout.as_millis(),
+        stderr: collect_persistent_channel_stderr(process, manifest.name.as_str())?,
+    })
+}
+
+pub fn drain_pending_channel_notifications(
+    process: &mut PersistentChannelPluginProcess,
+) -> Vec<PluginNotificationEnvelope<ChannelEventNotification>> {
+    process.pending_notifications.drain(..).collect()
+}
+
+pub fn recv_persistent_channel_notification(
+    process: &mut PersistentChannelPluginProcess,
+    manifest: &ChannelPluginManifest,
+    timeout: Option<Duration>,
+) -> Result<Option<PluginNotificationEnvelope<ChannelEventNotification>>, ChannelPluginCallError> {
+    if let Some(notification) = process.pending_notifications.pop_front() {
+        return Ok(Some(notification));
+    }
+
+    let deadline = timeout.map(|duration| Instant::now() + duration);
+    let Some(message) = recv_channel_plugin_message(process, manifest.name.as_str(), deadline)?
+    else {
+        return Ok(None);
+    };
+    match message {
+        PluginMessage::Notification(notification) => Ok(Some(notification)),
+        PluginMessage::Response { response, .. } => Err(ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: format!(
+                "channel plugin returned unexpected response while waiting for ingress events: {}",
+                describe_channel_plugin_response(&response)
+            ),
+        }),
+    }
+}
+
+pub fn shutdown_persistent_channel_plugin(
+    process: &mut PersistentChannelPluginProcess,
+    manifest: &ChannelPluginManifest,
+) -> Result<(), ChannelPluginCallError> {
+    if process
+        .write_request(manifest, ChannelPluginRequest::Shutdown)
+        .is_ok()
+    {
+        let _ = recv_channel_plugin_message(
+            process,
+            manifest.name.as_str(),
+            Some(Instant::now() + Duration::from_millis(200)),
+        );
+    }
+    let _ = process.stdin.flush();
+    kill_child_and_wait(&mut process.child);
+    let _ = collect_persistent_channel_stderr(process, manifest.name.as_str())?;
+    Ok(())
+}
+
+fn spawn_channel_plugin_output_reader(
+    stdout: ChildStdout,
+    channel: String,
+) -> mpsc::Receiver<Result<PluginMessage, ChannelPluginCallError>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let result = read_channel_plugin_message(&mut reader, channel.as_str());
+            let should_break = result.is_err();
+            if tx.send(result).is_err() {
+                break;
+            }
+            if should_break {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn read_channel_plugin_message<R: std::io::BufRead>(
+    reader: &mut R,
+    channel: &str,
+) -> Result<PluginMessage, ChannelPluginCallError> {
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line).map_err(|source| {
+        ChannelPluginCallError::ReadPluginResponse {
+            channel: channel.to_string(),
+            source,
+        }
+    })?;
+    if bytes == 0 {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_string(),
+            message: "channel plugin produced no response".to_string(),
+        });
+    }
+    parse_jsonrpc_message(line.trim_end()).map_err(|message| {
+        ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_string(),
+            message,
+        }
+    })
+}
+
+fn recv_channel_plugin_message(
+    process: &mut PersistentChannelPluginProcess,
+    channel: &str,
+    deadline: Option<Instant>,
+) -> Result<Option<PluginMessage>, ChannelPluginCallError> {
+    let result = match deadline {
+        Some(deadline) => {
+            let timeout = remaining_channel_plugin_timeout(deadline);
+            match process.outputs.recv_timeout(timeout) {
+                Ok(result) => Some(result),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            }
+        }
+        None => process.outputs.recv().ok(),
+    };
+
+    match result {
+        Some(result) => result.map(Some),
+        None => Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_string(),
+            message: "channel plugin output reader disconnected".to_string(),
+        }),
+    }
+}
+
+fn collect_persistent_channel_stderr(
+    process: &mut PersistentChannelPluginProcess,
+    _channel: &str,
+) -> Result<String, ChannelPluginCallError> {
+    // The stderr pipe is drained asynchronously by a dedicated reader thread
+    // (see `spawn_channel_plugin_stderr_reader`). We snapshot what has been
+    // captured so far without blocking, which keeps timeouts prompt even if a
+    // descendant process is still holding the pipe's write end open.
+    let stderr = match process.stderr.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    Ok(stderr.trim().to_string())
+}
+
+fn spawn_channel_plugin_stderr_reader(mut stderr: ChildStderr) -> Arc<Mutex<String>> {
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let writer = Arc::clone(&buffer);
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if let Ok(mut guard) = writer.lock() {
+                        guard.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    buffer
+}
+
+fn write_channel_plugin_request_to<W: std::io::Write>(
+    mut writer: W,
+    channel: &str,
+    request_id: PluginRequestId,
+    request: ChannelPluginRequest,
+) -> Result<(), ChannelPluginCallError> {
+    let rpc_request = request_to_jsonrpc(
+        request_id,
+        &ChannelPluginRequestEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request,
+        },
+    )
+    .map_err(|message| ChannelPluginCallError::PluginProtocol {
+        channel: channel.to_string(),
+        message,
+    })?;
+    serde_json::to_writer(&mut writer, &rpc_request).map_err(|source| {
+        ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_string(),
+            message: format!("failed to serialize channel plugin request: {source}"),
+        }
+    })?;
+    writer
+        .write_all(b"\n")
+        .map_err(|source| ChannelPluginCallError::WritePluginRequest {
+            channel: channel.to_string(),
+            source,
+        })?;
+    writer
+        .flush()
+        .map_err(|source| ChannelPluginCallError::WritePluginRequest {
+            channel: channel.to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
+fn ensure_matching_channel_request_id(
+    channel: &str,
+    expected_id: &PluginRequestId,
+    actual_id: &PluginRequestId,
+) -> Result<(), ChannelPluginCallError> {
+    if actual_id == expected_id {
+        return Ok(());
+    }
+
+    Err(ChannelPluginCallError::PluginProtocol {
+        channel: channel.to_string(),
+        message: format!(
+            "channel plugin response id `{}` did not match request id `{}`",
+            format_channel_request_id(actual_id),
+            format_channel_request_id(expected_id)
+        ),
+    })
+}
+
+fn format_channel_request_id(id: &PluginRequestId) -> String {
+    match id {
+        PluginRequestId::String(value) => format!("\"{value}\""),
+        PluginRequestId::Integer(value) => value.to_string(),
+    }
+}
+
 fn call_channel_plugin_with_timeout(
     manifest: &ChannelPluginManifest,
     request: ChannelPluginRequest,
@@ -467,7 +798,6 @@ fn call_channel_plugin_with_timeout(
         })?;
 
     {
-        let request_id = PluginRequestId::Integer(1);
         let mut stdin =
             child
                 .stdin
@@ -476,35 +806,12 @@ fn call_channel_plugin_with_timeout(
                     channel: manifest.name.clone(),
                     message: "channel plugin stdin was not captured".to_string(),
                 })?;
-        let rpc_request = request_to_jsonrpc(
-            request_id.clone(),
-            &ChannelPluginRequestEnvelope {
-                protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-                request,
-            },
-        )
-        .map_err(|message| ChannelPluginCallError::PluginProtocol {
-            channel: manifest.name.clone(),
-            message,
-        })?;
-        serde_json::to_writer(&mut stdin, &rpc_request).map_err(|source| {
-            ChannelPluginCallError::PluginProtocol {
-                channel: manifest.name.clone(),
-                message: format!("failed to serialize channel plugin request: {source}"),
-            }
-        })?;
-        stdin
-            .write_all(b"\n")
-            .map_err(|source| ChannelPluginCallError::WritePluginRequest {
-                channel: manifest.name.clone(),
-                source,
-            })?;
-        stdin
-            .flush()
-            .map_err(|source| ChannelPluginCallError::WritePluginRequest {
-                channel: manifest.name.clone(),
-                source,
-            })?;
+        write_channel_plugin_request_to(
+            &mut stdin,
+            manifest.name.as_str(),
+            PluginRequestId::Integer(1),
+            request,
+        )?;
     }
 
     let stdout = child
@@ -612,18 +919,11 @@ fn call_channel_plugin_with_timeout(
             message,
         }
     })?;
-    if response_id != PluginRequestId::Integer(1) {
-        return Err(ChannelPluginCallError::PluginProtocol {
-            channel: manifest.name.clone(),
-            message: format!(
-                "channel plugin response id `{}` did not match request id `1`",
-                match response_id {
-                    PluginRequestId::String(value) => format!("\"{value}\""),
-                    PluginRequestId::Integer(value) => value.to_string(),
-                }
-            ),
-        });
-    }
+    ensure_matching_channel_request_id(
+        manifest.name.as_str(),
+        &PluginRequestId::Integer(1),
+        &response_id,
+    )?;
     if status.success() {
         return Ok(response);
     }
@@ -637,6 +937,22 @@ fn call_channel_plugin_with_timeout(
 
 fn remaining_channel_plugin_timeout(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+fn describe_channel_plugin_response(response: &ChannelPluginResponse) -> &'static str {
+    match response {
+        ChannelPluginResponse::Capabilities { .. } => "capabilities",
+        ChannelPluginResponse::Configured { .. } => "configured",
+        ChannelPluginResponse::Health { .. } => "health",
+        ChannelPluginResponse::IngressStarted { .. } => "ingress_started",
+        ChannelPluginResponse::IngressStopped { .. } => "ingress_stopped",
+        ChannelPluginResponse::IngressEventsReceived { .. } => "ingress_events_received",
+        ChannelPluginResponse::Delivered { .. } => "delivered",
+        ChannelPluginResponse::Pushed { .. } => "pushed",
+        ChannelPluginResponse::StatusAccepted { .. } => "status_accepted",
+        ChannelPluginResponse::Ok => "ok",
+        ChannelPluginResponse::Error { .. } => "error",
+    }
 }
 
 fn join_stdout_reader(
@@ -873,12 +1189,12 @@ pub fn validate_channel_plugin_manifest(
             message: "protocol_version must be greater than zero".to_string(),
         });
     }
-    if manifest.protocol_version != 1 {
+    if manifest.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Err(PluginRegistryError::InvalidManifest {
             path: path.display().to_string(),
             message: format!(
-                "protocol_version `{}` is unsupported; expected 1",
-                manifest.protocol_version
+                "protocol_version `{}` is unsupported; expected {}",
+                manifest.protocol_version, CHANNEL_PLUGIN_PROTOCOL_VERSION
             ),
         });
     }
@@ -1271,7 +1587,7 @@ mod tests {
                 ChannelPluginManifest {
                     name: "one".to_string(),
                     version: "0.1.0".to_string(),
-                    protocol_version: 1,
+                    protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
                     transport: PluginTransport::Jsonl,
                     description: None,
                     exec: ChannelPluginExec {
@@ -1293,7 +1609,7 @@ mod tests {
                 ChannelPluginManifest {
                     name: "two".to_string(),
                     version: "0.1.0".to_string(),
-                    protocol_version: 1,
+                    protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
                     transport: PluginTransport::Jsonl,
                     description: None,
                     exec: ChannelPluginExec {
@@ -1349,7 +1665,7 @@ mod tests {
         let manifest = ChannelPluginManifest {
             name: "".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1494,7 +1810,7 @@ printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{\"kind\":\"ca
         let manifest = ChannelPluginManifest {
             name: "telegram-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1535,7 +1851,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"kind":"capabilities","capabili
         let manifest = ChannelPluginManifest {
             name: "telegram-mismatched-id".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1576,7 +1892,7 @@ printf '%s\n' 'not-json'
         let manifest = ChannelPluginManifest {
             name: "invalid-json-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1617,7 +1933,7 @@ exit 7
         let manifest = ChannelPluginManifest {
             name: "no-response-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1663,7 +1979,7 @@ printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{\"kind\":\"ca
         let manifest = ChannelPluginManifest {
             name: "chatty-stderr-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1703,7 +2019,7 @@ sleep 5
         let manifest = ChannelPluginManifest {
             name: "hangs-before-response-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1747,7 +2063,7 @@ sleep 5
         let manifest = ChannelPluginManifest {
             name: "silent-hang-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1795,7 +2111,7 @@ sleep 5
         let manifest = ChannelPluginManifest {
             name: "hangs-after-response-demo".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -1814,6 +2130,67 @@ sleep 5
             Duration::from_millis(50),
         )
         .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
+        ));
+    }
+
+    #[test]
+    fn call_persistent_channel_plugin_times_out_without_hanging_on_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("persistent-hangs.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+# Hold the process alive indefinitely after reading each request so the host
+# has to kill us on timeout. If the host tries to drain stderr on a still-
+# running child, this test will hang past the measured deadline.
+while IFS= read -r _line; do
+    sleep 5
+done
+sleep 5
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let manifest = ChannelPluginManifest {
+            name: "persistent-hangs-demo".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: script_path.display().to_string(),
+                args: vec![],
+            },
+            platform: None,
+            attachment_sources: vec![],
+            ingress: None,
+            installed_sha256: None,
+        };
+
+        let mut process = spawn_persistent_channel_plugin(&manifest).expect("spawn plugin");
+        let start = Instant::now();
+        let error = call_persistent_channel_plugin(
+            &mut process,
+            &manifest,
+            ChannelPluginRequest::Capabilities,
+            Duration::from_millis(50),
+        )
+        .expect_err("call should time out");
+        // The fix for the stderr-drain hang ensures we return well within the
+        // plugin's long `sleep 5`. Use a generous upper bound so we only fail
+        // if the timeout path actually regresses to blocking on stderr.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "persistent channel call took {elapsed:?} to time out; likely hanging on stderr drain"
+        );
         assert!(matches!(
             error,
             ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
@@ -2062,7 +2439,7 @@ sleep 5
         let plugin = ChannelPluginManifest {
             name: "channel-webhook".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -2093,7 +2470,7 @@ sleep 5
         let plugin = ChannelPluginManifest {
             name: "channel-telegram".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {
@@ -2140,7 +2517,7 @@ sleep 5
         let plugin = ChannelPluginManifest {
             name: "channel-telegram".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: PluginTransport::Jsonl,
             description: None,
             exec: ChannelPluginExec {

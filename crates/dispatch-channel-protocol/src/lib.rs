@@ -1,18 +1,17 @@
 use dispatch_plugin_rpc::{
     JSONRPC_APPLICATION_ERROR, JSONRPC_INTERNAL_ERROR, JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR, JsonRpcErrorResponse,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcSuccessResponse, RequestId, ensure_jsonrpc_version,
-    standard_error_code_name,
+    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcSuccessResponse, RequestId,
+    ensure_jsonrpc_version, standard_error_code_name,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 pub const CHANNEL_PLUGIN_PROTOCOL_VERSION: u32 = 1;
+pub const CHANNEL_EVENT_NOTIFICATION_METHOD: &str = "channel.event";
 
-pub use dispatch_plugin_rpc::{
-    JsonRpcErrorObject, JsonRpcNotification, RequestId as PluginRequestId,
-};
+pub use dispatch_plugin_rpc::{JsonRpcErrorObject, RequestId as PluginRequestId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +55,13 @@ pub struct PluginRequestEnvelope<R> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginNotificationEnvelope<N> {
+    pub protocol_version: u32,
+    #[serde(flatten)]
+    pub notification: N,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PluginRequest<C, M> {
     Capabilities,
@@ -67,13 +73,10 @@ pub enum PluginRequest<C, M> {
     },
     StartIngress {
         config: C,
-    },
-    StopIngress {
-        config: C,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<IngressState>,
     },
-    PollIngress {
+    StopIngress {
         config: C,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<IngressState>,
@@ -96,6 +99,7 @@ pub enum PluginRequest<C, M> {
         config: C,
         update: StatusFrame,
     },
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,9 +138,29 @@ pub enum PluginResponse {
     StatusAccepted {
         status: StatusAcceptance,
     },
+    Ok,
     Error {
         error: PluginErrorPayload,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelEventNotification {
+    #[serde(default)]
+    pub events: Vec<InboundEventEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<IngressState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_after_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginMessage {
+    Response {
+        id: RequestId,
+        response: PluginResponse,
+    },
+    Notification(PluginNotificationEnvelope<ChannelEventNotification>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -436,11 +460,11 @@ pub fn request_method<C, M>(request: &PluginRequest<C, M>) -> &'static str {
         PluginRequest::Health { .. } => "channel.health",
         PluginRequest::StartIngress { .. } => "channel.start_ingress",
         PluginRequest::StopIngress { .. } => "channel.stop_ingress",
-        PluginRequest::PollIngress { .. } => "channel.poll_ingress",
         PluginRequest::IngressEvent { .. } => "channel.ingress_event",
         PluginRequest::Deliver { .. } => "channel.deliver",
         PluginRequest::Push { .. } => "channel.push",
         PluginRequest::Status { .. } => "channel.status",
+        PluginRequest::Shutdown => "channel.shutdown",
     }
 }
 
@@ -501,6 +525,27 @@ pub fn response_to_jsonrpc(id: &RequestId, response: &PluginResponse) -> Result<
 }
 
 pub fn parse_jsonrpc_response(line: &str) -> Result<(RequestId, PluginResponse), String> {
+    match parse_jsonrpc_message(line)? {
+        PluginMessage::Response { id, response } => Ok((id, response)),
+        PluginMessage::Notification(_) => {
+            Err("expected JSON-RPC response, got notification".to_string())
+        }
+    }
+}
+
+pub fn notification_to_jsonrpc(
+    envelope: &PluginNotificationEnvelope<ChannelEventNotification>,
+) -> Result<String, String> {
+    let params = notification_params_with_version(envelope)?;
+    let message = JsonRpcMessage::Notification(JsonRpcNotification::new(
+        CHANNEL_EVENT_NOTIFICATION_METHOD,
+        Some(params),
+    ));
+    serde_json::to_string(&message)
+        .map_err(|source| format!("failed to serialize JSON-RPC notification: {source}"))
+}
+
+pub fn parse_jsonrpc_message(line: &str) -> Result<PluginMessage, String> {
     let message: JsonRpcMessage = serde_json::from_str(line)
         .map_err(|source| format!("invalid JSON-RPC message: {source}"))?;
     match message {
@@ -509,23 +554,31 @@ pub fn parse_jsonrpc_response(line: &str) -> Result<(RequestId, PluginResponse),
             let id = response.id;
             let response = serde_json::from_value(response.result)
                 .map_err(|source| format!("invalid plugin result payload: {source}"))?;
-            Ok((id, response))
+            Ok(PluginMessage::Response { id, response })
         }
         JsonRpcMessage::Error(error) => {
             ensure_jsonrpc_version(&error.jsonrpc)?;
             let id = error.id.clone().ok_or_else(|| {
                 "expected JSON-RPC response id on plugin error response".to_string()
             })?;
-            Ok((
+            Ok(PluginMessage::Response {
                 id,
-                PluginResponse::Error {
+                response: PluginResponse::Error {
                     error: decode_dispatch_error(error),
                 },
-            ))
+            })
         }
-        JsonRpcMessage::Request(_) => Err("expected JSON-RPC response, got request".to_string()),
-        JsonRpcMessage::Notification(_) => {
-            Err("expected JSON-RPC response, got notification".to_string())
+        JsonRpcMessage::Notification(notification) => {
+            ensure_jsonrpc_version(&notification.jsonrpc)?;
+            Ok(PluginMessage::Notification(decode_notification_params(
+                &notification.method,
+                notification
+                    .params
+                    .ok_or_else(|| "missing JSON-RPC params".to_string())?,
+            )?))
+        }
+        JsonRpcMessage::Request(_) => {
+            Err("expected JSON-RPC response or notification, got request".to_string())
         }
     }
 }
@@ -542,6 +595,21 @@ fn request_params_with_version<C: Serialize, M: Serialize>(
     object.insert(
         "protocol_version".to_string(),
         Value::from(protocol_version),
+    );
+    Ok(params)
+}
+
+fn notification_params_with_version(
+    envelope: &PluginNotificationEnvelope<ChannelEventNotification>,
+) -> Result<Value, String> {
+    let mut params = serde_json::to_value(&envelope.notification)
+        .map_err(|source| format!("failed to serialize notification: {source}"))?;
+    let Value::Object(ref mut object) = params else {
+        return Err("channel plugin notification did not serialize to an object".to_string());
+    };
+    object.insert(
+        "protocol_version".to_string(),
+        Value::from(envelope.protocol_version),
     );
     Ok(params)
 }
@@ -570,6 +638,33 @@ fn decode_request_params<C: DeserializeOwned, M: DeserializeOwned>(
     Ok(PluginRequestEnvelope {
         protocol_version,
         request,
+    })
+}
+
+fn decode_notification_params(
+    method: &str,
+    params: Value,
+) -> Result<PluginNotificationEnvelope<ChannelEventNotification>, String> {
+    if method != CHANNEL_EVENT_NOTIFICATION_METHOD {
+        return Err(format!(
+            "unexpected JSON-RPC notification method `{method}`"
+        ));
+    }
+
+    let Value::Object(mut object) = params else {
+        return Err("JSON-RPC params must be an object".to_string());
+    };
+    let protocol_version = object
+        .remove("protocol_version")
+        .ok_or_else(|| "missing protocol_version in JSON-RPC params".to_string())?
+        .as_u64()
+        .ok_or_else(|| "protocol_version must be an unsigned integer".to_string())?
+        as u32;
+    let notification = serde_json::from_value(Value::Object(object))
+        .map_err(|source| format!("invalid channel notification payload: {source}"))?;
+    Ok(PluginNotificationEnvelope {
+        protocol_version,
+        notification,
     })
 }
 
@@ -718,8 +813,34 @@ mod tests {
     #[test]
     fn response_rejects_notification() {
         let notification = JsonRpcNotification::new(
-            "channel.status",
-            Some(serde_json::json!({ "kind": "processing" })),
+            CHANNEL_EVENT_NOTIFICATION_METHOD,
+            Some(serde_json::json!({
+                "protocol_version": CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                "events": [{
+                    "event_id": "evt-1",
+                    "platform": "telegram",
+                    "event_type": "message.received",
+                    "received_at": "2026-04-12T00:00:00Z",
+                    "conversation": {
+                        "id": "chat-1",
+                        "kind": "private"
+                    },
+                    "actor": {
+                        "id": "user-1",
+                        "is_bot": false,
+                        "metadata": {}
+                    },
+                    "message": {
+                        "id": "msg-1",
+                        "content": "hello",
+                        "content_type": "text/plain",
+                        "attachments": [],
+                        "metadata": {}
+                    },
+                    "metadata": {}
+                }],
+                "poll_after_ms": 25
+            })),
         );
         let json = serde_json::to_string(&notification).unwrap();
 
@@ -788,10 +909,10 @@ mod tests {
     }
 
     #[test]
-    fn poll_ingress_request_round_trips_json() {
+    fn start_ingress_request_round_trips_json() {
         let request = JsonEnvelope {
             protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-            request: PluginRequest::PollIngress {
+            request: PluginRequest::StartIngress {
                 config: serde_json::json!({ "channel": "telegram" }),
                 state: Some(IngressState {
                     mode: IngressMode::Polling,
@@ -824,6 +945,55 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let parsed: PluginResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn event_notification_round_trips_jsonrpc() {
+        let notification = PluginNotificationEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            notification: ChannelEventNotification {
+                events: vec![InboundEventEnvelope {
+                    event_id: "evt-1".to_string(),
+                    platform: "signal".to_string(),
+                    event_type: "message.received".to_string(),
+                    received_at: "2026-04-12T00:00:00Z".to_string(),
+                    conversation: InboundConversationRef {
+                        id: "chat-1".to_string(),
+                        kind: "private".to_string(),
+                        thread_id: None,
+                        parent_message_id: None,
+                    },
+                    actor: InboundActor {
+                        id: "user-1".to_string(),
+                        display_name: Some("User".to_string()),
+                        username: None,
+                        is_bot: false,
+                        metadata: BTreeMap::new(),
+                    },
+                    message: InboundMessage {
+                        id: "msg-1".to_string(),
+                        content: "hello".to_string(),
+                        content_type: "text/plain".to_string(),
+                        reply_to_message_id: None,
+                        attachments: Vec::new(),
+                        metadata: BTreeMap::new(),
+                    },
+                    account_id: None,
+                    metadata: BTreeMap::new(),
+                }],
+                state: Some(IngressState {
+                    mode: IngressMode::Polling,
+                    status: "running".to_string(),
+                    endpoint: None,
+                    metadata: BTreeMap::from([("cursor".to_string(), "42".to_string())]),
+                }),
+                poll_after_ms: Some(250),
+            },
+        };
+
+        let json = notification_to_jsonrpc(&notification).unwrap();
+        let parsed = parse_jsonrpc_message(&json).unwrap();
+        assert_eq!(parsed, PluginMessage::Notification(notification));
     }
 
     #[test]

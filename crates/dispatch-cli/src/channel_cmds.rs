@@ -3,13 +3,17 @@ use atomic_write_file::AtomicWriteFile;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use dispatch_core::{
-    AttachmentSource, ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse,
-    DeliveryReceipt, InboundEventEnvelope, IngressCallbackReply, IngressMode, IngressPayload,
-    IngressState, OutboundAttachment, OutboundMessageEnvelope, build_channel_reply_envelope,
-    call_channel_plugin, channel_event_session_file, default_channel_registry_path,
+    AttachmentSource, ChannelEventNotification, ChannelPluginManifest, ChannelPluginRequest,
+    ChannelPluginResponse, DeliveryReceipt, InboundEventEnvelope, IngressCallbackReply,
+    IngressMode, IngressPayload, IngressState, OutboundAttachment, OutboundMessageEnvelope,
+    PersistentChannelPluginProcess, PluginNotificationEnvelope, build_channel_reply_envelope,
+    call_channel_plugin, call_persistent_channel_plugin, channel_event_session_file,
+    default_channel_registry_path, drain_pending_channel_notifications,
     extract_assistant_channel_reply, install_channel_plugin, list_channel_catalog,
-    match_channel_ingress_endpoint, render_inbound_event_chat_input, resolve_channel_plugin,
-    resolve_channel_plugin_for_ingress, verify_host_managed_ingress_trust,
+    match_channel_ingress_endpoint, recv_persistent_channel_notification,
+    render_inbound_event_chat_input, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
+    shutdown_persistent_channel_plugin, spawn_persistent_channel_plugin,
+    verify_host_managed_ingress_trust,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -20,15 +24,15 @@ use std::{
     io::{Read, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    thread,
     time::Duration,
 };
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 use url::form_urlencoded;
 
-const DEFAULT_CHANNEL_POLL_INTERVAL_MS: u64 = 1_000;
 const DISPATCH_MEDIA_ROUTE_PREFIX: &str = "/_dispatch/media/";
-const CHANNEL_POLL_STATE_DIR: &str = ".dispatch/channel-state";
+const CHANNEL_INGRESS_STATE_DIR: &str = ".dispatch/channel-state";
+const CHANNEL_RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_LISTEN_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct ChannelIngressArgs<'a> {
     name: Option<&'a str>,
@@ -100,6 +104,21 @@ struct ChannelParcelBridge {
     session_root: PathBuf,
     tool_approval: crate::CliToolApprovalMode,
     deliver_replies: bool,
+}
+
+struct ActiveChannelRuntimePlugin {
+    plugin: ChannelPluginManifest,
+    process: PersistentChannelPluginProcess,
+    ingress_state: Option<IngressState>,
+}
+
+struct ChannelRuntimeEventContext<'a> {
+    config: &'a Value,
+    ingress_state_path: &'a Path,
+    parcel_bridge: Option<&'a ChannelParcelBridge>,
+    staged_media: &'a ListenerStagedMedia,
+    emit_json: bool,
+    source: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -466,21 +485,32 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
         args.tool_approval,
         args.deliver_replies,
     )?;
+    let ingress_state_path =
+        default_channel_ingress_state_path(&args.label, &plugin.name, &args.config)?;
+    let restored_state = load_channel_ingress_state(&ingress_state_path)?;
+    let mut runtime = start_channel_runtime_plugin(&plugin, &args.config, restored_state)?;
+    if let Some(state) = &runtime.ingress_state {
+        save_channel_ingress_state(&ingress_state_path, state)?;
+    }
 
     match args.mode {
-        ChannelRuntimeMode::Poll { interval_ms } => {
+        ChannelRuntimeMode::Poll { .. } => {
             let staged_media = ListenerStagedMedia::from_config(&Value::Null);
-            let poll_state_path =
-                default_channel_poll_state_path(&args.label, &plugin.name, &args.config)?;
-            let persisted_state = load_channel_poll_state(&poll_state_path)?;
-            let mut ingress_state = Some(start_channel_listener_ingress(&plugin, &args.config)?);
+            let event_context = ChannelRuntimeEventContext {
+                config: &args.config,
+                ingress_state_path: &ingress_state_path,
+                parcel_bridge: parcel_bridge.as_ref(),
+                staged_media: &staged_media,
+                emit_json: args.emit_json,
+                source: "Poll",
+            };
             if !matches!(
-                ingress_state.as_ref().map(|state| &state.mode),
+                runtime.ingress_state.as_ref().map(|state| &state.mode),
                 Some(IngressMode::Polling)
             ) {
-                let stop_result =
-                    stop_channel_listener_ingress(&plugin, &args.config, ingress_state.clone());
-                let mode_name = ingress_state
+                let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
+                let mode_name = runtime
+                    .ingress_state
                     .as_ref()
                     .map(|state| format!("{:?}", state.mode))
                     .unwrap_or_else(|| "<unknown>".to_string());
@@ -495,11 +525,6 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                         .context(format!("also failed to stop ingress cleanly: {stop_error}"))),
                 };
             }
-            if let Some(state) = persisted_state
-                && matches!(state.mode, IngressMode::Polling)
-            {
-                ingress_state = Some(state);
-            }
 
             println!("Polling {}", plugin.name);
             if let Some(parcel_bridge) = &parcel_bridge {
@@ -513,99 +538,34 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
 
             let run_result = (|| -> Result<()> {
                 loop {
-                    let response = call_channel_plugin(
-                        &plugin,
-                        ChannelPluginRequest::PollIngress {
-                            config: args.config.clone(),
-                            state: ingress_state.clone(),
-                        },
+                    let Some(notification) = recv_persistent_channel_notification(
+                        &mut runtime.process,
+                        &runtime.plugin,
+                        None,
+                    )?
+                    else {
+                        bail!(
+                            "channel plugin `{}` closed its ingress notification stream",
+                            runtime.plugin.name
+                        );
+                    };
+
+                    let _handled = handle_channel_runtime_notification(
+                        &mut runtime,
+                        notification,
+                        &event_context,
                     )?;
-
-                    match response {
-                        ChannelPluginResponse::IngressEventsReceived {
-                            events,
-                            callback_reply,
-                            state,
-                            poll_after_ms,
-                        } => {
-                            if callback_reply.is_some() {
-                                bail!(
-                                    "channel plugin returned callback_reply for poll_ingress; callback replies are only valid for ingress_event webhook handling"
-                                );
-                            }
-                            if let Some(state) = state {
-                                save_channel_poll_state(&poll_state_path, &state)?;
-                                ingress_state = Some(state);
-                            }
-
-                            let parcel_runs = if let Some(parcel_bridge) = &parcel_bridge {
-                                execute_channel_parcel_runs(
-                                    &plugin,
-                                    parcel_bridge,
-                                    &staged_media,
-                                    &args.config,
-                                    &events,
-                                )?
-                            } else {
-                                Vec::new()
-                            };
-
-                            if args.emit_json {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string(&json!({
-                                        "plugin": plugin.name,
-                                        "events": events,
-                                        "parcel_runs": parcel_runs,
-                                        "state": ingress_state,
-                                        "poll_after_ms": poll_after_ms,
-                                    }))?
-                                );
-                            } else {
-                                println!("Poll {} -> {} event(s)", plugin.name, events.len());
-                                for parcel_run in &parcel_runs {
-                                    println!(
-                                        "Parcel {} -> {}",
-                                        parcel_run.event_id,
-                                        parcel_run.session_file.display()
-                                    );
-                                    if let Some(delivery) = &parcel_run.delivery {
-                                        println!(
-                                            "Delivered reply: {} -> {}",
-                                            delivery.message_id, delivery.conversation_id
-                                        );
-                                    }
-                                    if !parcel_run.output.is_empty() {
-                                        print!("{}", parcel_run.output);
-                                    }
-                                }
-                            }
-
-                            if args.once {
-                                break;
-                            }
-
-                            thread::sleep(Duration::from_millis(resolved_poll_delay_ms(
-                                interval_ms,
-                                poll_after_ms,
-                            )));
-                        }
-                        ChannelPluginResponse::Error { error } => bail!(
-                            "channel plugin error {} while polling ingress: {}",
-                            error.code,
-                            error.message
-                        ),
-                        other => bail!(
-                            "channel plugin returned unexpected response variant for poll_ingress: {}",
-                            response_kind(&other)
-                        ),
+                    let _handled_pending =
+                        process_pending_channel_notifications(&mut runtime, &event_context)?;
+                    if args.once {
+                        break;
                     }
                 }
 
                 Ok(())
             })();
 
-            let stop_result = stop_channel_listener_ingress(&plugin, &args.config, ingress_state);
+            let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
             match (run_result, stop_result) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(error), Ok(())) => Err(error),
@@ -618,15 +578,21 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
         }
         ChannelRuntimeMode::Listen { listen } => {
             let staged_media = ListenerStagedMedia::from_config(&args.config);
+            let event_context = ChannelRuntimeEventContext {
+                config: &args.config,
+                ingress_state_path: &ingress_state_path,
+                parcel_bridge: parcel_bridge.as_ref(),
+                staged_media: &staged_media,
+                emit_json: args.emit_json,
+                source: "Ingress",
+            };
             let server = Server::http(&listen)
                 .map_err(|error| anyhow::anyhow!("failed to bind {listen}: {error}"))?;
-            let mut ingress_state = Some(start_channel_listener_ingress(&plugin, &args.config)?);
             if matches!(
-                ingress_state.as_ref().map(|state| &state.mode),
+                runtime.ingress_state.as_ref().map(|state| &state.mode),
                 Some(IngressMode::Polling)
             ) {
-                let stop_result =
-                    stop_channel_listener_ingress(&plugin, &args.config, ingress_state.clone());
+                let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
                 let run_error = anyhow::anyhow!(
                     "channel plugin `{}` started ingress in polling mode; use poll bindings instead of listen bindings",
                     plugin.name
@@ -650,23 +616,35 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
 
             let run_result = (|| -> Result<()> {
                 loop {
-                    handle_channel_listener_connection(
-                        &plugin,
-                        &args.config,
-                        &mut ingress_state,
-                        server.recv().context("failed to accept connection")?,
-                        parcel_bridge.as_ref(),
-                        &staged_media,
-                        args.emit_json,
-                    )?;
-                    if args.once {
+                    let handled_notifications =
+                        process_pending_channel_notifications(&mut runtime, &event_context)?;
+                    if args.once && handled_notifications > 0 {
+                        break;
+                    }
+
+                    let Some(request) = server
+                        .recv_timeout(CHANNEL_LISTEN_RECV_TIMEOUT)
+                        .context("failed to accept connection")?
+                    else {
+                        continue;
+                    };
+
+                    let handled_request =
+                        handle_channel_listener_connection(&mut runtime, request, &event_context)?;
+                    if args.once && handled_request {
+                        break;
+                    }
+
+                    let handled_pending =
+                        process_pending_channel_notifications(&mut runtime, &event_context)?;
+                    if args.once && handled_pending > 0 {
                         break;
                     }
                 }
                 Ok(())
             })();
 
-            let stop_result = stop_channel_listener_ingress(&plugin, &args.config, ingress_state);
+            let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
             match (run_result, stop_result) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(error), Ok(())) => Err(error),
@@ -762,6 +740,9 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
                 println!("Metadata:");
                 println!("{}", serde_json::to_string_pretty(&status.metadata)?);
             }
+        }
+        ChannelPluginResponse::Ok => {
+            println!("OK");
         }
         ChannelPluginResponse::Error { error } => {
             bail!("{}: {}", error.code, error.message);
@@ -895,24 +876,14 @@ fn parse_key_value_pairs(entries: &[String], field_name: &str) -> Result<BTreeMa
     Ok(values)
 }
 
-fn resolved_poll_delay_ms(override_ms: Option<u64>, suggested_ms: Option<u64>) -> u64 {
-    override_ms
-        .or(suggested_ms)
-        .unwrap_or(DEFAULT_CHANNEL_POLL_INTERVAL_MS)
-        .max(1)
-}
-
 fn handle_channel_listener_connection(
-    plugin: &ChannelPluginManifest,
-    config: &Value,
-    ingress_state: &mut Option<IngressState>,
+    runtime: &mut ActiveChannelRuntimePlugin,
     mut request: Request,
-    parcel_bridge: Option<&ChannelParcelBridge>,
-    staged_media: &ListenerStagedMedia,
-    emit_json: bool,
-) -> Result<()> {
+    event_context: &ChannelRuntimeEventContext<'_>,
+) -> Result<bool> {
     if let Some(media_id) = staged_media_request_id(request.url()).map(str::to_string) {
-        return serve_staged_media_request(request, staged_media, &media_id);
+        serve_staged_media_request(request, event_context.staged_media, &media_id)?;
+        return Ok(false);
     }
 
     let remote_addr = request
@@ -922,46 +893,50 @@ fn handle_channel_listener_connection(
     let parsed = match parse_http_request(&mut request, 1024 * 1024) {
         Ok(request) => request,
         Err(error) => {
-            return respond_http_request(
+            respond_http_request(
                 request,
                 400,
                 Some("text/plain; charset=utf-8"),
                 &format!("invalid request: {error}\n"),
-            );
+            )?;
+            return Ok(true);
         }
     };
 
     let matched_endpoint =
-        match match_channel_ingress_endpoint(plugin, &parsed.method, &parsed.path) {
+        match match_channel_ingress_endpoint(&runtime.plugin, &parsed.method, &parsed.path) {
             Some(endpoint) => endpoint,
             None => {
-                return respond_http_request(
+                respond_http_request(
                     request,
                     404,
                     Some("text/plain; charset=utf-8"),
                     "request did not match an installed ingress endpoint\n",
-                );
+                )?;
+                return Ok(true);
             }
         };
-    let trust_verified = match verify_host_managed_ingress_trust(plugin, &parsed.headers) {
+    let trust_verified = match verify_host_managed_ingress_trust(&runtime.plugin, &parsed.headers) {
         Ok(verified) => verified,
         Err(error) => {
-            return respond_http_request(
+            respond_http_request(
                 request,
                 error.status_code,
                 Some("text/plain; charset=utf-8"),
                 &format!("{}\n", error.message),
-            );
+            )?;
+            return Ok(true);
         }
     };
 
-    let response = call_channel_plugin(
-        plugin,
+    let response = call_persistent_channel_plugin(
+        &mut runtime.process,
+        &runtime.plugin,
         ChannelPluginRequest::IngressEvent {
-            config: config.clone(),
-            state: ingress_state.clone(),
+            config: event_context.config.clone(),
+            state: runtime.ingress_state.clone(),
             payload: IngressPayload {
-                endpoint_id: Some(format!("{}:{}", plugin.name, matched_endpoint.path)),
+                endpoint_id: Some(format!("{}:{}", runtime.plugin.name, matched_endpoint.path)),
                 method: parsed.method.clone(),
                 path: parsed.path.clone(),
                 headers: parsed.headers.clone(),
@@ -972,6 +947,7 @@ fn handle_channel_listener_connection(
                 received_at: Some(Utc::now().to_rfc3339()),
             },
         },
+        CHANNEL_RUNTIME_REQUEST_TIMEOUT,
     );
 
     match response {
@@ -982,47 +958,19 @@ fn handle_channel_listener_connection(
             ..
         }) => {
             if let Some(state) = state {
-                *ingress_state = Some(state);
+                save_channel_ingress_state(event_context.ingress_state_path, &state)?;
+                runtime.ingress_state = Some(state);
             }
-            let parcel_runs = if let Some(parcel_bridge) = parcel_bridge {
-                execute_channel_parcel_runs(plugin, parcel_bridge, staged_media, config, &events)?
-            } else {
-                Vec::new()
-            };
-            if emit_json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "plugin": plugin.name,
-                        "events": events,
-                        "parcel_runs": parcel_runs,
-                    }))?
-                );
-            } else {
-                println!(
-                    "Ingress {} {} from {} -> {} event(s)",
-                    parsed.method,
-                    parsed.path,
-                    remote_addr,
-                    events.len()
-                );
-                for parcel_run in &parcel_runs {
-                    println!(
-                        "Parcel {} -> {}",
-                        parcel_run.event_id,
-                        parcel_run.session_file.display()
-                    );
-                    if let Some(delivery) = &parcel_run.delivery {
-                        println!(
-                            "Delivered reply: {} -> {}",
-                            delivery.message_id, delivery.conversation_id
-                        );
-                    }
-                    if !parcel_run.output.is_empty() {
-                        print!("{}", parcel_run.output);
-                    }
-                }
-            }
+            let _handled_events = emit_channel_runtime_events(
+                runtime,
+                event_context,
+                events,
+                None,
+                Some(format!(
+                    "Ingress {} {} from {}",
+                    parsed.method, parsed.path, remote_addr
+                )),
+            )?;
 
             let reply = callback_reply.unwrap_or(IngressCallbackReply {
                 status: 200,
@@ -1034,29 +982,39 @@ fn handle_channel_listener_connection(
                 reply.status,
                 reply.content_type.as_deref(),
                 &reply.body,
-            )
+            )?;
+            Ok(true)
         }
-        Ok(ChannelPluginResponse::Error { error }) => respond_http_request(
-            request,
-            502,
-            Some("text/plain; charset=utf-8"),
-            &format!("channel plugin error {}: {}\n", error.code, error.message),
-        ),
-        Ok(other) => respond_http_request(
-            request,
-            502,
-            Some("text/plain; charset=utf-8"),
-            &format!(
-                "channel plugin returned unexpected response variant for ingress: {:?}\n",
-                response_kind(&other)
-            ),
-        ),
-        Err(error) => respond_http_request(
-            request,
-            502,
-            Some("text/plain; charset=utf-8"),
-            &format!("failed to call channel plugin: {error}\n"),
-        ),
+        Ok(ChannelPluginResponse::Error { error }) => {
+            respond_http_request(
+                request,
+                502,
+                Some("text/plain; charset=utf-8"),
+                &format!("channel plugin error {}: {}\n", error.code, error.message),
+            )?;
+            Ok(true)
+        }
+        Ok(other) => {
+            respond_http_request(
+                request,
+                502,
+                Some("text/plain; charset=utf-8"),
+                &format!(
+                    "channel plugin returned unexpected response variant for ingress: {:?}\n",
+                    response_kind(&other)
+                ),
+            )?;
+            Ok(true)
+        }
+        Err(error) => {
+            respond_http_request(
+                request,
+                502,
+                Some("text/plain; charset=utf-8"),
+                &format!("failed to call channel plugin: {error}\n"),
+            )?;
+            Ok(true)
+        }
     }
 }
 
@@ -1104,18 +1062,27 @@ fn prepare_channel_parcel_bridge(
     }))
 }
 
-fn start_channel_listener_ingress(
+fn start_channel_runtime_plugin(
     plugin: &ChannelPluginManifest,
     config: &Value,
-) -> Result<IngressState> {
-    let response = call_channel_plugin(
+    restored_state: Option<IngressState>,
+) -> Result<ActiveChannelRuntimePlugin> {
+    let mut process = spawn_persistent_channel_plugin(plugin)?;
+    let response = call_persistent_channel_plugin(
+        &mut process,
         plugin,
         ChannelPluginRequest::StartIngress {
             config: config.clone(),
+            state: restored_state,
         },
+        CHANNEL_RUNTIME_REQUEST_TIMEOUT,
     )?;
     match response {
-        ChannelPluginResponse::IngressStarted { state } => Ok(state),
+        ChannelPluginResponse::IngressStarted { state } => Ok(ActiveChannelRuntimePlugin {
+            plugin: plugin.clone(),
+            process,
+            ingress_state: Some(state),
+        }),
         ChannelPluginResponse::Error { error } => bail!(
             "channel plugin error {} while starting ingress: {}",
             error.code,
@@ -1128,48 +1095,149 @@ fn start_channel_listener_ingress(
     }
 }
 
-fn stop_channel_listener_ingress(
-    plugin: &ChannelPluginManifest,
+fn stop_channel_runtime_plugin(
+    runtime: &mut ActiveChannelRuntimePlugin,
     config: &Value,
-    state: Option<IngressState>,
 ) -> Result<()> {
-    let response = call_channel_plugin(
-        plugin,
-        ChannelPluginRequest::StopIngress {
-            config: config.clone(),
-            state,
-        },
-    )?;
-    match response {
-        ChannelPluginResponse::IngressStopped { .. } => Ok(()),
-        ChannelPluginResponse::Error { error } => bail!(
-            "channel plugin error {} while stopping ingress: {}",
-            error.code,
-            error.message
-        ),
-        other => bail!(
-            "channel plugin returned unexpected response variant for stop_ingress: {}",
-            response_kind(&other)
-        ),
+    let stop_result = (|| -> Result<()> {
+        let response = call_persistent_channel_plugin(
+            &mut runtime.process,
+            &runtime.plugin,
+            ChannelPluginRequest::StopIngress {
+                config: config.clone(),
+                state: runtime.ingress_state.clone(),
+            },
+            CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+        )?;
+        match response {
+            ChannelPluginResponse::IngressStopped { state } => {
+                runtime.ingress_state = Some(state);
+                Ok(())
+            }
+            ChannelPluginResponse::Error { error } => bail!(
+                "channel plugin error {} while stopping ingress: {}",
+                error.code,
+                error.message
+            ),
+            other => bail!(
+                "channel plugin returned unexpected response variant for stop_ingress: {}",
+                response_kind(&other)
+            ),
+        }
+    })();
+    let shutdown_result = shutdown_persistent_channel_plugin(&mut runtime.process, &runtime.plugin);
+    match (stop_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(anyhow::anyhow!(error)),
+        (Err(stop_error), Err(shutdown_error)) => Err(stop_error.context(format!(
+            "also failed to shut down channel plugin cleanly: {shutdown_error}"
+        ))),
     }
 }
 
+fn process_pending_channel_notifications(
+    runtime: &mut ActiveChannelRuntimePlugin,
+    event_context: &ChannelRuntimeEventContext<'_>,
+) -> Result<usize> {
+    let mut handled_events = 0;
+    for notification in drain_pending_channel_notifications(&mut runtime.process) {
+        handled_events +=
+            handle_channel_runtime_notification(runtime, notification, event_context)?;
+    }
+    Ok(handled_events)
+}
+
+fn handle_channel_runtime_notification(
+    runtime: &mut ActiveChannelRuntimePlugin,
+    notification: PluginNotificationEnvelope<ChannelEventNotification>,
+    event_context: &ChannelRuntimeEventContext<'_>,
+) -> Result<usize> {
+    if let Some(state) = notification.notification.state {
+        save_channel_ingress_state(event_context.ingress_state_path, &state)?;
+        runtime.ingress_state = Some(state);
+    }
+    emit_channel_runtime_events(
+        runtime,
+        event_context,
+        notification.notification.events,
+        notification.notification.poll_after_ms,
+        Some(event_context.source.to_string()),
+    )
+}
+
+fn emit_channel_runtime_events(
+    runtime: &mut ActiveChannelRuntimePlugin,
+    event_context: &ChannelRuntimeEventContext<'_>,
+    events: Vec<InboundEventEnvelope>,
+    poll_after_ms: Option<u64>,
+    source: Option<String>,
+) -> Result<usize> {
+    let parcel_runs = execute_channel_parcel_runs(
+        runtime,
+        event_context.config,
+        event_context.parcel_bridge,
+        event_context.staged_media,
+        &events,
+    )?;
+    if event_context.emit_json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "plugin": runtime.plugin.name,
+                "events": events,
+                "parcel_runs": parcel_runs,
+                "state": runtime.ingress_state,
+                "poll_after_ms": poll_after_ms,
+            }))?
+        );
+    } else {
+        let label = source.unwrap_or_else(|| "Ingress".to_string());
+        println!(
+            "{label} {} -> {} event(s)",
+            runtime.plugin.name,
+            events.len()
+        );
+        for parcel_run in &parcel_runs {
+            println!(
+                "Parcel {} -> {}",
+                parcel_run.event_id,
+                parcel_run.session_file.display()
+            );
+            if let Some(delivery) = &parcel_run.delivery {
+                println!(
+                    "Delivered reply: {} -> {}",
+                    delivery.message_id, delivery.conversation_id
+                );
+            }
+            if !parcel_run.output.is_empty() {
+                print!("{}", parcel_run.output);
+            }
+        }
+    }
+    Ok(events.len())
+}
+
 fn execute_channel_parcel_runs(
-    plugin: &ChannelPluginManifest,
-    parcel_bridge: &ChannelParcelBridge,
-    staged_media: &ListenerStagedMedia,
+    runtime: &mut ActiveChannelRuntimePlugin,
     config: &Value,
+    parcel_bridge: Option<&ChannelParcelBridge>,
+    staged_media: &ListenerStagedMedia,
     events: &[InboundEventEnvelope],
 ) -> Result<Vec<ChannelParcelRunResult>> {
+    let Some(parcel_bridge) = parcel_bridge else {
+        return Ok(Vec::new());
+    };
+
     let mut results = Vec::with_capacity(events.len());
     for event in events {
         let session_file = channel_event_session_file(
             &parcel_bridge.session_root,
-            &plugin.name,
+            &runtime.plugin.name,
             &parcel_bridge.parcel_digest,
             event,
         );
-        let input = render_inbound_event_chat_input(&plugin.name, event)?;
+        let input = render_inbound_event_chat_input(&runtime.plugin.name, event)?;
         let response = crate::run::execute_chat_turn(
             parcel_bridge.parcel_path.clone(),
             parcel_bridge.courier.clone(),
@@ -1183,7 +1251,7 @@ fn execute_channel_parcel_runs(
         crate::run::print_courier_events(&mut output, &response.events)?;
         let delivery = if parcel_bridge.deliver_replies {
             if let Some(reply) = extract_assistant_channel_reply(&response.events) {
-                deliver_channel_reply(plugin, event, config, staged_media, reply)?
+                deliver_channel_reply(runtime, event, config, staged_media, reply)?
             } else {
                 None
             }
@@ -1201,22 +1269,24 @@ fn execute_channel_parcel_runs(
 }
 
 fn deliver_channel_reply(
-    plugin: &ChannelPluginManifest,
+    runtime: &mut ActiveChannelRuntimePlugin,
     event: &InboundEventEnvelope,
     config: &Value,
     staged_media: &ListenerStagedMedia,
     reply: OutboundMessageEnvelope,
 ) -> Result<Option<DeliveryReceipt>> {
-    let reply = rewrite_reply_attachments_for_channel(plugin, staged_media, reply)?;
+    let reply = rewrite_reply_attachments_for_channel(&runtime.plugin, staged_media, reply)?;
     let message = serde_json::to_value(build_channel_reply_envelope(event, reply))
         .context("failed to serialize channel reply envelope")?;
 
-    let response = call_channel_plugin(
-        plugin,
+    let response = call_persistent_channel_plugin(
+        &mut runtime.process,
+        &runtime.plugin,
         ChannelPluginRequest::Deliver {
             config: config.clone(),
             message,
         },
+        CHANNEL_RUNTIME_REQUEST_TIMEOUT,
     )?;
     match response {
         ChannelPluginResponse::Delivered { delivery } => Ok(Some(delivery)),
@@ -1438,6 +1508,7 @@ fn response_kind(response: &ChannelPluginResponse) -> &'static str {
         ChannelPluginResponse::Delivered { .. } => "delivered",
         ChannelPluginResponse::Pushed { .. } => "pushed",
         ChannelPluginResponse::StatusAccepted { .. } => "status_accepted",
+        ChannelPluginResponse::Ok => "ok",
         ChannelPluginResponse::Error { .. } => "error",
     }
 }
@@ -1522,7 +1593,7 @@ fn format_duration_literal(duration: Duration) -> String {
     format!("{}ms", duration.as_millis())
 }
 
-fn default_channel_poll_state_path(
+fn default_channel_ingress_state_path(
     label: &str,
     plugin_name: &str,
     config: &Value,
@@ -1534,7 +1605,7 @@ fn default_channel_poll_state_path(
     );
     let config_hash = hex_encode(config_hasher.finalize().as_slice());
     Ok(cwd
-        .join(CHANNEL_POLL_STATE_DIR)
+        .join(CHANNEL_INGRESS_STATE_DIR)
         .join(plugin_name)
         .join(format!(
             "{}-{}.json",
@@ -1558,7 +1629,7 @@ fn sanitize_path_component(value: &str) -> String {
     }
 }
 
-fn load_channel_poll_state(path: &Path) -> Result<Option<IngressState>> {
+fn load_channel_ingress_state(path: &Path) -> Result<Option<IngressState>> {
     let body = match fs::read_to_string(path) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1572,13 +1643,13 @@ fn load_channel_poll_state(path: &Path) -> Result<Option<IngressState>> {
     Ok(Some(state))
 }
 
-fn save_channel_poll_state(path: &Path, state: &IngressState) -> Result<()> {
+fn save_channel_ingress_state(path: &Path, state: &IngressState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let body =
-        serde_json::to_vec_pretty(state).context("failed to serialize channel poll state")?;
+        serde_json::to_vec_pretty(state).context("failed to serialize channel ingress state")?;
     let mut file = AtomicWriteFile::options()
         .open(path)
         .with_context(|| format!("failed to open {} for atomic write", path.display()))?;

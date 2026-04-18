@@ -223,7 +223,8 @@ fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::
     fs::write(
         &script_path,
         r#"#!/bin/sh
-read line
+set -eu
+while IFS= read -r line; do
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
@@ -233,14 +234,18 @@ case "$line" in
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"ingress_stopped","state":{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{}}}}'
         ;;
+    *'"method":"channel.shutdown"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"ok"}}'
+        break
+        ;;
     *'"method":"channel.ingress_event"'*)
         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}}'
         ;;
     *)
         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}'
-        exit 1
         ;;
 esac
+done
 "#,
     )?;
     #[cfg(unix)]
@@ -297,7 +302,8 @@ fn write_lifecycle_channel_test_plugin(
         &script_path,
         format!(
             r#"#!/bin/sh
-read line
+set -eu
+while IFS= read -r line; do
 printf '%s\n' "$line" >> "{}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
@@ -308,6 +314,10 @@ case "$line" in
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{"phase":"stop"}}}}}}}}'
         ;;
+    *'"method":"channel.shutdown"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ok"}}}}'
+        break
+        ;;
     *'"method":"channel.ingress_event"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
         ;;
@@ -315,6 +325,7 @@ case "$line" in
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
         ;;
 esac
+done
 "#,
             log_path.display()
         ),
@@ -370,24 +381,28 @@ fn write_polling_channel_test_plugin(
         &script_path,
         format!(
             r#"#!/bin/sh
-read line
+set -eu
+while IFS= read -r line; do
 printf '%s\n' "$line" >> "{}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
     *'"method":"channel.start_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}'
-        ;;
-    *'"method":"channel.poll_ingress"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
+        printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
         ;;
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}'
+        ;;
+    *'"method":"channel.shutdown"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ok"}}}}'
+        break
         ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
         ;;
 esac
+done
 "#,
             log_path.display()
         ),
@@ -443,19 +458,19 @@ fn write_stateful_polling_channel_test_plugin(
         &script_path,
         format!(
             r#"#!/bin/sh
-read line
+set -eu
+while IFS= read -r line; do
 printf '%s\n' "$line" >> "{}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
+    *'"method":"channel.start_ingress"'*'"cursor":"1"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}}}}}}'
+        printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}'
+        ;;
     *'"method":"channel.start_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}'
-        ;;
-    *'"method":"channel.poll_ingress"'*'"cursor":"1"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}'
-        ;;
-    *'"method":"channel.poll_ingress"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
+        printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
         ;;
     *'"method":"channel.stop_ingress"'*'"cursor":"2"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"2"}}}}}}}}'
@@ -463,10 +478,15 @@ case "$line" in
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}'
         ;;
+    *'"method":"channel.shutdown"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ok"}}}}'
+        break
+        ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
         ;;
 esac
+done
 "#,
             log_path.display()
         ),
@@ -522,7 +542,8 @@ fn write_logging_channel_test_plugin(
         &script_path,
         format!(
             r#"#!/bin/sh
-read line
+set -eu
+while IFS= read -r line; do
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
@@ -532,15 +553,19 @@ case "$line" in
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{}}}}}}}}'
         ;;
+    *'"method":"channel.shutdown"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ok"}}}}'
+        break
+        ;;
     *'"method":"channel.ingress_event"'*)
         printf '%s\n' "$line" > "{}"
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
         ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
-        exit 1
         ;;
 esac
+done
 "#,
             log_path.display()
         ),
@@ -597,7 +622,8 @@ fn write_trusted_channel_test_plugin(
         &script_path,
         format!(
             r#"#!/bin/sh
-read line
+set -eu
+while IFS= read -r line; do
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
@@ -607,15 +633,19 @@ case "$line" in
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{}}}}}}}}'
         ;;
+    *'"method":"channel.shutdown"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ok"}}}}'
+        break
+        ;;
     *'"method":"channel.ingress_event"'*)
         echo invoked >> "{}"
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
         ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
-        exit 1
         ;;
 esac
+done
 "#,
             log_path.display()
         ),
@@ -898,13 +928,16 @@ fn write_reply_channel_test_plugin(
         concat!(
             "#!/bin/sh\n",
             "set -eu\n",
-            "read line\n",
+            "while IFS= read -r line; do\n",
             "request_id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
             "[ -n \"$request_id\" ] || request_id=1\n",
             "if printf '%s' \"$line\" | grep -q '\"method\":\"channel.start_ingress\"'; then\n",
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ingress_started\\\",\\\"state\\\":{\\\"mode\\\":\\\"webhook\\\",\\\"status\\\":\\\"registered\\\",\\\"endpoint\\\":\\\"https://example.test/hook\\\",\\\"metadata\\\":{}}}}\"\n",
             "elif printf '%s' \"$line\" | grep -q '\"method\":\"channel.stop_ingress\"'; then\n",
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ingress_stopped\\\",\\\"state\\\":{\\\"mode\\\":\\\"webhook\\\",\\\"status\\\":\\\"stopped\\\",\\\"endpoint\\\":\\\"https://example.test/hook\\\",\\\"metadata\\\":{}}}}\"\n",
+            "elif printf '%s' \"$line\" | grep -q '\"method\":\"channel.shutdown\"'; then\n",
+            "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ok\\\"}}\"\n",
+            "  break\n",
             "elif printf '%s' \"$line\" | grep -q '\"method\":\"channel.ingress_event\"'; then\n",
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ingress_events_received\\\",\\\"events\\\":[{\\\"event_id\\\":\\\"evt-1\\\",\\\"platform\\\":\\\"webhook\\\",\\\"event_type\\\":\\\"message\\\",\\\"received_at\\\":\\\"2026-04-12T00:00:00Z\\\",\\\"conversation\\\":{\\\"id\\\":\\\"conv-1\\\",\\\"kind\\\":\\\"private\\\",\\\"thread_id\\\":\\\"thread-1\\\"},\\\"actor\\\":{\\\"id\\\":\\\"user-1\\\",\\\"is_bot\\\":false,\\\"metadata\\\":{}},\\\"message\\\":{\\\"id\\\":\\\"msg-1\\\",\\\"content\\\":\\\"hello\\\",\\\"content_type\\\":\\\"text/plain\\\",\\\"attachments\\\":[],\\\"metadata\\\":{}},\\\"metadata\\\":{}}],\\\"callback_reply\\\":{\\\"status\\\":200,\\\"content_type\\\":\\\"text/plain; charset=utf-8\\\",\\\"body\\\":\\\"ok\\\\n\\\"}}}\"\n",
             "elif printf '%s' \"$line\" | grep -q '\"method\":\"channel.deliver\"'; then\n",
@@ -912,8 +945,8 @@ fn write_reply_channel_test_plugin(
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"delivered\\\",\\\"delivery\\\":{\\\"message_id\\\":\\\"delivery-1\\\",\\\"conversation_id\\\":\\\"conv-1\\\",\\\"metadata\\\":{\\\"delivered_by\\\":\\\"test\\\"}}}}\"\n",
             "else\n",
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"error\\\":{\\\"code\\\":-32000,\\\"message\\\":\\\"unhandled request\\\",\\\"data\\\":{\\\"dispatch_error\\\":{\\\"code\\\":\\\"unexpected_request\\\",\\\"message\\\":\\\"unhandled request\\\"}}}}\"\n",
-            "  exit 1\n",
-            "fi\n"
+            "fi\n",
+            "done\n"
         )
         .replace("__DELIVERY_LOG__", &log_path.display().to_string()),
     )?;
@@ -1611,17 +1644,19 @@ fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::erro
     let request_lines = logged_requests.lines().collect::<Vec<_>>();
     assert_eq!(
         request_lines.len(),
-        3,
+        4,
         "unexpected lifecycle log:\n{logged_requests}"
     );
 
     let start_request = decode_logged_channel_request(request_lines[0])?;
     let ingress_request = decode_logged_channel_request(request_lines[1])?;
     let stop_request = decode_logged_channel_request(request_lines[2])?;
+    let shutdown_request = decode_logged_channel_request(request_lines[3])?;
 
     assert_eq!(start_request["request"]["kind"], "start_ingress");
     assert_eq!(ingress_request["request"]["kind"], "ingress_event");
     assert_eq!(stop_request["request"]["kind"], "stop_ingress");
+    assert_eq!(shutdown_request["request"]["kind"], "shutdown");
     assert_eq!(stop_request["request"]["state"]["status"], "registered");
     assert_eq!(
         stop_request["request"]["state"]["endpoint"],
@@ -1696,13 +1731,13 @@ fn channel_poll_calls_start_poll_and_stop_ingress() -> Result<(), Box<dyn std::e
     );
 
     let start_request = decode_logged_channel_request(request_lines[0])?;
-    let poll_request = decode_logged_channel_request(request_lines[1])?;
-    let stop_request = decode_logged_channel_request(request_lines[2])?;
+    let stop_request = decode_logged_channel_request(request_lines[1])?;
+    let shutdown_request = decode_logged_channel_request(request_lines[2])?;
 
     assert_eq!(start_request["request"]["kind"], "start_ingress");
-    assert_eq!(poll_request["request"]["kind"], "poll_ingress");
     assert_eq!(stop_request["request"]["kind"], "stop_ingress");
-    assert_eq!(poll_request["request"]["state"]["metadata"]["cursor"], "0");
+    assert_eq!(shutdown_request["request"]["kind"], "shutdown");
+    assert_eq!(start_request["request"]["state"], Value::Null);
     assert_eq!(stop_request["request"]["state"]["metadata"]["cursor"], "1");
 
     Ok(())
@@ -1800,14 +1835,11 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
         "unexpected stateful poll log:\n{logged_requests}"
     );
 
-    let first_poll_request = decode_logged_channel_request(request_lines[1])?;
-    let second_poll_request = decode_logged_channel_request(request_lines[4])?;
+    let first_start_request = decode_logged_channel_request(request_lines[0])?;
+    let second_start_request = decode_logged_channel_request(request_lines[3])?;
+    assert_eq!(first_start_request["request"]["state"], Value::Null);
     assert_eq!(
-        first_poll_request["request"]["state"]["metadata"]["cursor"],
-        "0"
-    );
-    assert_eq!(
-        second_poll_request["request"]["state"]["metadata"]["cursor"],
+        second_start_request["request"]["state"]["metadata"]["cursor"],
         "1"
     );
 
@@ -1890,14 +1922,16 @@ fn channel_listen_rejects_polling_plugins_and_stops_ingress()
     let request_lines = logged_requests.lines().collect::<Vec<_>>();
     assert_eq!(
         request_lines.len(),
-        2,
+        3,
         "unexpected poll log:\n{logged_requests}"
     );
 
     let start_request = decode_logged_channel_request(request_lines[0])?;
     let stop_request = decode_logged_channel_request(request_lines[1])?;
+    let shutdown_request = decode_logged_channel_request(request_lines[2])?;
     assert_eq!(start_request["request"]["kind"], "start_ingress");
     assert_eq!(stop_request["request"]["kind"], "stop_ingress");
+    assert_eq!(shutdown_request["request"]["kind"], "shutdown");
 
     Ok(())
 }

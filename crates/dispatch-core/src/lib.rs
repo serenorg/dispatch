@@ -30,12 +30,15 @@ pub use catalog::{
     find_cached_entry, load_cached_catalog, refresh_catalog, search_cached, write_cache,
 };
 pub use channel_plugin_protocol::{
-    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPluginRequest,
-    ChannelPluginRequestEnvelope, ChannelPluginResponse, ChannelPolicy, ConfiguredChannel,
-    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
-    IngressState, OutboundAttachment, OutboundMessageEnvelope, PluginRequestId,
-    RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
+    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities,
+    ChannelEventNotification, ChannelPluginRequest, ChannelPluginRequestEnvelope,
+    ChannelPluginResponse, ChannelPolicy, ConfiguredChannel, DeliveryReceipt, HealthReport,
+    InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
+    IngressCallbackReply, IngressMode, IngressPayload, IngressState, OutboundAttachment,
+    OutboundMessageEnvelope, PluginMessage as ChannelPluginMessage, PluginNotificationEnvelope,
+    PluginRequestId, RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind,
+    ThreadingModel, notification_to_jsonrpc as channel_notification_to_jsonrpc,
+    parse_jsonrpc_message as parse_channel_jsonrpc_message,
     parse_jsonrpc_request as parse_channel_jsonrpc_request,
     parse_jsonrpc_response as parse_channel_jsonrpc_response,
     request_to_jsonrpc as channel_request_to_jsonrpc,
@@ -44,12 +47,15 @@ pub use channel_plugin_protocol::{
 pub use channel_plugins::{
     ChannelCatalogEntry, ChannelIngressEndpoint, ChannelIngressTrust, ChannelIngressTrustFailure,
     ChannelPluginCallError, ChannelPluginExec, ChannelPluginIngress, ChannelPluginManifest,
-    ChannelPluginRegistry, build_channel_reply_envelope, build_channel_reply_message,
-    call_channel_plugin, channel_event_session_file, default_channel_registry_path,
+    ChannelPluginRegistry, PersistentChannelPluginProcess, build_channel_reply_envelope,
+    build_channel_reply_message, call_channel_plugin, call_persistent_channel_plugin,
+    channel_event_session_file, default_channel_registry_path, drain_pending_channel_notifications,
     extract_assistant_channel_reply, extract_assistant_reply, install_channel_plugin,
     list_channel_catalog, load_channel_registry, match_channel_ingress_endpoint,
-    render_inbound_event_chat_input, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
-    validate_channel_plugin_manifest, verify_host_managed_ingress_trust,
+    recv_persistent_channel_notification, render_inbound_event_chat_input, resolve_channel_plugin,
+    resolve_channel_plugin_for_ingress, shutdown_persistent_channel_plugin,
+    spawn_persistent_channel_plugin, validate_channel_plugin_manifest,
+    verify_host_managed_ingress_trust,
 };
 // Keep the crate root focused on the primary parcel/courier entrypoints.
 // Lower-level courier modeling types remain available under `dispatch_core::courier`.

@@ -67,24 +67,29 @@ A channel plugin implements:
 - `capabilities` - declare platform, ingress modes, threading model
 - `configure` - validate credentials and report channel metadata
 - `health` - verify connectivity and account identity
-- `start_ingress` / `stop_ingress` - register/deregister webhook endpoints
+- `start_ingress` / `stop_ingress` - begin/end an ingress session
 - `ingress_event` - parse a raw webhook payload into normalized events
-- `poll_ingress` - fetch inbound events for polling transports
 - `deliver` - send a reply to an existing conversation
 - `push` - send a proactive message (broadcast, alert, scheduled)
 - `status` - relay agent progress to the conversation (typing indicators, etc.)
+- `shutdown` - allow the host to terminate a persistent ingress process cleanly
 
 Examples: Telegram, Discord, Slack, WhatsApp, Signal, Twilio SMS, generic
 webhooks.
 
 Channel plugins vary by platform, but the protocol covers the full inbound and
 outbound lifecycle: configuration, health, ingress setup, webhook forwarding or
-polling, delivery, push, and status frames.
+background receive loops, delivery, push, and status frames.
 
-Dispatch treats `poll_ingress` as a host-facing polling contract, not as a
-statement about the upstream transport. A polling channel plugin may fetch
-events with repeated HTTP requests, or it may open an upstream websocket and
-return the next normalized event when the host polls it.
+Dispatch keeps channel plugins alive as persistent subprocesses while a listener
+or poller is active. The host still speaks JSON-RPC 2.0 messages over JSONL
+stdio, but inbound channel activity is delivered back to the host as
+`channel.event` notifications rather than one-shot `poll_ingress` responses.
+
+That separation is intentional. Dispatch controls the plugin lifecycle and the
+stdio framing; the plugin is free to translate that into whatever upstream
+transport best matches the platform, including repeated HTTP polling, upstream
+websockets, or daemon-backed local IPC.
 
 ### Connector bundles
 
@@ -131,21 +136,21 @@ attachments without depending on the parcel reply bridge conventions.
 commands. They are useful for development, testing, and direct operator
 control, but they are not the canonical authored configuration surface for
 project-specific channel wiring.
-For polling channels, Dispatch persists the latest plugin-reported ingress
+For polling-style channels, Dispatch persists the latest plugin-reported ingress
 state under `.dispatch/channel-state/` in the current working directory so
 repeated `dispatch channel poll --once` runs resume from the last source
 cursor instead of replaying old events. Delete that directory (or the
 specific `<plugin>/<label>-<hash>.json` file) to reset the cursor and
 reprocess events on the next poll.
 
-Common polling patterns:
+Common ingress patterns:
 
-- Telegram polling uses the Bot API `getUpdates` HTTP flow.
+- Telegram polling uses the Bot API `getUpdates` HTTP flow inside the plugin.
 - Signal polling uses either upstream HTTP receive (`native` / `normal`) or
   websocket-backed receive (`json-rpc`) inside the plugin.
 - Slack polling uses Socket Mode: the plugin opens Slack's websocket via
-  `apps.connections.open`, acknowledges each `envelope_id`, and returns the
-  normalized event through `poll_ingress`.
+  `apps.connections.open`, acknowledges each `envelope_id`, and emits
+  normalized ingress notifications to the host.
 
 `dispatch up` is the project-level runtime binding command. It reads
 `dispatch.toml`, reconciles declared extension manifests into project-local
@@ -329,8 +334,8 @@ the manifest transport defines how those messages are carried between host and
 plugin.
 
 Dispatch does not currently use JSON-RPC batch requests for channel plugins.
-The host sends one request at a time and expects one terminal response whose
-`id` matches the request.
+The host keeps at most one request in flight per plugin stream and expects each
+terminal response `id` to match the active request.
 
 ### Request types
 
@@ -339,13 +344,13 @@ The host sends one request at a time and expects one terminal response whose
 | `capabilities` | (none) | Query plugin features |
 | `configure` | `config` | Validate config, report metadata |
 | `health` | `config` | Verify credentials and connectivity |
-| `start_ingress` | `config` | Register webhook / begin listening |
+| `start_ingress` | `config`, `state?` | Start or resume an ingress session |
 | `stop_ingress` | `config`, `state?` | Deregister webhook / stop listening |
-| `ingress_event` | `config`, `payload` | Parse a raw webhook into events |
-| `poll_ingress` | `config`, `state?` | Fetch inbound events for polling ingress |
+| `ingress_event` | `config`, `state?`, `payload` | Parse a raw webhook into events |
 | `deliver` | `config`, `message` | Send reply to existing conversation |
 | `push` | `config`, `message` | Send proactive/broadcast message |
 | `status` | `config`, `update` | Relay agent progress to channel |
+| `shutdown` | (none) | Request clean process shutdown |
 
 `deliver` and `push` share the same outbound message shape:
 
@@ -389,9 +394,21 @@ These are the typed response payloads carried in JSON-RPC success responses:
 | `delivered` | `delivery` | Delivery receipt |
 | `pushed` | `delivery` | Push delivery receipt |
 | `status_accepted` | `status` | Status acknowledgment |
+| `ok` | (none) | Generic success for shutdown/ack-only operations |
 
-Channel plugins do not currently use JSON-RPC notifications. Every host call
-expects exactly one terminal JSON-RPC response.
+### Notification types
+
+Channel plugins may emit JSON-RPC notifications between requests while an
+ingress session is active:
+
+| Method | Params | Purpose |
+|---|---|---|
+| `channel.event` | `protocol_version`, `events`, `state?`, `poll_after_ms?` | Deliver normalized inbound events from a persistent ingress session |
+
+Dispatch does not currently use JSON-RPC batch requests for channel plugins,
+and the host never pipelines multiple concurrent requests into the same plugin
+process. Notifications are therefore the only async message shape on the
+channel side of the protocol.
 
 ### Ingress event flow
 
@@ -408,25 +425,28 @@ Installed channel manifests may also retain ingress endpoint declarations so
 the host can match a request path and method before forwarding the payload to
 the plugin.
 
-When using `dispatch channel listen`, the host also sends `start_ingress`
-before entering the HTTP serve loop and sends `stop_ingress` with the last
-reported ingress state when the listener exits cleanly.
+When using `dispatch channel listen`, the host sends `start_ingress` before
+entering the HTTP serve loop, forwards webhook payloads through `ingress_event`
+requests, and finally sends `stop_ingress` followed by `shutdown` when the
+listener exits cleanly.
 
-Polling channels use a similar lifecycle:
+For polling-style bindings, the host sends `start_ingress` with the last saved
+opaque state (if any), then waits for `channel.event` notifications from the
+plugin. Each notification carries:
 
-1. Host sends `start_ingress`
-2. Plugin responds with `state.mode = "polling"` and any opaque cursor state
-3. Host loops on `poll_ingress { state? }`
-4. Plugin responds with `events`, updated `state`, and optional `poll_after_ms`
-5. Host sends `stop_ingress` with the last state when polling stops
+- `events` - zero or more normalized inbound events
+- `state?` - updated opaque ingress state such as cursors
+- `poll_after_ms?` - plugin-provided advisory pacing metadata
 
-For CLI-driven polling, the host also checkpoints the latest polling state on
-disk between runs. This lets repeated `dispatch channel poll --once` calls
-resume from the last plugin cursor rather than re-fetching previously handled
+The host checkpoints `state` between runs. This lets repeated
+`dispatch channel poll --once` invocations resume from the last plugin cursor
+without replaying old events. For CLI-driven `--once` polling, Dispatch exits
+after the first ingress notification cycle, whether or not that cycle carried
 events.
 
 `callback_reply` is only valid for webhook `ingress_event` handling. Polling
-responses should leave it unset.
+notifications should leave it unset because they are not a direct HTTP callback
+path.
 
 ### Parcel reply bridge
 
@@ -535,7 +555,7 @@ Official extensions live in a separate repository:
 ```
 dispatch-plugins/
   channels/
-    proto/          # Shared protocol crate (channel-proto)
+    schema/         # Shared manifest and catalog schema crate
     telegram/       # channel-telegram
     discord/        # channel-discord
     slack/          # channel-slack
