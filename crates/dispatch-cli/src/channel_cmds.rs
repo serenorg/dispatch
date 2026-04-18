@@ -620,13 +620,13 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
             let staged_media = ListenerStagedMedia::from_config(&args.config);
             let server = Server::http(&listen)
                 .map_err(|error| anyhow::anyhow!("failed to bind {listen}: {error}"))?;
-            let ingress_state = start_channel_listener_ingress(&plugin, &args.config)?;
-            if matches!(ingress_state.mode, IngressMode::Polling) {
-                let stop_result = stop_channel_listener_ingress(
-                    &plugin,
-                    &args.config,
-                    Some(ingress_state.clone()),
-                );
+            let mut ingress_state = Some(start_channel_listener_ingress(&plugin, &args.config)?);
+            if matches!(
+                ingress_state.as_ref().map(|state| &state.mode),
+                Some(IngressMode::Polling)
+            ) {
+                let stop_result =
+                    stop_channel_listener_ingress(&plugin, &args.config, ingress_state.clone());
                 let run_error = anyhow::anyhow!(
                     "channel plugin `{}` started ingress in polling mode; use poll bindings instead of listen bindings",
                     plugin.name
@@ -653,6 +653,7 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                     handle_channel_listener_connection(
                         &plugin,
                         &args.config,
+                        &mut ingress_state,
                         server.recv().context("failed to accept connection")?,
                         parcel_bridge.as_ref(),
                         &staged_media,
@@ -665,8 +666,7 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                 Ok(())
             })();
 
-            let stop_result =
-                stop_channel_listener_ingress(&plugin, &args.config, Some(ingress_state));
+            let stop_result = stop_channel_listener_ingress(&plugin, &args.config, ingress_state);
             match (run_result, stop_result) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(error), Ok(())) => Err(error),
@@ -855,6 +855,7 @@ fn build_ingress_request(parts: IngressRequestParts<'_>) -> Result<ChannelPlugin
 
     Ok(ChannelPluginRequest::IngressEvent {
         config: parts.config,
+        state: None,
         payload: IngressPayload {
             endpoint_id: parts.endpoint_id,
             method: parts.method.to_string(),
@@ -904,6 +905,7 @@ fn resolved_poll_delay_ms(override_ms: Option<u64>, suggested_ms: Option<u64>) -
 fn handle_channel_listener_connection(
     plugin: &ChannelPluginManifest,
     config: &Value,
+    ingress_state: &mut Option<IngressState>,
     mut request: Request,
     parcel_bridge: Option<&ChannelParcelBridge>,
     staged_media: &ListenerStagedMedia,
@@ -957,6 +959,7 @@ fn handle_channel_listener_connection(
         plugin,
         ChannelPluginRequest::IngressEvent {
             config: config.clone(),
+            state: ingress_state.clone(),
             payload: IngressPayload {
                 endpoint_id: Some(format!("{}:{}", plugin.name, matched_endpoint.path)),
                 method: parsed.method.clone(),
@@ -975,8 +978,12 @@ fn handle_channel_listener_connection(
         Ok(ChannelPluginResponse::IngressEventsReceived {
             events,
             callback_reply,
+            state,
             ..
         }) => {
+            if let Some(state) = state {
+                *ingress_state = Some(state);
+            }
             let parcel_runs = if let Some(parcel_bridge) = parcel_bridge {
                 execute_channel_parcel_runs(plugin, parcel_bridge, staged_media, config, &events)?
             } else {
@@ -1645,10 +1652,16 @@ mod tests {
         })
         .expect("build ingress request");
 
-        let ChannelPluginRequest::IngressEvent { config, payload } = request else {
+        let ChannelPluginRequest::IngressEvent {
+            config,
+            state,
+            payload,
+        } = request
+        else {
             panic!("expected ingress request");
         };
         assert_eq!(config, json!({}));
+        assert_eq!(state, None);
         assert_eq!(payload.method, "POST");
         assert_eq!(payload.path, "/hook");
         assert_eq!(payload.body, "");

@@ -69,6 +69,8 @@ pub enum PluginRequest<C, M> {
     },
     IngressEvent {
         config: C,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<IngressState>,
         payload: IngressPayload,
     },
     Deliver {
@@ -503,6 +505,12 @@ mod tests {
             protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             request: PluginRequest::IngressEvent {
                 config: serde_json::json!({ "channel": "twilio_sms" }),
+                state: Some(IngressState {
+                    mode: IngressMode::Webhook,
+                    status: "running".to_string(),
+                    endpoint: Some("/twilio/sms".to_string()),
+                    metadata: BTreeMap::from([("cursor".to_string(), "41".to_string())]),
+                }),
                 payload: IngressPayload {
                     endpoint_id: Some("channel-twilio-sms:/twilio/sms".to_string()),
                     method: "POST".to_string(),
@@ -544,9 +552,10 @@ mod tests {
         });
 
         let parsed: JsonEnvelope = serde_json::from_value(json).unwrap();
-        let PluginRequest::IngressEvent { payload, .. } = parsed.request else {
+        let PluginRequest::IngressEvent { state, payload, .. } = parsed.request else {
             panic!("expected ingress_event request");
         };
+        assert_eq!(state, None);
         assert_eq!(payload.raw_query, None);
     }
 
