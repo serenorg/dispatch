@@ -89,9 +89,13 @@ Minimum expectations:
 - local tool enumeration should emit `LocalToolsListed`
 - couriers that fall back from one execution path to another should surface that as an explicit event when possible
 
-Dispatch currently returns a bounded batch of ordered events per turn. A future courier protocol may stream them incrementally, but the event ordering guarantees should remain stable.
+Dispatch currently preserves event ordering and, for external courier plugins,
+streams courier events incrementally as JSON-RPC 2.0 notifications framed as
+line-delimited JSON on stdio. The terminal `done` result for a `run()` call is
+returned as the final JSON-RPC success response for that request.
 
-For external JSONL courier plugins, Dispatch keeps one long-lived subprocess per open session and sends subsequent `run` requests over the same stdio stream.
+For external courier plugins, Dispatch keeps one long-lived subprocess per open
+session and sends subsequent `run` requests over the same stdio stream.
 
 ## Inspection Rules
 

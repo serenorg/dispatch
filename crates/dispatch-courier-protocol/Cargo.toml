@@ -11,5 +11,6 @@ categories = ["development-tools"]
 
 [dependencies]
 dispatch-channel-protocol = { path = "../dispatch-channel-protocol" }
+dispatch-plugin-rpc = { path = "../dispatch-plugin-rpc" }
 serde.workspace = true
 serde_json.workspace = true

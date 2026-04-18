@@ -1,15 +1,14 @@
 [package]
-name = "dispatch-channel-protocol"
+name = "dispatch-plugin-rpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared channel plugin wire protocol for Dispatch."
+description = "Shared JSON-RPC 2.0 envelope types for Dispatch plugin protocols."
 readme = "../../README.md"
-keywords = ["agents", "channel", "plugin", "protocol", "dispatch"]
+keywords = ["agents", "json-rpc", "plugin", "protocol", "dispatch"]
 categories = ["development-tools"]
 
 [dependencies]
-dispatch-plugin-rpc = { path = "../dispatch-plugin-rpc" }
 serde.workspace = true
 serde_json.workspace = true

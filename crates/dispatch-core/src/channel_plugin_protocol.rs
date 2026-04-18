@@ -3,9 +3,10 @@ pub use dispatch_channel_protocol::{
     ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor, InboundAttachment,
     InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
     IngressMode, IngressPayload, IngressState, OutboundAttachment, OutboundMessageEnvelope,
-    PluginErrorPayload, PluginRequest, PluginRequestEnvelope, PluginResponse, RuntimeStateSnapshot,
-    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, parse_tagged_channel_reply,
-    plugin_error,
+    PluginErrorPayload, PluginRequest, PluginRequestEnvelope, PluginRequestId, PluginResponse,
+    RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
+    parse_jsonrpc_request, parse_jsonrpc_response, parse_tagged_channel_reply, plugin_error,
+    request_method, request_to_jsonrpc, response_to_jsonrpc,
 };
 use serde_json::Value;
 

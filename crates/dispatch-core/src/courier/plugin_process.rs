@@ -2,7 +2,10 @@ use super::{
     BufReader, Child, ChildStdout, CourierError, CourierEvent, CourierSession, LoadedParcel,
     PersistentPluginProcess,
 };
-use crate::plugin_protocol::{PluginRequest, PluginRequestEnvelope, PluginResponse};
+use crate::plugin_protocol::{
+    PluginRequest, PluginRequestEnvelope, PluginRequestId, PluginResponse, parse_jsonrpc_message,
+    request_to_jsonrpc,
+};
 use std::{io::Write as _, sync::mpsc, time::Duration};
 
 pub(super) fn write_plugin_request(
@@ -19,7 +22,13 @@ pub(super) fn write_plugin_request(
             courier: courier_name.to_string(),
             message: "plugin stdin was not captured".to_string(),
         })?;
-    write_plugin_request_to(stdin, courier_name, protocol_version, request)?;
+    write_plugin_request_to(
+        stdin,
+        courier_name,
+        PluginRequestId::Integer(1),
+        protocol_version,
+        request,
+    )?;
     if close_stdin {
         let _ = child.stdin.take();
     }
@@ -29,19 +38,26 @@ pub(super) fn write_plugin_request(
 pub(super) fn write_plugin_request_to<W: std::io::Write>(
     mut writer: W,
     courier_name: &str,
+    request_id: PluginRequestId,
     protocol_version: u32,
     request: PluginRequest,
 ) -> Result<(), CourierError> {
-    serde_json::to_writer(
-        &mut writer,
+    let rpc_request = request_to_jsonrpc(
+        request_id,
         &PluginRequestEnvelope {
             protocol_version,
             request,
         },
     )
-    .map_err(|source| CourierError::PluginProtocol {
+    .map_err(|message| CourierError::PluginProtocol {
         courier: courier_name.to_string(),
-        message: format!("failed to serialize plugin request: {source}"),
+        message,
+    })?;
+    serde_json::to_writer(&mut writer, &rpc_request).map_err(|source| {
+        CourierError::PluginProtocol {
+            courier: courier_name.to_string(),
+            message: format!("failed to serialize plugin request: {source}"),
+        }
     })?;
     writer
         .write_all(b"\n")
@@ -65,7 +81,15 @@ impl PersistentPluginProcess {
         courier_name: &str,
         request: PluginRequest,
     ) -> Result<(), CourierError> {
-        write_plugin_request_to(&mut self.stdin, courier_name, protocol_version, request)
+        let request_id = PluginRequestId::Integer(self.next_request_id);
+        self.next_request_id += 1;
+        write_plugin_request_to(
+            &mut self.stdin,
+            courier_name,
+            request_id,
+            protocol_version,
+            request,
+        )
     }
 
     pub(super) fn read_response(
@@ -142,9 +166,9 @@ pub(super) fn read_plugin_response<R: std::io::BufRead>(
             message: "plugin produced no response".to_string(),
         });
     }
-    serde_json::from_str(line.trim_end()).map_err(|source| CourierError::PluginProtocol {
+    parse_jsonrpc_message(line.trim_end()).map_err(|message| CourierError::PluginProtocol {
         courier: courier_name.to_string(),
-        message: format!("invalid plugin JSON: {source}"),
+        message,
     })
 }
 
@@ -271,12 +295,13 @@ pub(super) fn describe_plugin_response(response: &PluginResponse) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::read_plugin_response;
-    use crate::plugin_protocol::PluginResponse;
+    use crate::plugin_protocol::{PluginRequestId, PluginResponse, response_to_jsonrpc};
     use std::io::Cursor;
 
     #[test]
     fn read_plugin_response_accepts_eof_terminated_json() {
-        let mut reader = Cursor::new(br#"{"kind":"ok"}"#.to_vec());
+        let line = response_to_jsonrpc(&PluginRequestId::Integer(1), &PluginResponse::Ok).unwrap();
+        let mut reader = Cursor::new(line.into_bytes());
 
         let response = read_plugin_response(&mut reader, "demo").unwrap();
 

@@ -34,8 +34,12 @@ pub use channel_plugin_protocol::{
     ChannelPluginRequestEnvelope, ChannelPluginResponse, ChannelPolicy, ConfiguredChannel,
     DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
     InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
-    IngressState, OutboundAttachment, OutboundMessageEnvelope, RuntimeStateSnapshot,
-    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
+    IngressState, OutboundAttachment, OutboundMessageEnvelope, PluginRequestId,
+    RuntimeStateSnapshot, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
+    parse_jsonrpc_request as parse_channel_jsonrpc_request,
+    parse_jsonrpc_response as parse_channel_jsonrpc_response,
+    request_to_jsonrpc as channel_request_to_jsonrpc,
+    response_to_jsonrpc as channel_response_to_jsonrpc,
 };
 pub use channel_plugins::{
     ChannelCatalogEntry, ChannelIngressEndpoint, ChannelIngressTrust, ChannelIngressTrustFailure,
@@ -78,7 +82,8 @@ pub use manifest::{
 pub use parse::{ParseError, parse_agentfile};
 pub use plugin_protocol::{
     COURIER_PLUGIN_PROTOCOL_VERSION, PluginErrorPayload, PluginRequest, PluginRequestEnvelope,
-    PluginResponse,
+    PluginResponse, parse_jsonrpc_message, parse_jsonrpc_request, request_to_jsonrpc,
+    response_to_jsonrpc,
 };
 pub use plugins::{
     BuiltinCourier, CourierCatalogEntry, CourierPluginExec, CourierPluginManifest,

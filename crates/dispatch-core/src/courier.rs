@@ -661,6 +661,7 @@ struct PersistentPluginProcess {
     stdin: ChildStdin,
     stderr: ChildStderr,
     responses: mpsc::Receiver<Result<PluginResponse, CourierError>>,
+    next_request_id: i64,
 }
 
 #[derive(Clone)]
@@ -1582,6 +1583,7 @@ impl JsonlCourierPlugin {
             stdin,
             stderr,
             responses: spawn_plugin_response_reader(stdout, self.manifest.name.clone()),
+            next_request_id: 1,
         })
     }
 

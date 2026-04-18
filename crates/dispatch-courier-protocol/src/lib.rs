@@ -1,8 +1,16 @@
 pub use dispatch_channel_protocol::{OutboundAttachment, OutboundMessageEnvelope};
+use dispatch_plugin_rpc::{
+    JSONRPC_APPLICATION_ERROR, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcSuccessResponse, RequestId, ensure_jsonrpc_version,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 pub const COURIER_PLUGIN_PROTOCOL_VERSION: u32 = 1;
+pub const COURIER_EVENT_NOTIFICATION_METHOD: &str = "courier.event";
+
+pub use dispatch_plugin_rpc::{JsonRpcErrorObject, RequestId as PluginRequestId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginRequestEnvelope {
@@ -416,12 +424,172 @@ pub fn plugin_error(code: &str, message: impl Into<String>) -> PluginResponse {
     }
 }
 
+pub fn request_method(request: &PluginRequest) -> &'static str {
+    match request {
+        PluginRequest::Capabilities => "courier.capabilities",
+        PluginRequest::ValidateParcel { .. } => "courier.validate_parcel",
+        PluginRequest::Inspect { .. } => "courier.inspect",
+        PluginRequest::OpenSession { .. } => "courier.open_session",
+        PluginRequest::ResumeSession { .. } => "courier.resume_session",
+        PluginRequest::Shutdown => "courier.shutdown",
+        PluginRequest::Run { .. } => "courier.run",
+    }
+}
+
+pub fn request_to_jsonrpc(
+    id: RequestId,
+    envelope: &PluginRequestEnvelope,
+) -> Result<JsonRpcRequest, String> {
+    let mut params = request_params_with_version(envelope.protocol_version, &envelope.request)?;
+    if !matches!(params, Value::Object(_)) {
+        let mut object = Map::new();
+        object.insert(
+            "protocol_version".to_string(),
+            Value::from(envelope.protocol_version),
+        );
+        object.insert("payload".to_string(), params);
+        params = Value::Object(object);
+    }
+
+    Ok(JsonRpcRequest::new(
+        id,
+        request_method(&envelope.request),
+        Some(params),
+    ))
+}
+
+pub fn parse_jsonrpc_request(line: &str) -> Result<(RequestId, PluginRequestEnvelope), String> {
+    let message: JsonRpcMessage = serde_json::from_str(line)
+        .map_err(|source| format!("invalid JSON-RPC message: {source}"))?;
+    let JsonRpcMessage::Request(request) = message else {
+        return Err("expected JSON-RPC request".to_string());
+    };
+    ensure_jsonrpc_version(&request.jsonrpc)?;
+    let params = request
+        .params
+        .ok_or_else(|| "missing JSON-RPC params".to_string())?;
+    let envelope = decode_request_params(&request.method, params)?;
+    Ok((request.id, envelope))
+}
+
+pub fn response_to_jsonrpc(id: &RequestId, response: &PluginResponse) -> Result<String, String> {
+    let message = match response {
+        PluginResponse::Event { .. } => JsonRpcMessage::Notification(JsonRpcNotification::new(
+            COURIER_EVENT_NOTIFICATION_METHOD,
+            Some(
+                serde_json::to_value(response)
+                    .map_err(|source| format!("failed to serialize courier event: {source}"))?,
+            ),
+        )),
+        PluginResponse::Error { error } => JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+            Some(id.clone()),
+            JSONRPC_APPLICATION_ERROR,
+            error.message.clone(),
+            Some(serde_json::json!({ "dispatch_error": error })),
+        )),
+        other => JsonRpcMessage::Response(JsonRpcSuccessResponse::new(
+            id.clone(),
+            serde_json::to_value(other)
+                .map_err(|source| format!("failed to serialize plugin response: {source}"))?,
+        )),
+    };
+    serde_json::to_string(&message)
+        .map_err(|source| format!("failed to serialize JSON-RPC message: {source}"))
+}
+
+pub fn parse_jsonrpc_message(line: &str) -> Result<PluginResponse, String> {
+    let message: JsonRpcMessage = serde_json::from_str(line)
+        .map_err(|source| format!("invalid JSON-RPC message: {source}"))?;
+    match message {
+        JsonRpcMessage::Response(response) => {
+            ensure_jsonrpc_version(&response.jsonrpc)?;
+            serde_json::from_value(response.result)
+                .map_err(|source| format!("invalid courier result payload: {source}"))
+        }
+        JsonRpcMessage::Error(error) => {
+            ensure_jsonrpc_version(&error.jsonrpc)?;
+            Ok(PluginResponse::Error {
+                error: decode_dispatch_error(error),
+            })
+        }
+        JsonRpcMessage::Notification(notification) => {
+            ensure_jsonrpc_version(&notification.jsonrpc)?;
+            if notification.method != COURIER_EVENT_NOTIFICATION_METHOD {
+                return Err(format!(
+                    "unexpected JSON-RPC notification method `{}`",
+                    notification.method
+                ));
+            }
+            serde_json::from_value(
+                notification
+                    .params
+                    .ok_or_else(|| "missing courier event params".to_string())?,
+            )
+            .map_err(|source| format!("invalid courier notification payload: {source}"))
+        }
+        JsonRpcMessage::Request(_) => Err("expected JSON-RPC response, got request".to_string()),
+    }
+}
+
+fn request_params_with_version(
+    protocol_version: u32,
+    request: &PluginRequest,
+) -> Result<Value, String> {
+    let mut params = serde_json::to_value(request)
+        .map_err(|source| format!("failed to serialize request: {source}"))?;
+    let Value::Object(ref mut object) = params else {
+        return Err("plugin request did not serialize to an object".to_string());
+    };
+    object.insert(
+        "protocol_version".to_string(),
+        Value::from(protocol_version),
+    );
+    Ok(params)
+}
+
+fn decode_request_params(method: &str, params: Value) -> Result<PluginRequestEnvelope, String> {
+    let Value::Object(mut object) = params else {
+        return Err("JSON-RPC params must be an object".to_string());
+    };
+    let protocol_version = object
+        .remove("protocol_version")
+        .ok_or_else(|| "missing protocol_version in JSON-RPC params".to_string())?
+        .as_u64()
+        .ok_or_else(|| "protocol_version must be an unsigned integer".to_string())?
+        as u32;
+    let request: PluginRequest = serde_json::from_value(Value::Object(object))
+        .map_err(|source| format!("invalid plugin request params: {source}"))?;
+    let expected_method = request_method(&request);
+    if expected_method != method {
+        return Err(format!(
+            "JSON-RPC method `{method}` did not match request payload `{expected_method}`"
+        ));
+    }
+    Ok(PluginRequestEnvelope {
+        protocol_version,
+        request,
+    })
+}
+
+fn decode_dispatch_error(error: JsonRpcErrorResponse) -> PluginErrorPayload {
+    let dispatch_error = error
+        .error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("dispatch_error"))
+        .and_then(|value| serde_json::from_value::<PluginErrorPayload>(value.clone()).ok());
+    dispatch_error.unwrap_or_else(|| PluginErrorPayload {
+        code: "jsonrpc_error".to_string(),
+        message: error.error.message,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn run_request_round_trips_json() {
+    fn run_request_round_trips_jsonrpc() {
         let request = PluginRequestEnvelope {
             protocol_version: COURIER_PLUGIN_PROTOCOL_VERSION,
             request: PluginRequest::Run {
@@ -446,13 +614,15 @@ mod tests {
             },
         };
 
-        let json = serde_json::to_string(&request).unwrap();
-        let parsed: PluginRequestEnvelope = serde_json::from_str(&json).unwrap();
+        let rpc = request_to_jsonrpc(RequestId::integer(5), &request).unwrap();
+        let json = serde_json::to_string(&rpc).unwrap();
+        let (id, parsed) = parse_jsonrpc_request(&json).unwrap();
+        assert_eq!(id, RequestId::integer(5));
         assert_eq!(parsed, request);
     }
 
     #[test]
-    fn response_round_trips_json() {
+    fn response_round_trips_jsonrpc() {
         let response = PluginResponse::Capabilities {
             capabilities: CourierCapabilities {
                 courier_id: "demo".to_string(),
@@ -465,13 +635,13 @@ mod tests {
             },
         };
 
-        let json = serde_json::to_string(&response).unwrap();
-        let parsed: PluginResponse = serde_json::from_str(&json).unwrap();
+        let json = response_to_jsonrpc(&RequestId::integer(8), &response).unwrap();
+        let parsed = parse_jsonrpc_message(&json).unwrap();
         assert_eq!(parsed, response);
     }
 
     #[test]
-    fn run_event_response_round_trips_channel_reply() {
+    fn run_event_response_round_trips_notification() {
         let response = PluginResponse::Event {
             event: CourierEvent::ChannelReply {
                 message: OutboundMessageEnvelope {
@@ -483,8 +653,16 @@ mod tests {
             },
         };
 
-        let json = serde_json::to_string(&response).unwrap();
-        let parsed: PluginResponse = serde_json::from_str(&json).unwrap();
+        let json = response_to_jsonrpc(&RequestId::integer(9), &response).unwrap();
+        let parsed = parse_jsonrpc_message(&json).unwrap();
+        assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn error_round_trips_jsonrpc() {
+        let response = plugin_error("bad_request", "missing parcel_dir");
+        let json = response_to_jsonrpc(&RequestId::integer(10), &response).unwrap();
+        let parsed = parse_jsonrpc_message(&json).unwrap();
         assert_eq!(parsed, response);
     }
 

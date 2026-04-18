@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/dispatch-plugin-rpc",
     "crates/dispatch-channel-protocol",
     "crates/dispatch-process",
     "crates/dispatch-core",

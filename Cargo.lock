@@ -859,6 +859,7 @@ dependencies = [
 name = "dispatch-channel-protocol"
 version = "0.3.0"
 dependencies = [
+ "dispatch-plugin-rpc",
  "serde",
  "serde_json",
 ]
@@ -907,6 +908,15 @@ name = "dispatch-courier-protocol"
 version = "0.3.0"
 dependencies = [
  "dispatch-channel-protocol",
+ "dispatch-plugin-rpc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dispatch-plugin-rpc"
+version = "0.3.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

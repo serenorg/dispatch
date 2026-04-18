@@ -2,7 +2,8 @@ use crate::{
     channel_plugin_protocol::{
         AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelPluginRequest,
         ChannelPluginRequestEnvelope, ChannelPluginResponse, InboundEventEnvelope,
-        OutboundMessageEnvelope, parse_tagged_channel_reply,
+        OutboundMessageEnvelope, PluginRequestId, parse_jsonrpc_response,
+        parse_tagged_channel_reply, request_to_jsonrpc,
     },
     courier::CourierEvent,
     plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
@@ -474,16 +475,22 @@ fn call_channel_plugin_with_timeout(
                     channel: manifest.name.clone(),
                     message: "channel plugin stdin was not captured".to_string(),
                 })?;
-        serde_json::to_writer(
-            &mut stdin,
+        let rpc_request = request_to_jsonrpc(
+            PluginRequestId::Integer(1),
             &ChannelPluginRequestEnvelope {
                 protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
                 request,
             },
         )
-        .map_err(|source| ChannelPluginCallError::PluginProtocol {
+        .map_err(|message| ChannelPluginCallError::PluginProtocol {
             channel: manifest.name.clone(),
-            message: format!("failed to serialize channel plugin request: {source}"),
+            message,
+        })?;
+        serde_json::to_writer(&mut stdin, &rpc_request).map_err(|source| {
+            ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: format!("failed to serialize channel plugin request: {source}"),
+            }
         })?;
         stdin
             .write_all(b"\n")
@@ -598,13 +605,12 @@ fn call_channel_plugin_with_timeout(
         });
     }
 
-    let response =
-        serde_json::from_str::<ChannelPluginResponse>(line.trim_end()).map_err(|source| {
-            ChannelPluginCallError::PluginProtocol {
-                channel: manifest.name.clone(),
-                message: format!("invalid channel plugin JSON: {source}"),
-            }
-        })?;
+    let response = parse_jsonrpc_response(line.trim_end()).map_err(|message| {
+        ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message,
+        }
+    })?;
     if status.success() {
         return Ok(response);
     }
@@ -1462,7 +1468,9 @@ mod tests {
             &script_path,
             r#"#!/bin/sh
 read line
-printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}'
+request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+[ -n "$request_id" ] || request_id=1
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{\"kind\":\"capabilities\",\"capabilities\":{\"plugin_id\":\"telegram\",\"platform\":\"telegram\",\"ingress_modes\":[\"webhook\"],\"outbound_message_types\":[\"text\"],\"threading_model\":\"chat_or_topic\",\"attachment_support\":false,\"reply_verification_support\":true,\"account_scoped_config\":true,\"accepts_push\":true,\"accepts_status_frames\":true}}}"
 "#,
         )
         .unwrap();
@@ -1530,7 +1538,7 @@ printf '%s\n' 'not-json'
         let error = call_channel_plugin(&manifest, ChannelPluginRequest::Capabilities).unwrap_err();
         assert!(matches!(
             error,
-            ChannelPluginCallError::PluginProtocol { message, .. } if message.contains("invalid channel plugin JSON")
+            ChannelPluginCallError::PluginProtocol { message, .. } if message.contains("invalid JSON-RPC message")
         ));
     }
 
@@ -1588,7 +1596,9 @@ exit 7
 read line
 dd if=/dev/zero bs=131072 count=1 2>/dev/null | tr '\000' x >&2
 printf '\n' >&2
-printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}'
+request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+[ -n "$request_id" ] || request_id=1
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{\"kind\":\"capabilities\",\"capabilities\":{\"plugin_id\":\"telegram\",\"platform\":\"telegram\",\"ingress_modes\":[\"webhook\"],\"outbound_message_types\":[\"text\"],\"threading_model\":\"chat_or_topic\",\"attachment_support\":false,\"reply_verification_support\":true,\"account_scoped_config\":true,\"accepts_push\":true,\"accepts_status_frames\":true}}}"
 "#,
         )
         .unwrap();
@@ -1717,7 +1727,9 @@ sleep 5
             &script_path,
             r#"#!/bin/sh
 read line
-printf '%s\n' '{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram","ingress_modes":["webhook"],"outbound_message_types":["text"],"threading_model":"chat_or_topic","attachment_support":false,"reply_verification_support":true,"account_scoped_config":true,"accepts_push":true,"accepts_status_frames":true}}'
+request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+[ -n "$request_id" ] || request_id=1
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{\"kind\":\"capabilities\",\"capabilities\":{\"plugin_id\":\"telegram\",\"platform\":\"telegram\",\"ingress_modes\":[\"webhook\"],\"outbound_message_types\":[\"text\"],\"threading_model\":\"chat_or_topic\",\"attachment_support\":false,\"reply_verification_support\":true,\"account_scoped_config\":true,\"accepts_push\":true,\"accepts_status_frames\":true}}}"
 sleep 5
 "#,
         )

@@ -2,7 +2,7 @@
 
 Dispatch courier plugins are external executables that implement the Dispatch courier contract over stdio.
 
-Dispatch uses newline-delimited JSON envelopes and responses over stdio, with one important execution rule:
+Dispatch uses JSON-RPC 2.0 messages framed as line-delimited JSON over stdio, with one important execution rule:
 
 - `open_session` may start a persistent plugin process for that session
 - subsequent `run` requests for the same session are sent to the same process over the same stdio stream
@@ -11,10 +11,10 @@ This removes the per-turn process spawn cost for multi-turn chat, job, and heart
 
 ## Transport
 
-The protocol uses newline-delimited JSON over stdio.
+The protocol uses JSON-RPC 2.0 over stdio, framed as newline-delimited JSON.
 
 - Dispatch writes one JSON request line at a time to plugin stdin
-- the plugin writes one JSON object per line to stdout
+- the plugin writes one JSON-RPC message per line to stdout
 - stderr is reserved for human-readable diagnostics and logs
 
 Dispatch may keep stdin/stdout open across multiple requests for one session.
@@ -39,30 +39,36 @@ Plugins declare the protocol version in their manifest:
 
 Dispatch supports protocol version `1`.
 
-## Request Envelope
+## Requests
 
-Every request uses the same envelope shape:
+Every host call is sent as a JSON-RPC request. The `method` identifies the courier
+operation and `params` contains the typed Dispatch request payload.
 
 ```json
 {
-  "protocol_version": 1,
-  "request": {
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "courier.capabilities",
+  "params": {
+    "protocol_version": 1,
     "kind": "capabilities"
   }
 }
 ```
 
-Request kinds:
+Courier request methods:
 
-- `capabilities`
-- `validate_parcel`
-- `inspect`
-- `open_session`
-- `resume_session`
-- `shutdown`
-- `run`
+- `courier.capabilities`
+- `courier.validate_parcel`
+- `courier.inspect`
+- `courier.open_session`
+- `courier.resume_session`
+- `courier.shutdown`
+- `courier.run`
 
-For parcel-aware requests, Dispatch passes the absolute built parcel directory in `parcel_dir`.
+For parcel-aware requests, Dispatch passes the absolute built parcel directory in
+`parcel_dir`. The `params.kind` payload still uses the same typed Dispatch request
+shape that the Rust protocol crate exposes; JSON-RPC only standardizes the envelope.
 
 ## Session Lifecycle
 
@@ -87,34 +93,66 @@ Plugins should therefore:
 
 ## Responses
 
-Response shapes are:
+Non-streaming requests return exactly one JSON-RPC success response:
 
-Non-streaming requests return exactly one line with one of:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "kind": "capabilities",
+    "capabilities": {
+      "id": "dispatch-courier-echo",
+      "kind": "plugin"
+    }
+  }
+}
+```
 
-- `{"kind":"capabilities","capabilities":...}`
-- `{"kind":"inspection","inspection":...}`
-- `{"kind":"session","session":...}`
-- `{"kind":"ok"}`
-- `{"kind":"error","error":...}`
+Structured Dispatch errors are returned as JSON-RPC error responses. Dispatch-specific
+error details live in `error.data.dispatch_error`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32000,
+    "message": "courier rejected parcel",
+    "data": {
+      "dispatch_error": {
+        "code": "unsupported_parcel",
+        "message": "courier rejected parcel",
+        "details": {
+          "reference": "dispatch/docker:latest"
+        }
+      }
+    }
+  }
+}
+```
 
 `run` remains stream-first:
 
-- zero or more `{"kind":"event",...}` lines
-- one terminal `{"kind":"done",...}` line
+- zero or more JSON-RPC notifications with method `courier.event`
+- one terminal JSON-RPC success response whose `result.kind` is `done`
 
 Example `run` stream:
 
 ```json
-{"kind":"event","event":{"kind":"message","role":"assistant","content":"hello"}}
-{"kind":"done","session":{"id":"remote-worker-<digest>-1","parcel_digest":"<digest>","entrypoint":"chat","turn_count":2,"history":[{"role":"user","content":"hello"},{"role":"assistant","content":"hello"}]}}
+{"jsonrpc":"2.0","method":"courier.event","params":{"kind":"message","role":"assistant","content":"hello"}}
+{"jsonrpc":"2.0","id":7,"result":{"kind":"done","session":{"id":"remote-worker-<digest>-1","parcel_digest":"<digest>","entrypoint":"chat","turn_count":2,"history":[{"role":"user","content":"hello"},{"role":"assistant","content":"hello"}]}}}
 ```
 
 Plugins may also emit a first-class structured channel reply event when the
 caller will bridge the courier response back through a channel plugin:
 
 ```json
-{"kind":"event","event":{"kind":"channel_reply","message":{"content":"Dispatch attached the report.","content_type":"text/plain","attachments":[{"name":"report.txt","mime_type":"text/plain","data_base64":"aGVsbG8="}],"metadata":{"custom":"value"}}}}
+{"jsonrpc":"2.0","method":"courier.event","params":{"kind":"channel_reply","message":{"content":"Dispatch attached the report.","content_type":"text/plain","attachments":[{"name":"report.txt","mime_type":"text/plain","data_base64":"aGVsbG8="}],"metadata":{"custom":"value"}}}}
 ```
+
+The manifest field `transport = "jsonl"` still refers to framing: one JSON
+message per line on stdio. JSON-RPC defines the message shape inside that framing.
 
 ## Implementation Guidance
 
@@ -126,8 +164,8 @@ The intended implementation model is:
 - avoid per-turn process startup during multi-turn chat, job, and heartbeat flows
 
 If a plugin cannot reconstruct a saved session during `resume_session`, it should return an
-`error` response and let Dispatch surface the failed resume. Dispatch does not retry with a
-different protocol version or silently downgrade `resume_session` into `open_session`.
+JSON-RPC error response and let Dispatch surface the failed resume. Dispatch does not retry
+with a different protocol version or silently downgrade `resume_session` into `open_session`.
 
 ## Trust Model
 

@@ -9,7 +9,7 @@ Dispatch supports three categories of extensions:
 | Connector bundles | Reusable tool/provider packages | Planned |
 
 Extensions live outside the core repository and communicate with Dispatch over
-JSONL subprocess protocols.
+JSON-RPC 2.0 messages framed as line-delimited JSON on stdio.
 
 Dispatch has first-class install/runtime support for courier plugins and
 channel plugins. Connector bundles are a planned category without a host
@@ -284,21 +284,49 @@ The courier `kind` field is optional, but when present it must be `"courier"`.
 
 ## Channel plugin protocol
 
-Channel plugins communicate over newline-delimited JSON on stdin/stdout.
+Channel plugins communicate over stdio using JSON-RPC 2.0 messages, framed as
+one JSON value per line.
 
 ### Wire format
 
-Each request from the host is a single JSON line:
+Each request from the host is a JSON-RPC request line:
 
 ```json
-{"protocol_version":1,"request":{"kind":"capabilities"}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "channel.capabilities",
+  "params": {
+    "protocol_version": 1,
+    "kind": "capabilities"
+  }
+}
 ```
 
-Each response from the plugin is a single JSON line:
+Each non-error response from the plugin is a JSON-RPC success response whose
+`result` carries the existing typed channel payload:
 
 ```json
-{"kind":"capabilities","capabilities":{"plugin_id":"telegram","platform":"telegram",...}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "kind": "capabilities",
+    "capabilities": {
+      "plugin_id": "telegram",
+      "platform": "telegram"
+    }
+  }
+}
 ```
+
+Errors are returned as JSON-RPC error responses. Dispatch-specific structured
+error details are carried in `error.data.dispatch_error`.
+
+Dispatch keeps the manifest transport value as `"jsonl"` because the framing is
+still one JSON message per line on stdio. JSON-RPC defines the message shape;
+the manifest transport defines how those messages are carried between host and
+plugin.
 
 ### Request types
 
@@ -344,6 +372,8 @@ Each response from the plugin is a single JSON line:
 
 ### Response types
 
+These are the typed response payloads carried in JSON-RPC success responses:
+
 | Kind | Fields | Purpose |
 |---|---|---|
 | `capabilities` | `capabilities` | Plugin feature declaration |
@@ -355,7 +385,9 @@ Each response from the plugin is a single JSON line:
 | `delivered` | `delivery` | Delivery receipt |
 | `pushed` | `delivery` | Push delivery receipt |
 | `status_accepted` | `status` | Status acknowledgment |
-| `error` | `error` | Error with code and message |
+
+Channel plugins do not currently use JSON-RPC notifications. Every host call
+expects exactly one terminal JSON-RPC response.
 
 ### Ingress event flow
 

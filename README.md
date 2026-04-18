@@ -10,7 +10,7 @@ Agentfile  ->  dispatch parcel build  ->  parcel (artifact)  ->  dispatch run  -
 
 An `Agentfile` is the source definition; a **parcel** is the built artifact; a **courier** executes it; a **session** is the active run.
 
-Available couriers today include native, Docker, WASM, and external JSONL plugins. The WASM path runs a guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) in any host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
+Available couriers today include native, Docker, WASM, and external plugins that speak JSON-RPC 2.0 over line-delimited JSON on stdio. The WASM path runs a guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) in any host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
 
 ## Why Dispatch
 
@@ -523,7 +523,7 @@ Dispatch defines the parcel format and courier contract. Multiple couriers can i
 - **native** - executes the parcel as a host process with model-backed chat; reference implementation in `crates/dispatch-core`
 - **docker** - keeps session state, mounts, and model orchestration on the host, while running declared local tools inside Docker as an execution sandbox
 - **wasm** - typed component-model courier using the Dispatch WIT ABI; see [WASM Courier](#wasm-courier)
-- **plugins** - external JSONL courier plugins launched as subprocesses; protocol in `docs/courier-plugin-protocol.md`
+- **plugins** - external courier plugins launched as subprocesses; protocol is JSON-RPC 2.0 messages framed as one JSON value per line on stdio in `docs/courier-plugin-protocol.md`
 
 The courier/plugin boundary lives in [`crates/dispatch-core/src/courier.rs`](crates/dispatch-core/src/courier.rs).
 

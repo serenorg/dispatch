@@ -1,8 +1,8 @@
 use dispatch_core::{
     COURIER_PLUGIN_PROTOCOL_VERSION, ConversationMessage, CourierCapabilities, CourierEvent,
     CourierInspection, CourierKind, CourierOperation, CourierSession, LoadedParcel,
-    PluginErrorPayload, PluginRequest, PluginRequestEnvelope, PluginResponse, list_local_tools,
-    load_parcel, resolve_prompt_text,
+    PluginErrorPayload, PluginRequest, PluginRequestId, PluginResponse, list_local_tools,
+    load_parcel, parse_jsonrpc_request, resolve_prompt_text, response_to_jsonrpc,
 };
 use std::{
     io::{self, BufRead as _, Write as _},
@@ -13,12 +13,15 @@ fn main() -> std::process::ExitCode {
     match run_stdio() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            let _ = emit_response(&PluginResponse::Error {
-                error: PluginErrorPayload {
-                    code: "courier_error".to_string(),
-                    message: error,
+            let _ = emit_response(
+                &PluginRequestId::Integer(0),
+                &PluginResponse::Error {
+                    error: PluginErrorPayload {
+                        code: "courier_error".to_string(),
+                        message: error,
+                    },
                 },
-            });
+            );
             std::process::ExitCode::from(1)
         }
     }
@@ -31,7 +34,7 @@ fn run_stdio() -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let envelope: PluginRequestEnvelope = serde_json::from_str(&line)
+        let (request_id, envelope) = parse_jsonrpc_request(&line)
             .map_err(|error| format!("invalid request JSON: {error}"))?;
         if envelope.protocol_version != COURIER_PLUGIN_PROTOCOL_VERSION {
             return Err(format!(
@@ -42,7 +45,7 @@ fn run_stdio() -> Result<(), String> {
 
         let should_shutdown = matches!(envelope.request, PluginRequest::Shutdown);
         for response in handle_request(envelope.request)? {
-            emit_response(&response)
+            emit_response(&request_id, &response)
                 .map_err(|error| format!("failed to write response: {error}"))?;
         }
         if should_shutdown {
@@ -52,10 +55,11 @@ fn run_stdio() -> Result<(), String> {
     Ok(())
 }
 
-fn emit_response(response: &PluginResponse) -> io::Result<()> {
+fn emit_response(request_id: &PluginRequestId, response: &PluginResponse) -> io::Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    serde_json::to_writer(&mut lock, response)?;
+    let json = response_to_jsonrpc(request_id, response).map_err(io::Error::other)?;
+    lock.write_all(json.as_bytes())?;
     lock.write_all(b"\n")?;
     lock.flush()
 }
