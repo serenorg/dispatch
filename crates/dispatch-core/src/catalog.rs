@@ -9,7 +9,7 @@
 //! - fetch and on-disk cache logic
 //! - search over cached entries
 //!
-//! Tier 1 of the plugin ecosystem roadmap; see `docs/plugin-ecosystem.md`.
+//! Tier 1/2 of the plugin ecosystem roadmap; see `docs/plugin-ecosystem.md`.
 
 use std::{
     fs,
@@ -30,16 +30,21 @@ pub const CATALOG_CACHE_DIR: &str = "catalog-cache";
 const CATALOG_CONFIG_RELATIVE: &str = ".config/dispatch/catalogs.toml";
 const CATALOG_CACHE_RELATIVE: &str = ".config/dispatch/catalog-cache";
 
+fn user_home_dir() -> Result<PathBuf, CatalogError> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or(CatalogError::MissingHome)
+}
+
 /// Default absolute path for the user-level catalog config.
 pub fn default_catalog_config_path() -> Result<PathBuf, CatalogError> {
-    let home = std::env::var_os("HOME").ok_or(CatalogError::MissingHome)?;
-    Ok(PathBuf::from(home).join(CATALOG_CONFIG_RELATIVE))
+    Ok(user_home_dir()?.join(CATALOG_CONFIG_RELATIVE))
 }
 
 /// Default absolute path for the on-disk catalog cache directory.
 pub fn default_catalog_cache_dir() -> Result<PathBuf, CatalogError> {
-    let home = std::env::var_os("HOME").ok_or(CatalogError::MissingHome)?;
-    Ok(PathBuf::from(home).join(CATALOG_CACHE_RELATIVE))
+    Ok(user_home_dir()?.join(CATALOG_CACHE_RELATIVE))
 }
 
 /// Upper bound on how many bytes Dispatch will download for one catalog.
@@ -161,6 +166,29 @@ impl CatalogExtensionKind {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CatalogInstallSource {
+    GithubRelease {
+        repo: String,
+        tag: String,
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
+        checksum_asset: Option<String>,
+        binaries: Vec<GithubReleaseBinary>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubReleaseBinary {
+    pub target: String,
+    pub asset: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    pub binary_name: String,
+}
+
 /// One plugin entry inside an `ExtensionCatalog`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEntry {
@@ -187,6 +215,8 @@ pub struct CatalogEntry {
     pub tags: Vec<String>,
     #[serde(default)]
     pub install_hint: Option<String>,
+    #[serde(default)]
+    pub source: Option<CatalogInstallSource>,
     #[serde(default)]
     pub auth: Option<serde_json::Value>,
     #[serde(default)]
@@ -276,7 +306,7 @@ pub enum CatalogError {
     CatalogTooLarge { name: String, limit: u64 },
     #[error("no catalog has been cached for `{name}`; run `dispatch extension catalog refresh`")]
     NoCache { name: String },
-    #[error("$HOME is not set; cannot resolve default catalog paths")]
+    #[error("HOME and USERPROFILE are not set; cannot resolve default catalog paths")]
     MissingHome,
 }
 
@@ -476,6 +506,7 @@ mod tests {
             install_hint: Some(format!(
                 "dispatch channel install {name}/channel-plugin.json"
             )),
+            source: None,
             auth: None,
             requirements: None,
         }
@@ -507,6 +538,58 @@ mod tests {
         config.save(&path).unwrap();
         let loaded = CatalogConfig::load(&path).unwrap();
         assert_eq!(loaded.catalogs, config.catalogs);
+    }
+
+    #[test]
+    fn catalog_entry_deserializes_github_release_source() {
+        let catalog: ExtensionCatalog = serde_json::from_str(
+            r#"{
+                "entries": [
+                    {
+                        "name": "seren-cloud",
+                        "kind": "courier",
+                        "version": "0.1.0",
+                        "source": {
+                            "type": "github_release",
+                            "repo": "serenorg/dispatch-courier-seren-cloud",
+                            "tag": "v0.1.0",
+                            "binaries": [
+                                {
+                                    "target": "x86_64-unknown-linux-gnu",
+                                    "asset": "dispatch-courier-seren-cloud-x86_64-unknown-linux-gnu",
+                                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                                    "binary_name": "dispatch-courier-seren-cloud"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let source = catalog.entries[0]
+            .source
+            .clone()
+            .expect("source should parse");
+        assert_eq!(
+            source,
+            CatalogInstallSource::GithubRelease {
+                repo: "serenorg/dispatch-courier-seren-cloud".to_string(),
+                tag: "v0.1.0".to_string(),
+                base_url: None,
+                checksum_asset: None,
+                binaries: vec![GithubReleaseBinary {
+                    target: "x86_64-unknown-linux-gnu".to_string(),
+                    asset: "dispatch-courier-seren-cloud-x86_64-unknown-linux-gnu".to_string(),
+                    sha256: Some(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                    ),
+                    binary_name: "dispatch-courier-seren-cloud".to_string(),
+                }],
+            }
+        );
     }
 
     #[test]

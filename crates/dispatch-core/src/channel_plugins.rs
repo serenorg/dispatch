@@ -28,6 +28,13 @@ const CHANNEL_REGISTRY_RELATIVE_PATH: &str = ".config/dispatch/channels.json";
 const CHANNEL_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const CHANNEL_PLUGIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+fn user_home_dir() -> Result<PathBuf, PluginRegistryError> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or(PluginRegistryError::MissingHome)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelPluginExec {
     pub command: String,
@@ -239,8 +246,7 @@ pub struct ChannelIngressTrustFailure {
 }
 
 pub fn default_channel_registry_path() -> Result<PathBuf, PluginRegistryError> {
-    let home = std::env::var_os("HOME").ok_or(PluginRegistryError::MissingHome)?;
-    Ok(PathBuf::from(home).join(CHANNEL_REGISTRY_RELATIVE_PATH))
+    Ok(user_home_dir()?.join(CHANNEL_REGISTRY_RELATIVE_PATH))
 }
 
 pub fn load_channel_registry(

@@ -9,6 +9,13 @@ use thiserror::Error;
 
 const REGISTRY_RELATIVE_PATH: &str = ".config/dispatch/couriers.json";
 
+fn user_home_dir() -> Result<PathBuf, PluginRegistryError> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or(PluginRegistryError::MissingHome)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginTransport {
@@ -94,7 +101,7 @@ pub enum BuiltinCourier {
 
 #[derive(Debug, Error)]
 pub enum PluginRegistryError {
-    #[error("HOME is not set; cannot determine default courier registry path")]
+    #[error("HOME and USERPROFILE are not set; cannot determine default courier registry path")]
     MissingHome,
     #[error("failed to read `{path}`: {source}")]
     ReadFile {
@@ -173,8 +180,7 @@ impl BuiltinCourier {
 }
 
 pub fn default_courier_registry_path() -> Result<PathBuf, PluginRegistryError> {
-    let home = std::env::var_os("HOME").ok_or(PluginRegistryError::MissingHome)?;
-    Ok(PathBuf::from(home).join(REGISTRY_RELATIVE_PATH))
+    Ok(user_home_dir()?.join(REGISTRY_RELATIVE_PATH))
 }
 
 pub fn load_courier_registry(

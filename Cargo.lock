@@ -851,6 +851,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "toml",
+ "ureq",
  "url",
 ]
 

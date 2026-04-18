@@ -593,10 +593,19 @@ dispatch extension show channel-telegram
 ```
 
 Catalogs are stored in `~/.config/dispatch/catalogs.toml` and fetched JSON is
-cached under `~/.config/dispatch/catalog-cache/`. Installing a discovered
-plugin still uses the existing `dispatch courier install` /
-`dispatch channel install` commands; install-by-name (Tier 2) and
-capability-based trust (Tier 3) are on the roadmap.
+cached under `~/.config/dispatch/catalog-cache/`.
+
+If a catalog entry publishes machine-installable source metadata, Dispatch can
+also install it directly by name:
+
+```bash
+dispatch extension install <name>
+```
+
+The shipped install-by-name path is intentionally narrow: it supports direct
+GitHub release binaries and still rewrites the catalog's manifest into the
+existing `dispatch courier install` / `dispatch channel install` flow.
+Capability-based trust remains on the roadmap.
 
 See [`docs/plugin-ecosystem.md`](docs/plugin-ecosystem.md) for the full
 roadmap, including the canonical list of known third-party catalogs and

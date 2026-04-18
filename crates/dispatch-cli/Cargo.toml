@@ -28,6 +28,7 @@ signal-hook.workspace = true
 atomic-write-file.workspace = true
 tiny_http.workspace = true
 url.workspace = true
+ureq.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["process"] }

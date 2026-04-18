@@ -540,13 +540,25 @@ dispatch extension show seren-cloud
 ```
 
 `dispatch extension show` prints the name, version, catalog, description,
-install hint, requirements, and manifest location. Operators still run the
-existing `dispatch courier install` / `dispatch channel install` command with
-the manifest path from the catalog entry.
+install hint, requirements, manifest location, and any machine-installable
+source metadata.
 
-Tier 1 (this release) stops at discovery. Install-by-name
-(`dispatch extension install <name>`) and capability-based trust are planned;
-see [`plugin-ecosystem.md`](./plugin-ecosystem.md).
+If a catalog entry publishes a `source` block with a direct GitHub release
+binary, Dispatch can install it by name:
+
+```bash
+dispatch extension install <name>
+```
+
+The current install-by-name flow is intentionally narrow:
+
+- it only handles direct GitHub release binaries, not archive extraction
+- it requires an absolute, version-pinned `manifest_url` in the catalog entry
+- it still ends by calling the normal `dispatch courier install` or
+  `dispatch channel install` flow with a rewritten manifest
+
+Capability-based trust remains follow-up work; see
+[`plugin-ecosystem.md`](./plugin-ecosystem.md).
 
 ## Design principles
 

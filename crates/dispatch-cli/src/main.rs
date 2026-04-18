@@ -801,6 +801,26 @@ enum ExtensionCommand {
         #[command(subcommand)]
         command: ExtensionCatalogCommand,
     },
+    /// Install an extension by catalog name
+    Install {
+        /// Extension name (e.g. `seren-cloud`)
+        name: String,
+        /// Skip the install confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Override the catalog config path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the catalog cache directory
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Override the courier registry path
+        #[arg(long)]
+        courier_registry: Option<PathBuf>,
+        /// Override the channel registry path
+        #[arg(long)]
+        channel_registry: Option<PathBuf>,
+    },
     /// Search cached catalogs for extensions matching a query
     Search {
         /// Free-text query. Matches name, display name, description, keywords, and tags.
@@ -1481,10 +1501,10 @@ fn secret_command(command: SecretCommand) -> Result<()> {
 mod tests {
     use super::{
         ChannelCommand, Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand, DepotCommand,
-        EvalArgs, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs,
-        ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs, RestartArgs,
-        SecretCommand, SignArgs, SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs,
-        ValidateSkillArgs, VerifyArgs, WaitArgs,
+        EvalArgs, ExtensionCommand, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand,
+        KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs,
+        RestartArgs, SecretCommand, SignArgs, SkillCommand, SkillSynthesisOverrideArgs,
+        StateCommand, StopArgs, ValidateSkillArgs, VerifyArgs, WaitArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -2551,6 +2571,53 @@ mod tests {
         assert_eq!(name, "docker");
         assert!(!json);
         assert!(registry.is_none());
+    }
+
+    #[test]
+    fn cli_parses_extension_install_command() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "extension",
+            "install",
+            "seren-cloud",
+            "--yes",
+            "--config",
+            "/tmp/catalogs.toml",
+            "--cache-dir",
+            "/tmp/catalog-cache",
+            "--courier-registry",
+            "/tmp/couriers.json",
+            "--channel-registry",
+            "/tmp/channels.json",
+        ])
+        .unwrap();
+
+        let Command::Extension { command } = cli.command else {
+            panic!("expected extension command");
+        };
+        let ExtensionCommand::Install {
+            name,
+            yes,
+            config,
+            cache_dir,
+            courier_registry,
+            channel_registry,
+        } = command
+        else {
+            panic!("expected extension install command");
+        };
+        assert_eq!(name, "seren-cloud");
+        assert!(yes);
+        assert_eq!(config.as_deref(), Some(Path::new("/tmp/catalogs.toml")));
+        assert_eq!(cache_dir.as_deref(), Some(Path::new("/tmp/catalog-cache")));
+        assert_eq!(
+            courier_registry.as_deref(),
+            Some(Path::new("/tmp/couriers.json"))
+        );
+        assert_eq!(
+            channel_registry.as_deref(),
+            Some(Path::new("/tmp/channels.json"))
+        );
     }
 
     #[test]

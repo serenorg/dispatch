@@ -12,7 +12,7 @@ distribution, and trust model. The tiers are incremental: each one is useful
 on its own and provides the foundation for the next.
 
 - Tier 1 (v0.3.0): **Catalog sources** — Homebrew-tap style discovery
-- Tier 2 (v0.4.0+): **Install by name** — resolve, fetch, verify binaries
+- Tier 2 (v0.3.0): **Install by name** — resolve, fetch, verify published binaries
 - Tier 3 (vFuture): **Capability-based trust** — manifest-declared permissions
 - Tier 4 (vFuture): **Official index** — curated registry, if warranted
 
@@ -101,8 +101,9 @@ Conventions used by existing catalogs:
 - Keep `install_hint` accurate for the Tier 1 flow (clone + build + `dispatch
   {courier,channel} install ...`) and self-contained enough to work when an
   operator copies it out of `dispatch extension show`. If install requires the
-  repo root, include the `git clone` + `cd` steps explicitly. Tier 2 will add
-  a `source` block and the `install_hint` becomes advisory.
+  repo root, include the `git clone` + `cd` steps explicitly. If the entry also
+  publishes a Tier 2 `source` block, `install_hint` becomes advisory rather
+  than required.
 
 Third-party authors do not need to coordinate with Dispatch to publish a
 catalog. Users add the catalog URL with `dispatch extension catalog add <url>`
@@ -125,7 +126,6 @@ the catalog URL and a one-line description.
 ### Out of scope for Tier 1
 
 - Fetching the manifest or binary (Tier 2)
-- Installing by catalog name (Tier 2)
 - Signature verification (Tier 3)
 - Capability enforcement (Tier 3)
 
@@ -133,7 +133,7 @@ the catalog URL and a one-line description.
 
 ## Tier 2: Install by name
 
-**Status:** planned for v0.4.0.
+**Status:** implemented in v0.3.0 for GitHub release binaries.
 
 ### Problem
 
@@ -151,7 +151,8 @@ own build toolchain expectations.
 ### Design
 
 Extend catalog entries with a `source` block that describes how Dispatch can
-acquire the binary itself. Two acquisition modes:
+acquire the binary itself. The shipped v0.3.0 path supports direct GitHub
+release binaries.
 
 **GitHub release (preferred — no toolchain needed):**
 
@@ -160,65 +161,61 @@ acquire the binary itself. Two acquisition modes:
   "type": "github_release",
   "repo": "serenorg/dispatch-courier-seren-cloud",
   "tag": "v0.1.0",
+  "checksum_asset": "SHA256SUMS.txt",
   "binaries": [
     {
       "target": "aarch64-apple-darwin",
-      "asset": "dispatch-courier-seren-cloud-aarch64-apple-darwin.tar.gz",
-      "binary_path": "dispatch-courier-seren-cloud",
-      "sha256": "..."
+      "asset": "dispatch-courier-seren-cloud-aarch64-apple-darwin",
+      "binary_name": "dispatch-courier-seren-cloud"
     },
     {
       "target": "x86_64-unknown-linux-gnu",
-      "asset": "dispatch-courier-seren-cloud-x86_64-unknown-linux-gnu.tar.gz",
-      "binary_path": "dispatch-courier-seren-cloud",
-      "sha256": "..."
+      "asset": "dispatch-courier-seren-cloud-x86_64-unknown-linux-gnu",
+      "binary_name": "dispatch-courier-seren-cloud"
     }
   ]
 }
 ```
 
-**Cargo / Git source fallback (requires local toolchain):**
-
-```json
-"source": {
-  "type": "cargo_git",
-  "repo": "https://github.com/serenorg/dispatch-courier-seren-cloud",
-  "rev": "v0.1.0",
-  "build_command": ["cargo", "build", "--release"],
-  "binary_path": "target/release/dispatch-courier-seren-cloud"
-}
-```
+Each binary entry may either include an inline `sha256` or inherit its hash
+from a release-level checksum asset such as `SHA256SUMS.txt`.
 
 ### New command
 
-`dispatch extension install <name> [--version <ver>]`
+`dispatch extension install <name>`
 
 Flow:
 
 1. Resolve `name` via configured catalogs
-2. If the entry has a `github_release` binary for the current target:
-  download, verify SHA256, extract to `~/.dispatch/bin/<name>/<version>/`
-3. Otherwise if `cargo_git` is present and `cargo` is available:
-  clone to a temp dir, run `build_command`, copy the built binary to
-  `~/.dispatch/bin/<name>/<version>/`
-4. Fetch `manifest_path` from the catalog source and rewrite
-  `exec.command` to the staged binary path
-5. Call the existing `install_courier_plugin` / `install_channel_plugin`
+2. Select the published `github_release` binary that matches the current host target
+3. Download the asset and verify its SHA256
+4. Stage the binary under `~/.config/dispatch/bin/<name>/<version>/`
+5. Fetch the absolute `manifest_url` declared by the catalog entry and rewrite
+  `exec.command` / `entrypoint.command` to the staged binary path
+6. Call the existing `install_courier_plugin` / `install_channel_plugin`
   flow with the rewritten manifest
 
 This removes the fragile relative `./target/release/...` manifest path that
 third parties (including `dispatch-courier-seren-cloud`) currently have.
 
+Catalog entries that want to participate in install-by-name should declare an
+absolute, version-pinned `manifest_url`. Relative `manifest_path` remains fine
+for Tier 1 discovery, but it is too loose for versioned binary installs.
+
 ### Trust at this tier
 
-- SHA256 pinning on every asset (already captured in the catalog entry)
+- SHA256 pinning on every asset, either inline per binary or through a
+  release checksum asset such as `SHA256SUMS.txt`
 - First-install prompt: "Install `courier-seren-cloud` v0.1.0 from
   `serenorg/dispatch-courier-seren-cloud`, sha256 `abc...`? [y/N]"
   suppressible via `--yes`
-- Installed entries record the catalog name, version, and SHA256 for audit
+- Installed plugin registries keep the normal installed manifest metadata; the
+  SHA256 check happens at install time before the staged binary is trusted
 
 ### Out of scope for Tier 2
 
+- Alternate acquisition sources such as `cargo_git`
+- Archive extraction for packaged tarballs or zip files
 - Cryptographic signature verification beyond SHA256 (Tier 3)
 - Runtime capability enforcement (Tier 3)
 - Auto-updates (Tier 2 can ship with an explicit `extension upgrade`; auto is
