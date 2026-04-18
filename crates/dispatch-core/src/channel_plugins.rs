@@ -700,6 +700,10 @@ pub fn render_inbound_event_chat_input(
     plugin_name: &str,
     event: &InboundEventEnvelope,
 ) -> Result<String, serde_json::Error> {
+    if should_render_plain_message_chat_input(event) {
+        return Ok(event.message.content.clone());
+    }
+
     let event_json = serde_json::to_string_pretty(event)?;
     Ok(format!(
         "Dispatch inbound channel event\nplugin: {}\nplatform: {}\nevent_type: {}\nconversation_id: {}\nthread_id: {}\nactor_id: {}\nactor_name: {}\nmessage_id: {}\ncontent_type: {}\n\nUser message:\n{}\n\nRaw event JSON:\n{}\n",
@@ -720,6 +724,23 @@ pub fn render_inbound_event_chat_input(
         event.message.content,
         event_json
     ))
+}
+
+fn should_render_plain_message_chat_input(event: &InboundEventEnvelope) -> bool {
+    if event.message.content.trim().is_empty() {
+        return false;
+    }
+    if !event.message.attachments.is_empty() {
+        return false;
+    }
+    if !event.message.content_type.starts_with("text/") {
+        return false;
+    }
+
+    matches!(
+        event.event_type.as_str(),
+        "message" | "message.created" | "message.received"
+    )
 }
 
 pub fn extract_assistant_reply(events: &[CourierEvent]) -> Option<String> {
@@ -1753,14 +1774,48 @@ sleep 5
     }
 
     #[test]
-    fn render_inbound_event_chat_input_includes_message_and_context() {
+    fn render_inbound_event_chat_input_uses_plain_message_for_text_events() {
         let rendered = render_inbound_event_chat_input("channel-telegram", &sample_inbound_event())
             .expect("render");
+
+        assert_eq!(rendered, "hello from telegram");
+    }
+
+    #[test]
+    fn render_inbound_event_chat_input_falls_back_to_structured_context_for_non_message_events() {
+        let mut event = sample_inbound_event();
+        event.event_type = "reaction.added".to_string();
+
+        let rendered = render_inbound_event_chat_input("channel-telegram", &event).expect("render");
 
         assert!(rendered.contains("plugin: channel-telegram"));
         assert!(rendered.contains("conversation_id: chat-123"));
         assert!(rendered.contains("User message:\nhello from telegram"));
         assert!(rendered.contains("\"event_id\": \"evt-1\""));
+    }
+
+    #[test]
+    fn render_inbound_event_chat_input_falls_back_to_structured_context_for_attachments() {
+        let mut event = sample_inbound_event();
+        event
+            .message
+            .attachments
+            .push(crate::channel_plugin_protocol::InboundAttachment {
+                id: None,
+                kind: "file".to_string(),
+                url: None,
+                mime_type: Some("text/plain".to_string()),
+                size_bytes: None,
+                name: Some("report.txt".to_string()),
+                storage_key: None,
+                extracted_text: None,
+                extras: BTreeMap::new(),
+            });
+
+        let rendered = render_inbound_event_chat_input("channel-telegram", &event).expect("render");
+
+        assert!(rendered.contains("Dispatch inbound channel event"));
+        assert!(rendered.contains("\"attachments\": ["));
     }
 
     #[test]
