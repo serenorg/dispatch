@@ -647,7 +647,7 @@ fn read_channel_plugin_message<R: std::io::BufRead>(
     parse_jsonrpc_message(line.trim_end()).map_err(|message| {
         ChannelPluginCallError::PluginProtocol {
             channel: channel.to_string(),
-            message,
+            message: message.to_string(),
         }
     })
 }
@@ -728,7 +728,7 @@ fn write_channel_plugin_request_to<W: std::io::Write>(
     )
     .map_err(|message| ChannelPluginCallError::PluginProtocol {
         channel: channel.to_string(),
-        message,
+        message: message.to_string(),
     })?;
     serde_json::to_writer(&mut writer, &rpc_request).map_err(|source| {
         ChannelPluginCallError::PluginProtocol {
@@ -916,7 +916,7 @@ fn call_channel_plugin_with_timeout(
     let (response_id, response) = parse_jsonrpc_response(line.trim_end()).map_err(|message| {
         ChannelPluginCallError::PluginProtocol {
             channel: manifest.name.clone(),
-            message,
+            message: message.to_string(),
         }
     })?;
     ensure_matching_channel_request_id(

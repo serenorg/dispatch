@@ -54,7 +54,7 @@ pub(super) fn write_plugin_request_to<W: std::io::Write>(
     )
     .map_err(|message| CourierError::PluginProtocol {
         courier: courier_name.to_string(),
-        message,
+        message: message.to_string(),
     })?;
     serde_json::to_writer(&mut writer, &rpc_request).map_err(|source| {
         CourierError::PluginProtocol {
@@ -173,7 +173,7 @@ pub(super) fn read_plugin_response<R: std::io::BufRead>(
     }
     parse_jsonrpc_message(line.trim_end()).map_err(|message| CourierError::PluginProtocol {
         courier: courier_name.to_string(),
-        message,
+        message: message.to_string(),
     })
 }
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -12,6 +13,51 @@ pub const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 pub const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub const JSONRPC_INTERNAL_ERROR: i64 = -32603;
 pub const JSONRPC_APPLICATION_ERROR: i64 = -32000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum JsonRpcMessageError {
+    #[error("invalid JSON-RPC message: {0}")]
+    InvalidMessage(String),
+    #[error("expected JSON-RPC request")]
+    ExpectedRequest,
+    #[error("expected JSON-RPC response")]
+    ExpectedResponse,
+    #[error("expected JSON-RPC response, got notification")]
+    UnexpectedNotification,
+    #[error("expected JSON-RPC response or notification, got request")]
+    UnexpectedRequest,
+    #[error("missing JSON-RPC params")]
+    MissingParams,
+    #[error("JSON-RPC params must be an object")]
+    ParamsMustBeObject,
+    #[error("missing protocol_version in JSON-RPC params")]
+    MissingProtocolVersion,
+    #[error("protocol_version must be an unsigned integer")]
+    InvalidProtocolVersion,
+    #[error("expected JSON-RPC response id on plugin error response")]
+    MissingResponseId,
+    #[error("unexpected JSON-RPC notification method `{0}`")]
+    UnexpectedNotificationMethod(String),
+    #[error("JSON-RPC method `{method}` did not match request payload `{expected}`")]
+    MethodMismatch { method: String, expected: String },
+    #[error("expected jsonrpc version {expected}, got {actual}")]
+    InvalidVersion {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("{0}")]
+    Message(String),
+}
+
+impl JsonRpcMessageError {
+    pub fn invalid_json(source: impl std::fmt::Display) -> Self {
+        Self::InvalidMessage(source.to_string())
+    }
+
+    pub fn message(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+}
 
 pub fn standard_error_code_name(code: i64) -> Option<&'static str> {
     match code {
@@ -144,13 +190,14 @@ impl JsonRpcErrorResponse {
     }
 }
 
-pub fn ensure_jsonrpc_version(version: &str) -> Result<(), String> {
+pub fn ensure_jsonrpc_version(version: &str) -> Result<(), JsonRpcMessageError> {
     if version == JSONRPC_VERSION {
         Ok(())
     } else {
-        Err(format!(
-            "expected jsonrpc version {JSONRPC_VERSION}, got {version}"
-        ))
+        Err(JsonRpcMessageError::InvalidVersion {
+            expected: JSONRPC_VERSION,
+            actual: version.to_string(),
+        })
     }
 }
 

@@ -91,6 +91,23 @@ stdio framing; the plugin is free to translate that into whatever upstream
 transport best matches the platform, including repeated HTTP polling, upstream
 websockets, or daemon-backed local IPC.
 
+As a design rule, Dispatch defaults plugin interactions to one-shot
+request/response cycles and opts into persistence only when the domain is
+inherently sessioned or event-driven. Channel plugins fall into that second
+category: they may need to hold an upstream connection open, maintain ingress
+state across calls, or emit events on the platform's schedule rather than the
+host's schedule.
+
+For channel plugins specifically:
+
+- The long-lived process is scoped to an active channel ingress session, not to
+  a single agent turn and not to the entire host forever.
+- Host-initiated operations such as `configure`, `health`, `deliver`, `push`,
+  `status`, `stop_ingress`, and `shutdown` remain ordinary JSON-RPC requests
+  with terminal responses.
+- Spontaneous inbound activity is modeled as `channel.event` notifications
+  because the host did not initiate those events at a specific moment.
+
 ### Connector bundles
 
 Reusable tool packages for specific providers (Gmail, GitHub, Google Drive).
