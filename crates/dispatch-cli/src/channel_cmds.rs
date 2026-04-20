@@ -7,8 +7,8 @@ use dispatch_core::{
     ChannelPluginResponse, DeliveryReceipt, InboundEventEnvelope, IngressCallbackReply,
     IngressMode, IngressPayload, IngressState, OutboundAttachment, OutboundMessageEnvelope,
     PersistentChannelPluginProcess, PluginNotificationEnvelope, build_channel_reply_envelope,
-    call_channel_plugin, call_persistent_channel_plugin, channel_event_session_file,
-    default_channel_registry_path, drain_pending_channel_notifications,
+    call_channel_plugin, call_channel_plugin_with_timeout, call_persistent_channel_plugin,
+    channel_event_session_file, default_channel_registry_path, drain_pending_channel_notifications,
     extract_assistant_channel_reply, install_channel_plugin, list_channel_catalog,
     match_channel_ingress_endpoint, recv_persistent_channel_notification,
     render_inbound_event_chat_input, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
@@ -32,6 +32,7 @@ use url::form_urlencoded;
 const DISPATCH_MEDIA_ROUTE_PREFIX: &str = "/_dispatch/media/";
 const CHANNEL_INGRESS_STATE_DIR: &str = ".dispatch/channel-state";
 const CHANNEL_RUNTIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_POLL_REQUEST_GRACE: Duration = Duration::from_secs(15);
 const CHANNEL_LISTEN_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct ChannelIngressArgs<'a> {
@@ -488,6 +489,18 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
     let ingress_state_path =
         default_channel_ingress_state_path(&args.label, &plugin.name, &args.config)?;
     let restored_state = load_channel_ingress_state(&ingress_state_path)?;
+
+    if matches!(args.mode, ChannelRuntimeMode::Poll { .. }) && args.once {
+        return run_channel_poll_once(
+            &plugin,
+            &args.config,
+            restored_state,
+            &ingress_state_path,
+            parcel_bridge.as_ref(),
+            args.emit_json,
+        );
+    }
+
     let mut runtime = start_channel_runtime_plugin(&plugin, &args.config, restored_state)?;
     if let Some(state) = &runtime.ingress_state {
         save_channel_ingress_state(&ingress_state_path, state)?;
@@ -655,6 +668,84 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                 }
             }
         }
+    }
+}
+
+fn run_channel_poll_once(
+    plugin: &ChannelPluginManifest,
+    config: &Value,
+    restored_state: Option<IngressState>,
+    ingress_state_path: &Path,
+    parcel_bridge: Option<&ChannelParcelBridge>,
+    emit_json: bool,
+) -> Result<()> {
+    let staged_media = ListenerStagedMedia::from_config(&Value::Null);
+    let timeout = poll_request_timeout(config);
+    let response = call_channel_plugin_with_timeout(
+        plugin,
+        ChannelPluginRequest::PollIngress {
+            config: config.clone(),
+            state: restored_state,
+        },
+        timeout,
+    )?;
+
+    match response {
+        ChannelPluginResponse::IngressEventsReceived {
+            events,
+            callback_reply: _,
+            state,
+            poll_after_ms,
+        } => {
+            if let Some(state) = &state {
+                save_channel_ingress_state(ingress_state_path, state)?;
+            }
+            let parcel_runs =
+                execute_channel_parcel_runs(plugin, parcel_bridge, &events, |event, reply| {
+                    deliver_channel_reply_once(plugin, event, config, &staged_media, reply)
+                })?;
+
+            if emit_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "plugin": plugin.name,
+                        "events": events,
+                        "parcel_runs": parcel_runs,
+                        "state": state,
+                        "poll_after_ms": poll_after_ms,
+                    }))?
+                );
+            } else {
+                println!("Poll {} -> {} event(s)", plugin.name, events.len());
+                for parcel_run in &parcel_runs {
+                    println!(
+                        "Parcel {} -> {}",
+                        parcel_run.event_id,
+                        parcel_run.session_file.display()
+                    );
+                    if let Some(delivery) = &parcel_run.delivery {
+                        println!(
+                            "Delivered reply: {} -> {}",
+                            delivery.message_id, delivery.conversation_id
+                        );
+                    }
+                    if !parcel_run.output.is_empty() {
+                        print!("{}", parcel_run.output);
+                    }
+                }
+            }
+            Ok(())
+        }
+        ChannelPluginResponse::Error { error } => bail!(
+            "channel plugin error {} while polling ingress: {}",
+            error.code,
+            error.message
+        ),
+        other => bail!(
+            "channel plugin returned unexpected response variant for poll_ingress: {}",
+            response_kind(&other)
+        ),
     }
 }
 
@@ -1173,18 +1264,26 @@ fn emit_channel_runtime_events(
     poll_after_ms: Option<u64>,
     source: Option<String>,
 ) -> Result<usize> {
+    let plugin = runtime.plugin.clone();
     let parcel_runs = execute_channel_parcel_runs(
-        runtime,
-        event_context.config,
+        &plugin,
         event_context.parcel_bridge,
-        event_context.staged_media,
         &events,
+        |event, reply| {
+            deliver_channel_reply(
+                runtime,
+                event,
+                event_context.config,
+                event_context.staged_media,
+                reply,
+            )
+        },
     )?;
     if event_context.emit_json {
         println!(
             "{}",
             serde_json::to_string(&json!({
-                "plugin": runtime.plugin.name,
+                "plugin": plugin.name,
                 "events": events,
                 "parcel_runs": parcel_runs,
                 "state": runtime.ingress_state,
@@ -1193,11 +1292,7 @@ fn emit_channel_runtime_events(
         );
     } else {
         let label = source.unwrap_or_else(|| "Ingress".to_string());
-        println!(
-            "{label} {} -> {} event(s)",
-            runtime.plugin.name,
-            events.len()
-        );
+        println!("{label} {} -> {} event(s)", plugin.name, events.len());
         for parcel_run in &parcel_runs {
             println!(
                 "Parcel {} -> {}",
@@ -1219,11 +1314,13 @@ fn emit_channel_runtime_events(
 }
 
 fn execute_channel_parcel_runs(
-    runtime: &mut ActiveChannelRuntimePlugin,
-    config: &Value,
+    plugin: &ChannelPluginManifest,
     parcel_bridge: Option<&ChannelParcelBridge>,
-    staged_media: &ListenerStagedMedia,
     events: &[InboundEventEnvelope],
+    mut deliver_reply: impl FnMut(
+        &InboundEventEnvelope,
+        OutboundMessageEnvelope,
+    ) -> Result<Option<DeliveryReceipt>>,
 ) -> Result<Vec<ChannelParcelRunResult>> {
     let Some(parcel_bridge) = parcel_bridge else {
         return Ok(Vec::new());
@@ -1233,11 +1330,11 @@ fn execute_channel_parcel_runs(
     for event in events {
         let session_file = channel_event_session_file(
             &parcel_bridge.session_root,
-            &runtime.plugin.name,
+            &plugin.name,
             &parcel_bridge.parcel_digest,
             event,
         );
-        let input = render_inbound_event_chat_input(&runtime.plugin.name, event)?;
+        let input = render_inbound_event_chat_input(&plugin.name, event)?;
         let response = crate::run::execute_chat_turn(
             parcel_bridge.parcel_path.clone(),
             parcel_bridge.courier.clone(),
@@ -1251,7 +1348,7 @@ fn execute_channel_parcel_runs(
         crate::run::print_courier_events(&mut output, &response.events)?;
         let delivery = if parcel_bridge.deliver_replies {
             if let Some(reply) = extract_assistant_channel_reply(&response.events) {
-                deliver_channel_reply(runtime, event, config, staged_media, reply)?
+                deliver_reply(event, reply)?
             } else {
                 None
             }
@@ -1282,6 +1379,39 @@ fn deliver_channel_reply(
     let response = call_persistent_channel_plugin(
         &mut runtime.process,
         &runtime.plugin,
+        ChannelPluginRequest::Deliver {
+            config: config.clone(),
+            message,
+        },
+        CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+    )?;
+    match response {
+        ChannelPluginResponse::Delivered { delivery } => Ok(Some(delivery)),
+        ChannelPluginResponse::Error { error } => bail!(
+            "channel plugin error {} while delivering reply: {}",
+            error.code,
+            error.message
+        ),
+        other => bail!(
+            "channel plugin returned unexpected response variant for delivery: {}",
+            response_kind(&other)
+        ),
+    }
+}
+
+fn deliver_channel_reply_once(
+    plugin: &ChannelPluginManifest,
+    event: &InboundEventEnvelope,
+    config: &Value,
+    staged_media: &ListenerStagedMedia,
+    reply: OutboundMessageEnvelope,
+) -> Result<Option<DeliveryReceipt>> {
+    let reply = rewrite_reply_attachments_for_channel(plugin, staged_media, reply)?;
+    let message = serde_json::to_value(build_channel_reply_envelope(event, reply))
+        .context("failed to serialize channel reply envelope")?;
+
+    let response = call_channel_plugin_with_timeout(
+        plugin,
         ChannelPluginRequest::Deliver {
             config: config.clone(),
             message,
@@ -1333,6 +1463,17 @@ fn rewrite_reply_attachments_for_channel(
     }
     reply.attachments = rewritten;
     Ok(reply)
+}
+
+fn poll_request_timeout(config: &Value) -> Duration {
+    let poll_timeout_secs = config
+        .get("poll_timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    std::cmp::max(
+        CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+        Duration::from_secs(poll_timeout_secs).saturating_add(CHANNEL_POLL_REQUEST_GRACE),
+    )
 }
 
 fn rewrite_attachment_for_channel(

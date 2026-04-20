@@ -67,6 +67,7 @@ A channel plugin implements:
 - `capabilities` - declare platform, ingress modes, threading model
 - `configure` - validate credentials and report channel metadata
 - `health` - verify connectivity and account identity
+- `poll_ingress` - perform a single host-driven polling fetch when requested
 - `start_ingress` / `stop_ingress` - begin/end an ingress session
 - `ingress_event` - parse a raw webhook payload into normalized events
 - `deliver` - send a reply to an existing conversation
@@ -82,9 +83,15 @@ outbound lifecycle: configuration, health, ingress setup, webhook forwarding or
 background receive loops, delivery, push, and status frames.
 
 Dispatch keeps channel plugins alive as persistent subprocesses while a listener
-or poller is active. The host still speaks JSON-RPC 2.0 messages over JSONL
-stdio, but inbound channel activity is delivered back to the host as
-`channel.event` notifications rather than one-shot `poll_ingress` responses.
+or long-running poller is active. The host still speaks JSON-RPC 2.0 messages
+over JSONL stdio, but inbound channel activity is delivered back to the host as
+`channel.event` notifications during persistent ingress sessions. Dispatch also
+supports a one-shot `poll_ingress` request for explicit single-cycle polling.
+
+For channel ingress, `start_ingress` is the primary session-oriented contract.
+`poll_ingress` remains as the auxiliary one-shot receive primitive used when
+the host explicitly wants a single fetch cycle rather than a long-lived ingress
+session.
 
 That separation is intentional. Dispatch controls the plugin lifecycle and the
 stdio framing; the plugin is free to translate that into whatever upstream
@@ -103,8 +110,8 @@ For channel plugins specifically:
 - The long-lived process is scoped to an active channel ingress session, not to
   a single agent turn and not to the entire host forever.
 - Host-initiated operations such as `configure`, `health`, `deliver`, `push`,
-  `status`, `stop_ingress`, and `shutdown` remain ordinary JSON-RPC requests
-  with terminal responses.
+  `status`, `poll_ingress`, `stop_ingress`, and `shutdown` remain ordinary
+  JSON-RPC requests with terminal responses.
 - Spontaneous inbound activity is modeled as `channel.event` notifications
   because the host did not initiate those events at a specific moment.
 
@@ -361,6 +368,7 @@ terminal response `id` to match the active request.
 | `capabilities` | (none) | Query plugin features |
 | `configure` | `config` | Validate config, report metadata |
 | `health` | `config` | Verify credentials and connectivity |
+| `poll_ingress` | `config`, `state?` | Perform one polling cycle and return events directly |
 | `start_ingress` | `config`, `state?` | Start or resume an ingress session |
 | `stop_ingress` | `config`, `state?` | Deregister webhook / stop listening |
 | `ingress_event` | `config`, `state?`, `payload` | Parse a raw webhook into events |
@@ -447,9 +455,9 @@ entering the HTTP serve loop, forwards webhook payloads through `ingress_event`
 requests, and finally sends `stop_ingress` followed by `shutdown` when the
 listener exits cleanly.
 
-For polling-style bindings, the host sends `start_ingress` with the last saved
-opaque state (if any), then waits for `channel.event` notifications from the
-plugin. Each notification carries:
+For long-running polling bindings, the host sends `start_ingress` with the last
+saved opaque state (if any), then waits for `channel.event` notifications from
+the plugin. Each notification carries:
 
 - `events` - zero or more normalized inbound events
 - `state?` - updated opaque ingress state such as cursors
@@ -457,9 +465,14 @@ plugin. Each notification carries:
 
 The host checkpoints `state` between runs. This lets repeated
 `dispatch channel poll --once` invocations resume from the last plugin cursor
-without replaying old events. For CLI-driven `--once` polling, Dispatch exits
-after the first ingress notification cycle, whether or not that cycle carried
-events.
+without replaying old events.
+
+For CLI-driven one-shot polling, Dispatch sends `poll_ingress` with the last
+saved opaque state, expects a single `ingress_events_received` response, saves
+any returned `state`, and exits. This path is useful when the plugin's upstream
+transport is itself long-poll or websocket-backed and a true one-shot fetch is
+more appropriate than starting a persistent ingress session only to tear it
+down immediately.
 
 `callback_reply` is only valid for webhook `ingress_event` handling. Polling
 notifications should leave it unset because they are not a direct HTTP callback

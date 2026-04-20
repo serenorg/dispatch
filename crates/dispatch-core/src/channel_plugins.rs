@@ -777,7 +777,7 @@ fn format_channel_request_id(id: &PluginRequestId) -> String {
     }
 }
 
-fn call_channel_plugin_with_timeout(
+pub fn call_channel_plugin_with_timeout(
     manifest: &ChannelPluginManifest,
     request: ChannelPluginRequest,
     timeout: Duration,

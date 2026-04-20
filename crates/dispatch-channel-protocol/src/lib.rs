@@ -73,6 +73,11 @@ pub enum PluginRequest<C, M> {
     Health {
         config: C,
     },
+    PollIngress {
+        config: C,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<IngressState>,
+    },
     StartIngress {
         config: C,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -460,6 +465,7 @@ pub fn request_method<C, M>(request: &PluginRequest<C, M>) -> &'static str {
         PluginRequest::Capabilities => "channel.capabilities",
         PluginRequest::Configure { .. } => "channel.configure",
         PluginRequest::Health { .. } => "channel.health",
+        PluginRequest::PollIngress { .. } => "channel.poll_ingress",
         PluginRequest::StartIngress { .. } => "channel.start_ingress",
         PluginRequest::StopIngress { .. } => "channel.stop_ingress",
         PluginRequest::IngressEvent { .. } => "channel.ingress_event",
@@ -947,6 +953,29 @@ mod tests {
 
         let json = serde_json::to_string(&request).unwrap();
         let parsed: JsonEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn poll_ingress_request_round_trips_json() {
+        let request = JsonEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: PluginRequest::PollIngress {
+                config: serde_json::json!({ "channel": "slack" }),
+                state: Some(IngressState {
+                    mode: IngressMode::Polling,
+                    status: "running".to_string(),
+                    endpoint: None,
+                    metadata: BTreeMap::from([("cursor".to_string(), "42".to_string())]),
+                }),
+            },
+        };
+
+        let rpc = request_to_jsonrpc(RequestId::integer(13), &request).unwrap();
+        let json = serde_json::to_string(&rpc).unwrap();
+        let (id, parsed) =
+            parse_jsonrpc_request::<serde_json::Value, serde_json::Value>(&json).unwrap();
+        assert_eq!(id, RequestId::integer(13));
         assert_eq!(parsed, request);
     }
 

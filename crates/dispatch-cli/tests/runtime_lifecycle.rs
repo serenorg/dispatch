@@ -212,6 +212,44 @@ fn decode_logged_channel_request_value(value: Value) -> Result<Value, Box<dyn st
     }))
 }
 
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn shell_path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn toml_string_literal(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+fn write_channel_manifest(
+    manifest_path: &Path,
+    name: &str,
+    description: &str,
+    command_path: &Path,
+    channel_capability: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::json!({
+        "kind": "channel",
+        "name": name,
+        "version": "0.1",
+        "protocol": "jsonl",
+        "protocol_version": 1,
+        "description": description,
+        "entrypoint": {
+            "command": path_string(command_path),
+            "args": [],
+        },
+        "capabilities": {
+            "channel": channel_capability,
+        },
+    });
+    fs::write(manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    Ok(())
+}
+
 fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -256,32 +294,18 @@ done
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-test",
+        "Test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "webhook",
             "allowed_paths": ["/hook"],
-            "delivery": {{
-                "attachment_sources": ["data_base64"]
-            }}
-        }}
-    }}
-}}"#,
-            script_path.display()
-        ),
+            "delivery": {
+                "attachment_sources": ["data_base64"],
+            },
+        }),
     )?;
 
     Ok(manifest_path)
@@ -327,7 +351,7 @@ case "$line" in
 esac
 done
 "#,
-            log_path.display()
+            shell_path_string(log_path)
         ),
     )?;
     #[cfg(unix)]
@@ -338,29 +362,15 @@ done
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-lifecycle-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Lifecycle test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-lifecycle-test",
+        "Lifecycle test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "webhook",
-            "allowed_paths": ["/hook"]
-        }}
-    }}
-}}"#,
-            script_path.display()
-        ),
+            "allowed_paths": ["/hook"],
+        }),
     )?;
 
     Ok(manifest_path)
@@ -387,6 +397,9 @@ printf '%s\n' "$line" >> "{}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
+    *'"method":"channel.poll_ingress"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
+        ;;
     *'"method":"channel.start_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}'
         printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
@@ -404,7 +417,7 @@ case "$line" in
 esac
 done
 "#,
-            log_path.display()
+            shell_path_string(log_path)
         ),
     )?;
     #[cfg(unix)]
@@ -415,29 +428,15 @@ done
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-polling-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Polling test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-polling-test",
+        "Polling test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "telegram",
-            "ingress_modes": ["polling"]
-        }}
-    }}
-}}"#,
-            script_path.display()
-        ),
+            "ingress_modes": ["polling"],
+        }),
     )?;
 
     Ok(manifest_path)
@@ -464,6 +463,12 @@ printf '%s\n' "$line" >> "{}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
+    *'"method":"channel.poll_ingress"'*'"cursor":"1"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}'
+        ;;
+    *'"method":"channel.poll_ingress"'*)
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
+        ;;
     *'"method":"channel.start_ingress"'*'"cursor":"1"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}}}}}}'
         printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}'
@@ -488,7 +493,7 @@ case "$line" in
 esac
 done
 "#,
-            log_path.display()
+            shell_path_string(log_path)
         ),
     )?;
     #[cfg(unix)]
@@ -499,29 +504,15 @@ done
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-polling-stateful-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Stateful polling test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-polling-stateful-test",
+        "Stateful polling test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "telegram",
-            "ingress_modes": ["polling"]
-        }}
-    }}
-}}"#,
-            script_path.display()
-        ),
+            "ingress_modes": ["polling"],
+        }),
     )?;
 
     Ok(manifest_path)
@@ -567,7 +558,7 @@ case "$line" in
 esac
 done
 "#,
-            log_path.display()
+            shell_path_string(log_path)
         ),
     )?;
     #[cfg(unix)]
@@ -578,29 +569,15 @@ done
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-query-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Query decoding test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-query-test",
+        "Query decoding test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "webhook",
-            "allowed_paths": ["/hook"]
-        }}
-    }}
-}}"#,
-            script_path.display()
-        ),
+            "allowed_paths": ["/hook"],
+        }),
     )?;
 
     Ok(manifest_path)
@@ -647,7 +624,7 @@ case "$line" in
 esac
 done
 "#,
-            log_path.display()
+            shell_path_string(log_path)
         ),
     )?;
     #[cfg(unix)]
@@ -658,44 +635,29 @@ done
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-trusted-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Trusted test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-trusted-test",
+        "Trusted test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "webhook",
-            "ingress": {{
+            "ingress": {
                 "endpoints": [
-                    {{
+                    {
                         "path": "/hook",
                         "methods": ["POST"],
-                        "host_managed": true
-                    }}
+                        "host_managed": true,
+                    }
                 ],
-                "trust": {{
+                "trust": {
                     "mode": "shared_secret_header",
                     "header_name": "X-Dispatch-Secret",
-                    "secret_name": "{}",
-                    "host_managed": true
-                }}
-            }}
-        }}
-    }}
-}}"#,
-            script_path.display(),
-            secret_name
-        ),
+                    "secret_name": secret_name,
+                    "host_managed": true,
+                }
+            }
+        }),
     )?;
 
     Ok(manifest_path)
@@ -777,7 +739,7 @@ fn write_test_courier_plugin_manifest(
             transport: PluginTransport::Jsonl,
             description: Some("Demo courier plugin for runtime tests".to_string()),
             exec: CourierPluginExec {
-                command: script_path.display().to_string(),
+                command: path_string(&script_path),
                 args: Vec::new(),
             },
             installed_sha256: None,
@@ -876,7 +838,7 @@ fn install_test_courier_plugin_with_event(
             transport: PluginTransport::Jsonl,
             description: Some("Demo courier plugin for listener tests".to_string()),
             exec: CourierPluginExec {
-                command: script_path.display().to_string(),
+                command: path_string(&script_path),
                 args: Vec::new(),
             },
             installed_sha256: None,
@@ -948,7 +910,7 @@ fn write_reply_channel_test_plugin(
             "fi\n",
             "done\n"
         )
-        .replace("__DELIVERY_LOG__", &log_path.display().to_string()),
+        .replace("__DELIVERY_LOG__", &shell_path_string(log_path)),
     )?;
     #[cfg(unix)]
     {
@@ -958,29 +920,15 @@ fn write_reply_channel_test_plugin(
     }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
-    fs::write(
+    write_channel_manifest(
         &manifest_path,
-        format!(
-            r#"{{
-    "kind": "channel",
-    "name": "channel-reply-test",
-    "version": "0.1",
-    "protocol": "jsonl",
-    "protocol_version": 1,
-    "description": "Reply test channel plugin",
-    "entrypoint": {{
-        "command": "{}",
-        "args": []
-    }},
-    "capabilities": {{
-        "channel": {{
+        "channel-reply-test",
+        "Reply test channel plugin",
+        &script_path,
+        serde_json::json!({
             "platform": "webhook",
-            "allowed_paths": ["/hook"]
-        }}
-    }}
-}}"#,
-            script_path.display()
-        ),
+            "allowed_paths": ["/hook"],
+        }),
     )?;
 
     Ok(manifest_path)
@@ -1253,7 +1201,7 @@ fn dispatch_up_uses_project_local_channel_registry() -> Result<(), Box<dyn std::
         format!(
             r#"
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[channels]]
 plugin = "channel-test"
@@ -1261,7 +1209,7 @@ mode = "listen"
 listen = "{}"
 once = true
 "#,
-            manifest_path.display(),
+            toml_string_literal(&path_string(&manifest_path)),
             listen_addr,
         ),
     )?;
@@ -1311,7 +1259,7 @@ mode = "reply"
         format!(
             r#"
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[channels]]
 plugin = "channel-query-test"
@@ -1320,7 +1268,7 @@ listen = "{}"
 once = true
 config_file = "./channel-config.toml"
 "#,
-            manifest_path.display(),
+            toml_string_literal(&path_string(&manifest_path)),
             listen_addr,
         ),
     )?;
@@ -1364,14 +1312,14 @@ fn dispatch_up_dry_run_does_not_install_or_start_channels() -> Result<(), Box<dy
         format!(
             r#"
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[channels]]
 plugin = "channel-test"
 mode = "poll"
 once = true
 "#,
-            manifest_path.display(),
+            toml_string_literal(&path_string(&manifest_path)),
         ),
     )?;
 
@@ -1406,14 +1354,14 @@ fn dispatch_up_dry_run_flags_unresolvable_courier() -> Result<(), Box<dyn std::e
 courier = "ghost-cloud"
 
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[channels]]
 plugin = "channel-test"
 mode = "poll"
 once = true
 "#,
-            manifest_path.display(),
+            toml_string_literal(&path_string(&manifest_path)),
         ),
     )?;
 
@@ -1443,18 +1391,18 @@ fn dispatch_up_dry_run_only_claims_matching_courier_will_install()
 courier = "ghost-cloud"
 
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[channels]]
 plugin = "channel-test"
 mode = "poll"
 once = true
 "#,
-            channel_manifest.display(),
-            courier_manifest.display(),
+            toml_string_literal(&path_string(&channel_manifest)),
+            toml_string_literal(&path_string(&courier_manifest)),
         ),
     )?;
 
@@ -1488,18 +1436,18 @@ fn dispatch_up_dry_run_reports_matching_courier_will_install()
 courier = "ghost-cloud"
 
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[extensions]]
-manifest = "{}"
+manifest = {}
 
 [[channels]]
 plugin = "channel-test"
 mode = "poll"
 once = true
 "#,
-            channel_manifest.display(),
-            courier_manifest.display(),
+            toml_string_literal(&path_string(&channel_manifest)),
+            toml_string_literal(&path_string(&courier_manifest)),
         ),
     )?;
 
@@ -1667,7 +1615,7 @@ fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn channel_poll_calls_start_poll_and_stop_ingress() -> Result<(), Box<dyn std::error::Error>> {
+fn channel_poll_once_issues_poll_ingress() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let registry_path = dir.path().join("channels.json");
     let poll_log = dir.path().join("poll.log");
@@ -1726,19 +1674,14 @@ fn channel_poll_calls_start_poll_and_stop_ingress() -> Result<(), Box<dyn std::e
     let request_lines = logged_requests.lines().collect::<Vec<_>>();
     assert_eq!(
         request_lines.len(),
-        3,
+        1,
         "unexpected poll log:\n{logged_requests}"
     );
 
-    let start_request = decode_logged_channel_request(request_lines[0])?;
-    let stop_request = decode_logged_channel_request(request_lines[1])?;
-    let shutdown_request = decode_logged_channel_request(request_lines[2])?;
+    let poll_request = decode_logged_channel_request(request_lines[0])?;
 
-    assert_eq!(start_request["request"]["kind"], "start_ingress");
-    assert_eq!(stop_request["request"]["kind"], "stop_ingress");
-    assert_eq!(shutdown_request["request"]["kind"], "shutdown");
-    assert_eq!(start_request["request"]["state"], Value::Null);
-    assert_eq!(stop_request["request"]["state"]["metadata"]["cursor"], "1");
+    assert_eq!(poll_request["request"]["kind"], "poll_ingress");
+    assert_eq!(poll_request["request"]["state"], Value::Null);
 
     Ok(())
 }
@@ -1831,15 +1774,18 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
     let request_lines = logged_requests.lines().collect::<Vec<_>>();
     assert_eq!(
         request_lines.len(),
-        6,
+        2,
         "unexpected stateful poll log:\n{logged_requests}"
     );
 
-    let first_start_request = decode_logged_channel_request(request_lines[0])?;
-    let second_start_request = decode_logged_channel_request(request_lines[3])?;
-    assert_eq!(first_start_request["request"]["state"], Value::Null);
+    let first_poll_request = decode_logged_channel_request(request_lines[0])?;
+    let second_poll_request = decode_logged_channel_request(request_lines[1])?;
+
+    assert_eq!(first_poll_request["request"]["kind"], "poll_ingress");
+    assert_eq!(second_poll_request["request"]["kind"], "poll_ingress");
+    assert_eq!(first_poll_request["request"]["state"], Value::Null);
     assert_eq!(
-        second_start_request["request"]["state"]["metadata"]["cursor"],
+        second_poll_request["request"]["state"]["metadata"]["cursor"],
         "1"
     );
 
