@@ -246,6 +246,7 @@ pub fn recv_line_with_child_exit(
     poll_interval: Duration,
 ) -> Result<Option<(usize, String)>, RecvLineError> {
     let deadline = timeout.and_then(|value| Instant::now().checked_add(value));
+    let mut child_exited = false;
     loop {
         let wait_for = deadline
             .map(|deadline| {
@@ -258,21 +259,77 @@ pub fn recv_line_with_child_exit(
         let recv_result = match receiver.recv_timeout(wait_for) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if child
-                    .try_wait()
-                    .map_err(RecvLineError::ChildWait)?
-                    .is_some()
+                if !child_exited
+                    && child
+                        .try_wait()
+                        .map_err(RecvLineError::ChildWait)?
+                        .is_some()
                 {
-                    return Ok(None);
+                    child_exited = true;
                 }
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     return Err(RecvLineError::Timeout);
                 }
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(RecvLineError::Disconnected),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if child_exited
+                    || child
+                        .try_wait()
+                        .map_err(RecvLineError::ChildWait)?
+                        .is_some()
+                {
+                    return Ok(None);
+                }
+                return Err(RecvLineError::Disconnected);
+            }
         };
 
         return recv_result.map(Some).map_err(RecvLineError::Read);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{process::Command, sync::mpsc, thread, time::Duration};
+
+    fn spawn_quick_exit_child() -> Child {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit 0"]);
+            command
+        };
+
+        command.spawn().expect("failed to spawn child")
+    }
+
+    #[test]
+    fn recv_line_with_child_exit_reads_line_arriving_after_child_exit() {
+        let (sender, receiver) = mpsc::channel();
+        let mut child = spawn_quick_exit_child();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let _ = sender.send(Ok((6, "ok\n".to_string())));
+        });
+
+        let result = recv_line_with_child_exit(
+            &receiver,
+            &mut child,
+            Some(Duration::from_millis(200)),
+            Duration::from_millis(5),
+        )
+        .expect("recv_line_with_child_exit should succeed");
+
+        assert_eq!(result, Some((6, "ok\n".to_string())));
     }
 }
