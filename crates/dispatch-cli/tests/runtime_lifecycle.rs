@@ -122,21 +122,33 @@ fn read_run_record(record_path: &Path) -> Result<Value, Box<dyn std::error::Erro
     Ok(serde_json::from_slice(&fs::read(record_path)?)?)
 }
 
+fn wait_until<T>(
+    context: &str,
+    mut poll: impl FnMut() -> Result<Option<T>, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {context}").into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_run_record(
     record_path: &Path,
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_until(&format!("record {}", record_path.display()), || {
         let record = read_run_record(record_path)?;
         if predicate(&record) {
-            return Ok(record);
+            return Ok(Some(record));
         }
-        if Instant::now() >= deadline {
-            return Err(format!("timed out waiting for record {}", record_path.display()).into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+        Ok(None)
+    })
 }
 
 fn http_request(addr: &str, request: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -2581,11 +2593,17 @@ fn inspect_run_reconciles_dead_service_helpers() -> Result<(), Box<dyn std::erro
 
     kill(Pid::from_raw(pid), Signal::SIGKILL)?;
 
-    let inspect_output = require_success(
-        run_dispatch(dir.path(), &[], &["inspect-run", &run_id, ".", "--json"])?,
-        "dispatch inspect-run after kill",
-    )?;
-    let inspected: Value = serde_json::from_str(&inspect_output)?;
+    let inspected = wait_until("inspect-run to reconcile a killed helper", || {
+        let inspect_output = require_success(
+            run_dispatch(dir.path(), &[], &["inspect-run", &run_id, ".", "--json"])?,
+            "dispatch inspect-run after kill",
+        )?;
+        let inspected: Value = serde_json::from_str(&inspect_output)?;
+        if inspected["status"] == "stopped" {
+            return Ok(Some(inspected));
+        }
+        Ok(None)
+    })?;
     assert_eq!(inspected["status"], "stopped");
 
     require_success(
