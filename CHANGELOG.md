@@ -2,6 +2,34 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.3.0] - 2026-04-22
+
+Extensions and plugin infrastructure release.
+
+This release makes runtime wiring first-class through `dispatch.toml` and `dispatch up`, ships the first host-side channel plugin runtime, and adds catalog-based discovery for third-party extensions. Channel support is usable but still provisional; capability-enforced trust remains follow-up work.
+
+### Extensions
+
+- Added project-level runtime wiring through `dispatch.toml`
+- Added `dispatch up` to reconcile project-local extension manifests and start configured channel bindings
+- Added first-class host support for channel plugins, including listen/poll runtime bindings, ingress forwarding, reply delivery, status handling, and attachment staging
+- Added one-shot `dispatch channel poll --once` support for ingress-capable channel plugins
+- Added persistent channel plugin sessions for long-lived ingress bindings instead of one process per hook
+- Added channel reply media staging for URL-only channels that do not support inline attachments
+- Added explicit host-side tracking of channel plugin attachment capabilities and inbound attachment source handling
+- Added Tier 1 extension discovery with `dispatch extension catalog add|ls|rm|refresh`, `search`, and `show`
+- Added direct `dispatch extension install <name>` for catalog entries that publish GitHub release binary metadata and a pinned manifest URL
+- Added project-local extension registries under `.dispatch/registries/` so deployment wiring does not mutate global host inventory
+- Added shared plugin protocol crates plus JSON-RPC envelopes for courier and channel plugin transports
+
+### Changed
+
+- Renamed skill sidecar manifests from `dispatch.toml` to `skill.toml` to reserve `dispatch.toml` for project deployment wiring
+- `dispatch.toml` extension entries can infer `kind` from plugin manifests instead of repeating it manually
+- Reply delivery through channel bindings now requires a parcel-backed runtime binding instead of silently proceeding without one
+- Channel poll ingress state now persists across runs and is updated atomically
+- Catalog refresh now fails correctly on fetch errors and uses more useful derived names for common GitHub catalog URLs
+
 ## [0.2.0] - 2026-04-10
 
 Security and hardening release.

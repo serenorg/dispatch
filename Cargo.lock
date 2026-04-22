@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "dispatch-channel-protocol",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch-courier-echo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dispatch-core",
  "serde_json",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch-process"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "nix 0.31.2",
@@ -932,11 +932,11 @@ dependencies = [
 
 [[package]]
 name = "dispatch-wasm-abi"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "dispatch-wasm-guest-reference"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "wit-bindgen 0.41.0",
  "wit-bindgen-rt",
