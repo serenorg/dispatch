@@ -156,9 +156,25 @@ fn http_request(addr: &str, request: &str) -> Result<String, Box<dyn std::error:
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if !response.is_empty()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
 fn http_request_with_retry(
@@ -240,7 +256,8 @@ fn write_channel_manifest(
     manifest_path: &Path,
     name: &str,
     description: &str,
-    command_path: &Path,
+    command: &str,
+    args: &[String],
     channel_capability: Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::json!({
@@ -251,8 +268,8 @@ fn write_channel_manifest(
         "protocol_version": 1,
         "description": description,
         "entrypoint": {
-            "command": path_string(command_path),
-            "args": [],
+            "command": command,
+            "args": args,
         },
         "capabilities": {
             "channel": channel_capability,
@@ -262,16 +279,70 @@ fn write_channel_manifest(
     Ok(())
 }
 
-fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
+#[cfg(unix)]
+fn write_channel_entrypoint_script(
+    dir: &Path,
+    stem: &str,
+    unix_body: &str,
+    _windows_body: &str,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
 
+    let script_path = dir.join(format!("{stem}.sh"));
+    fs::write(&script_path, unix_body)?;
+    let mut permissions = fs::metadata(&script_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions)?;
+    Ok((path_string(&script_path), Vec::new()))
+}
+
+#[cfg(windows)]
+fn write_channel_entrypoint_script(
+    dir: &Path,
+    stem: &str,
+    _unix_body: &str,
+    windows_body: &str,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+    let script_path = dir.join(format!("{stem}.ps1"));
+    let wrapper_path = dir.join(format!("{stem}.cmd"));
+    fs::write(
+        &script_path,
+        format!(
+            concat!(
+                "function Write-Output {{\n",
+                "    param([Parameter(ValueFromPipeline = $true)] [object] $InputObject)\n",
+                "    if ($null -eq $InputObject) {{\n",
+                "        [Console]::Out.WriteLine()\n",
+                "    }} else {{\n",
+                "        [Console]::Out.WriteLine([string]$InputObject)\n",
+                "    }}\n",
+                "}}\n\n",
+                "{}"
+            ),
+            windows_body
+        ),
+    )?;
+    fs::write(
+        &wrapper_path,
+        format!(
+            "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0{stem}.ps1\"\r\n"
+        ),
+    )?;
+    Ok((path_string(&wrapper_path), Vec::new()))
+}
+
+#[cfg(windows)]
+fn powershell_single_quote_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let plugin_dir = dir.join("channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
         r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
@@ -297,20 +368,35 @@ case "$line" in
 esac
 done
 "#,
-    )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
+        r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {
+        $requestId = $Matches[1]
     }
+    if ($line -like '*"method":"channel.start_ingress"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_started","state":{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{}}}}')
+    } elseif ($line -like '*"method":"channel.stop_ingress"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_stopped","state":{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{}}}}')
+    } elseif ($line -like '*"method":"channel.shutdown"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
+        break
+    } elseif ($line -like '*"method":"channel.ingress_event"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}}')
+    } else {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}')
+    }
+}
+"#,
+    )?;
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-test",
         "Test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "webhook",
             "allowed_paths": ["/hook"],
@@ -327,16 +413,17 @@ fn write_lifecycle_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = dir.join("lifecycle-channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
-        format!(
+    #[cfg(windows)]
+    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    #[cfg(not(windows))]
+    let windows_log_path = String::new();
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
+        &format!(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
@@ -365,20 +452,38 @@ done
 "#,
             shell_path_string(log_path)
         ),
+        &format!(
+            r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {{
+    Add-Content -Path '{windows_log_path}' -Value $line
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {{
+        $requestId = $Matches[1]
+    }}
+    if ($line -like '*"method":"channel.start_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{{"phase":"start"}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{"phase":"stop"}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.shutdown"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
+        break
+    }} elseif ($line -like '*"method":"channel.ingress_event"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
+    }} else {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
+    }}
+}}
+"#
+        ),
     )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
-    }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-lifecycle-test",
         "Lifecycle test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "webhook",
             "allowed_paths": ["/hook"],
@@ -392,16 +497,17 @@ fn write_polling_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = dir.join("polling-channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
-        format!(
+    #[cfg(windows)]
+    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    #[cfg(not(windows))]
+    let windows_log_path = String::new();
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
+        &format!(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
@@ -431,20 +537,39 @@ done
 "#,
             shell_path_string(log_path)
         ),
+        &format!(
+            r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {{
+    Add-Content -Path '{windows_log_path}' -Value $line
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {{
+        $requestId = $Matches[1]
+    }}
+    if ($line -like '*"method":"channel.poll_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
+    }} elseif ($line -like '*"method":"channel.start_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}')
+        Write-Output ('{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
+    }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.shutdown"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
+        break
+    }} else {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
+    }}
+}}
+"#
+        ),
     )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
-    }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-polling-test",
         "Polling test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "telegram",
             "ingress_modes": ["polling"],
@@ -458,16 +583,17 @@ fn write_stateful_polling_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = dir.join("stateful-polling-channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
-        format!(
+    #[cfg(windows)]
+    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    #[cfg(not(windows))]
+    let windows_log_path = String::new();
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
+        &format!(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
@@ -507,20 +633,46 @@ done
 "#,
             shell_path_string(log_path)
         ),
+        &format!(
+            r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {{
+    Add-Content -Path '{windows_log_path}' -Value $line
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {{
+        $requestId = $Matches[1]
+    }}
+    if ($line -like '*"method":"channel.poll_ingress"*' -and $line -like '*"cursor":"1"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}')
+    }} elseif ($line -like '*"method":"channel.poll_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
+    }} elseif ($line -like '*"method":"channel.start_ingress"*' -and $line -like '*"cursor":"1"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}}}}}}')
+        Write-Output ('{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}')
+    }} elseif ($line -like '*"method":"channel.start_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}')
+        Write-Output ('{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
+    }} elseif ($line -like '*"method":"channel.stop_ingress"*' -and $line -like '*"cursor":"2"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"2"}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.shutdown"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
+        break
+    }} else {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
+    }}
+}}
+"#
+        ),
     )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
-    }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-polling-stateful-test",
         "Stateful polling test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "telegram",
             "ingress_modes": ["polling"],
@@ -534,16 +686,17 @@ fn write_logging_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = dir.join("logging-channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
-        format!(
+    #[cfg(windows)]
+    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    #[cfg(not(windows))]
+    let windows_log_path = String::new();
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
+        &format!(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
@@ -572,20 +725,38 @@ done
 "#,
             shell_path_string(log_path)
         ),
+        &format!(
+            r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {{
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {{
+        $requestId = $Matches[1]
+    }}
+    if ($line -like '*"method":"channel.start_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{{}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.shutdown"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
+        break
+    }} elseif ($line -like '*"method":"channel.ingress_event"*') {{
+        Set-Content -Path '{windows_log_path}' -Value $line
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
+    }} else {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
+    }}
+}}
+"#
+        ),
     )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
-    }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-query-test",
         "Query decoding test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "webhook",
             "allowed_paths": ["/hook"],
@@ -600,16 +771,17 @@ fn write_trusted_channel_test_plugin(
     secret_name: &str,
     log_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = dir.join("trusted-channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
-        format!(
+    #[cfg(windows)]
+    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    #[cfg(not(windows))]
+    let windows_log_path = String::new();
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
+        &format!(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
@@ -638,20 +810,38 @@ done
 "#,
             shell_path_string(log_path)
         ),
+        &format!(
+            r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {{
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {{
+        $requestId = $Matches[1]
+    }}
+    if ($line -like '*"method":"channel.start_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{{}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{{}}}}}}}}')
+    }} elseif ($line -like '*"method":"channel.shutdown"*') {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
+        break
+    }} elseif ($line -like '*"method":"channel.ingress_event"*') {{
+        Add-Content -Path '{windows_log_path}' -Value 'invoked'
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
+    }} else {{
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
+    }}
+}}
+"#
+        ),
     )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
-    }
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-trusted-test",
         "Trusted test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "webhook",
             "ingress": {
@@ -706,19 +896,68 @@ fn install_test_courier_plugin(
     install_test_courier_plugin_with_reply(root, registry_path, name, parcel_digest, "plugin reply")
 }
 
+#[cfg(unix)]
+fn write_courier_entrypoint_script(
+    dir: &Path,
+    stem: &str,
+    unix_body: &str,
+    _windows_body: &str,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_path = dir.join(format!("{stem}.sh"));
+    fs::write(&script_path, unix_body)?;
+    let mut permissions = fs::metadata(&script_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions)?;
+    Ok((path_string(&script_path), Vec::new()))
+}
+
+#[cfg(windows)]
+fn write_courier_entrypoint_script(
+    dir: &Path,
+    stem: &str,
+    _unix_body: &str,
+    windows_body: &str,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+    let script_path = dir.join(format!("{stem}.ps1"));
+    let wrapper_path = dir.join(format!("{stem}.cmd"));
+    fs::write(
+        &script_path,
+        format!(
+            concat!(
+                "function Write-Output {{\n",
+                "    param([Parameter(ValueFromPipeline = $true)] [object] $InputObject)\n",
+                "    if ($null -eq $InputObject) {{\n",
+                "        [Console]::Out.WriteLine()\n",
+                "    }} else {{\n",
+                "        [Console]::Out.WriteLine([string]$InputObject)\n",
+                "    }}\n",
+                "}}\n\n",
+                "{}"
+            ),
+            windows_body
+        ),
+    )?;
+    fs::write(
+        &wrapper_path,
+        format!(
+            "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0{stem}.ps1\"\r\n"
+        ),
+    )?;
+    Ok((path_string(&wrapper_path), Vec::new()))
+}
+
 fn write_test_courier_plugin_manifest(
     root: &Path,
     name: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = root.join(format!("{name}-courier-plugin"));
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("courier-test.sh");
-    fs::write(
-        &script_path,
+    let (command, args) = write_courier_entrypoint_script(
+        &plugin_dir,
+        "courier-test",
         concat!(
             "#!/bin/sh\n",
             "set -eu\n",
@@ -733,13 +972,21 @@ fn write_test_courier_plugin_manifest(
             "fi\n",
             "done\n"
         ),
-    )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
+        r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {
+        $requestId = $Matches[1]
     }
+    if ($line -like '*"method":"courier.capabilities"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"capabilities","capabilities":{"courier_id":"demo-jsonl","kind":"custom","supports_chat":true,"supports_job":false,"supports_heartbeat":false,"supports_local_tools":false,"supports_mounts":[]}}}')
+    } else {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}')
+        exit 1
+    }
+}
+"#,
+    )?;
 
     let manifest_path = plugin_dir.join("courier-plugin.json");
     fs::write(
@@ -750,10 +997,7 @@ fn write_test_courier_plugin_manifest(
             protocol_version: 1,
             transport: PluginTransport::Jsonl,
             description: Some("Demo courier plugin for runtime tests".to_string()),
-            exec: CourierPluginExec {
-                command: path_string(&script_path),
-                args: Vec::new(),
-            },
+            exec: CourierPluginExec { command, args },
             installed_sha256: None,
         })?,
     )?;
@@ -769,10 +1013,8 @@ fn install_test_courier_plugin_with_event(
     event: Value,
     history_content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    let script_path = root.join("courier-test.sh");
+    let script_dir = root.join("listener-test-courier-plugin");
+    fs::create_dir_all(&script_dir)?;
     let event_json = shell_single_quote_literal(
         &serde_json::json!({
             "jsonrpc": "2.0",
@@ -781,6 +1023,8 @@ fn install_test_courier_plugin_with_event(
         })
         .to_string(),
     );
+    #[cfg(windows)]
+    let event_json = powershell_single_quote_literal(&event_json);
     let done_json = shell_single_quote_literal(
         &serde_json::json!({
             "jsonrpc": "2.0",
@@ -804,9 +1048,12 @@ fn install_test_courier_plugin_with_event(
         })
         .to_string(),
     );
-    fs::write(
-        &script_path,
-        concat!(
+    #[cfg(windows)]
+    let done_json = powershell_single_quote_literal(&done_json);
+    let (command, args) = write_courier_entrypoint_script(
+        &script_dir,
+        "courier-test",
+        &concat!(
             "#!/bin/sh\n",
             "set -eu\n",
             "while IFS= read -r line; do\n",
@@ -832,13 +1079,33 @@ fn install_test_courier_plugin_with_event(
         .replace("__PARCEL_DIGEST__", parcel_digest)
         .replace("__EVENT_JSON__", &event_json)
         .replace("__DONE_JSON__", &done_json),
-    )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
+        &r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {
+        $requestId = $Matches[1]
     }
+    if ($line -like '*"method":"courier.capabilities"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"capabilities","capabilities":{"courier_id":"demo-jsonl","kind":"custom","supports_chat":true,"supports_job":false,"supports_heartbeat":false,"supports_local_tools":false,"supports_mounts":[]}}}')
+    } elseif ($line -like '*"method":"courier.validate_parcel"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
+    } elseif ($line -like '*"method":"courier.inspect"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"inspection","inspection":{"courier_id":"demo-jsonl","kind":"custom","entrypoint":"chat","required_secrets":[],"mounts":[],"local_tools":[]}}}')
+    } elseif ($line -like '*"method":"courier.open_session"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"session","session":{"id":"demo-jsonl-session","parcel_digest":"__PARCEL_DIGEST__","entrypoint":"chat","turn_count":0,"elapsed_ms":0,"history":[],"resolved_mounts":[],"backend_state":"open"}}}')
+    } elseif ($line -like '*"method":"courier.run"*') {
+        [Console]::Out.WriteLine('__EVENT_JSON__')
+        [Console]::Out.WriteLine('__DONE_JSON__')
+    } else {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}')
+        exit 1
+    }
+}
+"#
+        .replace("__PARCEL_DIGEST__", parcel_digest)
+        .replace("__EVENT_JSON__", &event_json)
+        .replace("__DONE_JSON__", &done_json),
+    )?;
 
     let manifest_path = root.join("courier-plugin.json");
     fs::write(
@@ -849,10 +1116,7 @@ fn install_test_courier_plugin_with_event(
             protocol_version: 1,
             transport: PluginTransport::Jsonl,
             description: Some("Demo courier plugin for listener tests".to_string()),
-            exec: CourierPluginExec {
-                command: path_string(&script_path),
-                args: Vec::new(),
-            },
+            exec: CourierPluginExec { command, args },
             installed_sha256: None,
         })?,
     )?;
@@ -890,16 +1154,17 @@ fn write_reply_channel_test_plugin(
     dir: &Path,
     log_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let plugin_dir = dir.join("reply-channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
-    let script_path = plugin_dir.join("channel-test.sh");
-    fs::write(
-        &script_path,
-        concat!(
+    #[cfg(windows)]
+    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    #[cfg(not(windows))]
+    let windows_log_path = String::new();
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "channel-test",
+        &concat!(
             "#!/bin/sh\n",
             "set -eu\n",
             "while IFS= read -r line; do\n",
@@ -923,20 +1188,90 @@ fn write_reply_channel_test_plugin(
             "done\n"
         )
         .replace("__DELIVERY_LOG__", &shell_path_string(log_path)),
-    )?;
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions)?;
+        &r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') {
+        $requestId = $Matches[1]
     }
+    if ($line -like '*"method":"channel.start_ingress"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_started","state":{"mode":"webhook","status":"registered","endpoint":"https://example.test/hook","metadata":{}}}}')
+    } elseif ($line -like '*"method":"channel.stop_ingress"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_stopped","state":{"mode":"webhook","status":"stopped","endpoint":"https://example.test/hook","metadata":{}}}}')
+    } elseif ($line -like '*"method":"channel.shutdown"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
+        break
+    } elseif ($line -like '*"method":"channel.ingress_event"*') {
+        $response = @{
+            jsonrpc = "2.0"
+            id = [int]$requestId
+            result = @{
+                kind = "ingress_events_received"
+                events = @(
+                    @{
+                        event_id = "evt-1"
+                        platform = "webhook"
+                        event_type = "message"
+                        received_at = "2026-04-12T00:00:00Z"
+                        conversation = @{
+                            id = "conv-1"
+                            kind = "private"
+                            thread_id = "thread-1"
+                        }
+                        actor = @{
+                            id = "user-1"
+                            is_bot = $false
+                            metadata = @{}
+                        }
+                        message = @{
+                            id = "msg-1"
+                            content = "hello"
+                            content_type = "text/plain"
+                            attachments = @()
+                            metadata = @{}
+                        }
+                        metadata = @{}
+                    }
+                )
+                callback_reply = @{
+                    status = 200
+                    content_type = "text/plain; charset=utf-8"
+                    body = "ok`n"
+                }
+            }
+        } | ConvertTo-Json -Compress -Depth 10
+        [Console]::Out.WriteLine($response)
+    } elseif ($line -like '*"method":"channel.deliver"*') {
+        Add-Content -Path '__WINDOWS_LOG_PATH__' -Value $line
+        $response = @{
+            jsonrpc = "2.0"
+            id = [int]$requestId
+            result = @{
+                kind = "delivered"
+                delivery = @{
+                    message_id = "delivery-1"
+                    conversation_id = "conv-1"
+                    metadata = @{
+                        delivered_by = "test"
+                    }
+                }
+            }
+        } | ConvertTo-Json -Compress -Depth 10
+        [Console]::Out.WriteLine($response)
+    } else {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}')
+    }
+}
+"#.replace("__WINDOWS_LOG_PATH__", &windows_log_path),
+    )?;
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
         "channel-reply-test",
         "Reply test channel plugin",
-        &script_path,
+        &command,
+        &args,
         serde_json::json!({
             "platform": "webhook",
             "allowed_paths": ["/hook"],
@@ -1595,7 +1930,10 @@ fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::erro
         &listen_addr,
         "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     )?;
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response:\n{response}"
+    );
 
     let output = child.wait_with_output()?;
     let _ = require_success(output, "dispatch channel listen lifecycle --once")?;
@@ -2135,7 +2473,10 @@ fn channel_listen_delivers_replies_through_plugin() -> Result<(), Box<dyn std::e
         &listen_addr,
         "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
     )?;
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response:\n{response}"
+    );
 
     let output = child.wait_with_output()?;
     let stdout = require_success(output, "dispatch channel listen --deliver-replies")?;
@@ -2314,7 +2655,10 @@ fn channel_listen_delivers_structured_channel_reply_envelope()
         &listen_addr,
         "POST /hook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
     )?;
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response:\n{response}"
+    );
 
     let output = child.wait_with_output()?;
     let stdout = require_success(output, "dispatch channel listen --deliver-replies")?;

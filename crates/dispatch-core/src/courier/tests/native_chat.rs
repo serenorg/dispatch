@@ -546,14 +546,18 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_chat_emits_backend_fallback_when_tool_loop_is_exhausted() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 ENTRYPOINT chat
-",
-        &[("tools/demo.sh", "printf 'tool-output'")],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
     let backend = Arc::new(FakeChatBackend::with_replies(
         (0..8)
@@ -618,15 +622,19 @@ ENTRYPOINT chat
 
 #[test]
 fn native_courier_respects_configured_tool_round_limit() {
+    let tool_path = test_tool_relative_path("demo");
+    let tool_body = test_tool_print_body("ok");
     let test_parcel = build_test_parcel(
-        "\
+        &format!(
+            "\
 FROM dispatch/native:latest
 MODEL fake-model PROVIDER fake
-TOOL LOCAL tools/demo.sh AS demo
+TOOL LOCAL {tool_path} AS demo
 LIMIT TOOL_ROUNDS 3
 ENTRYPOINT chat
-",
-        &[("tools/demo.sh", "printf ok")],
+"
+        ),
+        &[(tool_path.as_str(), tool_body.as_str())],
     );
 
     let backend = Arc::new(FakeChatBackend::with_replies(
