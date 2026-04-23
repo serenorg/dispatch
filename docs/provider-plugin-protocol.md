@@ -91,6 +91,7 @@ Provider request methods:
   "kind": "capabilities",
   "capabilities": {
     "provider_id": "seren-models",
+    "protocol_version": 1,
     "models": [
       {
         "id": "seren-default",
@@ -139,7 +140,7 @@ A successful response carries typed provider metadata:
 }
 ```
 
-`provider.health` performs the minimal round-trip required to confirm credentials and network reachability. It is separate from `configure` so that a courier may run health checks without re-validating config on every turn.
+`provider.health` performs the minimal round-trip required to confirm credentials and network reachability. It is separate from `configure` so that a courier may run health checks without re-validating config on every turn. The `health` request reuses the same `config` object shape as `configure`.
 
 ## Completion and Streaming
 

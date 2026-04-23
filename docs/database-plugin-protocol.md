@@ -94,6 +94,7 @@ Database request methods:
   "kind": "capabilities",
   "capabilities": {
     "database_id": "seren-db",
+    "protocol_version": 1,
     "engine": "postgres",
     "operations": ["query", "execute", "describe"],
     "supports_transactions": true,
@@ -137,7 +138,7 @@ A successful response carries typed database metadata:
 }
 ```
 
-`database.health` performs the minimal round-trip required to confirm credentials and connectivity.
+`database.health` performs the minimal round-trip required to confirm credentials and connectivity. The `health` request reuses the same `config` object shape as `configure`.
 
 ## Schema Introspection
 

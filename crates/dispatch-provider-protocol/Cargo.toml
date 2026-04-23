@@ -1,0 +1,15 @@
+[package]
+name = "dispatch-provider-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared provider plugin wire protocol for Dispatch (v0.4.0 draft)."
+readme = "../../README.md"
+keywords = ["agents", "provider", "plugin", "protocol", "dispatch"]
+categories = ["development-tools"]
+
+[dependencies]
+dispatch-plugin-rpc = { path = "../dispatch-plugin-rpc" }
+serde.workspace = true
+serde_json.workspace = true
