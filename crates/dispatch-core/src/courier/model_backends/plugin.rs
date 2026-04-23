@@ -1,10 +1,12 @@
 use super::*;
+use crate::resolve_provider_plugin;
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::{
     io::{BufReader, Read, Write},
+    path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -59,9 +61,9 @@ impl ChatModelBackend for PluginModelBackend {
             return Ok(ModelGeneration::NotConfigured {
                 backend: self.provider.clone(),
                 reason: format!(
-                    "no `dispatch-backend-{}` plugin found; set DISPATCH_BACKEND_{}",
+                    "no provider plugin `{}` found in the installed registry, bundled backends, or DISPATCH_BACKEND_{}",
                     self.provider,
-                    self.provider.to_ascii_uppercase()
+                    self.provider.to_ascii_uppercase(),
                 ),
             });
         };
@@ -82,7 +84,7 @@ struct PluginLaunch {
     args: Vec<String>,
 }
 
-fn resolve_plugin_launch(provider: &str) -> Option<PluginLaunch> {
+fn resolve_plugin_launch(provider: &str, working_directory: Option<&str>) -> Option<PluginLaunch> {
     #[cfg(test)]
     if let Some(path) =
         TEST_PLUGIN_BINARY_OVERRIDES.with(|slot| slot.borrow().get(provider).cloned())
@@ -94,7 +96,7 @@ fn resolve_plugin_launch(provider: &str) -> Option<PluginLaunch> {
     }
 
     let env_key = format!("DISPATCH_BACKEND_{}", provider.to_ascii_uppercase());
-    if let Some(val) = std::env::var(&env_key)
+    if let Some(val) = env_var(&env_key)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -111,6 +113,10 @@ fn resolve_plugin_launch(provider: &str) -> Option<PluginLaunch> {
         return Some(PluginLaunch { program, args });
     }
 
+    if let Some(launch) = installed_provider_plugin_launch(provider, working_directory) {
+        return Some(launch);
+    }
+
     if let Some(launch) = bundled_plugin_launch(provider) {
         return Some(launch);
     }
@@ -120,6 +126,54 @@ fn resolve_plugin_launch(provider: &str) -> Option<PluginLaunch> {
         program: plugin_binary_name(provider),
         args: Vec::new(),
     })
+}
+
+fn installed_provider_plugin_launch(
+    provider: &str,
+    working_directory: Option<&str>,
+) -> Option<PluginLaunch> {
+    let registry_path = provider_registry_path_for_lookup(working_directory)?;
+    let plugin = resolve_provider_plugin(provider, Some(&registry_path)).ok()?;
+    Some(PluginLaunch {
+        program: plugin.exec.command,
+        args: plugin.exec.args,
+    })
+}
+
+fn provider_registry_path_for_lookup(working_directory: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = env_var("DISPATCH_PROVIDER_REGISTRY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
+
+    find_project_provider_registry(working_directory)
+        .or_else(|| crate::default_provider_registry_path().ok())
+}
+
+fn find_project_provider_registry(working_directory: Option<&str>) -> Option<PathBuf> {
+    let start = working_directory
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    let mut cursor = if start.is_dir() {
+        start
+    } else {
+        start.parent()?.to_path_buf()
+    };
+
+    loop {
+        let candidate = cursor.join(".dispatch/registries/providers.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !cursor.pop() {
+            break;
+        }
+    }
+
+    None
 }
 
 fn plugin_binary_name(provider: &str) -> String {
@@ -152,7 +206,7 @@ fn spawn_plugin_process(
     provider: &str,
     request: &ModelRequest,
 ) -> Result<Option<Child>, CourierError> {
-    let Some(launch) = resolve_plugin_launch(provider) else {
+    let Some(launch) = resolve_plugin_launch(provider, request.working_directory.as_deref()) else {
         return Ok(None);
     };
 

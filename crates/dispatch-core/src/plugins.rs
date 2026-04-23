@@ -129,6 +129,10 @@ pub enum PluginRegistryError {
     BuiltinNameConflict { name: String },
     #[error("courier `{name}` is not installed")]
     UnknownCourier { name: String },
+    #[error("provider plugin `{name}` is not installed")]
+    UnknownProvider { name: String },
+    #[error("database plugin `{name}` is not installed")]
+    UnknownDatabase { name: String },
     #[error("channel plugin `{name}` is not installed")]
     UnknownChannel { name: String },
     #[error("no installed channel plugin matches ingress {method} {path}")]
