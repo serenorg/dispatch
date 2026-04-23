@@ -452,6 +452,18 @@ fn install_github_release_extension(
                 hit.entry.name
             );
         }
+        CatalogExtensionKind::Provider => {
+            bail!(
+                "extension `{}` is a provider; install-by-name is not implemented for providers yet",
+                hit.entry.name
+            );
+        }
+        CatalogExtensionKind::Database => {
+            bail!(
+                "extension `{}` is a database; install-by-name is not implemented for databases yet",
+                hit.entry.name
+            );
+        }
     }
 
     drop(manifest_dir);
@@ -655,6 +667,18 @@ fn rewrite_manifest_for_staged_binary(
                 entry.name
             );
         }
+        CatalogExtensionKind::Provider => {
+            bail!(
+                "extension `{}` is a provider; install-by-name is not implemented for providers yet",
+                entry.name
+            );
+        }
+        CatalogExtensionKind::Database => {
+            bail!(
+                "extension `{}` is a database; install-by-name is not implemented for databases yet",
+                entry.name
+            );
+        }
     }
 
     let dir = tempdir().context("failed to create temporary manifest directory")?;
@@ -662,6 +686,8 @@ fn rewrite_manifest_for_staged_binary(
         CatalogExtensionKind::Courier => "courier-plugin.json",
         CatalogExtensionKind::Channel => "channel-plugin.json",
         CatalogExtensionKind::Connector => "connector-plugin.json",
+        CatalogExtensionKind::Provider => "provider-plugin.json",
+        CatalogExtensionKind::Database => "database-plugin.json",
     };
     let path = dir.path().join(filename);
     fs::write(

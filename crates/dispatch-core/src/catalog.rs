@@ -154,6 +154,8 @@ pub enum CatalogExtensionKind {
     Channel,
     Courier,
     Connector,
+    Provider,
+    Database,
 }
 
 impl CatalogExtensionKind {
@@ -162,6 +164,8 @@ impl CatalogExtensionKind {
             Self::Channel => "channel",
             Self::Courier => "courier",
             Self::Connector => "connector",
+            Self::Provider => "provider",
+            Self::Database => "database",
         }
     }
 }
