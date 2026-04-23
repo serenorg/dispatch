@@ -94,6 +94,7 @@ Provider request methods:
   "kind": "capabilities",
   "capabilities": {
     "provider_id": "seren-models",
+    "protocol_version": 1,
     "models": [
       {
         "id": "*",

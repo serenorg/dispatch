@@ -97,6 +97,7 @@ For `configure` and `health`, the plugin-specific connection object is in `confi
   "kind": "capabilities",
   "capabilities": {
     "database_id": "seren-db",
+    "protocol_version": 1,
     "engine": "postgres",
     "operations": ["query", "execute", "describe"],
     "supports_transactions": true,

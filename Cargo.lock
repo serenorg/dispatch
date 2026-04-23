@@ -914,6 +914,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch-database-protocol"
+version = "0.3.0"
+dependencies = [
+ "dispatch-plugin-rpc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dispatch-plugin-rpc"
 version = "0.3.0"
 dependencies = [
@@ -928,6 +937,15 @@ version = "0.3.0"
 dependencies = [
  "libc",
  "nix 0.31.2",
+]
+
+[[package]]
+name = "dispatch-provider-protocol"
+version = "0.3.0"
+dependencies = [
+ "dispatch-plugin-rpc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
