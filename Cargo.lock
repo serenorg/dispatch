@@ -872,6 +872,7 @@ dependencies = [
  "dispatch-channel-protocol",
  "dispatch-courier-protocol",
  "dispatch-process",
+ "dispatch-provider-protocol",
  "dispatch-wasm-abi",
  "futures",
  "jsonschema",

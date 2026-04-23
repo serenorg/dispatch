@@ -13,6 +13,7 @@ categories = ["development-tools"]
 dispatch-channel-protocol = { path = "../dispatch-channel-protocol" }
 dispatch-courier-protocol = { path = "../dispatch-courier-protocol" }
 dispatch-process = { path = "../dispatch-process" }
+dispatch-provider-protocol = { path = "../dispatch-provider-protocol" }
 dispatch-wasm-abi = { path = "../dispatch-wasm-abi" }
 futures.workspace = true
 serde.workspace = true

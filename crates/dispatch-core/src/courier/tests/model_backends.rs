@@ -106,9 +106,13 @@ fn installed_provider_plugin_launches_from_registry() {
     let _guard = lock_codex_backend_test();
     let dir = tempdir().unwrap();
     let script_path = dir.path().join("seren-models");
+    let capture_path = dir.path().join("provider-request.jsonl");
     write_executable_script(
         &script_path,
-        "#!/bin/sh\nwhile IFS= read -r _line; do :; done\nprintf '%s\\n' '{\"type\":\"result\",\"text\":\"hello from provider registry\",\"response_id\":\"resp_1\"}'\n",
+        &format!(
+            "#!/bin/sh\ncat > \"{}\"\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"kind\":\"completion\",\"response\":{{\"id\":\"resp_1\",\"content\":[{{\"kind\":\"text\",\"text\":\"hello from provider registry\"}}]}}}}}}'\n",
+            capture_path.display()
+        ),
     );
     let manifest_path = dir.path().join("provider-plugin.json");
     let registry_path = dir.path().join("providers.json");
@@ -169,6 +173,18 @@ fn installed_provider_plugin_launches_from_registry() {
         }
         other => panic!("expected Reply, got {other:?}"),
     }
+
+    let captured = fs::read_to_string(&capture_path).unwrap();
+    let request: serde_json::Value = serde_json::from_str(&captured).unwrap();
+    assert_eq!(request["method"], "provider.complete");
+    assert_eq!(request["params"]["kind"], "complete");
+    assert_eq!(request["params"]["params"]["model"], "seren-default");
+    assert_eq!(request["params"]["params"]["messages"][0]["role"], "system");
+    assert_eq!(request["params"]["params"]["messages"][1]["role"], "user");
+    assert_eq!(
+        request["params"]["params"]["messages"][1]["content"][0]["text"],
+        "hello"
+    );
 }
 
 #[test]
