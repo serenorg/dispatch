@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use dispatch_core::{install_channel_plugin, install_courier_plugin, resolve_courier};
+use dispatch_core::{
+    install_channel_plugin, install_courier_plugin, install_database_plugin,
+    install_provider_plugin, resolve_courier,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -22,6 +25,10 @@ struct DispatchProjectConfig {
     #[serde(default)]
     channel_registry: Option<PathBuf>,
     #[serde(default)]
+    provider_registry: Option<PathBuf>,
+    #[serde(default)]
+    database_registry: Option<PathBuf>,
+    #[serde(default)]
     tool_approval: Option<crate::CliToolApprovalMode>,
     #[serde(default)]
     extensions: Vec<ExtensionInstallConfig>,
@@ -34,6 +41,8 @@ struct DispatchProjectConfig {
 enum ExtensionKind {
     Channel,
     Courier,
+    Provider,
+    Database,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +107,8 @@ struct ResolvedDispatchProject {
     courier: String,
     courier_registry: PathBuf,
     channel_registry: PathBuf,
+    provider_registry: PathBuf,
+    database_registry: PathBuf,
     extensions: Vec<ResolvedExtensionInstall>,
     channels: Vec<crate::channel_cmds::ChannelRuntimeBindingArgs>,
 }
@@ -124,6 +135,8 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
     println!("Courier: {}", project.courier);
     println!("Courier Registry: {}", project.courier_registry.display());
     println!("Channel Registry: {}", project.channel_registry.display());
+    println!("Provider Registry: {}", project.provider_registry.display());
+    println!("Database Registry: {}", project.database_registry.display());
 
     if args.dry_run {
         print_dry_run(&project);
@@ -160,6 +173,8 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
             let kind = match extension.kind {
                 ExtensionKind::Channel => "channel",
                 ExtensionKind::Courier => "courier",
+                ExtensionKind::Provider => "provider",
+                ExtensionKind::Database => "database",
             };
             println!("  - {kind}: {}", extension.manifest.display());
         }
@@ -232,6 +247,14 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         .channel_registry
         .map(|value| resolve_relative_path(&root_dir, value))
         .unwrap_or_else(|| root_dir.join(".dispatch/registries/channels.json"));
+    let provider_registry = parsed
+        .provider_registry
+        .map(|value| resolve_relative_path(&root_dir, value))
+        .unwrap_or_else(|| root_dir.join(".dispatch/registries/providers.json"));
+    let database_registry = parsed
+        .database_registry
+        .map(|value| resolve_relative_path(&root_dir, value))
+        .unwrap_or_else(|| root_dir.join(".dispatch/registries/databases.json"));
 
     let mut channels = Vec::with_capacity(parsed.channels.len());
     for binding in parsed.channels {
@@ -253,6 +276,8 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         courier: parsed.courier,
         courier_registry,
         channel_registry,
+        provider_registry,
+        database_registry,
         extensions: parsed
             .extensions
             .into_iter()
@@ -392,19 +417,15 @@ fn resolve_extension_kind(
             "extension manifest `{}` declares unsupported kind `connector`",
             manifest.display()
         ),
-        Some(ExtensionManifestKind::Provider) => bail!(
-            "extension manifest `{}` declares kind `provider`; provider extensions are not yet routed through project config",
-            manifest.display()
-        ),
-        Some(ExtensionManifestKind::Database) => bail!(
-            "extension manifest `{}` declares kind `database`; database extensions are not yet routed through project config",
-            manifest.display()
-        ),
+        Some(ExtensionManifestKind::Provider) => Ok(ExtensionKind::Provider),
+        Some(ExtensionManifestKind::Database) => Ok(ExtensionKind::Database),
         None => match manifest.file_name().and_then(|value| value.to_str()) {
             Some("channel-plugin.json") => Ok(ExtensionKind::Channel),
             Some("courier-plugin.json") => Ok(ExtensionKind::Courier),
+            Some("provider-plugin.json") => Ok(ExtensionKind::Provider),
+            Some("database-plugin.json") => Ok(ExtensionKind::Database),
             _ => bail!(
-                "extension manifest `{}` must declare `kind`, or use a conventional filename like `channel-plugin.json` or `courier-plugin.json`",
+                "extension manifest `{}` must declare `kind`, or use a conventional filename like `channel-plugin.json`, `courier-plugin.json`, `provider-plugin.json`, or `database-plugin.json`",
                 manifest.display()
             ),
         },
@@ -444,6 +465,28 @@ fn reconcile_extensions(project: &ResolvedDispatchProject) -> Result<()> {
                             )
                         })?;
                 println!("Installed courier plugin `{}`", installed.name);
+            }
+            ExtensionKind::Provider => {
+                let installed =
+                    install_provider_plugin(&extension.manifest, Some(&project.provider_registry))
+                        .with_context(|| {
+                            format!(
+                                "failed to install provider plugin from {}",
+                                extension.manifest.display()
+                            )
+                        })?;
+                println!("Installed provider plugin `{}`", installed.name);
+            }
+            ExtensionKind::Database => {
+                let installed =
+                    install_database_plugin(&extension.manifest, Some(&project.database_registry))
+                        .with_context(|| {
+                            format!(
+                                "failed to install database plugin from {}",
+                                extension.manifest.display()
+                            )
+                        })?;
+                println!("Installed database plugin `{}`", installed.name);
             }
         }
     }
@@ -545,6 +588,14 @@ once = true
             project.channel_registry,
             dir.path().join(".dispatch/registries/channels.json")
         );
+        assert_eq!(
+            project.provider_registry,
+            dir.path().join(".dispatch/registries/providers.json")
+        );
+        assert_eq!(
+            project.database_registry,
+            dir.path().join(".dispatch/registries/databases.json")
+        );
         assert_eq!(project.channels.len(), 1);
     }
 
@@ -624,6 +675,68 @@ manifest = {}
         let project = load_dispatch_project(&config_path).unwrap();
         assert_eq!(project.extensions.len(), 1);
         assert!(matches!(project.extensions[0].kind, ExtensionKind::Channel));
+    }
+
+    #[test]
+    fn load_dispatch_project_accepts_provider_and_database_extension_kinds() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        let provider_manifest = dir.path().join("provider-plugin.json");
+        let database_manifest = dir.path().join("database-plugin.json");
+        fs::write(
+            &provider_manifest,
+            r#"
+{
+    "kind": "provider",
+    "name": "seren-models",
+    "version": "0.1.0",
+    "transport": "jsonl",
+    "protocol_version": 1,
+    "exec": { "command": "./seren-models", "args": [] }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &database_manifest,
+            r#"
+{
+    "kind": "database",
+    "name": "seren-db",
+    "version": "0.1.0",
+    "transport": "jsonl",
+    "protocol_version": 1,
+    "exec": { "command": "./seren-db", "args": [] }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[[extensions]]
+manifest = {}
+
+[[extensions]]
+manifest = {}
+"#,
+                toml_string_literal(&path_string(&provider_manifest)),
+                toml_string_literal(&path_string(&database_manifest))
+            ),
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path).unwrap();
+        assert_eq!(project.extensions.len(), 2);
+        assert!(matches!(
+            project.extensions[0].kind,
+            ExtensionKind::Provider
+        ));
+        assert!(matches!(
+            project.extensions[1].kind,
+            ExtensionKind::Database
+        ));
     }
 
     #[test]

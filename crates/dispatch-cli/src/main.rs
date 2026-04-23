@@ -820,6 +820,12 @@ enum ExtensionCommand {
         /// Override the channel registry path
         #[arg(long)]
         channel_registry: Option<PathBuf>,
+        /// Override the provider registry path
+        #[arg(long)]
+        provider_registry: Option<PathBuf>,
+        /// Override the database registry path
+        #[arg(long)]
+        database_registry: Option<PathBuf>,
     },
     /// Search cached catalogs for extensions matching a query
     Search {
@@ -903,6 +909,8 @@ enum ExtensionKindFilter {
     Channel,
     Courier,
     Connector,
+    Provider,
+    Database,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2589,6 +2597,10 @@ mod tests {
             "/tmp/couriers.json",
             "--channel-registry",
             "/tmp/channels.json",
+            "--provider-registry",
+            "/tmp/providers.json",
+            "--database-registry",
+            "/tmp/databases.json",
         ])
         .unwrap();
 
@@ -2602,6 +2614,8 @@ mod tests {
             cache_dir,
             courier_registry,
             channel_registry,
+            provider_registry,
+            database_registry,
         } = command
         else {
             panic!("expected extension install command");
@@ -2617,6 +2631,14 @@ mod tests {
         assert_eq!(
             channel_registry.as_deref(),
             Some(Path::new("/tmp/channels.json"))
+        );
+        assert_eq!(
+            provider_registry.as_deref(),
+            Some(Path::new("/tmp/providers.json"))
+        );
+        assert_eq!(
+            database_registry.as_deref(),
+            Some(Path::new("/tmp/databases.json"))
         );
     }
 

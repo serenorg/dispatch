@@ -101,6 +101,77 @@ fn default_chat_backend_selects_plugin_for_unknown_provider() {
 }
 
 #[test]
+#[cfg(unix)]
+fn installed_provider_plugin_launches_from_registry() {
+    let _guard = lock_codex_backend_test();
+    let dir = tempdir().unwrap();
+    let script_path = dir.path().join("seren-models");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nwhile IFS= read -r _line; do :; done\nprintf '%s\\n' '{\"type\":\"result\",\"text\":\"hello from provider registry\",\"response_id\":\"resp_1\"}'\n",
+    );
+    let manifest_path = dir.path().join("provider-plugin.json");
+    let registry_path = dir.path().join("providers.json");
+    fs::write(
+        &manifest_path,
+        format!(
+            "{{\n\
+\"kind\": \"provider\",\n\
+\"name\": \"seren-models\",\n\
+\"version\": \"0.1.0\",\n\
+\"protocol_version\": 1,\n\
+\"transport\": \"jsonl\",\n\
+\"exec\": {{\n\
+\"command\": \"{}\",\n\
+\"args\": []\n\
+}}\n\
+}}",
+            script_path.display()
+        ),
+    )
+    .unwrap();
+    crate::install_provider_plugin(&manifest_path, Some(&registry_path)).unwrap();
+    let _registry = TestEnvOverride::set(
+        "DISPATCH_PROVIDER_REGISTRY",
+        Some(&registry_path.display().to_string()),
+    );
+
+    let backend = PluginModelBackend::new("seren-models", false);
+    let reply = backend
+        .generate_with_events(
+            &ModelRequest {
+                model: "seren-default".to_string(),
+                provider: Some("seren-models".to_string()),
+                model_options: Default::default(),
+                llm_timeout_ms: None,
+                context_token_limit: None,
+                tool_call_limit: None,
+                tool_output_limit: None,
+                working_directory: Some(dir.path().display().to_string()),
+                instructions: "Be helpful.".to_string(),
+                messages: vec![ConversationMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                tools: Vec::new(),
+                pending_tool_calls: Vec::new(),
+                tool_outputs: Vec::new(),
+                previous_response_id: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+    match reply {
+        ModelGeneration::Reply(reply) => {
+            assert_eq!(reply.backend, "seren-models");
+            assert_eq!(reply.text.as_deref(), Some("hello from provider registry"));
+        }
+        other => panic!("expected Reply, got {other:?}"),
+    }
+}
+
+#[test]
 fn default_chat_backend_prefers_model_provider_over_env() {
     let backend = default_chat_backend_for_provider_with(Some("anthropic"), |name| match name {
         "LLM_BACKEND" => Some("openai".to_string()),

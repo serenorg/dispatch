@@ -11,8 +11,9 @@ use dispatch_core::{
     CatalogConfig, CatalogEntry, CatalogError, CatalogExtensionKind, CatalogInstallSource,
     CatalogSearchHit, CatalogSource, GithubReleaseBinary, default_catalog_cache_dir,
     default_catalog_config_path, default_channel_registry_path, default_courier_registry_path,
-    find_cached_entry, install_channel_plugin, install_courier_plugin, refresh_catalog,
-    search_cached,
+    default_database_registry_path, default_provider_registry_path, find_cached_entry,
+    install_channel_plugin, install_courier_plugin, install_database_plugin,
+    install_provider_plugin, refresh_catalog, search_cached,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -45,15 +46,19 @@ pub(crate) fn extension_command(command: crate::ExtensionCommand) -> Result<()> 
             cache_dir,
             courier_registry,
             channel_registry,
-        } => extension_install(
-            &name,
+            provider_registry,
+            database_registry,
+        } => extension_install(ExtensionInstallRequest {
+            name: &name,
             yes,
-            config.as_deref(),
-            cache_dir.as_deref(),
-            courier_registry.as_deref(),
-            channel_registry.as_deref(),
-            None,
-        ),
+            config_path: config.as_deref(),
+            cache_dir: cache_dir.as_deref(),
+            install_root: None,
+            courier_registry: courier_registry.as_deref(),
+            channel_registry: channel_registry.as_deref(),
+            provider_registry: provider_registry.as_deref(),
+            database_registry: database_registry.as_deref(),
+        }),
         crate::ExtensionCommand::Search {
             query,
             kind,
@@ -83,6 +88,20 @@ struct ExtensionInstallPaths<'a> {
     install_root: &'a Path,
     courier_registry: Option<&'a Path>,
     channel_registry: Option<&'a Path>,
+    provider_registry: Option<&'a Path>,
+    database_registry: Option<&'a Path>,
+}
+
+struct ExtensionInstallRequest<'a> {
+    name: &'a str,
+    yes: bool,
+    config_path: Option<&'a Path>,
+    cache_dir: Option<&'a Path>,
+    install_root: Option<&'a Path>,
+    courier_registry: Option<&'a Path>,
+    channel_registry: Option<&'a Path>,
+    provider_registry: Option<&'a Path>,
+    database_registry: Option<&'a Path>,
 }
 
 fn default_extension_bin_dir() -> Result<PathBuf> {
@@ -127,6 +146,20 @@ fn resolve_channel_registry_path(override_path: Option<&Path>) -> Result<PathBuf
     match override_path {
         Some(path) => Ok(path.to_path_buf()),
         None => default_channel_registry_path().map_err(Into::into),
+    }
+}
+
+fn resolve_provider_registry_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    match override_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => default_provider_registry_path().map_err(Into::into),
+    }
+}
+
+fn resolve_database_registry_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    match override_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => default_database_registry_path().map_err(Into::into),
     }
 }
 
@@ -318,28 +351,22 @@ fn catalog_refresh(
     ))
 }
 
-fn extension_install(
-    name: &str,
-    yes: bool,
-    config_path: Option<&Path>,
-    cache_dir: Option<&Path>,
-    courier_registry: Option<&Path>,
-    channel_registry: Option<&Path>,
-    install_root: Option<&Path>,
-) -> Result<()> {
-    let config_path = resolve_config_path(config_path)?;
+fn extension_install(request: ExtensionInstallRequest<'_>) -> Result<()> {
+    let config_path = resolve_config_path(request.config_path)?;
     let config = CatalogConfig::load(&config_path)?;
-    let cache_dir = resolve_cache_dir(cache_dir)?;
-    let install_root = resolve_extension_bin_dir(install_root)?;
+    let cache_dir = resolve_cache_dir(request.cache_dir)?;
+    let install_root = resolve_extension_bin_dir(request.install_root)?;
 
-    let hit = find_cached_entry(&config, &cache_dir, name).ok_or_else(|| {
+    let hit = find_cached_entry(&config, &cache_dir, request.name).ok_or_else(|| {
         anyhow!(
-            "extension `{name}` not found in any cached catalog; run `dispatch extension catalog refresh`"
+            "extension `{}` not found in any cached catalog; run `dispatch extension catalog refresh`",
+            request.name
         )
     })?;
     let source = hit.entry.source.clone().ok_or_else(|| {
         anyhow!(
-            "extension `{name}` does not publish machine-installable source metadata yet; follow its install_hint instead"
+            "extension `{}` does not publish machine-installable source metadata yet; follow its install_hint instead",
+            request.name
         )
     })?;
     if config.find(&hit.catalog).is_none() {
@@ -348,7 +375,7 @@ fn extension_install(
             hit.catalog
         ));
     }
-    if !yes {
+    if !request.yes {
         prompt_extension_install_confirmation(&hit, &source)?;
     }
 
@@ -368,8 +395,10 @@ fn extension_install(
             &binaries,
             ExtensionInstallPaths {
                 install_root: &install_root,
-                courier_registry,
-                channel_registry,
+                courier_registry: request.courier_registry,
+                channel_registry: request.channel_registry,
+                provider_registry: request.provider_registry,
+                database_registry: request.database_registry,
             },
         ),
     }
@@ -453,16 +482,30 @@ fn install_github_release_extension(
             );
         }
         CatalogExtensionKind::Provider => {
-            bail!(
-                "extension `{}` is a provider; install-by-name is not implemented for providers yet",
-                hit.entry.name
+            let registry = resolve_provider_registry_path(paths.provider_registry)?;
+            let installed =
+                install_provider_plugin(&manifest_path, Some(&registry)).with_context(|| {
+                    format!("failed to install provider plugin `{}`", hit.entry.name)
+                })?;
+            println!(
+                "Installed provider `{}` {} from catalog `{}`",
+                installed.name, installed.version, hit.catalog
             );
+            println!("Binary: {}", staged_binary.display());
+            println!("Registry: {}", registry.display());
         }
         CatalogExtensionKind::Database => {
-            bail!(
-                "extension `{}` is a database; install-by-name is not implemented for databases yet",
-                hit.entry.name
+            let registry = resolve_database_registry_path(paths.database_registry)?;
+            let installed =
+                install_database_plugin(&manifest_path, Some(&registry)).with_context(|| {
+                    format!("failed to install database plugin `{}`", hit.entry.name)
+                })?;
+            println!(
+                "Installed database `{}` {} from catalog `{}`",
+                installed.name, installed.version, hit.catalog
             );
+            println!("Binary: {}", staged_binary.display());
+            println!("Registry: {}", registry.display());
         }
     }
 
@@ -668,16 +711,22 @@ fn rewrite_manifest_for_staged_binary(
             );
         }
         CatalogExtensionKind::Provider => {
-            bail!(
-                "extension `{}` is a provider; install-by-name is not implemented for providers yet",
-                entry.name
-            );
+            let command = manifest
+                .get_mut("exec")
+                .and_then(|value| value.as_object_mut())
+                .ok_or_else(|| anyhow!("downloaded provider manifest is missing exec"))?
+                .get_mut("command")
+                .ok_or_else(|| anyhow!("downloaded provider manifest is missing exec.command"))?;
+            *command = serde_json::Value::String(staged_binary.display().to_string());
         }
         CatalogExtensionKind::Database => {
-            bail!(
-                "extension `{}` is a database; install-by-name is not implemented for databases yet",
-                entry.name
-            );
+            let command = manifest
+                .get_mut("exec")
+                .and_then(|value| value.as_object_mut())
+                .ok_or_else(|| anyhow!("downloaded database manifest is missing exec"))?
+                .get_mut("command")
+                .ok_or_else(|| anyhow!("downloaded database manifest is missing exec.command"))?;
+            *command = serde_json::Value::String(staged_binary.display().to_string());
         }
     }
 
@@ -870,6 +919,8 @@ impl From<crate::ExtensionKindFilter> for CatalogExtensionKind {
             crate::ExtensionKindFilter::Channel => Self::Channel,
             crate::ExtensionKindFilter::Courier => Self::Courier,
             crate::ExtensionKindFilter::Connector => Self::Connector,
+            crate::ExtensionKindFilter::Provider => Self::Provider,
+            crate::ExtensionKindFilter::Database => Self::Database,
         }
     }
 }
@@ -878,7 +929,7 @@ impl From<crate::ExtensionKindFilter> for CatalogExtensionKind {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use dispatch_core::{cache_path, load_courier_registry, write_cache};
+    use dispatch_core::{cache_path, load_courier_registry, load_provider_registry, write_cache};
     #[cfg(unix)]
     use std::thread;
     #[cfg(unix)]
@@ -1138,15 +1189,17 @@ mod tests {
         .unwrap();
         assert!(cache_path(&cache_dir, "seren-cloud").exists());
 
-        extension_install(
-            "seren-cloud",
-            true,
-            Some(&config_path),
-            Some(&cache_dir),
-            Some(&registry_path),
-            None,
-            Some(&install_root),
-        )
+        extension_install(ExtensionInstallRequest {
+            name: "seren-cloud",
+            yes: true,
+            config_path: Some(&config_path),
+            cache_dir: Some(&cache_dir),
+            install_root: Some(&install_root),
+            courier_registry: Some(&registry_path),
+            channel_registry: None,
+            provider_registry: None,
+            database_registry: None,
+        })
         .unwrap();
 
         server_thread.join().unwrap();
@@ -1162,6 +1215,161 @@ mod tests {
         let registry = load_courier_registry(Some(&registry_path)).unwrap();
         assert_eq!(registry.plugins.len(), 1);
         assert_eq!(registry.plugins[0].name, "seren-cloud");
+        let expected_command = fs::canonicalize(&staged_binary)
+            .unwrap()
+            .display()
+            .to_string();
+        let installed_command = fs::canonicalize(&registry.plugins[0].exec.command)
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(installed_command, expected_command);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_install_downloads_and_installs_provider_from_release_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("catalogs.toml");
+        let cache_dir = dir.path().join("cache");
+        let install_root = dir.path().join("bin");
+        let registry_path = dir.path().join("providers.json");
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr();
+        let base_url = format!("http://{}", addr);
+        let target = host_target_triple().unwrap().to_string();
+
+        let binary_name = "seren-models";
+        let binary_body = b"#!/bin/sh\nexit 0\n".to_vec();
+        let manifest_body = format!(
+            "{{\n\
+\"kind\": \"provider\",\n\
+\"name\": \"seren-models\",\n\
+\"version\": \"0.1.0\",\n\
+\"protocol_version\": 1,\n\
+\"transport\": \"jsonl\",\n\
+\"description\": \"Demo provider plugin\",\n\
+\"exec\": {{\n\
+\"command\": \"./{binary_name}\",\n\
+\"args\": []\n\
+}}\n\
+}}"
+        );
+
+        let server_thread = thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server.recv().unwrap();
+                let path = request.url().to_string();
+                let response = match path.as_str() {
+                    "/catalog/provider-plugin.json" => Response::from_string(manifest_body.clone())
+                        .with_header(
+                            Header::from_bytes(
+                                b"Content-Type".as_slice(),
+                                b"application/json".as_slice(),
+                            )
+                            .unwrap(),
+                        ),
+                    "/serenorg/dispatch-seren-plugins/releases/download/seren-models-v0.1.0/seren-models" =>
+                    {
+                        let mut response = Response::from_data(binary_body.clone());
+                        response.add_header(
+                            Header::from_bytes(
+                                b"Content-Type".as_slice(),
+                                b"application/octet-stream".as_slice(),
+                            )
+                            .unwrap(),
+                        );
+                        response
+                    }
+                    "/serenorg/dispatch-seren-plugins/releases/download/seren-models-v0.1.0/SHA256SUMS.txt" => {
+                        Response::from_string(format!(
+                            "{}  seren-models\n",
+                            encode_hex(Sha256::digest(&binary_body))
+                        ))
+                        .with_header(
+                            Header::from_bytes(
+                                b"Content-Type".as_slice(),
+                                b"text/plain".as_slice(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    _ => Response::from_string("not found").with_status_code(StatusCode(404)),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let mut config = CatalogConfig::default();
+        config
+            .add(CatalogSource {
+                name: "seren".to_string(),
+                url: format!("{base_url}/catalog/extensions.json"),
+            })
+            .unwrap();
+        config.save(&config_path).unwrap();
+
+        write_cache(
+            &cache_dir,
+            "seren",
+            &format!(
+                r#"{{
+                    "entries": [
+                        {{
+                            "name": "seren-models",
+                            "kind": "provider",
+                            "version": "0.1.0",
+                            "manifest_url": "{base_url}/catalog/provider-plugin.json",
+                            "source": {{
+                                "type": "github_release",
+                                "repo": "serenorg/dispatch-seren-plugins",
+                                "tag": "seren-models-v0.1.0",
+                                "base_url": "{base_url}",
+                                "checksum_asset": "SHA256SUMS.txt",
+                                "binaries": [
+                                    {{
+                                        "target": "{target}",
+                                        "asset": "{binary_name}",
+                                        "binary_name": "{binary_name}"
+                                    }}
+                                ]
+                            }}
+                        }}
+                    ]
+                }}"#,
+                target = target
+            ),
+        )
+        .unwrap();
+
+        extension_install(ExtensionInstallRequest {
+            name: "seren-models",
+            yes: true,
+            config_path: Some(&config_path),
+            cache_dir: Some(&cache_dir),
+            install_root: Some(&install_root),
+            courier_registry: None,
+            channel_registry: None,
+            provider_registry: Some(&registry_path),
+            database_registry: None,
+        })
+        .unwrap();
+
+        server_thread.join().unwrap();
+
+        let staged_binary = install_root
+            .join("seren-models")
+            .join("0.1.0")
+            .join(binary_name);
+        assert!(staged_binary.exists());
+        let mode = fs::metadata(&staged_binary).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111);
+
+        let registry = load_provider_registry(Some(&registry_path)).unwrap();
+        assert_eq!(registry.plugins.len(), 1);
+        assert_eq!(registry.plugins[0].name, "seren-models");
         let expected_command = fs::canonicalize(&staged_binary)
             .unwrap()
             .display()

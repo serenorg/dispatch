@@ -4,12 +4,14 @@ pub mod catalog;
 pub mod channel_plugin_protocol;
 pub mod channel_plugins;
 pub mod courier;
+pub mod database_plugins;
 pub mod depot;
 pub mod eval;
 pub mod manifest;
 pub mod parse;
 pub mod plugin_protocol;
 pub mod plugins;
+pub mod provider_plugins;
 pub mod secrets;
 pub mod signing;
 mod skill;
@@ -57,6 +59,11 @@ pub use channel_plugins::{
     shutdown_persistent_channel_plugin, spawn_persistent_channel_plugin,
     validate_channel_plugin_manifest, verify_host_managed_ingress_trust,
 };
+pub use database_plugins::{
+    DatabasePluginExec, DatabasePluginManifest, DatabasePluginRegistry,
+    default_database_registry_path, install_database_plugin, load_database_registry,
+    resolve_database_plugin, validate_database_plugin_manifest,
+};
 // Keep the crate root focused on the primary parcel/courier entrypoints.
 // Lower-level courier modeling types remain available under `dispatch_core::courier`.
 pub use courier::{
@@ -96,6 +103,11 @@ pub use plugins::{
     CourierPluginRegistry, PluginRegistryError, PluginTransport, ResolvedCourier,
     default_courier_registry_path, install_courier_plugin, list_courier_catalog,
     load_courier_registry, resolve_courier,
+};
+pub use provider_plugins::{
+    ProviderPluginExec, ProviderPluginManifest, ProviderPluginRegistry,
+    default_provider_registry_path, install_provider_plugin, load_provider_registry,
+    resolve_provider_plugin, validate_provider_plugin_manifest,
 };
 pub use secrets::{
     SecretStoreError, SecretStorePaths, init_secret_store, list_secret_names,
