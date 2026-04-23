@@ -1,16 +1,18 @@
 # Dispatch Extensions
 
-Dispatch supports three categories of extensions:
+Dispatch supports the following extension categories:
 
 | Category | Purpose | Status |
 |---|---|---|
 | Courier plugins | Alternate runtime backends for parcel execution | Stable |
 | Channel plugins | Messaging and webhook transport integrations | Provisional |
-| Connector bundles | Reusable tool/provider packages | Planned |
+| Provider plugins | External LLM inference backends | Draft (v0.4.0) |
+| Database plugins | Read+write database backends exposed to parcels as tools | Draft (v0.4.0) |
+| Connector bundles | Reusable tool/provider packages | Superseded by Provider + Database plugins |
 
 Extensions live outside the core repository and communicate with Dispatch over JSON-RPC 2.0 messages framed as line-delimited JSON on stdio.
 
-Dispatch has first-class install/runtime support for courier plugins and channel plugins. Connector bundles are a planned category without a host registry or execution model.
+Dispatch has first-class install/runtime support for courier plugins and channel plugins today. Provider and database plugins are in draft against v0.4.0; see [`provider-plugin-protocol.md`](./provider-plugin-protocol.md) and [`database-plugin-protocol.md`](./database-plugin-protocol.md) for the in-progress specifications. The previously-planned "connector bundles" category is subsumed by these two concrete plugin kinds.
 
 For discovering third-party extensions published in separate repositories, see [Discovery via catalogs](#discovery-via-catalogs) below. The broader ecosystem roadmap lives in [`plugin-ecosystem.md`](./plugin-ecosystem.md).
 
@@ -78,9 +80,47 @@ For channel plugins specifically:
 - Host-initiated operations such as `configure`, `health`, `deliver`, `push`, `status`, `poll_ingress`, `stop_ingress`, and `shutdown` remain ordinary JSON-RPC requests with terminal responses.
 - Spontaneous inbound activity is modeled as `channel.event` notifications because the host did not initiate those events at a specific moment.
 
+### Provider plugins
+
+Provider plugins are external LLM inference backends. A courier routes completion and streaming requests through a provider plugin when the target model is served by an endpoint Dispatch does not natively link against.
+
+A provider plugin implements:
+
+- `capabilities` - declare supported models, modalities, tool-use, streaming
+- `configure` - validate credentials and endpoint
+- `health` - verify connectivity and auth
+- `complete` - one-shot non-streaming completion
+- `stream` - streaming completion with event notifications
+- `cancel` - best-effort cancellation of an in-flight stream
+- `shutdown` - clean up
+
+Examples: hosted model gateways, self-hosted inference servers, specialized endpoints for fine-tuned or private models.
+
+See [`provider-plugin-protocol.md`](./provider-plugin-protocol.md) for the wire protocol.
+
+### Database plugins
+
+Database plugins are read+write database backends exposed to parcels as callable tools. They cover traditional OLTP-style databases and document stores under a shared protocol.
+
+A database plugin implements:
+
+- `capabilities` - declare engine, supported operations, authentication modes
+- `configure` - validate connection and credentials
+- `health` - verify connectivity
+- `describe` - return schema or collection introspection metadata
+- `open_session` / `close_session` - manage connection or transaction lifecycle
+- `execute` - run a typed operation
+- `shutdown` - clean up
+
+Examples: PostgreSQL, SerenDB, Neon, Supabase, MongoDB, MySQL, SQLite.
+
+Vector stores, full-text search indices, object storage, caches, and queues are out of scope for the database kind; they will get dedicated plugin kinds as they are needed.
+
+See [`database-plugin-protocol.md`](./database-plugin-protocol.md) for the wire protocol.
+
 ### Connector bundles
 
-Reusable tool packages for specific providers (Gmail, GitHub, Google Drive). No first-class extension type exists for connector bundles. These remain packaged local tools until reuse patterns emerge.
+The previously-planned "connector bundles" category is superseded. Inference-oriented integrations are now modeled as provider plugins; database-oriented integrations are now modeled as database plugins.
 
 ## Managing host extension inventory
 
