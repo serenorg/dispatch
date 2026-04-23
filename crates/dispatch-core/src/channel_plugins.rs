@@ -127,6 +127,8 @@ enum OnDiskManifestKind {
     Channel,
     Courier,
     Connector,
+    Provider,
+    Database,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1233,6 +1235,8 @@ impl OnDiskManifestKind {
             Self::Channel => "channel",
             Self::Courier => "courier",
             Self::Connector => "connector",
+            Self::Provider => "provider",
+            Self::Database => "database",
         }
     }
 }

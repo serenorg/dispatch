@@ -57,6 +57,8 @@ enum ExtensionManifestKind {
     Channel,
     Courier,
     Connector,
+    Provider,
+    Database,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +390,14 @@ fn resolve_extension_kind(
         Some(ExtensionManifestKind::Courier) => Ok(ExtensionKind::Courier),
         Some(ExtensionManifestKind::Connector) => bail!(
             "extension manifest `{}` declares unsupported kind `connector`",
+            manifest.display()
+        ),
+        Some(ExtensionManifestKind::Provider) => bail!(
+            "extension manifest `{}` declares kind `provider`; provider extensions are not yet routed through project config",
+            manifest.display()
+        ),
+        Some(ExtensionManifestKind::Database) => bail!(
+            "extension manifest `{}` declares kind `database`; database extensions are not yet routed through project config",
             manifest.display()
         ),
         None => match manifest.file_name().and_then(|value| value.to_str()) {

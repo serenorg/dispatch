@@ -47,6 +47,8 @@ enum OnDiskCourierManifestKind {
     Courier,
     Channel,
     Connector,
+    Provider,
+    Database,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -396,6 +398,8 @@ impl OnDiskCourierManifestKind {
             Self::Courier => "courier",
             Self::Channel => "channel",
             Self::Connector => "connector",
+            Self::Provider => "provider",
+            Self::Database => "database",
         }
     }
 }
