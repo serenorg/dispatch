@@ -8,11 +8,12 @@ Dispatch supports the following extension categories:
 | Channel plugins | Messaging and webhook transport integrations | Provisional |
 | Provider plugins | External LLM inference backends | Draft (v0.4.0) |
 | Database plugins | Read+write database backends exposed to parcels as tools | Draft (v0.4.0) |
+| Deployment plugins | Managed deployment lifecycle control planes | Draft (v0.4.0) |
 | Connector bundles | Reusable tool/provider packages | Superseded by Provider + Database plugins |
 
 Extensions live outside the core repository and communicate with Dispatch over JSON-RPC 2.0 messages framed as line-delimited JSON on stdio.
 
-Dispatch has first-class install/runtime support for courier plugins and channel plugins today. Provider and database plugins are in draft against v0.4.0; see [`provider-plugin-protocol.md`](./provider-plugin-protocol.md) and [`database-plugin-protocol.md`](./database-plugin-protocol.md) for the in-progress specifications. The previously-planned "connector bundles" category is subsumed by these two concrete plugin kinds.
+Dispatch has first-class install/runtime support for courier plugins, channel plugins, and deployment plugins today. Provider and database plugins are in draft against v0.4.0; see [`provider-plugin-protocol.md`](./provider-plugin-protocol.md) and [`database-plugin-protocol.md`](./database-plugin-protocol.md) for the in-progress specifications. The previously-planned "connector bundles" category is subsumed by these concrete plugin kinds.
 
 For discovering third-party extensions published in separate repositories, see [Discovery via catalogs](#discovery-via-catalogs) below. The broader ecosystem roadmap lives in [`plugin-ecosystem.md`](./plugin-ecosystem.md).
 
@@ -21,7 +22,7 @@ For discovering third-party extensions published in separate repositories, see [
 Dispatch keeps authored parcel source separate from host-managed extension inventory.
 
 - `Agentfile` is the canonical authored source for a parcel. It defines the agent's prompt stack, tools, model policy, mounts, and generic runtime intent that should survive build, review, and signing.
-- installed courier plugins and channel plugins are host inventory. They are local runtime capabilities available to an operator on a specific machine or environment.
+- installed courier plugins, channel plugins, and deployment plugins are host inventory. They are local runtime capabilities available to an operator on a specific machine or environment.
 - extension install commands do not mutate parcel source. They populate a host registry that runtime commands can resolve by name.
 
 That split is intentional. Courier binaries, channel adapter binaries, webhook URLs, and platform credentials are deployment concerns, not parcel build inputs.
@@ -118,6 +119,25 @@ Vector stores, full-text search indices, object storage, caches, and queues are 
 
 See [`database-plugin-protocol.md`](./database-plugin-protocol.md) for the wire protocol.
 
+### Deployment plugins
+
+Deployment plugins are managed deployment control planes. They create, update, roll back, list, start, stop, and delete deployments, but they do not execute runtime turns. Runtime turns remain the responsibility of courier plugins, usually addressed by the `deployment_id` returned by a deployment plugin.
+
+A deployment plugin implements:
+
+- `capabilities` - declare lifecycle features and supported templates or policies
+- `configure` - validate credentials and endpoint
+- `health` - verify connectivity
+- `validate` - check a candidate deployment spec without side effects
+- `test_run` - run a draft preflight without creating a long-lived deployment
+- `deploy`, `update`, `preview_update` - manage deployment revisions
+- `list`, `get`, `list_revisions` - inspect deployment state
+- `preview_rollback`, `rollback` - inspect and apply revision rollback
+- `start`, `stop`, `delete` - manage lifecycle state
+- `shutdown` - clean up
+
+Examples: managed-agent control planes such as `seren-agent`.
+
 ### Connector bundles
 
 The previously-planned "connector bundles" category is superseded. Inference-oriented integrations are now modeled as provider plugins; database-oriented integrations are now modeled as database plugins.
@@ -130,6 +150,15 @@ The previously-planned "connector bundles" category is superseded. Inference-ori
 dispatch courier install path/to/courier-plugin.json
 dispatch courier ls
 dispatch courier inspect <name>
+```
+
+### Deployment plugins
+
+```sh
+dispatch deployment list
+dispatch deployment inspect <name>
+dispatch deployment deploy <name> spec.json
+dispatch deployment rollback <name> <deployment-id> <revision-id>
 ```
 
 ### Channel plugins
@@ -184,7 +213,7 @@ Channel binding config files may be JSON or TOML. Inline `config = { ... }` tabl
 
 `deliver_replies = true` requires a project-level `parcel = "..."` entry or a direct `--parcel` argument on the low-level channel commands. Reply delivery is a parcel-runtime bridge, not a standalone channel feature.
 
-`[[extensions]]` entries can omit `kind` when the referenced manifest declares its own `kind`, or when it uses the conventional `channel-plugin.json` or `courier-plugin.json` filename.
+`[[extensions]]` entries can omit `kind` when the referenced manifest declares its own `kind`, or when it uses a conventional filename such as `channel-plugin.json`, `courier-plugin.json`, or `deployment-plugin.json`.
 
 A concrete example lives at `examples/runtime/telegram-bot/dispatch.toml`.
 
@@ -193,6 +222,7 @@ A concrete example lives at `examples/runtime/telegram-bot/dispatch.toml`.
 Dispatch has two manifest shapes:
 
 - Courier plugins use a compact `courier-plugin.json` consumed by the courier registry installer.
+- Deployment plugins use a compact `deployment-plugin.json` consumed by the deployment registry installer.
 - Channel plugins use a richer `channel-plugin.json` that includes bootstrap, auth, capability, ingress, and requirement metadata.
 
 Channel plugin manifest example (`channel-plugin.json`):

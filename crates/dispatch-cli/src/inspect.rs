@@ -129,6 +129,19 @@ fn print_courier_inspection(inspection: &CourierInspection) {
     for secret in &inspection.required_secrets {
         println!("  secret: {secret}");
     }
+    if let Some(extensions) = inspection
+        .extensions
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in extensions {
+            match value {
+                serde_json::Value::String(text) => println!("  extension: {key} = {text}"),
+                serde_json::Value::Null => println!("  extension: {key} = null"),
+                other => println!("  extension: {key} = {other}"),
+            }
+        }
+    }
     for mount in &inspection.mounts {
         println!("  mount: {:?} {}", mount.kind, mount.driver);
     }

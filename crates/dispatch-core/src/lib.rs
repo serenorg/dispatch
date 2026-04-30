@@ -5,6 +5,7 @@ pub mod channel_plugin_protocol;
 pub mod channel_plugins;
 pub mod courier;
 pub mod database_plugins;
+pub mod deployment_plugins;
 pub mod depot;
 pub mod eval;
 pub mod manifest;
@@ -63,6 +64,11 @@ pub use database_plugins::{
     DatabasePluginExec, DatabasePluginManifest, DatabasePluginRegistry,
     default_database_registry_path, install_database_plugin, load_database_registry,
     resolve_database_plugin, validate_database_plugin_manifest,
+};
+pub use deployment_plugins::{
+    DeploymentPluginExec, DeploymentPluginManifest, DeploymentPluginRegistry,
+    default_deployment_registry_path, install_deployment_plugin, load_deployment_registry,
+    resolve_deployment_plugin, validate_deployment_plugin_manifest,
 };
 // Keep the crate root focused on the primary parcel/courier entrypoints.
 // Lower-level courier modeling types remain available under `dispatch_core::courier`.

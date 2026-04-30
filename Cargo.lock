@@ -839,6 +839,7 @@ dependencies = [
  "clap",
  "cron",
  "dispatch-core",
+ "dispatch-deployment-protocol",
  "dispatch-process",
  "futures",
  "jsonschema",
@@ -916,6 +917,15 @@ dependencies = [
 
 [[package]]
 name = "dispatch-database-protocol"
+version = "0.3.0"
+dependencies = [
+ "dispatch-plugin-rpc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dispatch-deployment-protocol"
 version = "0.3.0"
 dependencies = [
  "dispatch-plugin-rpc",

@@ -895,6 +895,7 @@ impl CourierBackend for NativeCourier {
                 .collect(),
             mounts: parcel.config.mounts.clone(),
             local_tools: list_local_tools(parcel),
+            extensions: None,
         };
         async move { Ok(inspection) }
     }
@@ -1143,6 +1144,7 @@ impl CourierBackend for DockerCourier {
                 .collect(),
             mounts: parcel.config.mounts.clone(),
             local_tools: list_local_tools(parcel),
+            extensions: None,
         };
         async move {
             validate_courier_reference("docker", CourierKind::Docker, &reference)?;
@@ -1800,6 +1802,7 @@ impl CourierBackend for WasmCourier {
                     .collect(),
                 mounts: parcel.config.mounts.clone(),
                 local_tools: list_local_tools(&parcel),
+                extensions: None,
             })
         }
     }
@@ -2047,6 +2050,7 @@ impl CourierBackend for StubCourier {
                 .collect(),
             mounts: parcel.config.mounts.clone(),
             local_tools: list_local_tools(parcel),
+            extensions: None,
         };
         async move {
             validate_courier_reference(courier_id, kind, &reference)?;

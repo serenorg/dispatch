@@ -133,6 +133,8 @@ pub enum PluginRegistryError {
     UnknownProvider { name: String },
     #[error("database plugin `{name}` is not installed")]
     UnknownDatabase { name: String },
+    #[error("deployment plugin `{name}` is not installed")]
+    UnknownDeployment { name: String },
     #[error("channel plugin `{name}` is not installed")]
     UnknownChannel { name: String },
     #[error("no installed channel plugin matches ingress {method} {path}")]
