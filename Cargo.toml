@@ -9,6 +9,7 @@ members = [
     "crates/dispatch-courier-echo",
     "crates/dispatch-provider-protocol",
     "crates/dispatch-database-protocol",
+    "crates/dispatch-deployment-protocol",
     "crates/dispatch-wasm-abi",
     "crates/dispatch-wasm-guest-reference",
 ]

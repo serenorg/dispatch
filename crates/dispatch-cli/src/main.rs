@@ -1,6 +1,7 @@
 mod channel_cmds;
 mod conformance;
 mod courier_cmds;
+mod deployment_cmds;
 mod eval;
 mod extension_cmds;
 mod inspect;
@@ -46,7 +47,7 @@ enum Command {
         #[command(subcommand)]
         command: DepotCommand,
     },
-    /// Build an immutable agent parcel
+    /// Build an immutable deployment parcel
     Build(BuildArgs),
     /// Inspect a built parcel
     Inspect(InspectArgs),
@@ -102,6 +103,11 @@ enum Command {
     Channel {
         #[command(subcommand)]
         command: ChannelCommand,
+    },
+    /// Drive installed deployment lifecycle plugins
+    Deployment {
+        #[command(subcommand)]
+        command: DeploymentCommand,
     },
     /// Discover third-party extensions via catalog sources
     Extension {
@@ -522,7 +528,7 @@ struct RunExecutionArgs {
 enum ParcelCommand {
     /// Validate an Agentfile
     Lint(LintArgs),
-    /// Build an immutable agent parcel
+    /// Build an immutable deployment parcel
     Build(BuildArgs),
     /// List locally built parcels
     #[command(visible_alias = "ls")]
@@ -557,7 +563,7 @@ enum DepotCommand {
 
 #[derive(Debug, Subcommand)]
 enum ImageCommand {
-    /// Build an immutable agent parcel
+    /// Build an immutable deployment parcel
     Build(BuildArgs),
     /// List locally built parcels
     #[command(visible_alias = "ls")]
@@ -795,6 +801,142 @@ enum ChannelCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DeploymentCommand {
+    /// List installed deployment plugins
+    #[command(visible_alias = "ls")]
+    List {
+        /// Print full registry entries as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the deployment plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+    /// Inspect one installed deployment plugin
+    Inspect {
+        /// Deployment plugin name
+        name: String,
+        /// Print full registry entry as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override the deployment plugin registry path
+        #[arg(long)]
+        registry: Option<PathBuf>,
+    },
+    /// Read deployment plugin capabilities
+    Capabilities(DeploymentNamedArgs),
+    /// Validate a deployment spec JSON file
+    Validate(DeploymentSpecArgs),
+    /// Deploy a deployment spec JSON file
+    Deploy(DeploymentSpecArgs),
+    /// Run a draft deployment spec once
+    TestRun(DeploymentTestRunArgs),
+    /// List deployments
+    Deployments(DeploymentListDeploymentsArgs),
+    /// Get one deployment
+    Get(DeploymentIdArgs),
+    /// List deployment revisions
+    Revisions(DeploymentIdArgs),
+    /// Roll back a deployment to a revision
+    Rollback(DeploymentRollbackArgs),
+    /// Start a deployment
+    Start(DeploymentIdArgs),
+    /// Stop a deployment
+    Stop(DeploymentIdArgs),
+    /// Delete a deployment
+    Delete(DeploymentIdArgs),
+}
+
+#[derive(Debug, Args)]
+struct DeploymentPluginOptions {
+    /// Print full plugin response as JSON
+    #[arg(long)]
+    json: bool,
+    /// Override the deployment plugin registry path
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// Raw JSON object sent through deployment.configure before the operation
+    #[arg(long, conflicts_with = "config_file")]
+    config_json: Option<String>,
+    /// JSON file sent through deployment.configure before the operation
+    #[arg(long, conflicts_with = "config_json")]
+    config_file: Option<PathBuf>,
+    /// Seren API origin convenience setting for deployment.configure
+    #[arg(long)]
+    api_origin: Option<String>,
+    /// Seren API key convenience setting for deployment.configure
+    #[arg(long)]
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DeploymentNamedArgs {
+    /// Deployment plugin name
+    name: String,
+    #[command(flatten)]
+    options: DeploymentPluginOptions,
+}
+
+#[derive(Debug, Args)]
+struct DeploymentSpecArgs {
+    /// Deployment plugin name
+    name: String,
+    /// Path to a JSON spec file
+    spec: PathBuf,
+    #[command(flatten)]
+    options: DeploymentPluginOptions,
+}
+
+#[derive(Debug, Args)]
+struct DeploymentTestRunArgs {
+    /// Deployment plugin name
+    name: String,
+    /// Path to a JSON spec file
+    spec: PathBuf,
+    /// Optional sample input for the draft run
+    #[arg(long)]
+    sample_input: Option<String>,
+    #[command(flatten)]
+    options: DeploymentPluginOptions,
+}
+
+#[derive(Debug, Args)]
+struct DeploymentListDeploymentsArgs {
+    /// Deployment plugin name
+    name: String,
+    /// Optional filters JSON object
+    #[arg(long, conflicts_with = "filters_file")]
+    filters_json: Option<String>,
+    /// Optional filters JSON file
+    #[arg(long, conflicts_with = "filters_json")]
+    filters_file: Option<PathBuf>,
+    #[command(flatten)]
+    options: DeploymentPluginOptions,
+}
+
+#[derive(Debug, Args)]
+struct DeploymentIdArgs {
+    /// Deployment plugin name
+    name: String,
+    /// Deployment id
+    deployment_id: String,
+    #[command(flatten)]
+    options: DeploymentPluginOptions,
+}
+
+#[derive(Debug, Args)]
+struct DeploymentRollbackArgs {
+    /// Deployment plugin name
+    name: String,
+    /// Deployment id
+    deployment_id: String,
+    /// Revision id to activate
+    revision_id: String,
+    #[command(flatten)]
+    options: DeploymentPluginOptions,
+}
+
+#[derive(Debug, Subcommand)]
 enum ExtensionCommand {
     /// Manage catalog sources (where plugins come from)
     Catalog {
@@ -826,6 +968,9 @@ enum ExtensionCommand {
         /// Override the database registry path
         #[arg(long)]
         database_registry: Option<PathBuf>,
+        /// Override the deployment registry path
+        #[arg(long)]
+        deployment_registry: Option<PathBuf>,
     },
     /// Search cached catalogs for extensions matching a query
     Search {
@@ -911,6 +1056,7 @@ enum ExtensionKindFilter {
     Connector,
     Provider,
     Database,
+    Deployment,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1163,6 +1309,7 @@ fn main() -> Result<()> {
         },
         Command::Courier { command } => courier_cmds::courier_command(command),
         Command::Channel { command } => channel_cmds::channel_command(command),
+        Command::Deployment { command } => deployment_cmds::deployment_command(command),
         Command::Extension { command } => extension_cmds::extension_command(command),
         Command::State { command } => state_command(command),
         Command::Secret { command } => secret_command(command),
@@ -1508,11 +1655,12 @@ fn secret_command(command: SecretCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelCommand, Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand, DepotCommand,
-        EvalArgs, ExtensionCommand, ImageCommand, InspectArgs, InspectRunArgs, InternalCommand,
-        KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs,
-        RestartArgs, SecretCommand, SignArgs, SkillCommand, SkillSynthesisOverrideArgs,
-        StateCommand, StopArgs, ValidateSkillArgs, VerifyArgs, WaitArgs,
+        ChannelCommand, Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand,
+        DeploymentCommand, DepotCommand, EvalArgs, ExtensionCommand, ImageCommand, InspectArgs,
+        InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs,
+        PullArgs, PushArgs, RemoveRunArgs, RestartArgs, SecretCommand, SignArgs, SkillCommand,
+        SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs, VerifyArgs,
+        WaitArgs,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -1801,7 +1949,7 @@ mod tests {
     #[test]
     fn resolve_parcels_root_prefers_source_context_store() {
         let dir = tempdir().unwrap();
-        let source_dir = dir.path().join("agent");
+        let source_dir = dir.path().join("deployment");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
             source_dir.join("Agentfile"),
@@ -2582,6 +2730,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_deployment_deploy_command() {
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "deployment",
+            "deploy",
+            "seren-deployment",
+            "deployment.json",
+            "--api-origin",
+            "https://api.example.com",
+            "--api-key",
+            "seren_test",
+            "--json",
+            "--registry",
+            "/tmp/deployments.json",
+        ])
+        .unwrap();
+
+        let Command::Deployment { command } = cli.command else {
+            panic!("expected deployment command");
+        };
+        let DeploymentCommand::Deploy(args) = command else {
+            panic!("expected deployment deploy subcommand");
+        };
+        assert_eq!(args.name, "seren-deployment");
+        assert_eq!(args.spec, PathBuf::from("deployment.json"));
+        assert_eq!(
+            args.options.api_origin.as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(args.options.api_key.as_deref(), Some("seren_test"));
+        assert!(args.options.json);
+        assert_eq!(
+            args.options.registry.as_deref(),
+            Some(Path::new("/tmp/deployments.json"))
+        );
+    }
+
+    #[test]
     fn cli_parses_extension_install_command() {
         let cli = Cli::try_parse_from([
             "dispatch",
@@ -2616,6 +2802,7 @@ mod tests {
             channel_registry,
             provider_registry,
             database_registry,
+            deployment_registry,
         } = command
         else {
             panic!("expected extension install command");
@@ -2640,6 +2827,7 @@ mod tests {
             database_registry.as_deref(),
             Some(Path::new("/tmp/databases.json"))
         );
+        assert_eq!(deployment_registry.as_deref(), None);
     }
 
     #[test]
@@ -2716,7 +2904,7 @@ mod tests {
     #[test]
     fn resolve_runs_root_prefers_source_context_store() {
         let dir = tempdir().unwrap();
-        let source_dir = dir.path().join("agent");
+        let source_dir = dir.path().join("deployment");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
             source_dir.join("Agentfile"),
@@ -3193,7 +3381,7 @@ SKILL SKILL.md\n\
 ENTRYPOINT chat\n",
         )
         .unwrap();
-        fs::write(context_dir.join("SKILL.md"), "You are a test agent.\n").unwrap();
+        fs::write(context_dir.join("SKILL.md"), "You are a test deployment.\n").unwrap();
 
         let built = build_agentfile(
             &context_dir.join("Agentfile"),

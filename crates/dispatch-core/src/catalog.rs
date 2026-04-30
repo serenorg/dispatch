@@ -156,6 +156,7 @@ pub enum CatalogExtensionKind {
     Connector,
     Provider,
     Database,
+    Deployment,
 }
 
 impl CatalogExtensionKind {
@@ -166,6 +167,7 @@ impl CatalogExtensionKind {
             Self::Connector => "connector",
             Self::Provider => "provider",
             Self::Database => "database",
+            Self::Deployment => "deployment",
         }
     }
 }

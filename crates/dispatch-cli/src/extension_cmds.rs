@@ -11,8 +11,9 @@ use dispatch_core::{
     CatalogConfig, CatalogEntry, CatalogError, CatalogExtensionKind, CatalogInstallSource,
     CatalogSearchHit, CatalogSource, GithubReleaseBinary, default_catalog_cache_dir,
     default_catalog_config_path, default_channel_registry_path, default_courier_registry_path,
-    default_database_registry_path, default_provider_registry_path, find_cached_entry,
-    install_channel_plugin, install_courier_plugin, install_database_plugin,
+    default_database_registry_path, default_deployment_registry_path,
+    default_provider_registry_path, find_cached_entry, install_channel_plugin,
+    install_courier_plugin, install_database_plugin, install_deployment_plugin,
     install_provider_plugin, refresh_catalog, search_cached,
 };
 use sha2::{Digest, Sha256};
@@ -48,6 +49,7 @@ pub(crate) fn extension_command(command: crate::ExtensionCommand) -> Result<()> 
             channel_registry,
             provider_registry,
             database_registry,
+            deployment_registry,
         } => extension_install(ExtensionInstallRequest {
             name: &name,
             yes,
@@ -58,6 +60,7 @@ pub(crate) fn extension_command(command: crate::ExtensionCommand) -> Result<()> 
             channel_registry: channel_registry.as_deref(),
             provider_registry: provider_registry.as_deref(),
             database_registry: database_registry.as_deref(),
+            deployment_registry: deployment_registry.as_deref(),
         }),
         crate::ExtensionCommand::Search {
             query,
@@ -90,6 +93,7 @@ struct ExtensionInstallPaths<'a> {
     channel_registry: Option<&'a Path>,
     provider_registry: Option<&'a Path>,
     database_registry: Option<&'a Path>,
+    deployment_registry: Option<&'a Path>,
 }
 
 struct ExtensionInstallRequest<'a> {
@@ -102,6 +106,7 @@ struct ExtensionInstallRequest<'a> {
     channel_registry: Option<&'a Path>,
     provider_registry: Option<&'a Path>,
     database_registry: Option<&'a Path>,
+    deployment_registry: Option<&'a Path>,
 }
 
 fn default_extension_bin_dir() -> Result<PathBuf> {
@@ -160,6 +165,13 @@ fn resolve_database_registry_path(override_path: Option<&Path>) -> Result<PathBu
     match override_path {
         Some(path) => Ok(path.to_path_buf()),
         None => default_database_registry_path().map_err(Into::into),
+    }
+}
+
+fn resolve_deployment_registry_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    match override_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => default_deployment_registry_path().map_err(Into::into),
     }
 }
 
@@ -399,6 +411,7 @@ fn extension_install(request: ExtensionInstallRequest<'_>) -> Result<()> {
                 channel_registry: request.channel_registry,
                 provider_registry: request.provider_registry,
                 database_registry: request.database_registry,
+                deployment_registry: request.deployment_registry,
             },
         ),
     }
@@ -502,6 +515,19 @@ fn install_github_release_extension(
                 })?;
             println!(
                 "Installed database `{}` {} from catalog `{}`",
+                installed.name, installed.version, hit.catalog
+            );
+            println!("Binary: {}", staged_binary.display());
+            println!("Registry: {}", registry.display());
+        }
+        CatalogExtensionKind::Deployment => {
+            let registry = resolve_deployment_registry_path(paths.deployment_registry)?;
+            let installed = install_deployment_plugin(&manifest_path, Some(&registry))
+                .with_context(|| {
+                    format!("failed to install deployment plugin `{}`", hit.entry.name)
+                })?;
+            println!(
+                "Installed deployment `{}` {} from catalog `{}`",
                 installed.name, installed.version, hit.catalog
             );
             println!("Binary: {}", staged_binary.display());
@@ -728,6 +754,15 @@ fn rewrite_manifest_for_staged_binary(
                 .ok_or_else(|| anyhow!("downloaded database manifest is missing exec.command"))?;
             *command = serde_json::Value::String(staged_binary.display().to_string());
         }
+        CatalogExtensionKind::Deployment => {
+            let command = manifest
+                .get_mut("exec")
+                .and_then(|value| value.as_object_mut())
+                .ok_or_else(|| anyhow!("downloaded deployment manifest is missing exec"))?
+                .get_mut("command")
+                .ok_or_else(|| anyhow!("downloaded deployment manifest is missing exec.command"))?;
+            *command = serde_json::Value::String(staged_binary.display().to_string());
+        }
     }
 
     let dir = tempdir().context("failed to create temporary manifest directory")?;
@@ -737,6 +772,7 @@ fn rewrite_manifest_for_staged_binary(
         CatalogExtensionKind::Connector => "connector-plugin.json",
         CatalogExtensionKind::Provider => "provider-plugin.json",
         CatalogExtensionKind::Database => "database-plugin.json",
+        CatalogExtensionKind::Deployment => "deployment-plugin.json",
     };
     let path = dir.path().join(filename);
     fs::write(
@@ -921,6 +957,7 @@ impl From<crate::ExtensionKindFilter> for CatalogExtensionKind {
             crate::ExtensionKindFilter::Connector => Self::Connector,
             crate::ExtensionKindFilter::Provider => Self::Provider,
             crate::ExtensionKindFilter::Database => Self::Database,
+            crate::ExtensionKindFilter::Deployment => Self::Deployment,
         }
     }
 }
@@ -1199,6 +1236,7 @@ mod tests {
             channel_registry: None,
             provider_registry: None,
             database_registry: None,
+            deployment_registry: None,
         })
         .unwrap();
 
@@ -1354,6 +1392,7 @@ mod tests {
             channel_registry: None,
             provider_registry: Some(&registry_path),
             database_registry: None,
+            deployment_registry: None,
         })
         .unwrap();
 

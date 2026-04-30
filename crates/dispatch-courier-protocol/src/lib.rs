@@ -360,6 +360,8 @@ pub struct CourierInspection {
     pub required_secrets: Vec<String>,
     pub mounts: Vec<MountConfig>,
     pub local_tools: Vec<LocalToolSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

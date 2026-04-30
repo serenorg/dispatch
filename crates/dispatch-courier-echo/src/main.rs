@@ -99,6 +99,7 @@ fn handle_request(request: PluginRequest) -> Result<Vec<PluginResponse>, String>
                         .collect(),
                     mounts: parcel.config.mounts.clone(),
                     local_tools,
+                    extensions: None,
                 },
             }])
         }
