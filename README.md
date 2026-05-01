@@ -472,26 +472,16 @@ Supported backends:
 
 ## Long-Lived Runtime
 
-Dispatch also has a local long-lived runtime for detached execution and always-on
-heartbeat services.
+Dispatch also has a local long-lived runtime for detached execution and always-on heartbeat services.
 
-- `dispatch run --detach` starts a detached `job` or `heartbeat` run and writes a
-  run record under `.dispatch/runs/`
-- detached helpers publish authoritative terminal snapshots so `wait`, `ps`,
-  and `inspect-run` can reconcile exited runs without guessing from dead pids
-- `dispatch serve` starts a long-lived `service` run that can wake from heartbeat
-  intervals, persisted cron schedules, and local HTTP ingress
-- `dispatch ps`, `dispatch logs`, `dispatch wait`, `dispatch stop`,
-  `dispatch restart`, `dispatch prune`, `dispatch rm`, and
-  `dispatch inspect-run` manage those runs
-- `dispatch build`, `dispatch inspect`, `dispatch pull`, `dispatch push`, and
-  `dispatch images` expose Docker-style top-level aliases for common parcel
-  operations
+- `dispatch run --detach` starts a detached `job` or `heartbeat` run and writes a run record under `.dispatch/runs/`
+- detached helpers publish authoritative terminal snapshots so `wait`, `ps`, and `inspect-run` can reconcile exited runs without guessing from dead pids
+- `dispatch serve` starts a long-lived `service` run that can wake from heartbeat intervals, persisted cron schedules, and local HTTP ingress
+- `dispatch ps`, `dispatch logs`, `dispatch wait`, `dispatch stop`, `dispatch restart`, `dispatch prune`, `dispatch rm`, and `dispatch inspect-run` manage those runs
+- `dispatch build`, `dispatch inspect`, `dispatch pull`, `dispatch push`, and `dispatch images` expose Docker-style top-level aliases for common parcel operations
 - `dispatch images` is shorthand for `dispatch image ls`
-- `dispatch image ...` exposes Docker-style aliases for parcel artifact
-  management commands
-- `dispatch container ...` exposes Docker-style aliases for the same run
-  management commands
+- `dispatch image ...` exposes Docker-style aliases for parcel artifact management commands
+- `dispatch container ...` exposes Docker-style aliases for the same run management commands
 
 `dispatch serve` currently requires a parcel authored with
 `ENTRYPOINT heartbeat`.
@@ -506,13 +496,9 @@ Service scheduling and ingress can be authored into the parcel:
 - `LISTEN_MAX_BODY_BYTES 8192`
 - `LISTEN_MAX_HEADER_BYTES 4096`
 
-CLI `dispatch serve` flags can also provide or override schedules, listeners,
-and ingress policy at runtime. For the full runtime contract, see
-[docs/runtime-and-serve.md](./docs/runtime-and-serve.md).
+CLI `dispatch serve` flags can also provide or override schedules, listeners, and ingress policy at runtime. For the full runtime contract, see [docs/runtime-and-serve.md](./docs/runtime-and-serve.md).
 
-`dispatch wait` prints the run exit code. Detached one-shot runs that complete
-normally return `0`; explicitly stopped runs and one-shot runs whose helper dies
-before recording terminal state return non-zero.
+`dispatch wait` prints the run exit code. Detached one-shot runs that complete normally return `0`; explicitly stopped runs and one-shot runs whose helper dies before recording terminal state return non-zero.
 
 `dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and run the same synthesis and parcel build that an authored `Agentfile` would use. `dispatch skill validate` stops after that build-time validation, while `dispatch skill run` then delegates to `dispatch run`. This means `validate` surfaces sidecar, frontmatter, packaging, and build errors directly and is suitable for CI, but it is intentionally heavier than a schema-only lint. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 
@@ -545,16 +531,9 @@ For courier implementers:
 
 Courier registry:
 
-The courier registry is host inventory, not parcel source. `Agentfile` remains
-the canonical authored spec, while `dispatch courier install` records which
-runtime backends are available on a given machine.
+The courier registry is host inventory, not parcel source. `Agentfile` remains the canonical authored spec, while `dispatch courier install` records which runtime backends are available on a given machine.
 
-For project-scoped runtime wiring, use `dispatch.toml` with `dispatch up`.
-That path is separate from `Agentfile`: `Agentfile` defines the parcel, while
-`dispatch.toml` binds parcels to installed channels/couriers and reconciles
-extension manifests into project-local registries under `.dispatch/registries/`.
-Reply delivery through channel bindings requires a parcel; `deliver_replies`
-does not work on a channel-only runtime binding.
+For project-scoped runtime wiring, use `dispatch.toml` with `dispatch up`. That path is separate from `Agentfile`: `Agentfile` defines the parcel, while `dispatch.toml` binds parcels to installed channels/couriers, declares managed deployment bindings, and reconciles extension manifests into project-local registries under `.dispatch/registries/`. Reply delivery through channel bindings requires a parcel; `deliver_replies` does not work on a channel-only runtime binding.
 
 - `dispatch parcel lint|build|inspect|verify|keygen|sign` - manage parcel sources, signatures, and built artifacts
 - `dispatch depot push|pull` - move parcels to and from depots
@@ -565,19 +544,14 @@ does not work on a channel-only runtime binding.
 - `dispatch courier conformance <name> --json` - emit the same conformance report as machine-readable JSON
 - `dispatch run --courier <name>` - select a backend by name
 - `dispatch run --registry <path>` - use a non-default courier registry
-- `dispatch up [dispatch.toml]` - reconcile project-local runtime bindings and start configured channel listeners/pollers
+- `dispatch up [dispatch.toml]` - reconcile project-local deployment/runtime bindings and start configured channel listeners/pollers
 - plugin installation records the executable SHA256; Dispatch checks that digest before each launch
 
-See `examples/runtime/telegram-bot/dispatch.toml` for a concrete
-project-level runtime config example.
+See `examples/runtime/telegram-bot/dispatch.toml` for a concrete project-level runtime config example.
 
 ### Extension discovery
 
-Third-party couriers and channels live in their own repositories. Dispatch
-discovers them through **catalogs** - JSON index documents at stable URLs,
-analogous to Homebrew taps. Each repo publishes its own catalog at
-`catalog/extensions.json`, users register the catalog URL once, and the
-entries become searchable locally.
+Third-party couriers and channels live in their own repositories. Dispatch discovers them through **catalogs** - JSON index documents at stable URLs, analogous to Homebrew taps. Each repo publishes its own catalog at `catalog/extensions.json`, users register the catalog URL once, and the entries become searchable locally.
 
 ```bash
 # Register a catalog (one-time)
@@ -592,24 +566,17 @@ dispatch extension search telegram
 dispatch extension show channel-telegram
 ```
 
-Catalogs are stored in `~/.config/dispatch/catalogs.toml` and fetched JSON is
-cached under `~/.config/dispatch/catalog-cache/`.
+Catalogs are stored in `~/.config/dispatch/catalogs.toml` and fetched JSON is cached under `~/.config/dispatch/catalog-cache/`.
 
-If a catalog entry publishes machine-installable source metadata, Dispatch can
-also install it directly by name:
+If a catalog entry publishes machine-installable source metadata, Dispatch can also install it directly by name:
 
 ```bash
 dispatch extension install <name>
 ```
 
-The shipped install-by-name path is intentionally narrow: it supports direct
-GitHub release binaries and still rewrites the catalog's manifest into the
-existing `dispatch courier install` / `dispatch channel install` flow.
-Capability-based trust remains on the roadmap.
+The shipped install-by-name path is intentionally narrow: it supports direct GitHub release binaries and still rewrites the catalog's manifest into the existing `dispatch courier install` / `dispatch channel install` flow. Capability-based trust remains on the roadmap.
 
-See [`docs/plugin-ecosystem.md`](docs/plugin-ecosystem.md) for the full
-roadmap, including the canonical list of known third-party catalogs and
-guidance for publishing a new one.
+See [`docs/plugin-ecosystem.md`](docs/plugin-ecosystem.md) for the full roadmap, including the canonical list of known third-party catalogs and guidance for publishing a new one.
 
 ## Mounts
 

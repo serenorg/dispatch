@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, bail};
 use dispatch_core::{
     install_channel_plugin, install_courier_plugin, install_database_plugin,
-    install_provider_plugin, resolve_courier,
+    install_deployment_plugin, install_provider_plugin, resolve_courier, resolve_deployment_plugin,
 };
-use serde::Deserialize;
+use dispatch_deployment_protocol::{PluginRequest, PluginResponse, ValidationIssue};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fs,
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -29,9 +32,13 @@ struct DispatchProjectConfig {
     #[serde(default)]
     database_registry: Option<PathBuf>,
     #[serde(default)]
+    deployment_registry: Option<PathBuf>,
+    #[serde(default)]
     tool_approval: Option<crate::CliToolApprovalMode>,
     #[serde(default)]
     extensions: Vec<ExtensionInstallConfig>,
+    #[serde(default)]
+    deployments: Vec<DeploymentBindingConfig>,
     #[serde(default)]
     channels: Vec<ChannelBindingConfig>,
 }
@@ -43,6 +50,7 @@ enum ExtensionKind {
     Courier,
     Provider,
     Database,
+    Deployment,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +76,51 @@ enum ExtensionManifestKind {
     Connector,
     Provider,
     Database,
+    Deployment,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DeploymentReconcileMode {
+    #[default]
+    Validate,
+    TestRun,
+    Deploy,
+    Upsert,
+}
+
+impl DeploymentReconcileMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::TestRun => "test-run",
+            Self::Deploy => "deploy",
+            Self::Upsert => "upsert",
+        }
+    }
+
+    fn mutates_remote_resources(self) -> bool {
+        matches!(self, Self::Deploy | Self::Upsert)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentBindingConfig {
+    #[serde(default)]
+    name: Option<String>,
+    plugin: String,
+    #[serde(default)]
+    reconcile: DeploymentReconcileMode,
+    #[serde(default)]
+    sample_input: Option<String>,
+    #[serde(default)]
+    config_file: Option<PathBuf>,
+    #[serde(default)]
+    config: Option<toml::Value>,
+    #[serde(default)]
+    spec_file: Option<PathBuf>,
+    #[serde(default)]
+    spec: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,7 +162,10 @@ struct ResolvedDispatchProject {
     channel_registry: PathBuf,
     provider_registry: PathBuf,
     database_registry: PathBuf,
+    deployment_registry: PathBuf,
+    deployment_state_path: PathBuf,
     extensions: Vec<ResolvedExtensionInstall>,
+    deployments: Vec<ResolvedDeploymentBinding>,
     channels: Vec<crate::channel_cmds::ChannelRuntimeBindingArgs>,
 }
 
@@ -118,6 +174,37 @@ struct ResolvedExtensionInstall {
     kind: ExtensionKind,
     name: String,
     manifest: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDeploymentBinding {
+    label: String,
+    plugin: String,
+    reconcile: DeploymentReconcileMode,
+    config: Option<Value>,
+    spec: Value,
+    sample_input: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct DeploymentStateFile {
+    #[serde(default)]
+    deployments: BTreeMap<String, DeploymentStateEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeploymentStateEntry {
+    plugin: String,
+    name: String,
+    deployment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_reconciled_at: Option<String>,
+}
+
+fn deployment_state_key(plugin: &str, name: &str) -> String {
+    format!("{plugin}::{name}")
 }
 
 fn default_courier_name() -> String {
@@ -137,6 +224,14 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
     println!("Channel Registry: {}", project.channel_registry.display());
     println!("Provider Registry: {}", project.provider_registry.display());
     println!("Database Registry: {}", project.database_registry.display());
+    println!(
+        "Deployment Registry: {}",
+        project.deployment_registry.display()
+    );
+    println!(
+        "Deployment State: {}",
+        project.deployment_state_path.display()
+    );
 
     if args.dry_run {
         print_dry_run(&project);
@@ -144,6 +239,21 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
     }
 
     reconcile_extensions(&project)?;
+
+    if !project.deployments.is_empty() {
+        confirm_remote_reconcile_or_bail(&project, args.yes)?;
+        run_deployments(&project)?;
+    }
+
+    if project.channels.is_empty() {
+        if project.deployments.is_empty() {
+            bail!(
+                "{} does not declare any [[channels]] or [[deployments]] bindings",
+                project.config_path.display()
+            );
+        }
+        return Ok(());
+    }
 
     resolve_courier(&project.courier, Some(&project.courier_registry)).with_context(|| {
         format!(
@@ -153,14 +263,196 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
         )
     })?;
 
-    if project.channels.is_empty() {
-        bail!(
-            "{} does not declare any [[channels]] bindings",
-            project.config_path.display()
-        );
+    run_channel_bindings(project)
+}
+
+fn confirm_remote_reconcile_or_bail(project: &ResolvedDispatchProject, yes: bool) -> Result<()> {
+    let mutating: Vec<&ResolvedDeploymentBinding> = project
+        .deployments
+        .iter()
+        .filter(|binding| binding.reconcile.mutates_remote_resources())
+        .collect();
+    if mutating.is_empty() || yes {
+        return Ok(());
     }
 
-    run_channels(project)
+    println!("The following deployment bindings create or reconcile remote resources:");
+    for binding in &mutating {
+        println!(
+            "  - {} via {} ({})",
+            binding.label,
+            binding.plugin,
+            binding.reconcile.label()
+        );
+    }
+    print!("Apply these bindings? [y/N] ");
+    io::stdout()
+        .flush()
+        .context("failed to flush deployment confirmation prompt")?;
+    let mut response = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut response)
+        .context("failed to read deployment confirmation response")?;
+    let trimmed = response.trim();
+    if matches!(trimmed, "y" | "Y" | "yes" | "YES") {
+        Ok(())
+    } else {
+        bail!("deployment reconcile aborted by user")
+    }
+}
+
+fn run_deployments(project: &ResolvedDispatchProject) -> Result<()> {
+    let mut state = load_deployment_state(&project.deployment_state_path)?;
+    let mut state_changed = false;
+    for deployment in &project.deployments {
+        let plugin =
+            resolve_deployment_plugin(&deployment.plugin, Some(&project.deployment_registry))
+                .with_context(|| {
+                    format!(
+                        "failed to resolve deployment plugin `{}` from {}",
+                        deployment.plugin,
+                        project.deployment_registry.display()
+                    )
+                })?;
+        let request = match deployment.reconcile {
+            DeploymentReconcileMode::Validate => PluginRequest::Validate {
+                spec: deployment.spec.clone(),
+            },
+            DeploymentReconcileMode::TestRun => PluginRequest::TestRun {
+                spec: deployment.spec.clone(),
+                sample_input: deployment.sample_input.clone(),
+            },
+            DeploymentReconcileMode::Deploy => PluginRequest::Deploy {
+                spec: deployment.spec.clone(),
+            },
+            DeploymentReconcileMode::Upsert => PluginRequest::Upsert {
+                name: deployment.label.clone(),
+                spec: deployment.spec.clone(),
+            },
+        };
+        let response = crate::deployment_cmds::invoke_deployment_plugin(
+            &plugin,
+            deployment.config.clone(),
+            request,
+        )
+        .with_context(|| format!("deployment `{}` failed", deployment.label))?;
+
+        state_changed |= handle_deployment_response(deployment, response, &mut state)?;
+    }
+    if state_changed {
+        save_deployment_state(&project.deployment_state_path, &state)?;
+    }
+    Ok(())
+}
+
+fn handle_deployment_response(
+    deployment: &ResolvedDeploymentBinding,
+    response: PluginResponse,
+    state: &mut DeploymentStateFile,
+) -> Result<bool> {
+    match (deployment.reconcile, response) {
+        (DeploymentReconcileMode::Validate, PluginResponse::Validation { result }) => {
+            if result.ok {
+                println!("Deployment `{}` validated", deployment.label);
+                Ok(false)
+            } else {
+                bail!(
+                    "deployment `{}` failed validation: {}",
+                    deployment.label,
+                    format_validation_issues(&result.issues)
+                )
+            }
+        }
+        (DeploymentReconcileMode::TestRun, PluginResponse::TestRunResult { result }) => {
+            println!(
+                "Deployment `{}` test-run status: {}",
+                deployment.label, result.status
+            );
+            Ok(false)
+        }
+        (DeploymentReconcileMode::Deploy, PluginResponse::Deployment { deployment: result })
+        | (DeploymentReconcileMode::Upsert, PluginResponse::Deployment { deployment: result }) => {
+            let key = deployment_state_key(&deployment.plugin, &deployment.label);
+            let same_id_as_state = state
+                .deployments
+                .get(&key)
+                .map(|entry| &entry.deployment_id)
+                == Some(&result.deployment_id);
+            let verb = match deployment.reconcile {
+                DeploymentReconcileMode::Upsert if same_id_as_state => "reconciled",
+                DeploymentReconcileMode::Upsert => "upserted",
+                _ => "deployed",
+            };
+            println!(
+                "Deployment `{}` {} as {}",
+                deployment.label, verb, result.deployment_id
+            );
+            state.deployments.insert(
+                key,
+                DeploymentStateEntry {
+                    plugin: deployment.plugin.clone(),
+                    name: deployment.label.clone(),
+                    deployment_id: result.deployment_id.clone(),
+                    revision_id: result.revision_id.clone(),
+                    last_reconciled_at: Some(chrono::Utc::now().to_rfc3339()),
+                },
+            );
+            Ok(true)
+        }
+        (_, PluginResponse::Error { error }) => {
+            bail!(
+                "deployment `{}` plugin error: {}: {}",
+                deployment.label,
+                error.code,
+                error.message
+            )
+        }
+        (_, other) => {
+            bail!(
+                "deployment `{}` returned unexpected response: {other:?}",
+                deployment.label
+            )
+        }
+    }
+}
+
+fn load_deployment_state(path: &Path) -> Result<DeploymentStateFile> {
+    if !path.exists() {
+        return Ok(DeploymentStateFile::default());
+    }
+    let body =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if body.trim().is_empty() {
+        return Ok(DeploymentStateFile::default());
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse deployment state {}", path.display()))
+}
+
+fn save_deployment_state(path: &Path, state: &DeploymentStateFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let body =
+        serde_json::to_string_pretty(state).context("failed to serialize deployment state")?;
+    fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn format_validation_issues(issues: &[ValidationIssue]) -> String {
+    if issues.is_empty() {
+        return "no issues returned".to_string();
+    }
+
+    issues
+        .iter()
+        .map(|issue| {
+            let field = issue.field.as_deref().unwrap_or("<root>");
+            format!("{field}: {}: {}", issue.code, issue.message)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn print_dry_run(project: &ResolvedDispatchProject) {
@@ -175,12 +467,35 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
                 ExtensionKind::Courier => "courier",
                 ExtensionKind::Provider => "provider",
                 ExtensionKind::Database => "database",
+                ExtensionKind::Deployment => "deployment",
             };
             println!("  - {kind}: {}", extension.manifest.display());
         }
     }
 
     print_dry_run_courier_status(project);
+
+    if project.deployments.is_empty() {
+        println!("Deployment Bindings: none");
+    } else {
+        println!("Deployment Bindings:");
+        let state = load_deployment_state(&project.deployment_state_path).unwrap_or_default();
+        for deployment in &project.deployments {
+            let key = deployment_state_key(&deployment.plugin, &deployment.label);
+            let known_id = state
+                .deployments
+                .get(&key)
+                .map(|entry| entry.deployment_id.as_str())
+                .unwrap_or("<none>");
+            println!(
+                "  - {} via {} ({}); known deployment_id={}",
+                deployment.label,
+                deployment.plugin,
+                deployment.reconcile.label(),
+                known_id
+            );
+        }
+    }
 
     if project.channels.is_empty() {
         println!("Channel Bindings: none");
@@ -255,6 +570,16 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         .database_registry
         .map(|value| resolve_relative_path(&root_dir, value))
         .unwrap_or_else(|| root_dir.join(".dispatch/registries/databases.json"));
+    let deployment_registry = parsed
+        .deployment_registry
+        .map(|value| resolve_relative_path(&root_dir, value))
+        .unwrap_or_else(|| root_dir.join(".dispatch/registries/deployments.json"));
+    let deployment_state_path = root_dir.join(".dispatch/state/deployments.json");
+
+    let mut deployments = Vec::with_capacity(parsed.deployments.len());
+    for deployment in parsed.deployments {
+        deployments.push(resolve_deployment_binding(&root_dir, deployment)?);
+    }
 
     let mut channels = Vec::with_capacity(parsed.channels.len());
     for binding in parsed.channels {
@@ -278,6 +603,8 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         channel_registry,
         provider_registry,
         database_registry,
+        deployment_registry,
+        deployment_state_path,
         extensions: parsed
             .extensions
             .into_iter()
@@ -291,7 +618,48 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
                 })
             })
             .collect::<Result<Vec<_>>>()?,
+        deployments,
         channels,
+    })
+}
+
+fn resolve_deployment_binding(
+    root_dir: &Path,
+    binding: DeploymentBindingConfig,
+) -> Result<ResolvedDeploymentBinding> {
+    let label = binding
+        .name
+        .clone()
+        .unwrap_or_else(|| binding.plugin.clone());
+    let config = load_optional_structured_config(
+        root_dir,
+        binding.config,
+        binding.config_file.as_deref(),
+        StructuredConfigKeys {
+            inline_key: "config",
+            file_key: "config_file",
+            label: "deployment config",
+        },
+    )?;
+    let spec = load_required_structured_config(
+        root_dir,
+        binding.spec,
+        binding.spec_file.as_deref(),
+        StructuredConfigKeys {
+            inline_key: "spec",
+            file_key: "spec_file",
+            label: "deployment spec",
+        },
+        &label,
+    )?;
+
+    Ok(ResolvedDeploymentBinding {
+        label,
+        plugin: binding.plugin,
+        reconcile: binding.reconcile,
+        config,
+        spec,
+        sample_input: binding.sample_input,
     })
 }
 
@@ -315,7 +683,7 @@ fn resolve_channel_binding(
         );
     }
 
-    let config = load_binding_config(root_dir, binding.config, binding.config_file.as_deref())?;
+    let config = load_channel_config(root_dir, binding.config, binding.config_file.as_deref())?;
     let session_root = binding
         .session_root
         .map(|value| resolve_relative_path(root_dir, value))
@@ -352,22 +720,70 @@ fn resolve_channel_binding(
     })
 }
 
-fn load_binding_config(
+#[derive(Debug, Clone, Copy)]
+struct StructuredConfigKeys {
+    inline_key: &'static str,
+    file_key: &'static str,
+    label: &'static str,
+}
+
+fn load_channel_config(
     root_dir: &Path,
     inline: Option<toml::Value>,
     config_file: Option<&Path>,
 ) -> Result<Value> {
+    load_optional_structured_config(
+        root_dir,
+        inline,
+        config_file,
+        StructuredConfigKeys {
+            inline_key: "config",
+            file_key: "config_file",
+            label: "channel config",
+        },
+    )
+    .map(|value| value.unwrap_or_else(|| serde_json::json!({})))
+}
+
+fn load_optional_structured_config(
+    root_dir: &Path,
+    inline: Option<toml::Value>,
+    config_file: Option<&Path>,
+    keys: StructuredConfigKeys,
+) -> Result<Option<Value>> {
     match (inline, config_file) {
         (Some(_), Some(_)) => {
-            bail!("use either `config` or `config_file` for a channel binding, not both")
+            bail!(
+                "use either `{}` or `{}` for {}, not both",
+                keys.inline_key,
+                keys.file_key,
+                keys.label
+            )
         }
-        (None, None) => Ok(serde_json::json!({})),
-        (Some(value), None) => toml_value_to_json(value),
+        (None, None) => Ok(None),
+        (Some(value), None) => toml_value_to_json(value).map(Some),
         (None, Some(path)) => crate::channel_cmds::load_structured_value_file(
             &resolve_relative_path(root_dir, path.to_path_buf()),
-            "channel config",
-        ),
+            keys.label,
+        )
+        .map(Some),
     }
+}
+
+fn load_required_structured_config(
+    root_dir: &Path,
+    inline: Option<toml::Value>,
+    config_file: Option<&Path>,
+    keys: StructuredConfigKeys,
+    binding_label: &str,
+) -> Result<Value> {
+    load_optional_structured_config(root_dir, inline, config_file, keys)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "deployment `{binding_label}` requires either `{}` or `{}`",
+            keys.inline_key,
+            keys.file_key
+        )
+    })
 }
 
 fn toml_value_to_json(value: toml::Value) -> Result<Value> {
@@ -419,13 +835,15 @@ fn resolve_extension_kind(
         ),
         Some(ExtensionManifestKind::Provider) => Ok(ExtensionKind::Provider),
         Some(ExtensionManifestKind::Database) => Ok(ExtensionKind::Database),
+        Some(ExtensionManifestKind::Deployment) => Ok(ExtensionKind::Deployment),
         None => match manifest.file_name().and_then(|value| value.to_str()) {
             Some("channel-plugin.json") => Ok(ExtensionKind::Channel),
             Some("courier-plugin.json") => Ok(ExtensionKind::Courier),
             Some("provider-plugin.json") => Ok(ExtensionKind::Provider),
             Some("database-plugin.json") => Ok(ExtensionKind::Database),
+            Some("deployment-plugin.json") => Ok(ExtensionKind::Deployment),
             _ => bail!(
-                "extension manifest `{}` must declare `kind`, or use a conventional filename like `channel-plugin.json`, `courier-plugin.json`, `provider-plugin.json`, or `database-plugin.json`",
+                "extension manifest `{}` must declare `kind`, or use a conventional filename like `channel-plugin.json`, `courier-plugin.json`, `provider-plugin.json`, `database-plugin.json`, or `deployment-plugin.json`",
                 manifest.display()
             ),
         },
@@ -488,12 +906,25 @@ fn reconcile_extensions(project: &ResolvedDispatchProject) -> Result<()> {
                         })?;
                 println!("Installed database plugin `{}`", installed.name);
             }
+            ExtensionKind::Deployment => {
+                let installed = install_deployment_plugin(
+                    &extension.manifest,
+                    Some(&project.deployment_registry),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to install deployment plugin from {}",
+                        extension.manifest.display()
+                    )
+                })?;
+                println!("Installed deployment plugin `{}`", installed.name);
+            }
         }
     }
     Ok(())
 }
 
-fn run_channels(project: ResolvedDispatchProject) -> Result<()> {
+fn run_channel_bindings(project: ResolvedDispatchProject) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let channel_count = project.channels.len();
     let one_shot_count = project
@@ -596,6 +1027,10 @@ once = true
             project.database_registry,
             dir.path().join(".dispatch/registries/databases.json")
         );
+        assert_eq!(
+            project.deployment_registry,
+            dir.path().join(".dispatch/registries/deployments.json")
+        );
         assert_eq!(project.channels.len(), 1);
     }
 
@@ -642,6 +1077,81 @@ deliver_replies = true
     }
 
     #[test]
+    fn load_dispatch_project_accepts_deployment_bindings() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        let spec_path = dir.path().join("deployment.json");
+        fs::write(
+            &spec_path,
+            r#"{ "name": "research-monitor", "mode": "llm" }"#,
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+deployment_registry = "./custom/deployments.json"
+
+[[deployments]]
+name = "research-monitor"
+plugin = "seren-agent"
+reconcile = "test_run"
+sample_input = "hello"
+config = {{ api_origin = "https://api.example.com", api_key = "seren_test" }}
+spec_file = {}
+"#,
+                toml_string_literal(&path_string(&spec_path))
+            ),
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path).unwrap();
+        assert_eq!(
+            project.deployment_registry,
+            dir.path().join("custom/deployments.json")
+        );
+        assert_eq!(project.deployments.len(), 1);
+        let deployment = &project.deployments[0];
+        assert_eq!(deployment.label, "research-monitor");
+        assert_eq!(deployment.plugin, "seren-agent");
+        assert!(matches!(
+            deployment.reconcile,
+            DeploymentReconcileMode::TestRun
+        ));
+        assert_eq!(deployment.sample_input.as_deref(), Some("hello"));
+        assert_eq!(
+            deployment
+                .config
+                .as_ref()
+                .and_then(|value| value.get("api_origin"))
+                .and_then(Value::as_str),
+            Some("https://api.example.com")
+        );
+        assert_eq!(
+            deployment.spec.get("name").and_then(Value::as_str),
+            Some("research-monitor")
+        );
+    }
+
+    #[test]
+    fn load_dispatch_project_rejects_deployment_without_spec() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[deployments]]
+name = "research-monitor"
+plugin = "seren-agent"
+"#,
+        )
+        .unwrap();
+
+        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        assert!(error.contains("requires either `spec` or `spec_file`"));
+    }
+
+    #[test]
     fn load_dispatch_project_infers_extension_kind_from_manifest() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
@@ -678,11 +1188,12 @@ manifest = {}
     }
 
     #[test]
-    fn load_dispatch_project_accepts_provider_and_database_extension_kinds() {
+    fn load_dispatch_project_accepts_provider_database_and_deployment_extension_kinds() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
         let provider_manifest = dir.path().join("provider-plugin.json");
         let database_manifest = dir.path().join("database-plugin.json");
+        let deployment_manifest = dir.path().join("deployment-plugin.json");
         fs::write(
             &provider_manifest,
             r#"
@@ -712,6 +1223,20 @@ manifest = {}
         )
         .unwrap();
         fs::write(
+            &deployment_manifest,
+            r#"
+{
+    "kind": "deployment",
+    "name": "seren-agent",
+    "version": "0.1.0",
+    "transport": "jsonl",
+    "protocol_version": 1,
+    "exec": { "command": "./seren-agent", "args": [] }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
             &config_path,
             format!(
                 r#"
@@ -720,15 +1245,19 @@ manifest = {}
 
 [[extensions]]
 manifest = {}
+
+[[extensions]]
+manifest = {}
 "#,
                 toml_string_literal(&path_string(&provider_manifest)),
-                toml_string_literal(&path_string(&database_manifest))
+                toml_string_literal(&path_string(&database_manifest)),
+                toml_string_literal(&path_string(&deployment_manifest))
             ),
         )
         .unwrap();
 
         let project = load_dispatch_project(&config_path).unwrap();
-        assert_eq!(project.extensions.len(), 2);
+        assert_eq!(project.extensions.len(), 3);
         assert!(matches!(
             project.extensions[0].kind,
             ExtensionKind::Provider
@@ -736,6 +1265,10 @@ manifest = {}
         assert!(matches!(
             project.extensions[1].kind,
             ExtensionKind::Database
+        ));
+        assert!(matches!(
+            project.extensions[2].kind,
+            ExtensionKind::Deployment
         ));
     }
 

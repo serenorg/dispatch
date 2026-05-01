@@ -31,6 +31,7 @@ pub const METHOD_HEALTH: &str = "deployment.health";
 pub const METHOD_VALIDATE: &str = "deployment.validate";
 pub const METHOD_TEST_RUN: &str = "deployment.test_run";
 pub const METHOD_DEPLOY: &str = "deployment.deploy";
+pub const METHOD_UPSERT: &str = "deployment.upsert";
 pub const METHOD_PREVIEW_UPDATE: &str = "deployment.preview_update";
 pub const METHOD_UPDATE: &str = "deployment.update";
 pub const METHOD_GET: &str = "deployment.get";
@@ -75,6 +76,17 @@ pub enum PluginRequest {
     },
     /// Create a managed deployment. Returns a `deployment_id` plus initial state.
     Deploy {
+        spec: Value,
+    },
+    /// Reconcile a managed deployment by stable name. Plugins are expected to
+    /// return the same `deployment_id` across repeated invocations with the
+    /// same `name`, creating on first call and either returning or updating the
+    /// existing deployment on subsequent calls. The exact reconcile semantics
+    /// (matching key, allowed updates, drift handling) are plugin-defined;
+    /// backends that cannot implement idempotent reconcile MAY return
+    /// `error_codes::UNIMPLEMENTED`.
+    Upsert {
+        name: String,
         spec: Value,
     },
     /// Diff a candidate update without applying it.
@@ -311,6 +323,7 @@ pub fn request_method(request: &PluginRequest) -> &'static str {
         PluginRequest::Validate { .. } => METHOD_VALIDATE,
         PluginRequest::TestRun { .. } => METHOD_TEST_RUN,
         PluginRequest::Deploy { .. } => METHOD_DEPLOY,
+        PluginRequest::Upsert { .. } => METHOD_UPSERT,
         PluginRequest::PreviewUpdate { .. } => METHOD_PREVIEW_UPDATE,
         PluginRequest::Update { .. } => METHOD_UPDATE,
         PluginRequest::Get { .. } => METHOD_GET,
@@ -617,6 +630,10 @@ mod tests {
                 sample_input: None,
             }),
             request_method(&PluginRequest::Deploy { spec: Value::Null }),
+            request_method(&PluginRequest::Upsert {
+                name: String::new(),
+                spec: Value::Null,
+            }),
             request_method(&PluginRequest::PreviewUpdate {
                 deployment_id: String::new(),
                 patch: Value::Null,

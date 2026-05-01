@@ -2958,3 +2958,124 @@ fn inspect_run_reconciles_dead_service_helpers() -> Result<(), Box<dyn std::erro
 
     Ok(())
 }
+
+fn write_deployment_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let plugin_dir = dir.join("deployment-plugin");
+    fs::create_dir_all(&plugin_dir)?;
+
+    let (command, args) = write_channel_entrypoint_script(
+        &plugin_dir,
+        "deployment-test",
+        r#"#!/bin/sh
+set -eu
+while IFS= read -r line; do
+request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+[ -n "$request_id" ] || request_id=1
+case "$line" in
+    *'"method":"deployment.configure"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"configured","configuration":{"deployment_plugin_id":"deployment-test"}}}'
+        ;;
+    *'"method":"deployment.deploy"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"deployment","deployment":{"deployment_id":"dep-stub-1","status":"running","revision_id":"rev-1"}}}'
+        ;;
+    *'"method":"deployment.shutdown"'*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"ok"}}'
+        break
+        ;;
+    *)
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"error":{"code":-32601,"message":"unsupported"}}'
+        ;;
+esac
+done
+"#,
+        r#"$stdin = [Console]::In
+while (($line = $stdin.ReadLine()) -ne $null) {
+    $requestId = "1"
+    if ($line -match '"id":([0-9]+)') { $requestId = $Matches[1] }
+    if ($line -like '*"method":"deployment.configure"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"configured","configuration":{"deployment_plugin_id":"deployment-test"}}}')
+    } elseif ($line -like '*"method":"deployment.deploy"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"deployment","deployment":{"deployment_id":"dep-stub-1","status":"running","revision_id":"rev-1"}}}')
+    } elseif ($line -like '*"method":"deployment.shutdown"*') {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
+        break
+    } else {
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32601,"message":"unsupported"}}')
+    }
+}
+"#,
+    )?;
+
+    let manifest_path = plugin_dir.join("deployment-plugin.json");
+    let manifest = serde_json::json!({
+        "kind": "deployment",
+        "name": "deployment-test",
+        "version": "0.1.0",
+        "transport": "jsonl",
+        "protocol_version": 1,
+        "description": "Test deployment plugin",
+        "exec": {
+            "command": command,
+            "args": args,
+        },
+    });
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    Ok(manifest_path)
+}
+
+#[test]
+fn dispatch_up_deploys_via_deployment_plugin_and_records_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let manifest_path = write_deployment_test_plugin(dir.path())?;
+    let spec_path = dir.path().join("spec.json");
+    fs::write(
+        &spec_path,
+        r#"{ "name": "research-monitor", "mode": "always_on" }"#,
+    )?;
+    fs::write(
+        dir.path().join("dispatch.toml"),
+        format!(
+            r#"
+[[extensions]]
+manifest = {}
+
+[[deployments]]
+name = "research-monitor"
+plugin = "deployment-test"
+reconcile = "deploy"
+spec_file = {}
+"#,
+            toml_string_literal(&path_string(&manifest_path)),
+            toml_string_literal(&path_string(&spec_path)),
+        ),
+    )?;
+
+    let dispatch_bin = dispatch_bin();
+    let output = Command::new(&dispatch_bin)
+        .current_dir(dir.path())
+        .args(["up", "dispatch.toml", "--yes"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    let stdout = require_success(output, "dispatch up")?;
+    assert!(
+        stdout.contains("Installed deployment plugin `deployment-test`"),
+        "expected install line, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Deployment `research-monitor` deployed as dep-stub-1"),
+        "expected deploy line, got: {stdout}"
+    );
+
+    let state_path = dir.path().join(".dispatch/state/deployments.json");
+    assert!(state_path.exists(), "expected state file at {state_path:?}");
+    let state: Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+    let entry = &state["deployments"]["deployment-test::research-monitor"];
+    assert_eq!(entry["plugin"], "deployment-test");
+    assert_eq!(entry["name"], "research-monitor");
+    assert_eq!(entry["deployment_id"], "dep-stub-1");
+    assert_eq!(entry["revision_id"], "rev-1");
+
+    Ok(())
+}

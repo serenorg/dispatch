@@ -337,6 +337,10 @@ struct UpArgs {
     /// Print planned installs and bindings without mutating registries or starting channels
     #[arg(long)]
     dry_run: bool,
+    /// Skip the confirmation prompt for deployment bindings that create or
+    /// reconcile remote resources (`reconcile = "deploy"` / `"upsert"`).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args, Clone)]

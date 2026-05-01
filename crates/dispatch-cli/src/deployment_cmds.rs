@@ -160,7 +160,7 @@ fn call_deployment_plugin(
     invoke_deployment_plugin(&plugin, configure, request)
 }
 
-fn invoke_deployment_plugin(
+pub(crate) fn invoke_deployment_plugin(
     plugin: &DeploymentPluginManifest,
     configure: Option<Value>,
     request: PluginRequest,

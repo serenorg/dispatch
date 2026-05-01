@@ -194,7 +194,7 @@ Common ingress patterns:
 - Signal polling uses either upstream HTTP receive (`native` / `normal`) or websocket-backed receive (`json-rpc`) inside the plugin.
 - Slack polling uses Socket Mode: the plugin opens Slack's websocket via `apps.connections.open`, acknowledges each `envelope_id`, and emits normalized ingress notifications to the host.
 
-`dispatch up` is the project-level runtime binding command. It reads `dispatch.toml`, reconciles declared extension manifests into project-local registries under `.dispatch/registries/`, and starts the configured channel bindings without mutating the global registries under `~/.config/dispatch/`. Use `dispatch up --dry-run` to preview installs and channel bindings without mutating registries or starting listeners/pollers.
+`dispatch up` is the project-level runtime binding command. It reads `dispatch.toml`, reconciles declared extension manifests into project-local registries under `.dispatch/registries/`, validates or applies declared deployment bindings, and starts the configured channel bindings without mutating the global registries under `~/.config/dispatch/`. Use `dispatch up --dry-run` to preview installs, deployment bindings, and channel bindings without mutating registries, invoking deployment plugins, or starting listeners/pollers.
 
 Minimal `dispatch.toml` example:
 
@@ -205,6 +205,16 @@ courier = "native"
 [[extensions]]
 manifest = "../dispatch-plugins/channels/telegram/channel-plugin.json"
 
+[[extensions]]
+manifest = "../dispatch-seren-plugins/deployments/seren-agent/deployment-plugin.json"
+
+[[deployments]]
+name = "research-monitor"
+plugin = "seren-agent"
+reconcile = "upsert"
+config = { api_origin = "https://api.serendb.com", api_key = "seren_test" }
+spec_file = "./deployments/research-monitor.json"
+
 [[channels]]
 plugin = "channel-telegram"
 mode = "listen"
@@ -213,7 +223,20 @@ deliver_replies = true
 config_file = "./config/telegram.toml"
 ```
 
-Channel binding config files may be JSON or TOML. Inline `config = { ... }` tables in `dispatch.toml` are also supported.
+Channel and deployment binding config files may be JSON or TOML. Inline `config = { ... }` tables in `dispatch.toml` are also supported.
+
+Deployment bindings carry two distinct payloads. `config` (or `config_file`) is the auth/endpoint setup sent through `deployment.configure` once before each operation, e.g. API base URL, API key, account id, workspace. `spec` (or `spec_file`) is the deployment definition the plugin validates, test-runs, deploys, or reconciles. Both accept inline tables or external JSON/TOML files.
+
+A deployment binding's `reconcile` mode controls what `dispatch up` does:
+
+- `validate` (default) checks the authored spec without creating or modifying remote resources.
+- `test_run` invokes plugin-defined preflight execution (often a one-shot dry run against the backend).
+- `deploy` calls `deployment.deploy`, which creates a managed deployment. Plugin-defined idempotency rules apply; if the underlying plugin treats `deploy` as create-only, repeated `dispatch up` runs will create duplicate deployments. Use `upsert` when you want compose-style reconcile-by-name semantics.
+- `upsert` calls `deployment.upsert` with a stable name, asking the plugin to reconcile by name (create on first run, then return or update the existing deployment on subsequent runs depending on plugin semantics). Plugins that do not implement upsert respond with `unimplemented`.
+
+`dispatch up` records the produced `deployment_id` and `revision_id` for every successful `deploy` or `upsert` in `.dispatch/state/deployments.json`, keyed by `(plugin, name)`. The state file is informational; subsequent runs use it to print the previously-known id during `--dry-run` but do not skip plugin invocation.
+
+Bindings with `reconcile = "deploy"` or `reconcile = "upsert"` are gated by an interactive confirmation prompt unless `dispatch up --yes` is passed. Bindings with `reconcile = "validate"` or `reconcile = "test_run"` run unprompted.
 
 `deliver_replies = true` requires a project-level `parcel = "..."` entry or a direct `--parcel` argument on the low-level channel commands. Reply delivery is a parcel-runtime bridge, not a standalone channel feature.
 
