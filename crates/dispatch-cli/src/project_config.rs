@@ -135,6 +135,8 @@ struct ChannelBindingConfig {
     #[serde(default)]
     name: Option<String>,
     plugin: String,
+    #[serde(default)]
+    deployment: Option<String>,
     mode: ChannelBindingMode,
     #[serde(default)]
     listen: Option<String>,
@@ -166,7 +168,7 @@ struct ResolvedDispatchProject {
     deployment_state_path: PathBuf,
     extensions: Vec<ResolvedExtensionInstall>,
     deployments: Vec<ResolvedDeploymentBinding>,
-    channels: Vec<crate::channel_cmds::ChannelRuntimeBindingArgs>,
+    channels: Vec<ResolvedChannelBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +186,12 @@ struct ResolvedDeploymentBinding {
     config: Option<Value>,
     spec: Value,
     sample_input: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedChannelBinding {
+    deployment: Option<String>,
+    runtime: crate::channel_cmds::ChannelRuntimeBindingArgs,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -263,6 +271,8 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
         )
     })?;
 
+    let mut project = project;
+    prepare_deployment_bound_channel_parcels(&mut project)?;
     run_channel_bindings(project)
 }
 
@@ -502,7 +512,7 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
     } else {
         println!("Channel Bindings:");
         for binding in &project.channels {
-            let mode = match &binding.mode {
+            let mode = match &binding.runtime.mode {
                 crate::channel_cmds::ChannelRuntimeMode::Listen { listen } => {
                     format!("listen {listen}")
                 }
@@ -513,7 +523,13 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
                     }
                 }
             };
-            println!("  - {} via {} ({mode})", binding.label, binding.plugin);
+            println!(
+                "  - {} via {} ({mode})",
+                binding.runtime.label, binding.runtime.plugin
+            );
+            if let Some(deployment) = &binding.deployment {
+                println!("    deployment: {deployment}");
+            }
         }
     }
 }
@@ -671,15 +687,21 @@ fn resolve_channel_binding(
     channel_registry: &Path,
     tool_approval: Option<crate::CliToolApprovalMode>,
     binding: ChannelBindingConfig,
-) -> Result<crate::channel_cmds::ChannelRuntimeBindingArgs> {
+) -> Result<ResolvedChannelBinding> {
     let label = binding
         .name
         .clone()
         .unwrap_or_else(|| binding.plugin.clone());
+    let deployment = binding.deployment.clone();
 
     if binding.deliver_replies && parcel.is_none() {
         bail!(
             "channel `{label}` sets `deliver_replies = true`, but dispatch.toml does not declare `parcel`"
+        );
+    }
+    if deployment.is_some() && parcel.is_none() {
+        bail!(
+            "channel `{label}` references `deployment`, but dispatch.toml does not declare `parcel`"
         );
     }
 
@@ -703,20 +725,23 @@ fn resolve_channel_binding(
         },
     };
 
-    Ok(crate::channel_cmds::ChannelRuntimeBindingArgs {
-        label,
-        plugin: binding.plugin,
-        config,
-        parcel: parcel.map(PathBuf::from),
-        courier: courier.to_string(),
-        courier_registry: Some(courier_registry.to_path_buf()),
-        session_root: Some(session_root),
-        tool_approval,
-        deliver_replies: binding.deliver_replies,
-        once: binding.once,
-        emit_json: false,
-        registry: Some(channel_registry.to_path_buf()),
-        mode,
+    Ok(ResolvedChannelBinding {
+        deployment,
+        runtime: crate::channel_cmds::ChannelRuntimeBindingArgs {
+            label,
+            plugin: binding.plugin,
+            config,
+            parcel: parcel.map(PathBuf::from),
+            courier: courier.to_string(),
+            courier_registry: Some(courier_registry.to_path_buf()),
+            session_root: Some(session_root),
+            tool_approval,
+            deliver_replies: binding.deliver_replies,
+            once: binding.once,
+            emit_json: false,
+            registry: Some(channel_registry.to_path_buf()),
+            mode,
+        },
     })
 }
 
@@ -924,16 +949,164 @@ fn reconcile_extensions(project: &ResolvedDispatchProject) -> Result<()> {
     Ok(())
 }
 
+fn prepare_deployment_bound_channel_parcels(project: &mut ResolvedDispatchProject) -> Result<()> {
+    if !project
+        .channels
+        .iter()
+        .any(|binding| binding.deployment.is_some())
+    {
+        return Ok(());
+    }
+
+    let state = load_deployment_state(&project.deployment_state_path)?;
+    for binding in &mut project.channels {
+        let Some(deployment_name) = binding.deployment.as_deref() else {
+            continue;
+        };
+        let deployment = resolve_deployment_state_entry(&state, deployment_name)?;
+        let parcel = binding.runtime.parcel.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "channel `{}` references deployment `{deployment_name}`, but no parcel is configured",
+                binding.runtime.label
+            )
+        })?;
+        let bound = materialize_deployment_bound_parcel(
+            &project.root_dir,
+            parcel,
+            &binding.runtime.label,
+            deployment,
+        )
+        .with_context(|| {
+            format!(
+                "failed to prepare parcel for channel `{}` bound to deployment `{deployment_name}`",
+                binding.runtime.label
+            )
+        })?;
+        binding.runtime.parcel = Some(bound);
+    }
+    Ok(())
+}
+
+fn resolve_deployment_state_entry<'a>(
+    state: &'a DeploymentStateFile,
+    name: &str,
+) -> Result<&'a DeploymentStateEntry> {
+    let mut matches = state
+        .deployments
+        .values()
+        .filter(|entry| entry.name == name);
+    let Some(entry) = matches.next() else {
+        bail!(
+            "deployment `{name}` has not been reconciled yet; run `dispatch up --yes` with a matching [[deployments]] binding first"
+        );
+    };
+    if matches.next().is_some() {
+        bail!(
+            "deployment `{name}` is ambiguous in deployment state; use distinct deployment binding names"
+        );
+    }
+    Ok(entry)
+}
+
+fn materialize_deployment_bound_parcel(
+    root_dir: &Path,
+    parcel: &Path,
+    channel_label: &str,
+    deployment: &DeploymentStateEntry,
+) -> Result<PathBuf> {
+    let loaded = crate::run::load_or_build_parcel_for_run(parcel.to_path_buf())?;
+    let target = root_dir
+        .join(".dispatch/runtime-parcels")
+        .join(sanitize_state_path_segment(channel_label))
+        .join(sanitize_state_path_segment(&deployment.deployment_id))
+        .join(&loaded.config.digest);
+    if target.exists() {
+        fs::remove_dir_all(&target)
+            .with_context(|| format!("failed to replace {}", target.display()))?;
+    }
+    copy_dir_all(&loaded.parcel_dir, &target)?;
+    let manifest_path = target.join("manifest.json");
+    let body = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let mut manifest: Value = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let labels = manifest
+        .as_object_mut()
+        .and_then(|object| object.get_mut("labels"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("parcel manifest labels must be an object"))?;
+    labels.insert(
+        "dispatch.deployment.id".to_string(),
+        Value::String(deployment.deployment_id.clone()),
+    );
+    labels.insert(
+        "dispatch.deployment.name".to_string(),
+        Value::String(deployment.name.clone()),
+    );
+    labels.insert(
+        "dispatch.deployment.plugin".to_string(),
+        Value::String(deployment.plugin.clone()),
+    );
+    if let Some(revision_id) = &deployment.revision_id {
+        labels.insert(
+            "dispatch.deployment.revision_id".to_string(),
+            Value::String(revision_id.clone()),
+        );
+    }
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+    Ok(target)
+}
+
+fn copy_dir_all(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", source.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        let next_target = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &next_target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &next_target)
+                .with_context(|| format!("failed to copy {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_state_path_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unnamed".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn run_channel_bindings(project: ResolvedDispatchProject) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let channel_count = project.channels.len();
     let one_shot_count = project
         .channels
         .iter()
-        .filter(|binding| binding.once)
+        .filter(|binding| binding.runtime.once)
         .count();
 
     for binding in project.channels {
+        let binding = binding.runtime;
         println!(
             "Starting channel `{}` via plugin `{}`",
             binding.label, binding.plugin
@@ -1077,6 +1250,58 @@ deliver_replies = true
     }
 
     #[test]
+    fn load_dispatch_project_accepts_channel_deployment_reference() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./Agentfile"
+courier = "seren-cloud"
+
+[[channels]]
+plugin = "channel-test"
+deployment = "research-monitor"
+mode = "poll"
+once = true
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path).unwrap();
+
+        assert_eq!(project.channels.len(), 1);
+        assert_eq!(
+            project.channels[0].deployment.as_deref(),
+            Some("research-monitor")
+        );
+        assert_eq!(
+            project.channels[0].runtime.parcel.as_deref(),
+            Some(dir.path().join("Agentfile").as_path())
+        );
+    }
+
+    #[test]
+    fn load_dispatch_project_rejects_channel_deployment_without_parcel() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[channels]]
+plugin = "channel-test"
+deployment = "research-monitor"
+mode = "poll"
+"#,
+        )
+        .unwrap();
+
+        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        assert!(error.contains("references `deployment`"));
+        assert!(error.contains("does not declare `parcel`"));
+    }
+
+    #[test]
     fn load_dispatch_project_accepts_deployment_bindings() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
@@ -1130,6 +1355,61 @@ spec_file = {}
         assert_eq!(
             deployment.spec.get("name").and_then(Value::as_str),
             Some("research-monitor")
+        );
+    }
+
+    #[test]
+    fn materialize_deployment_bound_parcel_injects_deployment_labels() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("agent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("Agentfile"),
+            "FROM dispatch/native:latest\nNAME deployment-bound\nENTRYPOINT chat\n",
+        )
+        .unwrap();
+        let state = DeploymentStateEntry {
+            plugin: "seren-agent".to_string(),
+            name: "research-monitor".to_string(),
+            deployment_id: "dep-123".to_string(),
+            revision_id: Some("rev-1".to_string()),
+            last_reconciled_at: None,
+        };
+
+        let parcel_dir =
+            materialize_deployment_bound_parcel(dir.path(), &source_dir, "telegram", &state)
+                .unwrap();
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(parcel_dir.join("manifest.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(
+            manifest
+                .get("labels")
+                .and_then(|labels| labels.get("dispatch.deployment.id"))
+                .and_then(Value::as_str),
+            Some("dep-123")
+        );
+        assert_eq!(
+            manifest
+                .get("labels")
+                .and_then(|labels| labels.get("dispatch.deployment.name"))
+                .and_then(Value::as_str),
+            Some("research-monitor")
+        );
+        assert_eq!(
+            manifest
+                .get("labels")
+                .and_then(|labels| labels.get("dispatch.deployment.plugin"))
+                .and_then(Value::as_str),
+            Some("seren-agent")
+        );
+        assert_eq!(
+            manifest
+                .get("labels")
+                .and_then(|labels| labels.get("dispatch.deployment.revision_id"))
+                .and_then(Value::as_str),
+            Some("rev-1")
         );
     }
 

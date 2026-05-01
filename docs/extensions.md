@@ -217,6 +217,7 @@ spec_file = "./deployments/research-monitor.json"
 
 [[channels]]
 plugin = "channel-telegram"
+deployment = "research-monitor"
 mode = "listen"
 listen = "127.0.0.1:8787"
 deliver_replies = true
@@ -237,6 +238,8 @@ A deployment binding's `reconcile` mode controls what `dispatch up` does:
 `dispatch up` records the produced `deployment_id` and `revision_id` for every successful `deploy` or `upsert` in `.dispatch/state/deployments.json`, keyed by `(plugin, name)`. The state file is informational; subsequent runs use it to print the previously-known id during `--dry-run` but do not skip plugin invocation.
 
 Bindings with `reconcile = "deploy"` or `reconcile = "upsert"` are gated by an interactive confirmation prompt unless `dispatch up --yes` is passed. Bindings with `reconcile = "validate"` or `reconcile = "test_run"` run unprompted.
+
+Channel bindings may reference a deployment binding by name with `deployment = "research-monitor"`. After deployment reconciliation, Dispatch resolves the recorded deployment state, creates a runtime copy of the parcel, and injects generic labels such as `dispatch.deployment.id`, `dispatch.deployment.name`, and `dispatch.deployment.plugin` into that copy before starting the channel. Couriers such as `seren-cloud` can use those labels to connect runtime sessions to the managed deployment without requiring users to edit built parcel manifests by hand.
 
 `deliver_replies = true` requires a project-level `parcel = "..."` entry or a direct `--parcel` argument on the low-level channel commands. Reply delivery is a parcel-runtime bridge, not a standalone channel feature.
 
