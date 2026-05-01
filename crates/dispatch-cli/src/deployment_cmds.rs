@@ -320,18 +320,19 @@ fn build_config(options: &DeploymentPluginOptions) -> Result<Option<Value>> {
         (Some(_), Some(_)) => unreachable!("clap enforces config conflicts"),
     };
 
-    if options.api_origin.is_some() || options.api_key.is_some() {
+    if !options.config_set.is_empty() {
         let object = config
             .get_or_insert_with(|| Value::Object(Default::default()))
             .as_object_mut()
-            .context(
-                "deployment config must be a JSON object when using --api-origin or --api-key",
-            )?;
-        if let Some(api_origin) = &options.api_origin {
-            object.insert("api_origin".to_string(), Value::String(api_origin.clone()));
-        }
-        if let Some(api_key) = &options.api_key {
-            object.insert("api_key".to_string(), Value::String(api_key.clone()));
+            .context("deployment config must be a JSON object when using --config-set")?;
+        for entry in &options.config_set {
+            let (key, value) = entry
+                .split_once('=')
+                .with_context(|| format!("invalid --config-set `{entry}`; expected KEY=VAL"))?;
+            if key.is_empty() {
+                bail!("invalid --config-set `{entry}`; key must not be empty");
+            }
+            object.insert(key.to_string(), Value::String(value.to_string()));
         }
     }
 
@@ -365,19 +366,11 @@ fn print_deployment_response(response: PluginResponse, emit_json: bool) -> Resul
         PluginResponse::Capabilities { capabilities } => {
             println!("Deployment Plugin: {}", capabilities.deployment_plugin_id);
             println!("Protocol: v{}", capabilities.protocol_version);
-            println!("Templates: {}", capabilities.supported_templates.join(", "));
-            println!(
-                "Tool Presets: {}",
-                capabilities.supported_tool_presets.join(", ")
-            );
-            println!(
-                "Model Policies: {}",
-                capabilities.supported_model_policies.join(", ")
-            );
             println!("Supports Test Run: {}", capabilities.supports_test_run);
             println!("Supports Revisions: {}", capabilities.supports_revisions);
             println!("Supports Rollback: {}", capabilities.supports_rollback);
             println!("Supports Scheduled: {}", capabilities.supports_scheduled);
+            print_extensions(capabilities.extensions.as_ref())?;
         }
         PluginResponse::Health { health } => {
             println!("Reachable: {}", health.reachable);
@@ -395,7 +388,12 @@ fn print_deployment_response(response: PluginResponse, emit_json: bool) -> Resul
         PluginResponse::TestRunResult { result } => {
             println!("Status: {}", result.status);
             if let Some(output) = result.output {
-                println!("Output: {output}");
+                let rendered = match output {
+                    Value::String(text) => text,
+                    Value::Null => "null".to_string(),
+                    other => serde_json::to_string_pretty(&other)?,
+                };
+                println!("Output: {rendered}");
             }
             if let Some(error) = result.error {
                 println!("Error: {error}");
@@ -426,6 +424,37 @@ fn print_deployment_response(response: PluginResponse, emit_json: bool) -> Resul
         }
     }
     Ok(())
+}
+
+fn print_extensions(extensions: Option<&Value>) -> Result<()> {
+    let Some(extensions) = extensions else {
+        return Ok(());
+    };
+
+    match extensions {
+        Value::Object(object) if object.is_empty() => Ok(()),
+        Value::Object(object) => {
+            println!("Extensions:");
+            for (key, value) in object {
+                println!("  {key}: {}", format_extension_value(value)?);
+            }
+            Ok(())
+        }
+        value => {
+            println!("Extensions: {}", format_extension_value(value)?);
+            Ok(())
+        }
+    }
+}
+
+fn format_extension_value(value: &Value) -> Result<String> {
+    match value {
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.clone()),
+        value => Ok(serde_json::to_string(value)?),
+    }
 }
 
 fn print_deployment(deployment: &Deployment) {

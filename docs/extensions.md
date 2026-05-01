@@ -125,7 +125,7 @@ Deployment plugins are managed deployment control planes. They create, update, r
 
 A deployment plugin implements:
 
-- `capabilities` - declare lifecycle features and supported templates or policies
+- `capabilities` - declare which lifecycle features the backend supports; backend-specific catalog data (templates, model policies, regions, instance classes, runtimes) is carried under `extensions`
 - `configure` - validate credentials and endpoint
 - `health` - verify connectivity
 - `validate` - check a candidate deployment spec without side effects
@@ -136,7 +136,9 @@ A deployment plugin implements:
 - `start`, `stop`, `delete` - manage lifecycle state
 - `shutdown` - clean up
 
-Examples: managed-agent control planes such as `seren-agent`.
+The `spec` and `patch` payloads are `serde_json::Value` so each backend defines its own deployment shape. Backends that do not support a given lifecycle (revisions, rollback, scheduled execution, test runs) advertise that through the `supports_*` capability booleans for discovery and planning, and should still return a clear unsupported-operation error if callers invoke an unsupported method.
+
+Examples: managed-agent control planes such as `seren-agent`; general workload deployers for serverless functions, edge workers, sandboxed dev environments, and container platforms.
 
 See [`deployment-plugin-protocol.md`](./deployment-plugin-protocol.md) for the wire protocol.
 

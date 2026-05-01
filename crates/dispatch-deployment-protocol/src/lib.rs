@@ -188,19 +188,16 @@ pub struct PluginErrorPayload {
 pub struct DeploymentCapabilities {
     pub deployment_plugin_id: String,
     pub protocol_version: u32,
-    /// Names of supported templates / presets / model policies the backend
-    /// advertises. Backends without templates leave these empty.
-    #[serde(default)]
-    pub supported_templates: Vec<String>,
-    #[serde(default)]
-    pub supported_tool_presets: Vec<String>,
-    #[serde(default)]
-    pub supported_model_policies: Vec<String>,
     pub supports_test_run: bool,
     pub supports_revisions: bool,
     pub supports_rollback: bool,
     pub supports_scheduled: bool,
-    /// Free-form extension blob for backend-specific capabilities.
+    /// Free-form extension blob for backend-specific capability data such as
+    /// supported templates, model policies, regions, instance classes, or
+    /// runtimes. Top-level keys SHOULD be unique enough to avoid collisions
+    /// across backends; namespaced keys (e.g. `cloudflare.account_id`) are
+    /// recommended for vendor-specific data that callers might want to
+    /// branch on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Value>,
 }
@@ -243,8 +240,11 @@ pub struct ValidationIssue {
 pub struct TestRunResult {
     /// Status reported by the backend (`completed`, `failed`, `awaiting_approval`, ...).
     pub status: String,
+    /// Backend-defined preflight result. LLM-shaped backends typically emit
+    /// a `Value::String`; code-bundle and worker backends may emit a
+    /// structured object (logs, return value, duration, exit code).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
+    pub output: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Backend-defined trace / metadata.
@@ -276,7 +276,9 @@ pub struct DeploymentRevision {
     pub revision_id: String,
     pub created_at: Option<String>,
     pub created_by: Option<String>,
-    /// `create`, `update`, `rollback`.
+    /// Backend-defined revision change kind. Common values include `create`,
+    /// `update`, and `rollback`; backends may use additional values such as
+    /// `gradual_rollout`, `alias_swap`, or `import`.
     pub change_kind: String,
     /// Backend-defined snapshot summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -861,12 +861,11 @@ struct DeploymentPluginOptions {
     /// JSON file sent through deployment.configure before the operation
     #[arg(long, conflicts_with = "config_json")]
     config_file: Option<PathBuf>,
-    /// Seren API origin convenience setting for deployment.configure
-    #[arg(long)]
-    api_origin: Option<String>,
-    /// Seren API key convenience setting for deployment.configure
-    #[arg(long)]
-    api_key: Option<String>,
+    /// Set or override a single string field in the configure payload.
+    /// Repeat to set multiple fields, e.g. `--config-set api_origin=https://api.seren.ai --config-set api_key=...`.
+    /// Merged on top of `--config-json` / `--config-file` if either is also provided.
+    #[arg(long = "config-set", value_name = "KEY=VAL")]
+    config_set: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -2737,10 +2736,10 @@ mod tests {
             "deploy",
             "seren-deployment",
             "deployment.json",
-            "--api-origin",
-            "https://api.example.com",
-            "--api-key",
-            "seren_test",
+            "--config-set",
+            "api_origin=https://api.example.com",
+            "--config-set",
+            "api_key=seren_test",
             "--json",
             "--registry",
             "/tmp/deployments.json",
@@ -2756,10 +2755,12 @@ mod tests {
         assert_eq!(args.name, "seren-deployment");
         assert_eq!(args.spec, PathBuf::from("deployment.json"));
         assert_eq!(
-            args.options.api_origin.as_deref(),
-            Some("https://api.example.com")
+            args.options.config_set,
+            vec![
+                "api_origin=https://api.example.com".to_string(),
+                "api_key=seren_test".to_string(),
+            ]
         );
-        assert_eq!(args.options.api_key.as_deref(), Some("seren_test"));
         assert!(args.options.json);
         assert_eq!(
             args.options.registry.as_deref(),
