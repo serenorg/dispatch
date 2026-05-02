@@ -165,6 +165,15 @@ pub(crate) fn invoke_deployment_plugin(
     configure: Option<Value>,
     request: PluginRequest,
 ) -> Result<PluginResponse> {
+    invoke_deployment_plugin_with_working_dir(plugin, configure, request, None)
+}
+
+pub(crate) fn invoke_deployment_plugin_with_working_dir(
+    plugin: &DeploymentPluginManifest,
+    configure: Option<Value>,
+    request: PluginRequest,
+    working_dir: Option<&Path>,
+) -> Result<PluginResponse> {
     if plugin.protocol_version != DEPLOYMENT_PLUGIN_PROTOCOL_VERSION {
         bail!(
             "deployment plugin `{}` uses unsupported protocol_version {}; expected {}",
@@ -175,7 +184,11 @@ pub(crate) fn invoke_deployment_plugin(
     }
     verify_installed_sha256(plugin)?;
 
-    let mut child = Command::new(&plugin.exec.command)
+    let mut command = Command::new(&plugin.exec.command);
+    if let Some(working_dir) = working_dir {
+        command.current_dir(working_dir);
+    }
+    let mut child = command
         .args(&plugin.exec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

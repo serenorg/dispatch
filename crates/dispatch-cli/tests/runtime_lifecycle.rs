@@ -2976,6 +2976,10 @@ case "$line" in
         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"configured","configuration":{"deployment_plugin_id":"deployment-test"}}}'
         ;;
     *'"method":"deployment.deploy"'*)
+        if [ ! -f project-root-marker ]; then
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"error","error":{"code":"bad_cwd","message":"deployment plugin was not invoked from project root"}}}'
+            continue
+        fi
         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"deployment","deployment":{"deployment_id":"dep-stub-1","status":"running","revision_id":"rev-1"}}}'
         ;;
     *'"method":"deployment.shutdown"'*)
@@ -2995,6 +2999,10 @@ while (($line = $stdin.ReadLine()) -ne $null) {
     if ($line -like '*"method":"deployment.configure"*') {
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"configured","configuration":{"deployment_plugin_id":"deployment-test"}}}')
     } elseif ($line -like '*"method":"deployment.deploy"*') {
+        if (-not (Test-Path "project-root-marker")) {
+            Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"error","error":{"code":"bad_cwd","message":"deployment plugin was not invoked from project root"}}}')
+            continue
+        }
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"deployment","deployment":{"deployment_id":"dep-stub-1","status":"running","revision_id":"rev-1"}}}')
     } elseif ($line -like '*"method":"deployment.shutdown"*') {
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
@@ -3028,6 +3036,7 @@ fn dispatch_up_deploys_via_deployment_plugin_and_records_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let manifest_path = write_deployment_test_plugin(dir.path())?;
+    fs::write(dir.path().join("project-root-marker"), "root")?;
     let spec_path = dir.path().join("spec.json");
     fs::write(
         &spec_path,
@@ -3052,9 +3061,11 @@ spec_file = {}
     )?;
 
     let dispatch_bin = dispatch_bin();
+    let run_dir = dir.path().join("subdir");
+    fs::create_dir(&run_dir)?;
     let output = Command::new(&dispatch_bin)
-        .current_dir(dir.path())
-        .args(["up", "dispatch.toml", "--yes"])
+        .current_dir(&run_dir)
+        .args(["up", "../dispatch.toml", "--yes"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()?;

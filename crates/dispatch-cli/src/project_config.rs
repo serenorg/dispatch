@@ -4,8 +4,10 @@ use dispatch_core::{
     install_deployment_plugin, install_provider_plugin, resolve_courier, resolve_deployment_plugin,
 };
 use dispatch_deployment_protocol::{PluginRequest, PluginResponse, ValidationIssue};
+use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -13,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_DISPATCH_CONFIG_FILE: &str = "dispatch.toml";
@@ -166,6 +169,8 @@ struct ResolvedDispatchProject {
     database_registry: PathBuf,
     deployment_registry: PathBuf,
     deployment_state_path: PathBuf,
+    deployment_bundle_cache_dir: PathBuf,
+    deployment_bundle_cache_index_path: PathBuf,
     extensions: Vec<ResolvedExtensionInstall>,
     deployments: Vec<ResolvedDeploymentBinding>,
     channels: Vec<ResolvedChannelBinding>,
@@ -211,6 +216,38 @@ struct DeploymentStateEntry {
     last_reconciled_at: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct DeploymentBundleCacheIndex {
+    #[serde(default)]
+    bundles: BTreeMap<String, DeploymentBundleCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeploymentBundleCacheEntry {
+    source_path: String,
+    source_kind: String,
+    source_fingerprint: BundleSourceFingerprint,
+    bundle_path: String,
+    sha256: String,
+    size_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BundleSourceFingerprint {
+    file_count: u64,
+    total_size_bytes: u64,
+    digest: String,
+}
+
+struct PreparedCachedBundle {
+    path: PathBuf,
+    sha256: String,
+    size_bytes: i64,
+    bundle_source: &'static str,
+    source_path: PathBuf,
+    manifest: Option<Value>,
+}
+
 fn deployment_state_key(plugin: &str, name: &str) -> String {
     format!("{plugin}::{name}")
 }
@@ -239,6 +276,10 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
     println!(
         "Deployment State: {}",
         project.deployment_state_path.display()
+    );
+    println!(
+        "Deployment Bundle Cache: {}",
+        project.deployment_bundle_cache_dir.display()
     );
 
     if args.dry_run {
@@ -325,26 +366,24 @@ fn run_deployments(project: &ResolvedDispatchProject) -> Result<()> {
                         project.deployment_registry.display()
                     )
                 })?;
+        let spec = prepare_deployment_spec_for_invocation(project, deployment)?;
         let request = match deployment.reconcile {
-            DeploymentReconcileMode::Validate => PluginRequest::Validate {
-                spec: deployment.spec.clone(),
-            },
+            DeploymentReconcileMode::Validate => PluginRequest::Validate { spec },
             DeploymentReconcileMode::TestRun => PluginRequest::TestRun {
-                spec: deployment.spec.clone(),
+                spec,
                 sample_input: deployment.sample_input.clone(),
             },
-            DeploymentReconcileMode::Deploy => PluginRequest::Deploy {
-                spec: deployment.spec.clone(),
-            },
+            DeploymentReconcileMode::Deploy => PluginRequest::Deploy { spec },
             DeploymentReconcileMode::Upsert => PluginRequest::Upsert {
                 name: deployment.label.clone(),
-                spec: deployment.spec.clone(),
+                spec,
             },
         };
-        let response = crate::deployment_cmds::invoke_deployment_plugin(
+        let response = crate::deployment_cmds::invoke_deployment_plugin_with_working_dir(
             &plugin,
             deployment.config.clone(),
             request,
+            Some(&project.root_dir),
         )
         .with_context(|| format!("deployment `{}` failed", deployment.label))?;
 
@@ -354,6 +393,386 @@ fn run_deployments(project: &ResolvedDispatchProject) -> Result<()> {
         save_deployment_state(&project.deployment_state_path, &state)?;
     }
     Ok(())
+}
+
+fn prepare_deployment_spec_for_invocation(
+    project: &ResolvedDispatchProject,
+    deployment: &ResolvedDeploymentBinding,
+) -> Result<Value> {
+    prepare_deployment_bundle_cache_spec(
+        &project.root_dir,
+        &project.deployment_bundle_cache_dir,
+        &project.deployment_bundle_cache_index_path,
+        &deployment.spec,
+    )
+    .with_context(|| {
+        format!(
+            "failed to prepare deployment bundle for `{}`",
+            deployment.label
+        )
+    })
+}
+
+fn prepare_deployment_bundle_cache_spec(
+    root_dir: &Path,
+    cache_dir: &Path,
+    index_path: &Path,
+    spec: &Value,
+) -> Result<Value> {
+    let Some(spec_object) = spec.as_object() else {
+        return Ok(spec.clone());
+    };
+    let Some(code_value) = spec_object.get("code") else {
+        return Ok(spec.clone());
+    };
+    let Some(code_object) = code_value.as_object() else {
+        return Ok(spec.clone());
+    };
+    if code_object.contains_key("cached_bundle") {
+        return Ok(spec.clone());
+    }
+
+    let bundle_path = code_object.get("bundle_path").and_then(Value::as_str);
+    let parcel_dir = code_object.get("parcel_dir").and_then(Value::as_str);
+    let source_count = [bundle_path.is_some(), parcel_dir.is_some()]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if source_count != 1 {
+        return Ok(spec.clone());
+    }
+
+    let prepared = if let Some(path) = parcel_dir {
+        let source_path = resolve_relative_path(root_dir, PathBuf::from(path));
+        let manifest = load_cached_parcel_manifest(&source_path)?;
+        materialize_deployment_bundle(
+            root_dir,
+            cache_dir,
+            index_path,
+            "dispatch_parcel",
+            &source_path,
+            Some(manifest),
+        )?
+    } else if let Some(path) = bundle_path {
+        let source_path = resolve_relative_path(root_dir, PathBuf::from(path));
+        materialize_deployment_bundle(
+            root_dir,
+            cache_dir,
+            index_path,
+            "bundle_path",
+            &source_path,
+            None,
+        )?
+    } else {
+        return Ok(spec.clone());
+    };
+
+    let mut spec_object = spec_object.clone();
+    let mut code_object = code_object.clone();
+    code_object.remove("bundle_path");
+    code_object.remove("parcel_dir");
+    let mut cached_bundle = Map::new();
+    cached_bundle.insert(
+        "path".to_string(),
+        Value::String(path_for_spec(root_dir, &prepared.path)),
+    );
+    cached_bundle.insert("sha256".to_string(), Value::String(prepared.sha256));
+    cached_bundle.insert(
+        "size_bytes".to_string(),
+        Value::Number(serde_json::Number::from(prepared.size_bytes)),
+    );
+    cached_bundle.insert(
+        "source_kind".to_string(),
+        Value::String("tar_gz".to_string()),
+    );
+    cached_bundle.insert(
+        "bundle_source".to_string(),
+        Value::String(prepared.bundle_source.to_string()),
+    );
+    cached_bundle.insert(
+        "source_path".to_string(),
+        Value::String(path_for_spec(root_dir, &prepared.source_path)),
+    );
+    if let Some(manifest) = prepared.manifest {
+        cached_bundle.insert("manifest".to_string(), manifest);
+    }
+    code_object.insert("cached_bundle".to_string(), Value::Object(cached_bundle));
+    spec_object.insert("code".to_string(), Value::Object(code_object));
+    Ok(Value::Object(spec_object))
+}
+
+fn materialize_deployment_bundle(
+    root_dir: &Path,
+    cache_dir: &Path,
+    index_path: &Path,
+    bundle_source: &'static str,
+    source_path: &Path,
+    manifest: Option<Value>,
+) -> Result<PreparedCachedBundle> {
+    let source_path = source_path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", source_path.display()))?;
+    let fingerprint = source_fingerprint(&source_path)?;
+    let cache_key = format!("{bundle_source}:{}", source_path.display());
+    let mut index = load_deployment_bundle_cache_index(index_path)?;
+    if let Some(entry) = index.bundles.get(&cache_key)
+        && entry.source_fingerprint == fingerprint
+    {
+        let cached_path = root_dir.join(&entry.bundle_path);
+        if cached_path.is_file() {
+            return Ok(PreparedCachedBundle {
+                path: cached_path,
+                sha256: entry.sha256.clone(),
+                size_bytes: entry.size_bytes,
+                bundle_source,
+                source_path,
+                manifest,
+            });
+        }
+    }
+
+    fs::create_dir_all(cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    let bytes = if source_path.is_dir() {
+        archive_directory(&source_path)?
+    } else {
+        fs::read(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?
+    };
+    let sha256 = sha256_hex(&bytes);
+    let size_bytes = i64::try_from(bytes.len()).context("deployment bundle is too large")?;
+    let final_path = cache_dir.join(format!("{sha256}.tar.gz"));
+    if !final_path.exists() {
+        let tmp_path = cache_dir.join(format!("{sha256}.tmp.{}", std::process::id()));
+        fs::write(&tmp_path, &bytes)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        if let Err(error) = fs::rename(&tmp_path, &final_path) {
+            // Another concurrent run may have moved its tmp into place first.
+            // The content is identical (same sha256), so prefer that result and
+            // clean up our duplicate tmp.
+            if final_path.is_file() {
+                let _ = fs::remove_file(&tmp_path);
+            } else {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "failed to move {} into place",
+                    final_path.display()
+                )));
+            }
+        }
+    }
+
+    let bundle_path = path_for_spec(root_dir, &final_path);
+    index.bundles.insert(
+        cache_key,
+        DeploymentBundleCacheEntry {
+            source_path: source_path.display().to_string(),
+            source_kind: bundle_source.to_string(),
+            source_fingerprint: fingerprint,
+            bundle_path,
+            sha256: sha256.clone(),
+            size_bytes,
+        },
+    );
+    save_deployment_bundle_cache_index(index_path, &index)?;
+
+    Ok(PreparedCachedBundle {
+        path: final_path,
+        sha256,
+        size_bytes,
+        bundle_source,
+        source_path,
+        manifest,
+    })
+}
+
+fn load_cached_parcel_manifest(parcel_dir: &Path) -> Result<Value> {
+    let manifest_path = parcel_dir.join("manifest.json");
+    let body = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))
+}
+
+fn load_deployment_bundle_cache_index(path: &Path) -> Result<DeploymentBundleCacheIndex> {
+    if !path.exists() {
+        return Ok(DeploymentBundleCacheIndex::default());
+    }
+    let body =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if body.trim().is_empty() {
+        return Ok(DeploymentBundleCacheIndex::default());
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse deployment bundle cache {}", path.display()))
+}
+
+fn save_deployment_bundle_cache_index(
+    path: &Path,
+    index: &DeploymentBundleCacheIndex,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(index)
+        .context("failed to serialize deployment bundle cache index")?;
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp_path, body)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to move {} into place", path.display()))
+}
+
+fn source_fingerprint(path: &Path) -> Result<BundleSourceFingerprint> {
+    let mut files = Vec::new();
+    if path.is_dir() {
+        collect_bundle_files(path, path, &mut files)?;
+    } else if path.is_file() {
+        files.push((
+            path.to_path_buf(),
+            PathBuf::from(path.file_name().unwrap_or_default()),
+        ));
+    } else {
+        bail!(
+            "deployment bundle source `{}` is not a file or directory",
+            path.display()
+        );
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+
+    let mut hasher = Sha256::new();
+    let mut total_size_bytes = 0_u64;
+    for (file, relative) in &files {
+        let metadata =
+            fs::metadata(file).with_context(|| format!("failed to inspect {}", file.display()))?;
+        let len = metadata.len();
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_unix_nanos)
+            .unwrap_or_default();
+        total_size_bytes = total_size_bytes.saturating_add(len);
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(len.to_le_bytes());
+        hasher.update(modified.to_le_bytes());
+    }
+
+    Ok(BundleSourceFingerprint {
+        file_count: files.len() as u64,
+        total_size_bytes,
+        digest: hex_digest(hasher.finalize()),
+    })
+}
+
+fn system_time_unix_nanos(value: SystemTime) -> Option<u128> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+fn archive_directory(source: &Path) -> Result<Vec<u8>> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    let mut files = Vec::new();
+    collect_bundle_files(source, source, &mut files)?;
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    for (path, relative) in files {
+        append_file_to_archive(&mut builder, &path, &relative)?;
+    }
+    let encoder = builder
+        .into_inner()
+        .context("failed to finish tar archive")?;
+    encoder.finish().context("failed to finish gzip archive")
+}
+
+fn collect_bundle_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    for entry in
+        fs::read_dir(current).with_context(|| format!("failed to read {}", current.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", current.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_bundle_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("failed to relativize {}", path.display()))?
+                .to_path_buf();
+            files.push((path, relative));
+        }
+    }
+    Ok(())
+}
+
+fn append_file_to_archive<W: Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    relative: &Path,
+) -> Result<()> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(metadata.len());
+    header.set_mode(file_mode(&metadata));
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, relative, &mut file)
+        .with_context(|| format!("failed to add {} to bundle", path.display()))
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    let digest = digest.as_ref();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn path_for_spec(root_dir: &Path, path: &Path) -> String {
+    let canonical_root = root_dir
+        .canonicalize()
+        .unwrap_or_else(|_| root_dir.to_path_buf());
+    path.strip_prefix(&canonical_root)
+        .or_else(|_| path.strip_prefix(root_dir))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn handle_deployment_response(
@@ -591,6 +1010,8 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         .map(|value| resolve_relative_path(&root_dir, value))
         .unwrap_or_else(|| root_dir.join(".dispatch/registries/deployments.json"));
     let deployment_state_path = root_dir.join(".dispatch/state/deployments.json");
+    let deployment_bundle_cache_dir = root_dir.join(".dispatch/state/bundles");
+    let deployment_bundle_cache_index_path = deployment_bundle_cache_dir.join("index.json");
 
     let mut deployments = Vec::with_capacity(parsed.deployments.len());
     for deployment in parsed.deployments {
@@ -621,6 +1042,8 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         database_registry,
         deployment_registry,
         deployment_state_path,
+        deployment_bundle_cache_dir,
+        deployment_bundle_cache_index_path,
         extensions: parsed
             .extensions
             .into_iter()
@@ -1355,6 +1778,53 @@ spec_file = {}
         assert_eq!(
             deployment.spec.get("name").and_then(Value::as_str),
             Some("research-monitor")
+        );
+    }
+
+    #[test]
+    fn prepare_deployment_bundle_cache_rewrites_parcel_dir_specs() {
+        let dir = tempdir().unwrap();
+        let parcel_dir = dir.path().join("parcel");
+        fs::create_dir_all(parcel_dir.join("context")).unwrap();
+        fs::write(
+            parcel_dir.join("manifest.json"),
+            r#"{"digest":"sha256:test","courier":{"kind":"wasm"},"entrypoint":null,"instructions":[]}"#,
+        )
+        .unwrap();
+        fs::write(parcel_dir.join("context").join("component.wasm"), b"wasm").unwrap();
+
+        let cache_dir = dir.path().join(".dispatch/state/bundles");
+        let index_path = cache_dir.join("index.json");
+        let spec = serde_json::json!({
+            "name": "parcel-worker",
+            "code": {
+                "parcel_dir": "./parcel",
+                "runtime_kind": "rust_wasm_adk"
+            }
+        });
+
+        let prepared =
+            prepare_deployment_bundle_cache_spec(dir.path(), &cache_dir, &index_path, &spec)
+                .unwrap();
+        let cached = prepared.pointer("/code/cached_bundle").unwrap();
+        assert!(prepared.pointer("/code/parcel_dir").is_none());
+        assert_eq!(cached["source_kind"], "tar_gz");
+        assert_eq!(cached["bundle_source"], "dispatch_parcel");
+        assert_eq!(cached["source_path"], "parcel");
+        assert_eq!(
+            cached.pointer("/manifest/digest").and_then(Value::as_str),
+            Some("sha256:test")
+        );
+        let cached_path = dir.path().join(cached["path"].as_str().unwrap());
+        assert!(cached_path.is_file());
+        assert!(index_path.is_file());
+
+        let prepared_again =
+            prepare_deployment_bundle_cache_spec(dir.path(), &cache_dir, &index_path, &spec)
+                .unwrap();
+        assert_eq!(
+            prepared_again.pointer("/code/cached_bundle/sha256"),
+            prepared.pointer("/code/cached_bundle/sha256")
         );
     }
 

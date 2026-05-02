@@ -17,6 +17,18 @@ Dispatch has first-class install/runtime support for courier plugins, channel pl
 
 For discovering third-party extensions published in separate repositories, see [Discovery via catalogs](#discovery-via-catalogs) below. The broader ecosystem roadmap lives in [`plugin-ecosystem.md`](./plugin-ecosystem.md).
 
+## Category boundary
+
+The extension category describes the operation Dispatch is asking the plugin to perform, not the vendor or product name behind it.
+
+- A **deployment plugin** provisions and manages durable remote resources. It owns lifecycle operations such as validate, deploy, upsert, update, rollback, start, stop, delete, and list. If a plugin uploads an artifact, creates a cloud workload, or reconciles a remote deployment by name, it is a deployment plugin.
+- A **courier plugin** talks to an execution runtime for an already-selected parcel or deployment. It owns runtime session operations such as validate parcel compatibility, inspect runtime requirements, open or resume a session, run turns, stream events, cancel, and shut down. If a plugin sends a turn to a running sandbox, local process, container, or remote session, it is a courier plugin.
+- A **channel plugin** talks to external messaging systems. It owns ingress and outbound delivery, not parcel execution and not remote deployment lifecycle.
+- A **provider plugin** handles LLM inference calls. It is a model backend, not a parcel runtime and not a deployment control plane.
+- A **database plugin** exposes database operations as tools or sessions. It is data access, not deployment lifecycle.
+
+The practical rule is: deployment provisions the thing; courier runs or talks to the thing. A cloud product may expose both concerns, but those concerns remain separate protocol surfaces. Dispatch should choose the plugin kind by the method being invoked rather than by the product label.
+
 ## Layering
 
 Dispatch keeps authored parcel source separate from host-managed extension inventory.
@@ -44,7 +56,7 @@ A courier plugin implements:
 - `run` - execute a turn and stream events
 - `shutdown` - clean up
 
-Examples: managed cloud runtimes, self-hosted cluster runners, specialized sandbox backends.
+Examples: local processes, Docker or WASM sandboxes, self-hosted cluster runners, SSH-backed sessions, browser automation sessions, and remote runtimes that already exist before the courier opens a session.
 
 ### Channel plugins
 
@@ -228,6 +240,8 @@ Channel and deployment binding config files may be JSON or TOML. Inline `config 
 
 Deployment bindings carry two distinct payloads. `config` (or `config_file`) is the auth/endpoint setup sent through `deployment.configure` once before each operation, e.g. API base URL, API key, account id, workspace. `spec` (or `spec_file`) is the deployment definition the plugin validates, test-runs, deploys, or reconciles. Both accept inline tables or external JSON/TOML files.
 
+For deployment specs that use the conventional `code.parcel_dir` or `code.bundle_path` helper shape, `dispatch up` materializes the local source into a project-local cached bundle under `.dispatch/state/bundles/`, keyed by SHA-256. The plugin receives `code.cached_bundle = { path, sha256, size_bytes, source_kind = "tar_gz" }` instead of the original source path. This keeps archive/hash work in the project orchestration layer, lets repeated `dispatch up` runs reuse unchanged bundles, and gives deployment plugins a stable artifact path they can upload or inspect without walking the user's source tree again.
+
 A deployment binding's `reconcile` mode controls what `dispatch up` does:
 
 - `validate` (default) checks the authored spec without creating or modifying remote resources.
@@ -239,7 +253,7 @@ A deployment binding's `reconcile` mode controls what `dispatch up` does:
 
 Bindings with `reconcile = "deploy"` or `reconcile = "upsert"` are gated by an interactive confirmation prompt unless `dispatch up --yes` is passed. Bindings with `reconcile = "validate"` or `reconcile = "test_run"` run unprompted.
 
-Channel bindings may reference a deployment binding by name with `deployment = "research-monitor"`. After deployment reconciliation, Dispatch resolves the recorded deployment state, creates a runtime copy of the parcel, and injects generic labels such as `dispatch.deployment.id`, `dispatch.deployment.name`, and `dispatch.deployment.plugin` into that copy before starting the channel. Couriers such as `seren-cloud` can use those labels to connect runtime sessions to the managed deployment without requiring users to edit built parcel manifests by hand.
+Channel bindings may reference a deployment binding by name with `deployment = "research-monitor"`. After deployment reconciliation, Dispatch resolves the recorded deployment state, creates a runtime copy of the parcel, and injects generic labels such as `dispatch.deployment.id`, `dispatch.deployment.name`, and `dispatch.deployment.plugin` into that copy before starting the channel. Couriers can use those labels to connect runtime sessions to an existing deployment without requiring users to edit built parcel manifests by hand.
 
 `deliver_replies = true` requires a project-level `parcel = "..."` entry or a direct `--parcel` argument on the low-level channel commands. Reply delivery is a parcel-runtime bridge, not a standalone channel feature.
 
@@ -582,11 +596,11 @@ dispatch-plugins/
     extensions.json
 ```
 
-Vendor-specific extensions (e.g., seren-cloud courier) live in their own repositories.
+Vendor-specific extensions live in their own repositories.
 
 ## Discovery via catalogs
 
-Every plugin in the ecosystem does not live in `dispatch-plugins`. Third-party couriers and channels ship in their own repositories (e.g. `dispatch-courier-seren-cloud`). Dispatch discovers them through **catalogs** - JSON index documents published at stable URLs.
+Every plugin in the ecosystem does not live in `dispatch-plugins`. Third-party and vendor-specific extensions can ship in their own repositories. Dispatch discovers them through **catalogs** - JSON index documents published at stable URLs.
 
 A catalog is just an `extensions.json` document listing entries. The canonical example lives at `https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json`. Any 3rd-party plugin repository can publish the same schema.
 
@@ -599,7 +613,7 @@ dispatch extension catalog add \
 
 # Register a vendor-specific catalog
 dispatch extension catalog add \
-  https://raw.githubusercontent.com/serenorg/dispatch-courier-seren-cloud/main/catalog/extensions.json
+  https://raw.githubusercontent.com/example/my-dispatch-extensions/main/catalog/extensions.json
 
 # See what you have
 dispatch extension catalog ls
@@ -638,13 +652,13 @@ The current install-by-name flow is intentionally narrow:
 
 - it only handles direct GitHub release binaries, not archive extraction
 - it requires an absolute, version-pinned `manifest_url` in the catalog entry
-- it still ends by calling the normal `dispatch courier install` or `dispatch channel install` flow with a rewritten manifest
+- it still ends by calling the normal category-specific install flow with a rewritten manifest
 
 Capability-based trust remains follow-up work; see [`plugin-ecosystem.md`](./plugin-ecosystem.md).
 
 ## Design principles
 
-1. **Separate extension categories explicitly.** Couriers, channels, and connectors have different trust, lifecycle, and runtime requirements.
+1. **Separate extension categories explicitly.** Couriers, channels, providers, databases, and deployments have different trust, lifecycle, and runtime requirements.
 
 2. **Keep the parcel contract primary.** Extensions work around parcels and runs. They do not replace the parcel as the core unit of portability.
 
