@@ -334,6 +334,9 @@ struct UpArgs {
     /// Path to a dispatch.toml file or a directory containing one
     #[arg(default_value = "dispatch.toml")]
     path: PathBuf,
+    /// Resolve deployment-time plugin artifacts for a remote target such as `seren-cloud`
+    #[arg(long)]
+    target: Option<String>,
     /// Print planned installs and bindings without mutating registries or starting channels
     #[arg(long)]
     dry_run: bool,
@@ -2416,13 +2419,22 @@ mod tests {
 
     #[test]
     fn cli_parses_up_command() {
-        let cli = Cli::try_parse_from(["dispatch", "up", "./dispatch.toml", "--dry-run"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "dispatch",
+            "up",
+            "./dispatch.toml",
+            "--target",
+            "seren-cloud",
+            "--dry-run",
+        ])
+        .unwrap();
 
         let Command::Up(args) = cli.command else {
             panic!("expected up command");
         };
 
         assert_eq!(args.path, PathBuf::from("./dispatch.toml"));
+        assert_eq!(args.target.as_deref(), Some("seren-cloud"));
         assert!(args.dry_run);
     }
 

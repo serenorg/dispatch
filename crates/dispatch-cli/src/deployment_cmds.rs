@@ -3,8 +3,8 @@ use dispatch_core::{
     DeploymentPluginManifest, load_deployment_registry, resolve_deployment_plugin,
 };
 use dispatch_deployment_protocol::{
-    DEPLOYMENT_PLUGIN_PROTOCOL_VERSION, Deployment, DeploymentRevision, PluginRequest,
-    PluginRequestEnvelope, PluginRequestId, PluginResponse, parse_jsonrpc_message,
+    DEPLOYMENT_PLUGIN_PROTOCOL_VERSION, Deployment, DeploymentRevision, DeploymentRuntimeTarget,
+    PluginRequest, PluginRequestEnvelope, PluginRequestId, PluginResponse, parse_jsonrpc_message,
     request_to_jsonrpc,
 };
 use serde_json::Value;
@@ -383,6 +383,7 @@ fn print_deployment_response(response: PluginResponse, emit_json: bool) -> Resul
             println!("Supports Revisions: {}", capabilities.supports_revisions);
             println!("Supports Rollback: {}", capabilities.supports_rollback);
             println!("Supports Scheduled: {}", capabilities.supports_scheduled);
+            print_runtime_targets(&capabilities.runtime_targets);
             print_extensions(capabilities.extensions.as_ref())?;
         }
         PluginResponse::Health { health } => {
@@ -437,6 +438,45 @@ fn print_deployment_response(response: PluginResponse, emit_json: bool) -> Resul
         }
     }
     Ok(())
+}
+
+fn print_runtime_targets(targets: &[DeploymentRuntimeTarget]) {
+    if targets.is_empty() {
+        return;
+    }
+
+    println!("Runtime Targets:");
+    for target in targets {
+        match target {
+            DeploymentRuntimeTarget::Native {
+                target_triple,
+                os,
+                arch,
+                libc,
+                preferred,
+            } => {
+                let preferred = if *preferred { " preferred" } else { "" };
+                let libc = libc
+                    .as_deref()
+                    .map(|value| format!(" libc={value}"))
+                    .unwrap_or_default();
+                println!("  native {target_triple} os={os} arch={arch}{libc}{preferred}");
+            }
+            DeploymentRuntimeTarget::Wasm {
+                abi,
+                version,
+                wit_world,
+                preferred,
+            } => {
+                let preferred = if *preferred { " preferred" } else { "" };
+                let wit_world = wit_world
+                    .as_deref()
+                    .map(|value| format!(" wit_world={value}"))
+                    .unwrap_or_default();
+                println!("  wasm abi={abi} version={version}{wit_world}{preferred}");
+            }
+        }
+    }
 }
 
 fn print_extensions(extensions: Option<&Value>) -> Result<()> {

@@ -137,7 +137,7 @@ Deployment plugins are managed deployment control planes. They create, update, r
 
 A deployment plugin implements:
 
-- `capabilities` - declare which lifecycle features the backend supports; backend-specific catalog data (templates, model policies, regions, instance classes, runtimes) is carried under `extensions`
+- `capabilities` - declare which lifecycle features and runtime artifact targets the backend supports; backend-specific catalog data (templates, model policies, regions, instance classes, runtimes) is carried under `extensions`
 - `configure` - validate credentials and endpoint
 - `health` - verify connectivity
 - `validate` - check a candidate deployment spec without side effects
@@ -149,6 +149,8 @@ A deployment plugin implements:
 - `shutdown` - clean up
 
 The `spec` and `patch` payloads are `serde_json::Value` so each backend defines its own deployment shape. Backends that do not support a given lifecycle (revisions, rollback, scheduled execution, test runs) advertise that through the `supports_*` capability booleans for discovery and planning, and should still return a clear unsupported-operation error if callers invoke an unsupported method.
+
+Deployment capabilities also include `runtime_targets` for deployment backends that execute packaged artifacts. These targets describe the remote runtime environment, not the plugin binary installed on the operator's laptop. Native targets use Rust-style triples such as `aarch64-unknown-linux-gnu`; WASM targets are advertised by Dispatch ABI/version because a generic `wasm32-wasi` artifact is not enough to prove compatibility with Dispatch host functions. Callers that package runtime plugins should prefer a compatible WASM artifact when the deployment backend advertises one, otherwise choose a native release asset matching the backend's preferred native target.
 
 Examples: managed-agent control planes such as `seren-agent`; general workload deployers for serverless functions, edge workers, sandboxed dev environments, and container platforms.
 
@@ -241,6 +243,8 @@ Channel and deployment binding config files may be JSON or TOML. Inline `config 
 Deployment bindings carry two distinct payloads. `config` (or `config_file`) is the auth/endpoint setup sent through `deployment.configure` once before each operation, e.g. API base URL, API key, account id, workspace. `spec` (or `spec_file`) is the deployment definition the plugin validates, test-runs, deploys, or reconciles. Both accept inline tables or external JSON/TOML files.
 
 For deployment specs that use the conventional `code.parcel_dir` or `code.bundle_path` helper shape, `dispatch up` materializes the local source into a project-local cached bundle under `.dispatch/state/bundles/`, keyed by SHA-256. The plugin receives `code.cached_bundle = { path, sha256, size_bytes, source_kind = "tar_gz" }` instead of the original source path. This keeps archive/hash work in the project orchestration layer, lets repeated `dispatch up` runs reuse unchanged bundles, and gives deployment plugins a stable artifact path they can upload or inspect without walking the user's source tree again.
+
+If that bundle contains runtime plugin executables, those executables must match the deployment plugin's `runtime_targets`, not the host machine that ran `dispatch up`. For example, a macOS user deploying to Seren Cloud should package a Linux arm64 Discord channel plugin asset, not the local macOS build. Dispatch's parcel format is portable only when its contents are portable; native binaries inside the parcel remain OS/architecture-specific.
 
 A deployment binding's `reconcile` mode controls what `dispatch up` does:
 

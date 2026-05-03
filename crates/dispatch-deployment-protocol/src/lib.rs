@@ -204,6 +204,15 @@ pub struct DeploymentCapabilities {
     pub supports_revisions: bool,
     pub supports_rollback: bool,
     pub supports_scheduled: bool,
+    /// Runtime artifact targets this deployment backend can execute.
+    ///
+    /// This describes artifacts that are packaged into the deployed workload,
+    /// not the plugin binary that runs on the operator's machine. For example,
+    /// a macOS operator may run a macOS `seren-cloud` deployment plugin while
+    /// the remote Seren Cloud runtime requires packaged native channel plugins
+    /// to be `aarch64-unknown-linux-gnu`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_targets: Vec<DeploymentRuntimeTarget>,
     /// Free-form extension blob for backend-specific capability data such as
     /// supported templates, model policies, regions, instance classes, or
     /// runtimes. Top-level keys SHOULD be unique enough to avoid collisions
@@ -212,6 +221,40 @@ pub struct DeploymentCapabilities {
     /// branch on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeploymentRuntimeTarget {
+    /// Native executable artifacts that must match the remote runtime OS/CPU
+    /// ABI. `target_triple` should use the Rust-style target triple whenever
+    /// one exists because Dispatch release catalogs already key native assets
+    /// that way.
+    Native {
+        target_triple: String,
+        os: String,
+        arch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        libc: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        preferred: bool,
+    },
+    /// WebAssembly artifacts are portable only when their host ABI matches.
+    /// Do not use this variant for arbitrary `wasm32-wasi` binaries unless the
+    /// deployment backend actually provides the Dispatch host functions needed
+    /// by that ABI.
+    Wasm {
+        abi: String,
+        version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wit_world: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        preferred: bool,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -611,6 +654,39 @@ mod tests {
         let line = serde_json::to_string(&rpc).unwrap();
         let (_id, parsed) = parse_jsonrpc_request(&line).unwrap();
         assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn capabilities_runtime_targets_round_trip() {
+        let response = PluginResponse::Capabilities {
+            capabilities: DeploymentCapabilities {
+                deployment_plugin_id: "demo-cloud".to_string(),
+                protocol_version: DEPLOYMENT_PLUGIN_PROTOCOL_VERSION,
+                supports_test_run: false,
+                supports_revisions: false,
+                supports_rollback: false,
+                supports_scheduled: true,
+                runtime_targets: vec![
+                    DeploymentRuntimeTarget::Native {
+                        target_triple: "aarch64-unknown-linux-gnu".to_string(),
+                        os: "linux".to_string(),
+                        arch: "arm64".to_string(),
+                        libc: Some("glibc".to_string()),
+                        preferred: true,
+                    },
+                    DeploymentRuntimeTarget::Wasm {
+                        abi: "dispatch-wasm-courier".to_string(),
+                        version: "1".to_string(),
+                        wit_world: Some("dispatch:courier/courier".to_string()),
+                        preferred: false,
+                    },
+                ],
+                extensions: None,
+            },
+        };
+        let line = response_to_jsonrpc(&RequestId::integer(9), &response).unwrap();
+        let (_id, parsed) = parse_jsonrpc_message(&line).unwrap();
+        assert_eq!(parsed, response);
     }
 
     #[test]

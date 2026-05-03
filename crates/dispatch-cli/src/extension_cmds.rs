@@ -109,6 +109,79 @@ struct ExtensionInstallRequest<'a> {
     deployment_registry: Option<&'a Path>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedExtensionArtifact {
+    pub(crate) target: String,
+    pub(crate) artifact_url: String,
+    pub(crate) sha256: String,
+    pub(crate) binary_name: String,
+    pub(crate) manifest_url: String,
+}
+
+pub(crate) struct NoninteractiveCatalogInstall<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) courier_registry: Option<&'a Path>,
+    pub(crate) channel_registry: Option<&'a Path>,
+    pub(crate) provider_registry: Option<&'a Path>,
+    pub(crate) database_registry: Option<&'a Path>,
+    pub(crate) deployment_registry: Option<&'a Path>,
+}
+
+pub(crate) fn install_catalog_extension_noninteractive(
+    request: NoninteractiveCatalogInstall<'_>,
+) -> Result<()> {
+    extension_install(ExtensionInstallRequest {
+        name: request.name,
+        yes: true,
+        config_path: None,
+        cache_dir: None,
+        install_root: None,
+        courier_registry: request.courier_registry,
+        channel_registry: request.channel_registry,
+        provider_registry: request.provider_registry,
+        database_registry: request.database_registry,
+        deployment_registry: request.deployment_registry,
+    })
+}
+
+pub(crate) fn resolve_catalog_extension_artifact(
+    entry: &CatalogEntry,
+    target: &str,
+) -> Result<ResolvedExtensionArtifact> {
+    let source = entry.source.as_ref().ok_or_else(|| {
+        anyhow!(
+            "extension `{}` does not publish machine-installable source metadata",
+            entry.name
+        )
+    })?;
+    match source {
+        CatalogInstallSource::GithubRelease {
+            repo,
+            tag,
+            base_url,
+            checksum_asset,
+            binaries,
+        } => {
+            let asset = select_release_binary(binaries, target)?;
+            let artifact_url = release_asset_url(repo, tag, base_url.as_deref(), &asset.asset);
+            let sha256 = expected_sha256_for_binary(
+                repo,
+                tag,
+                base_url.as_deref(),
+                checksum_asset.as_deref(),
+                asset,
+            )?;
+            Ok(ResolvedExtensionArtifact {
+                target: target.to_string(),
+                artifact_url,
+                sha256,
+                binary_name: asset.binary_name.clone(),
+                manifest_url: resolve_install_manifest_url(entry)?,
+            })
+        }
+    }
+}
+
 fn default_extension_bin_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

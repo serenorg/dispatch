@@ -1,7 +1,9 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use dispatch_core::{
-    install_channel_plugin, install_courier_plugin, install_database_plugin,
-    install_deployment_plugin, install_provider_plugin, resolve_courier, resolve_deployment_plugin,
+    CatalogConfig, CatalogEntry, CatalogExtensionKind, CatalogSearchHit, default_catalog_cache_dir,
+    default_catalog_config_path, find_cached_entry, install_channel_plugin, install_courier_plugin,
+    install_database_plugin, install_deployment_plugin, install_provider_plugin, resolve_courier,
+    resolve_deployment_plugin,
 };
 use dispatch_deployment_protocol::{PluginRequest, PluginResponse, ValidationIssue};
 use flate2::{Compression, write::GzEncoder};
@@ -56,11 +58,40 @@ enum ExtensionKind {
     Deployment,
 }
 
+impl ExtensionKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Channel => "channel",
+            Self::Courier => "courier",
+            Self::Provider => "provider",
+            Self::Database => "database",
+            Self::Deployment => "deployment",
+        }
+    }
+
+    fn is_runtime_plugin(&self) -> bool {
+        !matches!(self, Self::Deployment)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExtensionSourceConfig {
+    Catalog,
+}
+
 #[derive(Debug, Deserialize)]
 struct ExtensionInstallConfig {
     #[serde(default)]
     kind: Option<ExtensionKind>,
-    manifest: PathBuf,
+    #[serde(default)]
+    manifest: Option<PathBuf>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    source: Option<ExtensionSourceConfig>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +202,8 @@ struct ResolvedDispatchProject {
     deployment_state_path: PathBuf,
     deployment_bundle_cache_dir: PathBuf,
     deployment_bundle_cache_index_path: PathBuf,
+    target: Option<DeploymentTarget>,
+    extension_lock: Option<DispatchExtensionLock>,
     extensions: Vec<ResolvedExtensionInstall>,
     deployments: Vec<ResolvedDeploymentBinding>,
     channels: Vec<ResolvedChannelBinding>,
@@ -180,7 +213,54 @@ struct ResolvedDispatchProject {
 struct ResolvedExtensionInstall {
     kind: ExtensionKind,
     name: String,
-    manifest: PathBuf,
+    source: ResolvedExtensionInstallSource,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedExtensionInstallSource {
+    LocalManifest {
+        manifest: PathBuf,
+    },
+    Catalog {
+        catalog: String,
+        entry: Box<CatalogEntry>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DeploymentTarget {
+    name: String,
+    target_triple: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DispatchExtensionLock {
+    schema: &'static str,
+    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_image: Option<String>,
+    extensions: Vec<LockedExtension>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LockedExtension {
+    name: String,
+    kind: String,
+    version: String,
+    catalog: String,
+    target: String,
+    artifact_url: String,
+    sha256: String,
+    binary_name: String,
+    manifest_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    egress: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requirements: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,9 +337,15 @@ fn default_courier_name() -> String {
 }
 
 pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
-    let project = load_dispatch_project(&args.path)?;
+    let project = load_dispatch_project(&args.path, args.target.as_deref())?;
 
     println!("Using config: {}", project.config_path.display());
+    if let Some(target) = &project.target {
+        println!(
+            "Deployment Target: {} ({})",
+            target.name, target.target_triple
+        );
+    }
     match &project.parcel {
         Some(parcel) => println!("Parcel: {}", parcel.display()),
         None => println!("Parcel: <none>"),
@@ -399,7 +485,7 @@ fn prepare_deployment_spec_for_invocation(
     project: &ResolvedDispatchProject,
     deployment: &ResolvedDeploymentBinding,
 ) -> Result<Value> {
-    prepare_deployment_bundle_cache_spec(
+    let spec = prepare_deployment_bundle_cache_spec(
         &project.root_dir,
         &project.deployment_bundle_cache_dir,
         &project.deployment_bundle_cache_index_path,
@@ -410,7 +496,34 @@ fn prepare_deployment_spec_for_invocation(
             "failed to prepare deployment bundle for `{}`",
             deployment.label
         )
-    })
+    })?;
+    let lock = if deployment.plugin == "seren-cloud" {
+        project.extension_lock.as_ref()
+    } else {
+        None
+    };
+    attach_extension_lock(spec, lock)
+}
+
+fn attach_extension_lock(spec: Value, lock: Option<&DispatchExtensionLock>) -> Result<Value> {
+    let Some(lock) = lock else {
+        return Ok(spec);
+    };
+    if lock.extensions.is_empty() {
+        return Ok(spec);
+    }
+    let mut spec_object = match spec {
+        Value::Object(object) => object,
+        other => return Ok(other),
+    };
+    if spec_object.contains_key("dispatch_lockfile") {
+        bail!("deployment spec field `dispatch_lockfile` is reserved for dispatch up");
+    }
+    spec_object.insert(
+        "dispatch_lockfile".to_string(),
+        serde_json::to_value(lock).context("failed to serialize dispatch extension lock")?,
+    );
+    Ok(Value::Object(spec_object))
 }
 
 fn prepare_deployment_bundle_cache_spec(
@@ -891,14 +1004,32 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
     } else {
         println!("Extension Installs:");
         for extension in &project.extensions {
-            let kind = match extension.kind {
-                ExtensionKind::Channel => "channel",
-                ExtensionKind::Courier => "courier",
-                ExtensionKind::Provider => "provider",
-                ExtensionKind::Database => "database",
-                ExtensionKind::Deployment => "deployment",
+            match &extension.source {
+                ResolvedExtensionInstallSource::LocalManifest { manifest } => {
+                    println!("  - {}: {}", extension.kind.label(), manifest.display());
+                }
+                ResolvedExtensionInstallSource::Catalog { catalog, entry } => {
+                    println!(
+                        "  - {}: {} {} from catalog `{catalog}`",
+                        extension.kind.label(),
+                        entry.name,
+                        entry.version
+                    );
+                }
             };
-            println!("  - {kind}: {}", extension.manifest.display());
+        }
+    }
+    if let Some(lock) = &project.extension_lock {
+        println!("Target Extension Lock: {}", lock.target);
+        if lock.extensions.is_empty() {
+            println!("  runtime extensions: none");
+        } else {
+            for extension in &lock.extensions {
+                println!(
+                    "  - {} {} {} ({})",
+                    extension.kind, extension.name, extension.version, extension.target
+                );
+            }
         }
     }
 
@@ -976,7 +1107,7 @@ fn print_dry_run_courier_status(project: &ResolvedDispatchProject) {
     }
 }
 
-fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
+fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDispatchProject> {
     let config_path = resolve_dispatch_config_path(path)?;
     let body = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -1031,6 +1162,17 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         )?);
     }
 
+    let target = target.map(resolve_deployment_target).transpose()?;
+    let extensions = parsed
+        .extensions
+        .into_iter()
+        .map(|extension| resolve_extension_install(&root_dir, extension))
+        .collect::<Result<Vec<_>>>()?;
+    let extension_lock = target
+        .as_ref()
+        .map(|target| build_extension_lock(target, &extensions))
+        .transpose()?;
+
     Ok(ResolvedDispatchProject {
         config_path,
         root_dir: root_dir.clone(),
@@ -1044,22 +1186,158 @@ fn load_dispatch_project(path: &Path) -> Result<ResolvedDispatchProject> {
         deployment_state_path,
         deployment_bundle_cache_dir,
         deployment_bundle_cache_index_path,
-        extensions: parsed
-            .extensions
-            .into_iter()
-            .map(|extension| {
-                let manifest = resolve_relative_path(&root_dir, extension.manifest);
-                let probe = load_extension_manifest_probe(&manifest)?;
-                Ok(ResolvedExtensionInstall {
-                    kind: resolve_extension_kind(&manifest, extension.kind, &probe)?,
-                    name: resolve_extension_name(&manifest, &probe)?,
-                    manifest,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?,
+        target,
+        extension_lock,
+        extensions,
         deployments,
         channels,
     })
+}
+
+fn resolve_deployment_target(target: &str) -> Result<DeploymentTarget> {
+    match target {
+        "seren-cloud" => Ok(DeploymentTarget {
+            name: target.to_string(),
+            target_triple: "aarch64-unknown-linux-gnu".to_string(),
+        }),
+        other => bail!("unsupported dispatch up target `{other}`; supported targets: seren-cloud"),
+    }
+}
+
+fn resolve_extension_install(
+    root_dir: &Path,
+    extension: ExtensionInstallConfig,
+) -> Result<ResolvedExtensionInstall> {
+    match (extension.manifest, extension.source) {
+        (Some(manifest), None) => {
+            let manifest = resolve_relative_path(root_dir, manifest);
+            let probe = load_extension_manifest_probe(&manifest)?;
+            Ok(ResolvedExtensionInstall {
+                kind: resolve_extension_kind(&manifest, extension.kind, &probe)?,
+                name: resolve_extension_name(&manifest, &probe)?,
+                source: ResolvedExtensionInstallSource::LocalManifest { manifest },
+            })
+        }
+        (None, Some(ExtensionSourceConfig::Catalog)) => {
+            let name = extension
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("catalog extension install requires `name`"))?;
+            let hit = resolve_catalog_extension_entry(name)?;
+            if let Some(expected) = extension.version.as_deref()
+                && expected != hit.entry.version
+            {
+                bail!(
+                    "catalog extension `{name}` resolved to version {}, expected {expected}",
+                    hit.entry.version
+                );
+            }
+            let kind = extension
+                .kind
+                .map(Ok)
+                .unwrap_or_else(|| extension_kind_from_catalog(hit.entry.kind))?;
+            Ok(ResolvedExtensionInstall {
+                kind,
+                name: hit.entry.name.clone(),
+                source: ResolvedExtensionInstallSource::Catalog {
+                    catalog: hit.catalog,
+                    entry: Box::new(hit.entry),
+                },
+            })
+        }
+        (Some(_), Some(_)) => {
+            bail!("extension install must use either `manifest` or `source`, not both")
+        }
+        (None, None) => {
+            bail!("extension install requires either `manifest` or `source = \"catalog\"`")
+        }
+    }
+}
+
+fn resolve_catalog_extension_entry(name: &str) -> Result<CatalogSearchHit> {
+    let config_path = default_catalog_config_path()?;
+    let config = CatalogConfig::load(&config_path)?;
+    let cache_dir = default_catalog_cache_dir()?;
+    find_cached_entry(&config, &cache_dir, name).ok_or_else(|| {
+        anyhow!(
+            "extension `{name}` not found in any cached catalog; run `dispatch extension catalog refresh`"
+        )
+    })
+}
+
+fn extension_kind_from_catalog(kind: CatalogExtensionKind) -> Result<ExtensionKind> {
+    match kind {
+        CatalogExtensionKind::Channel => Ok(ExtensionKind::Channel),
+        CatalogExtensionKind::Courier => Ok(ExtensionKind::Courier),
+        CatalogExtensionKind::Provider => Ok(ExtensionKind::Provider),
+        CatalogExtensionKind::Database => Ok(ExtensionKind::Database),
+        CatalogExtensionKind::Deployment => Ok(ExtensionKind::Deployment),
+        CatalogExtensionKind::Connector => {
+            bail!("connector catalog extensions are not supported by dispatch up")
+        }
+    }
+}
+
+fn build_extension_lock(
+    target: &DeploymentTarget,
+    extensions: &[ResolvedExtensionInstall],
+) -> Result<DispatchExtensionLock> {
+    let mut locked = Vec::new();
+    for extension in extensions {
+        if !extension.kind.is_runtime_plugin() {
+            continue;
+        }
+        let ResolvedExtensionInstallSource::Catalog { catalog, entry } = &extension.source else {
+            continue;
+        };
+        let artifact =
+            crate::extension_cmds::resolve_catalog_extension_artifact(entry, &target.target_triple)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve extension `{}` for target `{}`",
+                        entry.name, target.target_triple
+                    )
+                })?;
+        locked.push(LockedExtension {
+            name: entry.name.clone(),
+            kind: entry.kind.as_str().to_string(),
+            version: entry.version.clone(),
+            catalog: catalog.clone(),
+            target: artifact.target,
+            artifact_url: artifact.artifact_url,
+            sha256: artifact.sha256,
+            binary_name: artifact.binary_name,
+            manifest_url: artifact.manifest_url,
+            protocol: entry.protocol.clone(),
+            protocol_version: entry.protocol_version,
+            egress: extension_egress(entry),
+            requirements: entry.requirements.clone(),
+        });
+    }
+    Ok(DispatchExtensionLock {
+        schema: "https://serenorg.github.io/dispatch/schemas/dispatch-cloud-lock.v1.json",
+        target: target.target_triple.clone(),
+        runtime_image: None,
+        extensions: locked,
+    })
+}
+
+fn extension_egress(entry: &CatalogEntry) -> Vec<String> {
+    entry
+        .requirements
+        .as_ref()
+        .and_then(|requirements| requirements.get("network_domains"))
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn resolve_deployment_binding(
@@ -1309,64 +1587,89 @@ fn resolve_extension_name(manifest: &Path, probe: &ExtensionManifestProbe) -> Re
 
 fn reconcile_extensions(project: &ResolvedDispatchProject) -> Result<()> {
     for extension in &project.extensions {
-        match extension.kind {
-            ExtensionKind::Channel => {
-                let installed =
-                    install_channel_plugin(&extension.manifest, Some(&project.channel_registry))
-                        .with_context(|| {
-                            format!(
-                                "failed to install channel plugin from {}",
-                                extension.manifest.display()
-                            )
-                        })?;
-                println!("Installed channel plugin `{}`", installed.name);
+        match &extension.source {
+            ResolvedExtensionInstallSource::LocalManifest { manifest } => {
+                reconcile_local_extension(project, extension, manifest)?;
             }
-            ExtensionKind::Courier => {
-                let installed =
-                    install_courier_plugin(&extension.manifest, Some(&project.courier_registry))
-                        .with_context(|| {
-                            format!(
-                                "failed to install courier plugin from {}",
-                                extension.manifest.display()
-                            )
-                        })?;
-                println!("Installed courier plugin `{}`", installed.name);
-            }
-            ExtensionKind::Provider => {
-                let installed =
-                    install_provider_plugin(&extension.manifest, Some(&project.provider_registry))
-                        .with_context(|| {
-                            format!(
-                                "failed to install provider plugin from {}",
-                                extension.manifest.display()
-                            )
-                        })?;
-                println!("Installed provider plugin `{}`", installed.name);
-            }
-            ExtensionKind::Database => {
-                let installed =
-                    install_database_plugin(&extension.manifest, Some(&project.database_registry))
-                        .with_context(|| {
-                            format!(
-                                "failed to install database plugin from {}",
-                                extension.manifest.display()
-                            )
-                        })?;
-                println!("Installed database plugin `{}`", installed.name);
-            }
-            ExtensionKind::Deployment => {
-                let installed = install_deployment_plugin(
-                    &extension.manifest,
-                    Some(&project.deployment_registry),
+            ResolvedExtensionInstallSource::Catalog { .. } => {
+                crate::extension_cmds::install_catalog_extension_noninteractive(
+                    crate::extension_cmds::NoninteractiveCatalogInstall {
+                        name: &extension.name,
+                        courier_registry: Some(&project.courier_registry),
+                        channel_registry: Some(&project.channel_registry),
+                        provider_registry: Some(&project.provider_registry),
+                        database_registry: Some(&project.database_registry),
+                        deployment_registry: Some(&project.deployment_registry),
+                    },
                 )
                 .with_context(|| {
                     format!(
-                        "failed to install deployment plugin from {}",
-                        extension.manifest.display()
+                        "failed to install {} plugin `{}` from catalog",
+                        extension.kind.label(),
+                        extension.name
                     )
                 })?;
-                println!("Installed deployment plugin `{}`", installed.name);
             }
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_local_extension(
+    project: &ResolvedDispatchProject,
+    extension: &ResolvedExtensionInstall,
+    manifest: &Path,
+) -> Result<()> {
+    match extension.kind {
+        ExtensionKind::Channel => {
+            let installed = install_channel_plugin(manifest, Some(&project.channel_registry))
+                .with_context(|| {
+                    format!(
+                        "failed to install channel plugin from {}",
+                        manifest.display()
+                    )
+                })?;
+            println!("Installed channel plugin `{}`", installed.name);
+        }
+        ExtensionKind::Courier => {
+            let installed = install_courier_plugin(manifest, Some(&project.courier_registry))
+                .with_context(|| {
+                    format!(
+                        "failed to install courier plugin from {}",
+                        manifest.display()
+                    )
+                })?;
+            println!("Installed courier plugin `{}`", installed.name);
+        }
+        ExtensionKind::Provider => {
+            let installed = install_provider_plugin(manifest, Some(&project.provider_registry))
+                .with_context(|| {
+                    format!(
+                        "failed to install provider plugin from {}",
+                        manifest.display()
+                    )
+                })?;
+            println!("Installed provider plugin `{}`", installed.name);
+        }
+        ExtensionKind::Database => {
+            let installed = install_database_plugin(manifest, Some(&project.database_registry))
+                .with_context(|| {
+                    format!(
+                        "failed to install database plugin from {}",
+                        manifest.display()
+                    )
+                })?;
+            println!("Installed database plugin `{}`", installed.name);
+        }
+        ExtensionKind::Deployment => {
+            let installed = install_deployment_plugin(manifest, Some(&project.deployment_registry))
+                .with_context(|| {
+                    format!(
+                        "failed to install deployment plugin from {}",
+                        manifest.display()
+                    )
+                })?;
+            println!("Installed deployment plugin `{}`", installed.name);
         }
     }
     Ok(())
@@ -1605,7 +1908,7 @@ once = true
         )
         .unwrap();
 
-        let project = load_dispatch_project(&config_path).unwrap();
+        let project = load_dispatch_project(&config_path, None).unwrap();
         assert_eq!(project.parcel, Some(dir.path().join("Agentfile")));
         assert_eq!(
             project.courier_registry,
@@ -1648,7 +1951,9 @@ config_file = "./channel.toml"
         )
         .unwrap();
 
-        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        let error = load_dispatch_project(&config_path, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("use either `config` or `config_file`"));
     }
 
@@ -1667,7 +1972,9 @@ deliver_replies = true
         )
         .unwrap();
 
-        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        let error = load_dispatch_project(&config_path, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("deliver_replies = true"));
         assert!(error.contains("does not declare `parcel`"));
     }
@@ -1691,7 +1998,7 @@ once = true
         )
         .unwrap();
 
-        let project = load_dispatch_project(&config_path).unwrap();
+        let project = load_dispatch_project(&config_path, None).unwrap();
 
         assert_eq!(project.channels.len(), 1);
         assert_eq!(
@@ -1719,7 +2026,9 @@ mode = "poll"
         )
         .unwrap();
 
-        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        let error = load_dispatch_project(&config_path, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("references `deployment`"));
         assert!(error.contains("does not declare `parcel`"));
     }
@@ -1753,7 +2062,7 @@ spec_file = {}
         )
         .unwrap();
 
-        let project = load_dispatch_project(&config_path).unwrap();
+        let project = load_dispatch_project(&config_path, None).unwrap();
         assert_eq!(
             project.deployment_registry,
             dir.path().join("custom/deployments.json")
@@ -1897,7 +2206,9 @@ plugin = "seren-agent"
         )
         .unwrap();
 
-        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        let error = load_dispatch_project(&config_path, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("requires either `spec` or `spec_file`"));
     }
 
@@ -1932,7 +2243,7 @@ manifest = {}
         )
         .unwrap();
 
-        let project = load_dispatch_project(&config_path).unwrap();
+        let project = load_dispatch_project(&config_path, None).unwrap();
         assert_eq!(project.extensions.len(), 1);
         assert!(matches!(project.extensions[0].kind, ExtensionKind::Channel));
     }
@@ -2006,7 +2317,7 @@ manifest = {}
         )
         .unwrap();
 
-        let project = load_dispatch_project(&config_path).unwrap();
+        let project = load_dispatch_project(&config_path, None).unwrap();
         assert_eq!(project.extensions.len(), 3);
         assert!(matches!(
             project.extensions[0].kind,
@@ -2049,7 +2360,9 @@ manifest = {}
         )
         .unwrap();
 
-        let error = load_dispatch_project(&config_path).unwrap_err().to_string();
+        let error = load_dispatch_project(&config_path, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("must declare `kind`"));
     }
 }
