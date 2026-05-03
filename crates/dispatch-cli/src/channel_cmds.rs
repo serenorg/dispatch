@@ -519,7 +519,7 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
             };
             if !matches!(
                 runtime.ingress_state.as_ref().map(|state| &state.mode),
-                Some(IngressMode::Polling)
+                Some(IngressMode::Polling | IngressMode::Websocket)
             ) {
                 let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
                 let mode_name = runtime
@@ -539,7 +539,12 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                 };
             }
 
-            println!("Polling {}", plugin.name);
+            let receive_mode = runtime
+                .ingress_state
+                .as_ref()
+                .map(|state| state.mode.wire_name())
+                .unwrap_or("<unknown>");
+            println!("Receiving {} ({receive_mode})", plugin.name);
             if let Some(parcel_bridge) = &parcel_bridge {
                 println!(
                     "Parcel bridge: {} via {} (sessions under {})",
@@ -603,12 +608,18 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                 .map_err(|error| anyhow::anyhow!("failed to bind {listen}: {error}"))?;
             if matches!(
                 runtime.ingress_state.as_ref().map(|state| &state.mode),
-                Some(IngressMode::Polling)
+                Some(IngressMode::Polling | IngressMode::Websocket)
             ) {
                 let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
+                let mode_name = runtime
+                    .ingress_state
+                    .as_ref()
+                    .map(|state| format!("{:?}", state.mode))
+                    .unwrap_or_else(|| "<unknown>".to_string());
                 let run_error = anyhow::anyhow!(
-                    "channel plugin `{}` started ingress in polling mode; use poll bindings instead of listen bindings",
-                    plugin.name
+                    "channel plugin `{}` started ingress in {} mode; use poll bindings instead of listen bindings",
+                    plugin.name,
+                    mode_name
                 );
                 return match stop_result {
                     Ok(()) => Err(run_error),

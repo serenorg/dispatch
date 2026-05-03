@@ -79,11 +79,11 @@ Examples: Telegram, Discord, Slack, WhatsApp, Signal, Twilio SMS, generic webhoo
 
 Channel plugins vary by platform, but the protocol covers the full inbound and outbound lifecycle: configuration, health, ingress setup, webhook forwarding or background receive loops, delivery, push, and status frames.
 
-Dispatch keeps channel plugins alive as persistent subprocesses while a listener or long-running poller is active. The host still speaks JSON-RPC 2.0 messages over JSONL stdio, but inbound channel activity is delivered back to the host as `channel.event` notifications during persistent ingress sessions. Dispatch also supports a one-shot `poll_ingress` request for explicit single-cycle polling.
+Dispatch keeps channel plugins alive as persistent subprocesses while a listener, long-running poller, or plugin-owned websocket connection is active. The host still speaks JSON-RPC 2.0 messages over JSONL stdio, but inbound channel activity is delivered back to the host as `channel.event` notifications during persistent ingress sessions. Dispatch also supports a one-shot `poll_ingress` request for explicit single-cycle polling.
 
 For channel ingress, `start_ingress` is the primary session-oriented contract. `poll_ingress` remains as the auxiliary one-shot receive primitive used when the host explicitly wants a single fetch cycle rather than a long-lived ingress session.
 
-That separation is intentional. Dispatch controls the plugin lifecycle and the stdio framing; the plugin is free to translate that into whatever upstream transport best matches the platform, including repeated HTTP polling, upstream websockets, or daemon-backed local IPC.
+That separation is intentional. Dispatch controls the plugin lifecycle and the stdio framing; the plugin is free to translate that into whatever upstream transport best matches the platform, including repeated HTTP polling, upstream websockets, upstream event sockets, or daemon-backed local IPC.
 
 As a design rule, Dispatch defaults plugin interactions to one-shot request/response cycles and opts into persistence only when the domain is inherently sessioned or event-driven. Channel plugins fall into that second category: they may need to hold an upstream connection open, maintain ingress state across calls, or emit events on the platform's schedule rather than the host's schedule.
 
@@ -300,7 +300,7 @@ Channel plugin manifest example (`channel-plugin.json`):
   "capabilities": {
     "channel": {
       "platform": "telegram",
-      "ingress_modes": ["webhook", "polling"],
+      "ingress_modes": ["webhook", "polling", "websocket"],
       "outbound_message_types": ["text"],
       "threading_model": "chat_or_topic",
       "attachment_support": true,
@@ -488,7 +488,7 @@ Installed channel manifests may also retain ingress endpoint declarations so the
 
 When using `dispatch channel listen`, the host sends `start_ingress` before entering the HTTP serve loop, forwards webhook payloads through `ingress_event` requests, and finally sends `stop_ingress` followed by `shutdown` when the listener exits cleanly.
 
-For long-running polling bindings, the host sends `start_ingress` with the last saved opaque state (if any), then waits for `channel.event` notifications from the plugin. Each notification carries:
+For long-running polling or websocket bindings, the host sends `start_ingress` with the last saved opaque state (if any), then waits for `channel.event` notifications from the plugin. Each notification carries:
 
 - `events` - zero or more normalized inbound events
 - `state?` - updated opaque ingress state such as cursors
@@ -498,7 +498,7 @@ The host checkpoints `state` between runs. This lets repeated `dispatch channel 
 
 For CLI-driven one-shot polling, Dispatch sends `poll_ingress` with the last saved opaque state, expects a single `ingress_events_received` response, saves any returned `state`, and exits. This path is useful when the plugin's upstream transport is itself long-poll or websocket-backed and a true one-shot fetch is more appropriate than starting a persistent ingress session only to tear it down immediately.
 
-`callback_reply` is only valid for webhook `ingress_event` handling. Polling notifications should leave it unset because they are not a direct HTTP callback path.
+`callback_reply` is only valid for webhook `ingress_event` handling. Polling and websocket notifications should leave it unset because they are not a direct HTTP callback path.
 
 ### Parcel reply bridge
 

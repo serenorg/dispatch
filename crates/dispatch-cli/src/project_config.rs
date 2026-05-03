@@ -203,7 +203,7 @@ struct ResolvedDispatchProject {
     deployment_bundle_cache_dir: PathBuf,
     deployment_bundle_cache_index_path: PathBuf,
     target: Option<DeploymentTarget>,
-    extension_lock: Option<DispatchExtensionLock>,
+    dispatch_extensions: Option<ResolvedDispatchExtensions>,
     extensions: Vec<ResolvedExtensionInstall>,
     deployments: Vec<ResolvedDeploymentBinding>,
     channels: Vec<ResolvedChannelBinding>,
@@ -233,17 +233,17 @@ struct DeploymentTarget {
     target_triple: String,
 }
 
+const DISPATCH_RESOLVED_EXTENSIONS_FORMAT: &str = "dispatch.resolved_extensions.v1";
+
 #[derive(Debug, Clone, Serialize)]
-struct DispatchExtensionLock {
-    schema: &'static str,
+struct ResolvedDispatchExtensions {
+    format: &'static str,
     target: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_image: Option<String>,
-    extensions: Vec<LockedExtension>,
+    extensions: Vec<ResolvedDispatchExtension>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct LockedExtension {
+struct ResolvedDispatchExtension {
     name: String,
     kind: String,
     version: String,
@@ -253,6 +253,7 @@ struct LockedExtension {
     sha256: String,
     binary_name: String,
     manifest_url: String,
+    manifest_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -497,31 +498,34 @@ fn prepare_deployment_spec_for_invocation(
             deployment.label
         )
     })?;
-    let lock = if deployment.plugin == "seren-cloud" {
-        project.extension_lock.as_ref()
+    let extensions = if deployment.plugin == "seren-cloud" {
+        project.dispatch_extensions.as_ref()
     } else {
         None
     };
-    attach_extension_lock(spec, lock)
+    attach_dispatch_extensions(spec, extensions)
 }
 
-fn attach_extension_lock(spec: Value, lock: Option<&DispatchExtensionLock>) -> Result<Value> {
-    let Some(lock) = lock else {
+fn attach_dispatch_extensions(
+    spec: Value,
+    extensions: Option<&ResolvedDispatchExtensions>,
+) -> Result<Value> {
+    let Some(extensions) = extensions else {
         return Ok(spec);
     };
-    if lock.extensions.is_empty() {
+    if extensions.extensions.is_empty() {
         return Ok(spec);
     }
     let mut spec_object = match spec {
         Value::Object(object) => object,
         other => return Ok(other),
     };
-    if spec_object.contains_key("dispatch_lockfile") {
-        bail!("deployment spec field `dispatch_lockfile` is reserved for dispatch up");
+    if spec_object.contains_key("dispatch_extensions") {
+        bail!("deployment spec field `dispatch_extensions` is reserved for dispatch up");
     }
     spec_object.insert(
-        "dispatch_lockfile".to_string(),
-        serde_json::to_value(lock).context("failed to serialize dispatch extension lock")?,
+        "dispatch_extensions".to_string(),
+        serde_json::to_value(extensions).context("failed to serialize dispatch extensions")?,
     );
     Ok(Value::Object(spec_object))
 }
@@ -1019,12 +1023,12 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
             };
         }
     }
-    if let Some(lock) = &project.extension_lock {
-        println!("Target Extension Lock: {}", lock.target);
-        if lock.extensions.is_empty() {
+    if let Some(extensions) = &project.dispatch_extensions {
+        println!("Target Resolved Extensions: {}", extensions.target);
+        if extensions.extensions.is_empty() {
             println!("  runtime extensions: none");
         } else {
-            for extension in &lock.extensions {
+            for extension in &extensions.extensions {
                 println!(
                     "  - {} {} {} ({})",
                     extension.kind, extension.name, extension.version, extension.target
@@ -1168,9 +1172,9 @@ fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDi
         .into_iter()
         .map(|extension| resolve_extension_install(&root_dir, extension))
         .collect::<Result<Vec<_>>>()?;
-    let extension_lock = target
+    let dispatch_extensions = target
         .as_ref()
-        .map(|target| build_extension_lock(target, &extensions))
+        .map(|target| build_dispatch_extensions(target, &extensions))
         .transpose()?;
 
     Ok(ResolvedDispatchProject {
@@ -1187,7 +1191,7 @@ fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDi
         deployment_bundle_cache_dir,
         deployment_bundle_cache_index_path,
         target,
-        extension_lock,
+        dispatch_extensions,
         extensions,
         deployments,
         channels,
@@ -1280,17 +1284,23 @@ fn extension_kind_from_catalog(kind: CatalogExtensionKind) -> Result<ExtensionKi
     }
 }
 
-fn build_extension_lock(
+fn build_dispatch_extensions(
     target: &DeploymentTarget,
     extensions: &[ResolvedExtensionInstall],
-) -> Result<DispatchExtensionLock> {
-    let mut locked = Vec::new();
+) -> Result<ResolvedDispatchExtensions> {
+    let mut resolved = Vec::new();
     for extension in extensions {
         if !extension.kind.is_runtime_plugin() {
             continue;
         }
         let ResolvedExtensionInstallSource::Catalog { catalog, entry } = &extension.source else {
-            continue;
+            bail!(
+                "{} plugin `{}` uses a local manifest, which cannot be deployed to target `{}`; publish the extension to a catalog and use `source = \"catalog\"` so Dispatch can resolve a `{}` artifact",
+                extension.kind.label(),
+                extension.name,
+                target.name,
+                target.target_triple
+            );
         };
         let artifact =
             crate::extension_cmds::resolve_catalog_extension_artifact(entry, &target.target_triple)
@@ -1300,7 +1310,7 @@ fn build_extension_lock(
                         entry.name, target.target_triple
                     )
                 })?;
-        locked.push(LockedExtension {
+        resolved.push(ResolvedDispatchExtension {
             name: entry.name.clone(),
             kind: entry.kind.as_str().to_string(),
             version: entry.version.clone(),
@@ -1310,17 +1320,17 @@ fn build_extension_lock(
             sha256: artifact.sha256,
             binary_name: artifact.binary_name,
             manifest_url: artifact.manifest_url,
+            manifest_sha256: artifact.manifest_sha256,
             protocol: entry.protocol.clone(),
             protocol_version: entry.protocol_version,
             egress: extension_egress(entry),
             requirements: entry.requirements.clone(),
         });
     }
-    Ok(DispatchExtensionLock {
-        schema: "https://serenorg.github.io/dispatch/schemas/dispatch-cloud-lock.v1.json",
+    Ok(ResolvedDispatchExtensions {
+        format: DISPATCH_RESOLVED_EXTENSIONS_FORMAT,
         target: target.target_triple.clone(),
-        runtime_image: None,
-        extensions: locked,
+        extensions: resolved,
     })
 }
 
@@ -2246,6 +2256,45 @@ manifest = {}
         let project = load_dispatch_project(&config_path, None).unwrap();
         assert_eq!(project.extensions.len(), 1);
         assert!(matches!(project.extensions[0].kind, ExtensionKind::Channel));
+    }
+
+    #[test]
+    fn load_dispatch_project_rejects_local_runtime_extension_for_cloud_target() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        let manifest_path = dir.path().join("channel-plugin.json");
+        fs::write(
+            &manifest_path,
+            r#"
+{
+    "kind": "channel",
+    "name": "channel-test",
+    "version": "0.1.0",
+    "protocol": "jsonl",
+    "protocol_version": 1,
+    "entrypoint": { "command": "./channel-test", "args": [] }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[[extensions]]
+manifest = {}
+"#,
+                toml_string_literal(&path_string(&manifest_path))
+            ),
+        )
+        .unwrap();
+
+        let error = load_dispatch_project(&config_path, Some("seren-cloud"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uses a local manifest"));
+        assert!(error.contains("publish the extension to a catalog"));
+        assert!(error.contains("source = \"catalog\""));
     }
 
     #[test]

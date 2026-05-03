@@ -116,6 +116,7 @@ pub(crate) struct ResolvedExtensionArtifact {
     pub(crate) sha256: String,
     pub(crate) binary_name: String,
     pub(crate) manifest_url: String,
+    pub(crate) manifest_sha256: String,
 }
 
 pub(crate) struct NoninteractiveCatalogInstall<'a> {
@@ -171,12 +172,19 @@ pub(crate) fn resolve_catalog_extension_artifact(
                 checksum_asset.as_deref(),
                 asset,
             )?;
+            let manifest_url = resolve_install_manifest_url(entry)?;
+            let manifest_bytes = fetch_bytes(
+                &format!("manifest for `{}`", entry.name),
+                &manifest_url,
+                1024 * 1024,
+            )?;
             Ok(ResolvedExtensionArtifact {
                 target: target.to_string(),
                 artifact_url,
                 sha256,
                 binary_name: asset.binary_name.clone(),
-                manifest_url: resolve_install_manifest_url(entry)?,
+                manifest_url,
+                manifest_sha256: encode_hex(Sha256::digest(&manifest_bytes)),
             })
         }
     }

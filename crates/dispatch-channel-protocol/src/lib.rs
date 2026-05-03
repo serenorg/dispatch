@@ -197,8 +197,34 @@ pub enum IngressMode {
     EventsWebhook,
     InteractionWebhook,
     Polling,
+    Websocket,
     #[serde(other)]
     Unknown,
+}
+
+impl IngressMode {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Webhook => "webhook",
+            Self::EventsWebhook => "events_webhook",
+            Self::InteractionWebhook => "interaction_webhook",
+            Self::Polling => "polling",
+            Self::Websocket => "websocket",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "webhook" => Some(Self::Webhook),
+            "events_webhook" => Some(Self::EventsWebhook),
+            "interaction_webhook" => Some(Self::InteractionWebhook),
+            "polling" => Some(Self::Polling),
+            "websocket" => Some(Self::Websocket),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -739,6 +765,26 @@ mod tests {
             serde_json::to_string(&IngressMode::InteractionWebhook).unwrap(),
             "\"interaction_webhook\""
         );
+        assert_eq!(
+            serde_json::to_string(&IngressMode::Websocket).unwrap(),
+            "\"websocket\""
+        );
+        assert_eq!(IngressMode::Websocket.wire_name(), "websocket");
+        assert_eq!(
+            IngressMode::InteractionWebhook.wire_name(),
+            "interaction_webhook"
+        );
+        for mode in [
+            IngressMode::Webhook,
+            IngressMode::EventsWebhook,
+            IngressMode::InteractionWebhook,
+            IngressMode::Polling,
+            IngressMode::Websocket,
+            IngressMode::Unknown,
+        ] {
+            assert_eq!(IngressMode::from_wire_name(mode.wire_name()), Some(mode));
+        }
+        assert_eq!(IngressMode::from_wire_name("future_mode"), None);
     }
 
     #[test]
