@@ -2,6 +2,41 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.4.0] - 2026-05-04
+
+Plugin protocol expansion release.
+
+This release adds three new plugin categories alongside the existing courier and channel infrastructure: provider plugins for LLM inference backends, database plugin protocol and registry support for read+write database backends, and deployment plugins for managed deployment lifecycle control planes. It also extends `dispatch up` to reconcile project-local deployment declarations and channel bindings against managed cloud backends.
+
+### Breaking
+
+- Extension catalog documents now require a top-level `catalog_id`, and every catalog entry now requires a stable publisher-prefixed `id`; catalogs missing those identity fields are rejected on refresh or load
+
+### Extensions
+
+- Added `dispatch-provider-protocol`, `dispatch-database-protocol`, and `dispatch-deployment-protocol` crates with JSON-RPC 2.0 stdio framing
+- Added provider and database plugin manifest validation, registry storage, catalog recognition, and `dispatch extension install` support
+- Added installed-provider-plugin bridging from the native courier model-backend path; the `DISPATCH_BACKEND_<PROVIDER>` override resolves to the installed plugin when one is registered for that provider name
+- Added the deployment plugin category, including manifest validation, registry storage, catalog recognition, and the `dispatch deployment` CLI for `validate`, `test-run`, `deploy`, `upsert`, `update`, `get`, `list`, `list-revisions`, `preview-rollback`, `rollback`, `start`, `stop`, and `delete` operations
+- Added project-local deployment bindings to `dispatch.toml` with `validate`, `test_run`, `deploy`, and `upsert` reconcile modes
+- Added confirmation gating for `dispatch up` deployment bindings that mutate remote resources, with `--yes` for non-interactive `deploy` and `upsert` runs
+- Added `.dispatch/state/deployments.json` tracking for deployment IDs and active revision IDs produced by `dispatch up`
+- Added cached deployment bundles so `dispatch up` materializes `code.parcel_dir` and `code.bundle_path` specs into reproducible bundles before sending them to the backend
+- Added channel-to-deployment binding support so channel parcels receive `dispatch.deployment.*` metadata labels generated during reconciliation
+- Added `dispatch up --target seren-cloud` support that resolves catalog-sourced extension artifacts for the remote target, embeds `dispatch.resolved_extensions` and `dispatch_channels` metadata in deployment specs, and skips local channel runtime startup for remote-target deployments
+- Added a websocket ingress mode to the channel plugin protocol for plugins that hold an upstream socket open instead of polling
+- Added provider, database, and deployment registry path configuration to project-local `dispatch.toml` resolution
+- Added provider, database, and deployment plugin protocol documentation under `docs/`
+
+### Changed
+
+- `dispatch parcel inspect` now renders courier inspection extension metadata generically instead of special-casing Seren deployment IDs
+- Connector bundles are superseded in extension documentation by the concrete provider and database plugin categories
+- Deployment plugin capabilities carry backend-specific capability details under namespaced `extensions` keys
+- Deployment `test_run` output may return either structured JSON or plain text
+- Provider, database, and deployment plugin protocols follow the existing lenient wire-protocol policy for forward compatibility
+- Plugin ecosystem documentation drops version anchors from tier status lines so the docs do not need to be updated each release
+
 ## [0.3.0] - 2026-04-22
 
 Extensions and plugin infrastructure release.
