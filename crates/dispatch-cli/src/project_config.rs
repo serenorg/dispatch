@@ -204,6 +204,7 @@ struct ResolvedDispatchProject {
     deployment_bundle_cache_index_path: PathBuf,
     target: Option<DeploymentTarget>,
     dispatch_extensions: Option<ResolvedDispatchExtensions>,
+    dispatch_channels: Vec<ResolvedDispatchChannelBinding>,
     extensions: Vec<ResolvedExtensionInstall>,
     deployments: Vec<ResolvedDeploymentBinding>,
     channels: Vec<ResolvedChannelBinding>,
@@ -234,6 +235,7 @@ struct DeploymentTarget {
 }
 
 const DISPATCH_RESOLVED_EXTENSIONS_FORMAT: &str = "dispatch.resolved_extensions.v1";
+const DISPATCH_CHANNEL_BINDINGS_FORMAT: &str = "dispatch.channel_bindings.v1";
 
 #[derive(Debug, Clone, Serialize)]
 struct ResolvedDispatchExtensions {
@@ -262,6 +264,24 @@ struct ResolvedDispatchExtension {
     egress: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requirements: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedDispatchChannelBindings {
+    format: &'static str,
+    channels: Vec<ResolvedDispatchChannelBinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedDispatchChannelBinding {
+    label: String,
+    plugin: String,
+    deployment: String,
+    mode: String,
+    #[serde(default)]
+    deliver_replies: bool,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    config: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +315,8 @@ struct DeploymentStateEntry {
     revision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_reconciled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spec_hash: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -369,16 +391,40 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
         project.deployment_bundle_cache_dir.display()
     );
 
+    validate_target_channel_bindings(&project)?;
+
     if args.dry_run {
         print_dry_run(&project);
         return Ok(());
     }
-
     reconcile_extensions(&project)?;
 
     if !project.deployments.is_empty() {
         confirm_remote_reconcile_or_bail(&project, args.yes)?;
         run_deployments(&project)?;
+    }
+
+    if let Some(target) = &project.target {
+        if !project.channels.is_empty() {
+            println!(
+                "Channel bindings were attached to deployment specs for target `{}`; local channel runtimes will not be started:",
+                target.name
+            );
+            for binding in &project.dispatch_channels {
+                println!(
+                    "  - {} via {} -> {}",
+                    binding.label, binding.plugin, binding.deployment
+                );
+            }
+        }
+        if project.deployments.is_empty() {
+            bail!(
+                "{} targets `{}` but does not declare any [[deployments]] bindings",
+                project.config_path.display(),
+                target.name
+            );
+        }
+        return Ok(());
     }
 
     if project.channels.is_empty() {
@@ -402,6 +448,63 @@ pub(crate) fn up(args: crate::UpArgs) -> Result<()> {
     let mut project = project;
     prepare_deployment_bound_channel_parcels(&mut project)?;
     run_channel_bindings(project)
+}
+
+fn validate_target_channel_bindings(project: &ResolvedDispatchProject) -> Result<()> {
+    if project.target.is_none() {
+        return Ok(());
+    }
+    let target = project
+        .target
+        .as_ref()
+        .map(|target| target.name.as_str())
+        .unwrap_or("target");
+    let local_only: Vec<&ResolvedChannelBinding> = project
+        .channels
+        .iter()
+        .filter(|binding| binding.deployment.is_none())
+        .collect();
+    if !local_only.is_empty() {
+        let labels = local_only
+            .iter()
+            .map(|binding| binding.runtime.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "channel binding(s) {labels} have no deployment binding and cannot run locally when --target {target} is set; remove them or add `deployment = \"...\"`"
+        );
+    }
+
+    for binding in &project.channels {
+        let deployment_name = binding
+            .deployment
+            .as_deref()
+            .expect("target channel bindings without deployment are rejected above");
+        let mut deployments = project
+            .deployments
+            .iter()
+            .filter(|deployment| deployment.label == deployment_name);
+        let Some(deployment) = deployments.next() else {
+            bail!(
+                "channel `{}` references deployment `{deployment_name}`, but no matching [[deployments]] binding exists for --target {target}",
+                binding.runtime.label
+            );
+        };
+        if deployments.next().is_some() {
+            bail!(
+                "channel `{}` references deployment `{deployment_name}`, but multiple [[deployments]] bindings use that name",
+                binding.runtime.label
+            );
+        }
+        if deployment.plugin != "seren-cloud" {
+            bail!(
+                "channel `{}` references deployment `{deployment_name}` via plugin `{}`, but --target {target} channel bindings can only attach to `seren-cloud` deployments",
+                binding.runtime.label,
+                deployment.plugin
+            );
+        }
+    }
+    Ok(())
 }
 
 fn confirm_remote_reconcile_or_bail(project: &ResolvedDispatchProject, yes: bool) -> Result<()> {
@@ -454,6 +557,20 @@ fn run_deployments(project: &ResolvedDispatchProject) -> Result<()> {
                     )
                 })?;
         let spec = prepare_deployment_spec_for_invocation(project, deployment)?;
+        let spec_hash = deployment_spec_hash(&spec)?;
+        if deployment.reconcile == DeploymentReconcileMode::Upsert
+            && project.target.is_some()
+            && deployment_state_matches_spec(&state, deployment, &spec_hash)
+        {
+            let key = deployment_state_key(&deployment.plugin, &deployment.label);
+            if let Some(entry) = state.deployments.get(&key) {
+                println!(
+                    "Deployment `{}` unchanged for target; skipping upsert as {}",
+                    deployment.label, entry.deployment_id
+                );
+            }
+            continue;
+        }
         let request = match deployment.reconcile {
             DeploymentReconcileMode::Validate => PluginRequest::Validate { spec },
             DeploymentReconcileMode::TestRun => PluginRequest::TestRun {
@@ -474,12 +591,26 @@ fn run_deployments(project: &ResolvedDispatchProject) -> Result<()> {
         )
         .with_context(|| format!("deployment `{}` failed", deployment.label))?;
 
-        state_changed |= handle_deployment_response(deployment, response, &mut state)?;
+        state_changed |=
+            handle_deployment_response(deployment, response, &mut state, Some(spec_hash))?;
     }
     if state_changed {
         save_deployment_state(&project.deployment_state_path, &state)?;
     }
     Ok(())
+}
+
+fn deployment_state_matches_spec(
+    state: &DeploymentStateFile,
+    deployment: &ResolvedDeploymentBinding,
+    spec_hash: &str,
+) -> bool {
+    let key = deployment_state_key(&deployment.plugin, &deployment.label);
+    state
+        .deployments
+        .get(&key)
+        .and_then(|entry| entry.spec_hash.as_deref())
+        == Some(spec_hash)
 }
 
 fn prepare_deployment_spec_for_invocation(
@@ -503,7 +634,18 @@ fn prepare_deployment_spec_for_invocation(
     } else {
         None
     };
-    attach_dispatch_extensions(spec, extensions)
+    let channels = if deployment.plugin == "seren-cloud" {
+        project
+            .dispatch_channels
+            .iter()
+            .filter(|binding| binding.deployment == deployment.label)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let spec = attach_dispatch_extensions(spec, extensions)?;
+    attach_dispatch_channels(spec, channels)
 }
 
 fn attach_dispatch_extensions(
@@ -518,7 +660,7 @@ fn attach_dispatch_extensions(
     }
     let mut spec_object = match spec {
         Value::Object(object) => object,
-        other => return Ok(other),
+        _ => bail!("deployment spec must be a JSON object to attach dispatch_extensions"),
     };
     if spec_object.contains_key("dispatch_extensions") {
         bail!("deployment spec field `dispatch_extensions` is reserved for dispatch up");
@@ -526,6 +668,31 @@ fn attach_dispatch_extensions(
     spec_object.insert(
         "dispatch_extensions".to_string(),
         serde_json::to_value(extensions).context("failed to serialize dispatch extensions")?,
+    );
+    Ok(Value::Object(spec_object))
+}
+
+fn attach_dispatch_channels(
+    spec: Value,
+    channels: Vec<ResolvedDispatchChannelBinding>,
+) -> Result<Value> {
+    if channels.is_empty() {
+        return Ok(spec);
+    }
+    let mut spec_object = match spec {
+        Value::Object(object) => object,
+        _ => bail!("deployment spec must be a JSON object to attach dispatch_channels"),
+    };
+    if spec_object.contains_key("dispatch_channels") {
+        bail!("deployment spec field `dispatch_channels` is reserved for dispatch up");
+    }
+    spec_object.insert(
+        "dispatch_channels".to_string(),
+        serde_json::to_value(ResolvedDispatchChannelBindings {
+            format: DISPATCH_CHANNEL_BINDINGS_FORMAT,
+            channels,
+        })
+        .context("failed to serialize dispatch channel bindings")?,
     );
     Ok(Value::Object(spec_object))
 }
@@ -896,6 +1063,7 @@ fn handle_deployment_response(
     deployment: &ResolvedDeploymentBinding,
     response: PluginResponse,
     state: &mut DeploymentStateFile,
+    spec_hash: Option<String>,
 ) -> Result<bool> {
     match (deployment.reconcile, response) {
         (DeploymentReconcileMode::Validate, PluginResponse::Validation { result }) => {
@@ -942,6 +1110,7 @@ fn handle_deployment_response(
                     deployment_id: result.deployment_id.clone(),
                     revision_id: result.revision_id.clone(),
                     last_reconciled_at: Some(chrono::Utc::now().to_rfc3339()),
+                    spec_hash,
                 },
             );
             Ok(true)
@@ -984,6 +1153,29 @@ fn save_deployment_state(path: &Path, state: &DeploymentStateFile) -> Result<()>
     let body =
         serde_json::to_string_pretty(state).context("failed to serialize deployment state")?;
     fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn deployment_spec_hash(spec: &Value) -> Result<String> {
+    let canonical = canonical_json_value(spec);
+    let bytes =
+        serde_json::to_vec(&canonical).context("failed to serialize deployment spec hash input")?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut canonical = Map::new();
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonical_json_value(value));
+            }
+            Value::Object(canonical)
+        }
+        other => other.clone(),
+    }
 }
 
 fn format_validation_issues(issues: &[ValidationIssue]) -> String {
@@ -1176,6 +1368,11 @@ fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDi
         .as_ref()
         .map(|target| build_dispatch_extensions(target, &extensions))
         .transpose()?;
+    let dispatch_channels = if target.is_some() {
+        build_dispatch_channel_bindings(&channels)
+    } else {
+        Vec::new()
+    };
 
     Ok(ResolvedDispatchProject {
         config_path,
@@ -1192,6 +1389,7 @@ fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDi
         deployment_bundle_cache_index_path,
         target,
         dispatch_extensions,
+        dispatch_channels,
         extensions,
         deployments,
         channels,
@@ -1332,6 +1530,32 @@ fn build_dispatch_extensions(
         target: target.target_triple.clone(),
         extensions: resolved,
     })
+}
+
+fn build_dispatch_channel_bindings(
+    channels: &[ResolvedChannelBinding],
+) -> Vec<ResolvedDispatchChannelBinding> {
+    channels
+        .iter()
+        .filter_map(|binding| {
+            let deployment = binding.deployment.as_ref()?;
+            Some(ResolvedDispatchChannelBinding {
+                label: binding.runtime.label.clone(),
+                plugin: binding.runtime.plugin.clone(),
+                deployment: deployment.clone(),
+                mode: channel_runtime_mode_name(&binding.runtime.mode).to_string(),
+                deliver_replies: binding.runtime.deliver_replies,
+                config: binding.runtime.config.clone(),
+            })
+        })
+        .collect()
+}
+
+fn channel_runtime_mode_name(mode: &crate::channel_cmds::ChannelRuntimeMode) -> &'static str {
+    match mode {
+        crate::channel_cmds::ChannelRuntimeMode::Listen { .. } => "listen",
+        crate::channel_cmds::ChannelRuntimeMode::Poll { .. } => "poll",
+    }
 }
 
 fn extension_egress(entry: &CatalogEntry) -> Vec<String> {
@@ -1891,6 +2115,7 @@ fn run_channel_bindings(project: ResolvedDispatchProject) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn path_string(path: &Path) -> String {
@@ -2018,6 +2243,247 @@ once = true
         assert_eq!(
             project.channels[0].runtime.parcel.as_deref(),
             Some(dir.path().join("Agentfile").as_path())
+        );
+    }
+
+    #[test]
+    fn load_dispatch_project_builds_cloud_channel_bindings_for_target() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./Agentfile"
+
+[[deployments]]
+name = "cloud-bot"
+plugin = "seren-cloud"
+reconcile = "upsert"
+
+[deployments.spec]
+name = "cloud-bot"
+
+[[channels]]
+name = "discord"
+plugin = "channel-discord"
+deployment = "cloud-bot"
+mode = "poll"
+deliver_replies = true
+config = { default_channel_id = "123" }
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, Some("seren-cloud")).unwrap();
+
+        assert_eq!(project.dispatch_channels.len(), 1);
+        assert_eq!(project.dispatch_channels[0].label, "discord");
+        assert_eq!(project.dispatch_channels[0].plugin, "channel-discord");
+        assert_eq!(project.dispatch_channels[0].deployment, "cloud-bot");
+        assert_eq!(project.dispatch_channels[0].mode, "poll");
+        assert!(project.dispatch_channels[0].deliver_replies);
+        assert_eq!(
+            project.dispatch_channels[0].config["default_channel_id"],
+            "123"
+        );
+
+        let spec =
+            prepare_deployment_spec_for_invocation(&project, &project.deployments[0]).unwrap();
+        assert_eq!(
+            spec.pointer("/dispatch_channels/format")
+                .and_then(Value::as_str),
+            Some(DISPATCH_CHANNEL_BINDINGS_FORMAT)
+        );
+        assert_eq!(
+            spec.pointer("/dispatch_channels/channels/0/plugin")
+                .and_then(Value::as_str),
+            Some("channel-discord")
+        );
+    }
+
+    #[test]
+    fn cloud_target_rejects_local_only_channel_bindings() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./Agentfile"
+
+[[deployments]]
+name = "cloud-bot"
+plugin = "seren-cloud"
+reconcile = "upsert"
+
+[deployments.spec]
+name = "cloud-bot"
+
+[[channels]]
+name = "telegram"
+plugin = "channel-telegram"
+mode = "poll"
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, Some("seren-cloud")).unwrap();
+        let error = validate_target_channel_bindings(&project).unwrap_err();
+
+        assert!(error.to_string().contains("have no deployment binding"));
+    }
+
+    #[test]
+    fn cloud_target_rejects_channel_binding_without_matching_deployment() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./Agentfile"
+
+[[deployments]]
+name = "cloud-bot"
+plugin = "seren-cloud"
+reconcile = "upsert"
+
+[deployments.spec]
+name = "cloud-bot"
+
+[[channels]]
+name = "discord"
+plugin = "channel-discord"
+deployment = "typo"
+mode = "poll"
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, Some("seren-cloud")).unwrap();
+        let error = validate_target_channel_bindings(&project).unwrap_err();
+
+        assert!(error.to_string().contains("no matching [[deployments]]"));
+    }
+
+    #[test]
+    fn cloud_target_rejects_channel_binding_for_non_cloud_deployment() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./Agentfile"
+
+[[deployments]]
+name = "worker"
+plugin = "other-cloud"
+reconcile = "upsert"
+
+[deployments.spec]
+name = "worker"
+
+[[channels]]
+name = "discord"
+plugin = "channel-discord"
+deployment = "worker"
+mode = "poll"
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, Some("seren-cloud")).unwrap();
+        let error = validate_target_channel_bindings(&project).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("can only attach to `seren-cloud`")
+        );
+    }
+
+    #[test]
+    fn attach_dispatch_channels_rejects_non_object_specs() {
+        let error = attach_dispatch_channels(
+            json!("not-object"),
+            vec![ResolvedDispatchChannelBinding {
+                label: "discord".to_string(),
+                plugin: "channel-discord".to_string(),
+                deployment: "cloud-bot".to_string(),
+                mode: "poll".to_string(),
+                deliver_replies: false,
+                config: Value::Null,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn deployment_state_matches_spec_hash() {
+        let deployment = ResolvedDeploymentBinding {
+            label: "cloud-bot".to_string(),
+            plugin: "seren-cloud".to_string(),
+            config: None,
+            reconcile: DeploymentReconcileMode::Upsert,
+            sample_input: None,
+            spec: json!({}),
+        };
+        let spec = json!({ "name": "cloud-bot" });
+        let spec_hash = deployment_spec_hash(&spec).unwrap();
+        let mut state = DeploymentStateFile::default();
+        state.deployments.insert(
+            deployment_state_key(&deployment.plugin, &deployment.label),
+            DeploymentStateEntry {
+                plugin: deployment.plugin.clone(),
+                name: deployment.label.clone(),
+                deployment_id: "dep-123".to_string(),
+                revision_id: None,
+                last_reconciled_at: None,
+                spec_hash: Some(spec_hash.clone()),
+            },
+        );
+
+        assert!(deployment_state_matches_spec(
+            &state,
+            &deployment,
+            &spec_hash
+        ));
+        assert!(!deployment_state_matches_spec(
+            &state,
+            &deployment,
+            "different"
+        ));
+    }
+
+    #[test]
+    fn deployment_spec_hash_canonicalizes_object_key_order() {
+        let mut left_nested = Map::new();
+        left_nested.insert("z".to_string(), json!(1));
+        left_nested.insert("a".to_string(), json!(2));
+        let mut left = Map::new();
+        left.insert("b".to_string(), Value::Object(left_nested));
+        left.insert("a".to_string(), json!([{"y": true, "x": false}]));
+
+        let mut right_nested = Map::new();
+        right_nested.insert("a".to_string(), json!(2));
+        right_nested.insert("z".to_string(), json!(1));
+        let mut array_object = Map::new();
+        array_object.insert("x".to_string(), json!(false));
+        array_object.insert("y".to_string(), json!(true));
+        let mut right = Map::new();
+        right.insert(
+            "a".to_string(),
+            Value::Array(vec![Value::Object(array_object)]),
+        );
+        right.insert("b".to_string(), Value::Object(right_nested));
+
+        assert_eq!(
+            deployment_spec_hash(&Value::Object(left)).unwrap(),
+            deployment_spec_hash(&Value::Object(right)).unwrap()
         );
     }
 
@@ -2163,6 +2629,7 @@ spec_file = {}
             deployment_id: "dep-123".to_string(),
             revision_id: Some("rev-1".to_string()),
             last_reconciled_at: None,
+            spec_hash: None,
         };
 
         let parcel_dir =
