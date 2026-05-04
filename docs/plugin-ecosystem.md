@@ -4,8 +4,8 @@ Dispatch's extension model currently assumes a user already has the manifest fil
 
 This document describes a four-tier roadmap for Dispatch's plugin discovery, distribution, and trust model. The tiers are incremental: each one is useful on its own and provides the foundation for the next.
 
-- Tier 1 (v0.3.0): **Catalog sources** - Homebrew tap-style discovery
-- Tier 2 (v0.3.0): **Install by name** - resolve, fetch, verify published binaries
+- Tier 1: **Catalog sources** - Homebrew tap-style discovery
+- Tier 2: **Install by name** - resolve, fetch, verify published binaries
 - Tier 3 (vFuture): **Capability-based trust** - manifest-declared permissions
 - Tier 4 (vFuture): **Official index** - curated registry, if warranted
 
@@ -15,7 +15,7 @@ The core principle across all tiers: manifest-first, decentralized, signed. Disp
 
 ## Tier 1: Catalog sources
 
-**Status:** implemented in v0.3.0.
+**Status:** Implemented.
 
 ### Problem
 
@@ -111,7 +111,7 @@ To propose adding a catalog here, open a pull request against Dispatch with the 
 
 ## Tier 2: Install by name
 
-**Status:** implemented in v0.3.0 for GitHub release binaries.
+**Status:** Implemented for GitHub release binaries.
 
 ### Problem
 
@@ -127,7 +127,7 @@ Step 3 is particularly painful for 3rd parties - every plugin repo has its own b
 
 ### Design
 
-Extend catalog entries with a `source` block that describes how Dispatch can acquire the binary itself. The shipped v0.3.0 path supports direct GitHub release binaries.
+Extend catalog entries with a `source` block that describes how Dispatch can acquire the binary itself. The shipped path supports direct GitHub release binaries.
 
 **GitHub release (preferred - no toolchain needed):**
 
