@@ -50,11 +50,17 @@ Fetched catalogs are cached as JSON under `~/.config/dispatch/catalog-cache/<nam
 
 ### Catalog schema v1
 
-Already shipped in `dispatch-plugins/catalog/extensions.json`. Each entry has:
+Already shipped in `dispatch-plugins/catalog/extensions.json`. The catalog document has:
 
-- `name` - catalog-unique identifier (e.g. `channel-telegram`)
+- `catalog_id` - immutable publisher/catalog identity (for example `seren`)
+- `entries` - extension records owned by that catalog
+
+Each entry has:
+
+- `id` - immutable extension identity scoped by the publisher/catalog (for example `seren.channel.telegram`)
+- `name` - install/runtime plugin name (for example `channel-telegram`)
 - `display_name`, `description`, `version`
-- `kind` - `channel`, `courier`, or `connector`
+- `kind` - `channel`, `courier`, `connector`, `provider`, `database`, or `deployment`
 - `protocol` / `protocol_version` - wire format and version
 - `manifest_path` OR `manifest_url` - relative-to-catalog path or absolute URL
 - `source_dir` - relative-to-catalog source tree (optional)
@@ -62,6 +68,8 @@ Already shipped in `dispatch-plugins/catalog/extensions.json`. Each entry has:
 - `install_hint` - human-readable install string for the current Tier 1 flow
 - `auth` - `{ method, provider, setup_url? }`
 - `requirements` - `{ secrets[], optional_secrets[], network_domains[], platforms[] }`
+
+`catalog_id` and entry `id` are required. They must use only lowercase ASCII letters, digits, `.`, `-`, and `_`; they are limited to 80 characters; they must not contain leading or trailing whitespace; and they must not start or end with `.`.
 
 Everything above is declarative. Dispatch never executes plugin code to populate or validate a catalog entry.
 
@@ -152,7 +160,7 @@ Each binary entry may either include an inline `sha256` or inherit its hash from
 
 Flow:
 
-1. Resolve `name` via configured catalogs
+1. Resolve the entry `name` via configured catalogs
 2. Select the published `github_release` binary that matches the current host target
 3. Download the asset and verify its SHA256
 4. Stage the binary under `~/.config/dispatch/bin/<name>/<version>/`

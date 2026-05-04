@@ -911,12 +911,14 @@ fn extension_search(
         #[derive(serde::Serialize)]
         struct HitView<'a> {
             catalog: &'a str,
+            catalog_id: &'a str,
             entry: &'a dispatch_core::CatalogEntry,
         }
         let view: Vec<HitView<'_>> = hits
             .iter()
             .map(|hit| HitView {
                 catalog: &hit.catalog,
+                catalog_id: &hit.catalog_id,
                 entry: &hit.entry,
             })
             .collect();
@@ -956,12 +958,14 @@ fn extension_show(
         #[derive(serde::Serialize)]
         struct ShowView<'a> {
             catalog: &'a str,
+            catalog_id: &'a str,
             entry: &'a dispatch_core::CatalogEntry,
         }
         println!(
             "{}",
             serde_json::to_string_pretty(&ShowView {
                 catalog: &hit.catalog,
+                catalog_id: &hit.catalog_id,
                 entry: &hit.entry,
             })?
         );
@@ -991,6 +995,7 @@ fn print_search_hit(hit: &CatalogSearchHit) {
 
 fn print_detail(hit: &CatalogSearchHit) {
     let entry = &hit.entry;
+    println!("id:           {}", entry.id);
     println!("name:         {}", entry.name);
     if let Some(display) = &entry.display_name {
         println!("display_name: {display}");
@@ -998,6 +1003,7 @@ fn print_detail(hit: &CatalogSearchHit) {
     println!("kind:         {}", entry.kind.as_str());
     println!("version:      {}", entry.version);
     println!("catalog:      {}", hit.catalog);
+    println!("catalog_id:   {}", hit.catalog_id);
     if let Some(description) = &entry.description {
         println!("description:  {description}");
     }
@@ -1152,6 +1158,7 @@ mod tests {
     #[test]
     fn resolve_install_manifest_url_requires_absolute_manifest_url() {
         let entry = CatalogEntry {
+            id: "seren.deployment.cloud".to_string(),
             name: "seren-cloud".to_string(),
             display_name: None,
             kind: CatalogExtensionKind::Courier,
@@ -1277,8 +1284,10 @@ mod tests {
             "seren-cloud",
             &format!(
                 r#"{{
+                    "catalog_id": "seren",
                     "entries": [
                         {{
+                            "id": "seren.deployment.cloud",
                             "name": "seren-cloud",
                             "kind": "courier",
                             "version": "0.1.0",
@@ -1435,8 +1444,10 @@ mod tests {
             "seren",
             &format!(
                 r#"{{
+                    "catalog_id": "seren",
                     "entries": [
                         {{
+                            "id": "seren.provider.models",
                             "name": "seren-models",
                             "kind": "provider",
                             "version": "0.1.0",

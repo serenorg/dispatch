@@ -140,6 +140,7 @@ impl CatalogConfig {
 pub struct ExtensionCatalog {
     #[serde(default, rename = "schema")]
     pub schema: Option<String>,
+    pub catalog_id: String,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
@@ -198,6 +199,7 @@ pub struct GithubReleaseBinary {
 /// One plugin entry inside an `ExtensionCatalog`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEntry {
+    pub id: String,
     pub name: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -234,6 +236,7 @@ impl CatalogEntry {
     pub fn matches(&self, needle: &str) -> bool {
         let needle = needle.to_ascii_lowercase();
         let fields: &[Option<&str>] = &[
+            Some(self.id.as_str()),
             Some(self.name.as_str()),
             self.display_name.as_deref(),
             self.description.as_deref(),
@@ -257,6 +260,7 @@ impl CatalogEntry {
 #[derive(Debug, Clone)]
 pub struct CatalogSearchHit {
     pub catalog: String,
+    pub catalog_id: String,
     pub entry: CatalogEntry,
 }
 
@@ -340,11 +344,18 @@ pub fn load_cached_catalog(cache_dir: &Path, name: &str) -> Result<ExtensionCata
             });
         }
     };
-    serde_json::from_str(&body).map_err(|error| CatalogError::ParseCatalog {
+    let parsed: ExtensionCatalog =
+        serde_json::from_str(&body).map_err(|error| CatalogError::ParseCatalog {
+            name: name.to_string(),
+            location: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+    validate_catalog_document(&parsed).map_err(|message| CatalogError::ParseCatalog {
         name: name.to_string(),
         location: path.display().to_string(),
-        message: error.to_string(),
-    })
+        message,
+    })?;
+    Ok(parsed)
 }
 
 /// Write a raw catalog response body to the cache, verifying it parses and
@@ -360,6 +371,11 @@ pub fn write_cache(
             location: "response body".to_string(),
             message: error.to_string(),
         })?;
+    validate_catalog_document(&parsed).map_err(|message| CatalogError::ParseCatalog {
+        name: name.to_string(),
+        location: "response body".to_string(),
+        message,
+    })?;
     fs::create_dir_all(cache_dir).map_err(|source| CatalogError::WriteCache {
         name: name.to_string(),
         path: cache_dir.display().to_string(),
@@ -372,6 +388,47 @@ pub fn write_cache(
         source,
     })?;
     Ok(parsed)
+}
+
+fn validate_catalog_document(catalog: &ExtensionCatalog) -> Result<(), String> {
+    validate_catalog_identifier("catalog_id", &catalog.catalog_id)?;
+    for entry in &catalog.entries {
+        validate_catalog_identifier("entry id", &entry.id).map_err(|message| {
+            format!("catalog entry `{}` has invalid id: {message}", entry.name)
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_catalog_identifier(field: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if trimmed != value {
+        return Err(format!(
+            "{field} must not contain leading or trailing whitespace"
+        ));
+    }
+    if value.len() > 80 {
+        return Err(format!("{field} must be at most 80 characters"));
+    }
+    if value.starts_with('.') || value.ends_with('.') {
+        return Err(format!("{field} must not start or end with `.`"));
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+    }) {
+        return Err(format!(
+            "{field} must use lowercase ASCII letters, digits, `.`, `-`, or `_`"
+        ));
+    }
+    if value.split('.').any(str::is_empty) {
+        return Err(format!(
+            "{field} must not contain empty dot-separated segments"
+        ));
+    }
+    Ok(())
 }
 
 /// Fetch a catalog document over HTTP and return the body as a string.
@@ -451,6 +508,7 @@ pub fn search_cached(
         let Ok(catalog) = load_cached_catalog(cache_dir, &source.name) else {
             continue;
         };
+        let catalog_id = catalog.catalog_id.clone();
         for entry in catalog.entries {
             if let Some(kind) = kind_filter
                 && entry.kind != kind
@@ -460,6 +518,7 @@ pub fn search_cached(
             if query.is_empty() || entry.matches(query) {
                 hits.push(CatalogSearchHit {
                     catalog: source.name.clone(),
+                    catalog_id: catalog_id.clone(),
                     entry,
                 });
             }
@@ -479,9 +538,11 @@ pub fn find_cached_entry(
         let Ok(catalog) = load_cached_catalog(cache_dir, &source.name) else {
             continue;
         };
+        let catalog_id = catalog.catalog_id.clone();
         if let Some(entry) = catalog.entries.into_iter().find(|entry| entry.name == name) {
             return Some(CatalogSearchHit {
                 catalog: source.name.clone(),
+                catalog_id,
                 entry,
             });
         }
@@ -497,6 +558,7 @@ mod tests {
 
     fn sample_entry(name: &str, kind: CatalogExtensionKind) -> CatalogEntry {
         CatalogEntry {
+            id: format!("seren.{name}"),
             name: name.to_string(),
             display_name: Some(format!("{name} display")),
             kind,
@@ -521,6 +583,7 @@ mod tests {
     fn sample_catalog() -> ExtensionCatalog {
         ExtensionCatalog {
             schema: Some(CATALOG_SCHEMA_V1.to_string()),
+            catalog_id: "seren".to_string(),
             repository: Some("dispatch-plugins".to_string()),
             generated_at: None,
             entries: vec![
@@ -550,8 +613,10 @@ mod tests {
     fn catalog_entry_deserializes_github_release_source() {
         let catalog: ExtensionCatalog = serde_json::from_str(
             r#"{
+                "catalog_id": "seren",
                 "entries": [
                     {
+                        "id": "seren.deployment.cloud",
                         "name": "seren-cloud",
                         "kind": "courier",
                         "version": "0.1.0",
@@ -642,6 +707,7 @@ mod tests {
         let entry = sample_entry("channel-telegram", CatalogExtensionKind::Channel);
         assert!(entry.matches("telegram"));
         assert!(entry.matches("TELEGRAM"));
+        assert!(entry.matches("seren.channel-telegram"));
         assert!(entry.matches("messaging"));
         assert!(entry.matches("prototype"));
         assert!(!entry.matches("discord"));
@@ -656,6 +722,115 @@ mod tests {
         assert_eq!(parsed.entries.len(), 2);
         let reloaded = load_cached_catalog(&cache_dir, "plugins").unwrap();
         assert_eq!(reloaded.entries[0].name, "channel-telegram");
+    }
+
+    #[test]
+    fn write_cache_rejects_missing_catalog_id() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join(CATALOG_CACHE_DIR);
+        let body = r#"{
+            "entries": [
+                {
+                    "id": "seren.channel.discord",
+                    "name": "discord",
+                    "kind": "channel",
+                    "version": "0.1.0"
+                }
+            ]
+        }"#;
+
+        let error = write_cache(&cache_dir, "plugins", body).unwrap_err();
+
+        assert!(matches!(error, CatalogError::ParseCatalog { .. }));
+        assert!(error.to_string().contains("missing field `catalog_id`"));
+    }
+
+    #[test]
+    fn write_cache_rejects_missing_entry_id() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join(CATALOG_CACHE_DIR);
+        let body = r#"{
+            "catalog_id": "seren",
+            "entries": [
+                {
+                    "name": "discord",
+                    "kind": "channel",
+                    "version": "0.1.0"
+                }
+            ]
+        }"#;
+
+        let error = write_cache(&cache_dir, "plugins", body).unwrap_err();
+
+        assert!(matches!(error, CatalogError::ParseCatalog { .. }));
+        assert!(error.to_string().contains("missing field `id`"));
+    }
+
+    #[test]
+    fn write_cache_rejects_invalid_entry_id_syntax() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join(CATALOG_CACHE_DIR);
+        let body = r#"{
+            "catalog_id": "seren",
+            "entries": [
+                {
+                    "id": "Seren/channel.discord",
+                    "name": "discord",
+                    "kind": "channel",
+                    "version": "0.1.0"
+                }
+            ]
+        }"#;
+
+        let error = write_cache(&cache_dir, "plugins", body).unwrap_err();
+
+        assert!(matches!(error, CatalogError::ParseCatalog { .. }));
+        assert!(error.to_string().contains("invalid id"));
+    }
+
+    #[test]
+    fn write_cache_rejects_invalid_catalog_id_syntax() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join(CATALOG_CACHE_DIR);
+        let body = r#"{
+            "catalog_id": "seren.",
+            "entries": [
+                {
+                    "id": "seren.channel.discord",
+                    "name": "discord",
+                    "kind": "channel",
+                    "version": "0.1.0"
+                }
+            ]
+        }"#;
+
+        let error = write_cache(&cache_dir, "plugins", body).unwrap_err();
+
+        assert!(matches!(error, CatalogError::ParseCatalog { .. }));
+        assert!(error.to_string().contains("catalog_id"));
+        assert!(error.to_string().contains("must not start or end"));
+    }
+
+    #[test]
+    fn write_cache_rejects_empty_dot_segments() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join(CATALOG_CACHE_DIR);
+        let body = r#"{
+            "catalog_id": "seren",
+            "entries": [
+                {
+                    "id": "seren..channel.discord",
+                    "name": "channel-discord",
+                    "kind": "channel",
+                    "version": "0.1.0"
+                }
+            ]
+        }"#;
+
+        let error = write_cache(&cache_dir, "plugins", body).unwrap_err();
+
+        assert!(matches!(error, CatalogError::ParseCatalog { .. }));
+        assert!(error.to_string().contains("empty dot-separated segments"));
     }
 
     #[test]
@@ -689,6 +864,7 @@ mod tests {
         let telegram = search_cached(&config, &cache_dir, "telegram", None);
         assert_eq!(telegram.len(), 1);
         assert_eq!(telegram[0].entry.name, "channel-telegram");
+        assert_eq!(telegram[0].catalog_id, "seren");
     }
 
     #[test]
@@ -707,6 +883,7 @@ mod tests {
 
         let hit = find_cached_entry(&config, &cache_dir, "courier-seren-cloud").unwrap();
         assert_eq!(hit.catalog, "plugins");
+        assert_eq!(hit.catalog_id, "seren");
         assert_eq!(hit.entry.kind, CatalogExtensionKind::Courier);
         assert!(find_cached_entry(&config, &cache_dir, "nope").is_none());
     }

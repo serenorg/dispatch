@@ -606,7 +606,7 @@ Vendor-specific extensions live in their own repositories.
 
 Every plugin in the ecosystem does not live in `dispatch-plugins`. Third-party and vendor-specific extensions can ship in their own repositories. Dispatch discovers them through **catalogs** - JSON index documents published at stable URLs.
 
-A catalog is just an `extensions.json` document listing entries. The canonical example lives at `https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json`. Any 3rd-party plugin repository can publish the same schema.
+A catalog is just an `extensions.json` document listing entries. The canonical example lives at `https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json`. Any 3rd-party plugin repository can publish the same schema. Remote catalogs must declare a top-level `catalog_id`, and every entry must declare an immutable `id`. Those ids use lowercase ASCII letters, digits, `.`, `-`, and `_`, are limited to 80 characters, and cannot start or end with `.` or whitespace.
 
 ### Registering a catalog
 
@@ -644,7 +644,7 @@ dispatch extension search --json
 dispatch extension show seren-cloud
 ```
 
-`dispatch extension show` prints the name, version, catalog, description, install hint, requirements, manifest location, and any machine-installable source metadata.
+`dispatch extension show` prints the id, name, version, catalog, catalog_id, description, install hint, requirements, manifest location, and any machine-installable source metadata.
 
 If a catalog entry publishes a `source` block with a direct GitHub release binary, Dispatch can install it by name:
 

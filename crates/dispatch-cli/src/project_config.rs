@@ -224,6 +224,7 @@ enum ResolvedExtensionInstallSource {
     },
     Catalog {
         catalog: String,
+        catalog_id: String,
         entry: Box<CatalogEntry>,
     },
 }
@@ -250,6 +251,8 @@ struct ResolvedDispatchExtension {
     kind: String,
     version: String,
     catalog: String,
+    catalog_id: String,
+    extension_id: String,
     target: String,
     artifact_url: String,
     sha256: String,
@@ -1204,7 +1207,7 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
                 ResolvedExtensionInstallSource::LocalManifest { manifest } => {
                     println!("  - {}: {}", extension.kind.label(), manifest.display());
                 }
-                ResolvedExtensionInstallSource::Catalog { catalog, entry } => {
+                ResolvedExtensionInstallSource::Catalog { catalog, entry, .. } => {
                     println!(
                         "  - {}: {} {} from catalog `{catalog}`",
                         extension.kind.label(),
@@ -1445,6 +1448,7 @@ fn resolve_extension_install(
                 name: hit.entry.name.clone(),
                 source: ResolvedExtensionInstallSource::Catalog {
                     catalog: hit.catalog,
+                    catalog_id: hit.catalog_id,
                     entry: Box::new(hit.entry),
                 },
             })
@@ -1491,7 +1495,12 @@ fn build_dispatch_extensions(
         if !extension.kind.is_runtime_plugin() {
             continue;
         }
-        let ResolvedExtensionInstallSource::Catalog { catalog, entry } = &extension.source else {
+        let ResolvedExtensionInstallSource::Catalog {
+            catalog,
+            catalog_id,
+            entry,
+        } = &extension.source
+        else {
             bail!(
                 "{} plugin `{}` uses a local manifest, which cannot be deployed to target `{}`; publish the extension to a catalog and use `source = \"catalog\"` so Dispatch can resolve a `{}` artifact",
                 extension.kind.label(),
@@ -1513,6 +1522,8 @@ fn build_dispatch_extensions(
             kind: entry.kind.as_str().to_string(),
             version: entry.version.clone(),
             catalog: catalog.clone(),
+            catalog_id: catalog_id.clone(),
+            extension_id: entry.id.clone(),
             target: artifact.target,
             artifact_url: artifact.artifact_url,
             sha256: artifact.sha256,
@@ -2762,6 +2773,75 @@ manifest = {}
         assert!(error.contains("uses a local manifest"));
         assert!(error.contains("publish the extension to a catalog"));
         assert!(error.contains("source = \"catalog\""));
+    }
+
+    #[test]
+    fn build_dispatch_extensions_uses_entry_id_for_cloud_identity() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", server.server_addr());
+        let server_thread = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            assert_eq!(request.url(), "/catalog/channel-plugin.json");
+            request
+                .respond(tiny_http::Response::from_string("{}"))
+                .unwrap();
+        });
+        let target = DeploymentTarget {
+            name: "seren-cloud".to_string(),
+            target_triple: "aarch64-unknown-linux-gnu".to_string(),
+        };
+        let entry = CatalogEntry {
+            id: "seren.channel.discord".to_string(),
+            name: "channel-discord".to_string(),
+            display_name: None,
+            kind: CatalogExtensionKind::Channel,
+            version: "0.1.0".to_string(),
+            description: None,
+            protocol: Some("jsonl".to_string()),
+            protocol_version: Some(1),
+            source_dir: None,
+            manifest_path: None,
+            manifest_url: Some(format!("{base_url}/catalog/channel-plugin.json")),
+            keywords: Vec::new(),
+            tags: Vec::new(),
+            install_hint: None,
+            source: Some(dispatch_core::CatalogInstallSource::GithubRelease {
+                repo: "serenorg/dispatch-channel-discord".to_string(),
+                tag: "v0.1.0".to_string(),
+                base_url: Some(base_url),
+                checksum_asset: None,
+                binaries: vec![dispatch_core::GithubReleaseBinary {
+                    target: "aarch64-unknown-linux-gnu".to_string(),
+                    asset: "dispatch-channel-discord-aarch64-unknown-linux-gnu".to_string(),
+                    sha256: Some(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                    ),
+                    binary_name: "dispatch-channel-discord".to_string(),
+                }],
+            }),
+            auth: None,
+            requirements: None,
+        };
+        let extension = ResolvedExtensionInstall {
+            kind: ExtensionKind::Channel,
+            name: entry.name.clone(),
+            source: ResolvedExtensionInstallSource::Catalog {
+                catalog: "local-short-slug".to_string(),
+                catalog_id: "seren".to_string(),
+                entry: Box::new(entry),
+            },
+        };
+
+        let resolved = build_dispatch_extensions(&target, &[extension]).unwrap();
+
+        server_thread.join().unwrap();
+        assert_eq!(resolved.extensions.len(), 1);
+        let extension = &resolved.extensions[0];
+        assert_eq!(extension.extension_id, "seren.channel.discord");
+        assert_eq!(extension.name, "channel-discord");
+        assert_eq!(extension.catalog, "local-short-slug");
+        assert_eq!(extension.catalog_id, "seren");
     }
 
     #[test]
