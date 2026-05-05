@@ -126,6 +126,7 @@ struct ChannelRuntimeEventContext<'a> {
 pub(crate) enum ChannelRuntimeMode {
     Listen { listen: String },
     Poll { interval_ms: Option<u64> },
+    Websocket,
 }
 
 #[derive(Debug, Clone)]
@@ -490,7 +491,7 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
         default_channel_ingress_state_path(&args.label, &plugin.name, &args.config)?;
     let restored_state = load_channel_ingress_state(&ingress_state_path)?;
 
-    if matches!(args.mode, ChannelRuntimeMode::Poll { .. }) && args.once {
+    if matches!(&args.mode, ChannelRuntimeMode::Poll { .. }) && args.once {
         return run_channel_poll_once(
             &plugin,
             &args.config,
@@ -506,8 +507,9 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
         save_channel_ingress_state(&ingress_state_path, state)?;
     }
 
-    match args.mode {
-        ChannelRuntimeMode::Poll { .. } => {
+    let explicit_websocket = matches!(&args.mode, ChannelRuntimeMode::Websocket);
+    match &args.mode {
+        ChannelRuntimeMode::Poll { .. } | ChannelRuntimeMode::Websocket => {
             let staged_media = ListenerStagedMedia::from_config(&Value::Null);
             let event_context = ChannelRuntimeEventContext {
                 config: &args.config,
@@ -515,12 +517,21 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                 parcel_bridge: parcel_bridge.as_ref(),
                 staged_media: &staged_media,
                 emit_json: args.emit_json,
-                source: "Poll",
+                source: if explicit_websocket {
+                    "Websocket"
+                } else {
+                    "Poll"
+                },
             };
-            if !matches!(
+            let mode_matches = match (
+                explicit_websocket.then_some(IngressMode::Websocket),
                 runtime.ingress_state.as_ref().map(|state| &state.mode),
-                Some(IngressMode::Polling | IngressMode::Websocket)
             ) {
+                (Some(expected), Some(actual)) => actual == &expected,
+                (None, Some(IngressMode::Polling | IngressMode::Websocket)) => true,
+                _ => false,
+            };
+            if !mode_matches {
                 let stop_result = stop_channel_runtime_plugin(&mut runtime, &args.config);
                 let mode_name = runtime
                     .ingress_state
@@ -604,7 +615,7 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                 emit_json: args.emit_json,
                 source: "Ingress",
             };
-            let server = Server::http(&listen)
+            let server = Server::http(listen.as_str())
                 .map_err(|error| anyhow::anyhow!("failed to bind {listen}: {error}"))?;
             if matches!(
                 runtime.ingress_state.as_ref().map(|state| &state.mode),

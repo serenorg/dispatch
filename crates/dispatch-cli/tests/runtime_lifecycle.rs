@@ -153,8 +153,8 @@ fn wait_for_run_record(
 
 fn http_request(addr: &str, request: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(request.as_bytes())?;
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -181,7 +181,7 @@ fn http_request_with_retry(
     addr: &str,
     request: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match http_request(addr, request) {
             Ok(response) => return Ok(response),
@@ -189,12 +189,7 @@ fn http_request_with_retry(
                 let retryable = error
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io_error| {
-                        matches!(
-                            io_error.kind(),
-                            std::io::ErrorKind::ConnectionRefused
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::ConnectionReset
-                        )
+                        io_error.kind() == std::io::ErrorKind::ConnectionRefused
                     });
                 if !retryable {
                     return Err(error);
@@ -1471,6 +1466,7 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let registry_path = dir.path().join("channels.json");
@@ -1539,6 +1535,7 @@ fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn dispatch_up_uses_project_local_channel_registry() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let manifest_path = write_channel_test_plugin(dir.path())?;
@@ -1587,6 +1584,7 @@ once = true
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn dispatch_up_loads_channel_toml_config_file() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let request_log = dir.path().join("request.json");
@@ -1812,6 +1810,7 @@ once = true
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dyn std::error::Error>>
 {
     let dir = tempdir()?;
@@ -1881,6 +1880,7 @@ fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dy
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let registry_path = dir.path().join("channels.json");
@@ -2160,6 +2160,7 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_rejects_polling_plugins_and_stops_ingress()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
@@ -2335,6 +2336,7 @@ fn channel_inspect_text_reports_fixed_timeout() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
@@ -2404,6 +2406,7 @@ fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_delivers_replies_through_plugin() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     let channel_registry_path = dir.path().join("channels.json");
@@ -2570,6 +2573,7 @@ fn channel_listen_rejects_deliver_replies_without_parcel() -> Result<(), Box<dyn
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_delivers_structured_channel_reply_envelope()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
@@ -2710,6 +2714,7 @@ fn channel_listen_delivers_structured_channel_reply_envelope()
 }
 
 #[test]
+#[serial_test::file_serial(channel_listener)]
 fn channel_listen_delivers_first_class_channel_reply_event()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
