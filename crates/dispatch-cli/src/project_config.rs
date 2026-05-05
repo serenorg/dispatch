@@ -162,6 +162,7 @@ struct DeploymentBindingConfig {
 enum ChannelBindingMode {
     Listen,
     Poll,
+    Websocket,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,8 +507,20 @@ fn validate_target_channel_bindings(project: &ResolvedDispatchProject) -> Result
                 deployment.plugin
             );
         }
+        if !deployment_spec_is_llm_workload(&deployment.spec) {
+            bail!(
+                "channel `{}` references deployment `{deployment_name}`, but --target {target} channel bindings require a `seren-cloud` LLM workload (`spec.workload.execution.type = \"llm\"`)",
+                binding.runtime.label
+            );
+        }
     }
     Ok(())
+}
+
+fn deployment_spec_is_llm_workload(spec: &Value) -> bool {
+    spec.pointer("/workload/execution/type")
+        .and_then(Value::as_str)
+        == Some("llm")
 }
 
 fn confirm_remote_reconcile_or_bail(project: &ResolvedDispatchProject, yes: bool) -> Result<()> {
@@ -1271,6 +1284,7 @@ fn print_dry_run(project: &ResolvedDispatchProject) {
                         None => "poll plugin default interval".to_string(),
                     }
                 }
+                crate::channel_cmds::ChannelRuntimeMode::Websocket => "websocket".to_string(),
             };
             println!(
                 "  - {} via {} ({mode})",
@@ -1348,20 +1362,22 @@ fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDi
         deployments.push(resolve_deployment_binding(&root_dir, deployment)?);
     }
 
+    let target = target.map(resolve_deployment_target).transpose()?;
+    let channel_resolve = ChannelBindingResolveContext {
+        root_dir: &root_dir,
+        parcel: parcel.as_deref(),
+        remote_target: target.is_some(),
+        courier: &parsed.courier,
+        courier_registry: &courier_registry,
+        channel_registry: &channel_registry,
+        tool_approval: parsed.tool_approval,
+    };
+
     let mut channels = Vec::with_capacity(parsed.channels.len());
     for binding in parsed.channels {
-        channels.push(resolve_channel_binding(
-            &root_dir,
-            parcel.as_deref(),
-            &parsed.courier,
-            &courier_registry,
-            &channel_registry,
-            parsed.tool_approval,
-            binding,
-        )?);
+        channels.push(resolve_channel_binding(&channel_resolve, binding)?);
     }
 
-    let target = target.map(resolve_deployment_target).transpose()?;
     let extensions = parsed
         .extensions
         .into_iter()
@@ -1566,6 +1582,7 @@ fn channel_runtime_mode_name(mode: &crate::channel_cmds::ChannelRuntimeMode) -> 
     match mode {
         crate::channel_cmds::ChannelRuntimeMode::Listen { .. } => "listen",
         crate::channel_cmds::ChannelRuntimeMode::Poll { .. } => "poll",
+        crate::channel_cmds::ChannelRuntimeMode::Websocket => "websocket",
     }
 }
 
@@ -1625,13 +1642,18 @@ fn resolve_deployment_binding(
     })
 }
 
-fn resolve_channel_binding(
-    root_dir: &Path,
-    parcel: Option<&Path>,
-    courier: &str,
-    courier_registry: &Path,
-    channel_registry: &Path,
+struct ChannelBindingResolveContext<'a> {
+    root_dir: &'a Path,
+    parcel: Option<&'a Path>,
+    remote_target: bool,
+    courier: &'a str,
+    courier_registry: &'a Path,
+    channel_registry: &'a Path,
     tool_approval: Option<crate::CliToolApprovalMode>,
+}
+
+fn resolve_channel_binding(
+    ctx: &ChannelBindingResolveContext<'_>,
     binding: ChannelBindingConfig,
 ) -> Result<ResolvedChannelBinding> {
     let label = binding
@@ -1640,22 +1662,22 @@ fn resolve_channel_binding(
         .unwrap_or_else(|| binding.plugin.clone());
     let deployment = binding.deployment.clone();
 
-    if binding.deliver_replies && parcel.is_none() {
+    if binding.deliver_replies && ctx.parcel.is_none() && !ctx.remote_target {
         bail!(
             "channel `{label}` sets `deliver_replies = true`, but dispatch.toml does not declare `parcel`"
         );
     }
-    if deployment.is_some() && parcel.is_none() {
+    if deployment.is_some() && ctx.parcel.is_none() && !ctx.remote_target {
         bail!(
             "channel `{label}` references `deployment`, but dispatch.toml does not declare `parcel`"
         );
     }
 
-    let config = load_channel_config(root_dir, binding.config, binding.config_file.as_deref())?;
+    let config = load_channel_config(ctx.root_dir, binding.config, binding.config_file.as_deref())?;
     let session_root = binding
         .session_root
-        .map(|value| resolve_relative_path(root_dir, value))
-        .unwrap_or_else(|| root_dir.join(".dispatch/channel-sessions"));
+        .map(|value| resolve_relative_path(ctx.root_dir, value))
+        .unwrap_or_else(|| ctx.root_dir.join(".dispatch/channel-sessions"));
 
     let mode = match binding.mode {
         ChannelBindingMode::Listen => {
@@ -1669,6 +1691,7 @@ fn resolve_channel_binding(
         ChannelBindingMode::Poll => crate::channel_cmds::ChannelRuntimeMode::Poll {
             interval_ms: binding.interval_ms,
         },
+        ChannelBindingMode::Websocket => crate::channel_cmds::ChannelRuntimeMode::Websocket,
     };
 
     Ok(ResolvedChannelBinding {
@@ -1677,15 +1700,15 @@ fn resolve_channel_binding(
             label,
             plugin: binding.plugin,
             config,
-            parcel: parcel.map(PathBuf::from),
-            courier: courier.to_string(),
-            courier_registry: Some(courier_registry.to_path_buf()),
+            parcel: ctx.parcel.map(PathBuf::from),
+            courier: ctx.courier.to_string(),
+            courier_registry: Some(ctx.courier_registry.to_path_buf()),
             session_root: Some(session_root),
-            tool_approval,
+            tool_approval: ctx.tool_approval,
             deliver_replies: binding.deliver_replies,
             once: binding.once,
             emit_json: false,
-            registry: Some(channel_registry.to_path_buf()),
+            registry: Some(ctx.channel_registry.to_path_buf()),
             mode,
         },
     })
@@ -2261,12 +2284,9 @@ once = true
     fn load_dispatch_project_builds_cloud_channel_bindings_for_target() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
-        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
-
 [[deployments]]
 name = "cloud-bot"
 plugin = "seren-cloud"
@@ -2275,11 +2295,18 @@ reconcile = "upsert"
 [deployments.spec]
 name = "cloud-bot"
 
+[deployments.spec.workload]
+publisher_only = false
+
+[deployments.spec.workload.execution]
+type = "llm"
+system_prompt = "hello"
+
 [[channels]]
 name = "discord"
 plugin = "channel-discord"
 deployment = "cloud-bot"
-mode = "poll"
+mode = "websocket"
 deliver_replies = true
 config = { default_channel_id = "123" }
 "#,
@@ -2292,7 +2319,7 @@ config = { default_channel_id = "123" }
         assert_eq!(project.dispatch_channels[0].label, "discord");
         assert_eq!(project.dispatch_channels[0].plugin, "channel-discord");
         assert_eq!(project.dispatch_channels[0].deployment, "cloud-bot");
-        assert_eq!(project.dispatch_channels[0].mode, "poll");
+        assert_eq!(project.dispatch_channels[0].mode, "websocket");
         assert!(project.dispatch_channels[0].deliver_replies);
         assert_eq!(
             project.dispatch_channels[0].config["default_channel_id"],
@@ -2310,6 +2337,11 @@ config = { default_channel_id = "123" }
             spec.pointer("/dispatch_channels/channels/0/plugin")
                 .and_then(Value::as_str),
             Some("channel-discord")
+        );
+        assert_eq!(
+            spec.pointer("/dispatch_channels/channels/0/mode")
+                .and_then(Value::as_str),
+            Some("websocket")
         );
     }
 
@@ -2412,6 +2444,43 @@ mode = "poll"
             error
                 .to_string()
                 .contains("can only attach to `seren-cloud`")
+        );
+    }
+
+    #[test]
+    fn cloud_target_rejects_channel_binding_for_non_llm_cloud_deployment() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./Agentfile"
+
+[[deployments]]
+name = "cloud-bot"
+plugin = "seren-cloud"
+reconcile = "upsert"
+
+[deployments.spec]
+name = "cloud-bot"
+
+[[channels]]
+name = "discord"
+plugin = "channel-discord"
+deployment = "cloud-bot"
+mode = "websocket"
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, Some("seren-cloud")).unwrap();
+        let error = validate_target_channel_bindings(&project).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("require a `seren-cloud` LLM workload")
         );
     }
 
