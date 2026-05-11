@@ -555,7 +555,16 @@ mod tests {
                 spec: json!({
                     "name": "btc-watcher",
                     "mode": "always_on",
-                    "workload": { "execution": { "type": "llm", "system_prompt": "watch" } }
+                    "workload": {
+                        "execution": {
+                            "type": "llm",
+                            "instructions": [{
+                                "kind": "skill",
+                                "path": "SKILL.md",
+                                "content": "watch"
+                            }]
+                        }
+                    }
                 }),
             },
         };
@@ -586,8 +595,8 @@ mod tests {
         let response = PluginResponse::Error {
             error: PluginErrorPayload {
                 code: "invalid_spec".to_string(),
-                message: "missing system_prompt".to_string(),
-                details: Some(json!({ "field": "workload.execution.system_prompt" })),
+                message: "missing instructions".to_string(),
+                details: Some(json!({ "field": "workload.execution.instructions" })),
             },
         };
         let line = response_to_jsonrpc(&RequestId::integer(3), &response).unwrap();
@@ -595,10 +604,10 @@ mod tests {
         match parsed {
             PluginResponse::Error { error } => {
                 assert_eq!(error.code, "invalid_spec");
-                assert_eq!(error.message, "missing system_prompt");
+                assert_eq!(error.message, "missing instructions");
                 assert_eq!(
                     error.details,
-                    Some(json!({ "field": "workload.execution.system_prompt" }))
+                    Some(json!({ "field": "workload.execution.instructions" }))
                 );
             }
             other => panic!("expected error response, got {other:?}"),

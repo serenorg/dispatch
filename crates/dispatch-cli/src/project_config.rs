@@ -2300,7 +2300,11 @@ publisher_only = false
 
 [deployments.spec.workload.execution]
 type = "llm"
-system_prompt = "hello"
+
+[[deployments.spec.workload.execution.instructions]]
+kind = "skill"
+path = "SKILL.md"
+content = "hello"
 
 [[channels]]
 name = "discord"
