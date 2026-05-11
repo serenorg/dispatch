@@ -137,7 +137,6 @@ fn run_with_courier<R: CourierBackend>(
         tool,
         input,
         tool_approval,
-        detach: _,
         ..
     } = exec;
     let parcel = load_or_build_parcel_for_run(path)?;

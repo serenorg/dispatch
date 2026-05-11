@@ -41,10 +41,9 @@ fn parse_timeout_duration(raw: &str) -> Option<Duration> {
         (value, "s")
     } else if let Some(value) = trimmed.strip_suffix('m') {
         (value, "m")
-    } else if let Some(value) = trimmed.strip_suffix('h') {
-        (value, "h")
     } else {
-        return None;
+        let value = trimmed.strip_suffix('h')?;
+        (value, "h")
     };
     let amount = value.trim().parse::<u64>().ok()?;
     match unit {

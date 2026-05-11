@@ -371,7 +371,13 @@ fn decode_hex(value: &str, path: &str) -> Result<Vec<u8>, SigningError> {
     }
 
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    let chars = value.as_bytes().chunks_exact(2);
+    let (chars, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(SigningError::InvalidHex {
+            path: path.to_string(),
+            message: "hex payload must have an even length".to_string(),
+        });
+    }
     for pair in chars {
         let text = std::str::from_utf8(pair).map_err(|_| SigningError::InvalidHex {
             path: path.to_string(),
