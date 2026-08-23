@@ -346,6 +346,12 @@ pub struct InboundEventEnvelope {
     pub message: InboundMessage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Activation evidence a host uses to re-authorize the event on its own.
+    ///
+    /// Absent when the plugin reports no activation evidence, so a host that
+    /// requires evidence rejects the event instead of inferring a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<InboundActivation>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
@@ -358,6 +364,48 @@ pub struct InboundConversationRef {
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_message_id: Option<String>,
+    /// Provider workspace, server, or guild that owns the conversation.
+    ///
+    /// Scoped one level above `id`: a workspace contains many conversations, so
+    /// the two identifiers are not interchangeable when checking policy scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Conversation this thread or sub-conversation descends from.
+    ///
+    /// Set when `id` names a child thread, so a host can resolve the thread back
+    /// to the parent conversation that policy was granted against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_conversation_id: Option<String>,
+}
+
+/// Evidence for why a plugin treated an inbound event as addressed to the agent.
+///
+/// Every field is a provider-supplied value relayed by the plugin, so a host
+/// treats it as untrusted input and re-checks it against its own policy rather
+/// than accepting the plugin's activation decision on its own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboundActivation {
+    /// Why the plugin considers this event addressed to the agent.
+    pub reason: String,
+    /// Provider account identity the plugin authenticated as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_account_id: Option<String>,
+    /// Author of the message this event replies to, when the activation is a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referenced_message_author_id: Option<String>,
+}
+
+impl InboundActivation {
+    /// The agent was named directly in the message.
+    pub const REASON_DIRECT_MENTION: &'static str = "direct_mention";
+    /// The message replies to one the agent authored.
+    pub const REASON_REPLY_TO_AGENT: &'static str = "reply_to_agent";
+    /// The event came from a command the provider routed to the agent.
+    pub const REASON_SLASH_COMMAND: &'static str = "slash_command";
+    /// The event arrived in a one-to-one conversation with the agent.
+    pub const REASON_DIRECT_MESSAGE: &'static str = "direct_message";
+    /// The binding activates on every message in the conversation.
+    pub const REASON_ALL_MESSAGES: &'static str = "all_messages";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,10 +493,48 @@ pub struct ChannelPolicy {
     pub owner_id: Option<String>,
     #[serde(default)]
     pub allowed_sender_ids: Vec<String>,
+    /// Conversations this binding may act on.
+    ///
+    /// Conversation-scoped only. A workspace, server, or guild identifier is one
+    /// level wider and belongs in `allowed_workspace_ids`; placing one here would
+    /// match no conversation, or the wrong one if the provider reuses the value.
     #[serde(default)]
     pub allowed_conversation_ids: Vec<String>,
+    /// Workspaces, servers, or guilds this binding may act within.
+    ///
+    /// Scoped one level above `allowed_conversation_ids` and checked separately,
+    /// so widening the workspace scope does not widen the conversation scope.
+    #[serde(default)]
+    pub allowed_workspace_ids: Vec<String>,
+    /// Destinations this binding may publish to.
+    ///
+    /// Empty means outbound is no wider than `allowed_conversation_ids`, so an
+    /// unset value never grants a destination the inbound scope excludes.
+    #[serde(default)]
+    pub allowed_outbound_conversation_ids: Vec<String>,
+    /// Activation mode in force for this binding.
+    ///
+    /// Recorded so a host evaluates inbound activation evidence against the mode
+    /// the binding was granted, not the mode the plugin reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<String>,
+    /// How child threads of an allowed conversation are treated.
+    ///
+    /// Stated explicitly because a thread is a distinct conversation on most
+    /// providers, so parent scope does not imply child scope on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_policy: Option<String>,
+    /// Explicit child-thread conversations when `thread_policy` is allowlist.
+    #[serde(default)]
+    pub allowed_thread_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dm_policy: Option<String>,
+    /// Explicit direct-message senders when `dm_policy` is allowlist.
+    #[serde(default)]
+    pub allowed_dm_sender_ids: Vec<String>,
+    /// Which runtime path owns the visible reply for one inbound event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_delivery: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_signature_validation: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1059,6 +1145,8 @@ mod tests {
                         kind: "private".to_string(),
                         thread_id: None,
                         parent_message_id: None,
+                        workspace_id: None,
+                        parent_conversation_id: None,
                     },
                     actor: InboundActor {
                         id: "user-1".to_string(),
@@ -1076,6 +1164,7 @@ mod tests {
                         metadata: BTreeMap::new(),
                     },
                     account_id: None,
+                    activation: None,
                     metadata: BTreeMap::new(),
                 }],
                 state: Some(IngressState {
@@ -1185,5 +1274,152 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn inbound_event_without_provenance_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "event_id": "evt-1",
+            "platform": "telegram",
+            "event_type": "message.received",
+            "received_at": "2026-04-12T00:00:00Z",
+            "conversation": {
+                "id": "chat-1",
+                "kind": "private",
+                "thread_id": "7"
+            },
+            "actor": {
+                "id": "user-1",
+                "is_bot": false,
+                "metadata": {}
+            },
+            "message": {
+                "id": "msg-1",
+                "content": "hello",
+                "content_type": "text/plain",
+                "attachments": [],
+                "metadata": {}
+            },
+            "metadata": {}
+        });
+
+        let parsed: InboundEventEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.activation, None);
+        assert_eq!(parsed.conversation.workspace_id, None);
+        assert_eq!(parsed.conversation.parent_conversation_id, None);
+        assert_eq!(parsed.conversation.thread_id, Some("7".to_string()));
+    }
+
+    #[test]
+    fn inbound_event_with_activation_round_trips_json() {
+        let envelope = InboundEventEnvelope {
+            event_id: "evt-2".to_string(),
+            platform: "slack".to_string(),
+            event_type: "message.received".to_string(),
+            received_at: "2026-04-12T00:00:00Z".to_string(),
+            conversation: InboundConversationRef {
+                id: "thread-9".to_string(),
+                kind: "channel".to_string(),
+                thread_id: Some("thread-9".to_string()),
+                parent_message_id: Some("msg-0".to_string()),
+                workspace_id: Some("workspace-1".to_string()),
+                parent_conversation_id: Some("channel-1".to_string()),
+            },
+            actor: InboundActor {
+                id: "user-1".to_string(),
+                display_name: Some("User".to_string()),
+                username: Some("user".to_string()),
+                is_bot: false,
+                metadata: BTreeMap::new(),
+            },
+            message: InboundMessage {
+                id: "msg-1".to_string(),
+                content: "hello".to_string(),
+                content_type: "text/plain".to_string(),
+                reply_to_message_id: Some("msg-0".to_string()),
+                attachments: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+            account_id: Some("account-1".to_string()),
+            activation: Some(InboundActivation {
+                reason: InboundActivation::REASON_REPLY_TO_AGENT.to_string(),
+                agent_account_id: Some("agent-1".to_string()),
+                referenced_message_author_id: Some("agent-1".to_string()),
+            }),
+            metadata: BTreeMap::new(),
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: InboundEventEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, envelope);
+
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["activation"]["reason"], "reply_to_agent");
+        assert_eq!(value["conversation"]["workspace_id"], "workspace-1");
+        assert_eq!(value["conversation"]["parent_conversation_id"], "channel-1");
+    }
+
+    #[test]
+    fn inbound_activation_omits_missing_optional_fields() {
+        let activation = InboundActivation {
+            reason: InboundActivation::REASON_DIRECT_MENTION.to_string(),
+            agent_account_id: None,
+            referenced_message_author_id: None,
+        };
+
+        let value = serde_json::to_value(&activation).unwrap();
+        assert!(value.get("agent_account_id").is_none());
+        assert!(value.get("referenced_message_author_id").is_none());
+
+        let parsed: InboundActivation = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, activation);
+    }
+
+    #[test]
+    fn channel_policy_without_scope_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "owner_id": "owner-1",
+            "allowed_sender_ids": ["user-1"],
+            "allowed_conversation_ids": ["chat-1"],
+            "dm_policy": "owner_only",
+            "require_signature_validation": true,
+            "allow_group_messages": false,
+            "metadata": {}
+        });
+
+        let parsed: ChannelPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.allowed_conversation_ids, vec!["chat-1".to_string()]);
+        assert!(parsed.allowed_workspace_ids.is_empty());
+        assert!(parsed.allowed_outbound_conversation_ids.is_empty());
+        assert_eq!(parsed.activation, None);
+        assert_eq!(parsed.thread_policy, None);
+        assert!(parsed.allowed_thread_ids.is_empty());
+        assert!(parsed.allowed_dm_sender_ids.is_empty());
+        assert_eq!(parsed.reply_delivery, None);
+    }
+
+    #[test]
+    fn channel_policy_with_scope_fields_round_trips_json() {
+        let policy = ChannelPolicy {
+            owner_id: Some("owner-1".to_string()),
+            allowed_sender_ids: vec!["user-1".to_string()],
+            allowed_conversation_ids: vec!["channel-1".to_string()],
+            allowed_workspace_ids: vec!["workspace-1".to_string()],
+            allowed_outbound_conversation_ids: vec!["channel-1".to_string()],
+            activation: Some(InboundActivation::REASON_DIRECT_MENTION.to_string()),
+            thread_policy: Some("inherit_parent".to_string()),
+            allowed_thread_ids: vec!["thread-1".to_string()],
+            dm_policy: Some("owner_only".to_string()),
+            allowed_dm_sender_ids: vec!["dm-user-1".to_string()],
+            reply_delivery: Some("runtime_owned".to_string()),
+            require_signature_validation: Some(true),
+            allow_group_messages: Some(false),
+            max_attachment_bytes: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let json = serde_json::to_string(&policy).unwrap();
+        let parsed: ChannelPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, policy);
     }
 }

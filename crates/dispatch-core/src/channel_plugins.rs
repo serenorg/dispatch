@@ -2574,6 +2574,8 @@ sleep 5
                 kind: "private".to_string(),
                 thread_id: Some("7".to_string()),
                 parent_message_id: None,
+                workspace_id: None,
+                parent_conversation_id: None,
             },
             actor: InboundActor {
                 id: "user-1".to_string(),
@@ -2591,6 +2593,7 @@ sleep 5
                 metadata: BTreeMap::new(),
             },
             account_id: None,
+            activation: None,
             metadata: BTreeMap::new(),
         }
     }
