@@ -2,6 +2,29 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.5.0] - 2026-08-24
+
+Channel provenance release.
+
+Inbound channel events can now carry the scope and activation evidence a host needs to re-authorize an event on its own, rather than trusting that the plugin already filtered it. Channel policies gained a workspace scope that is checked separately from the conversation scope, so widening one no longer widens the other.
+
+The new channel protocol fields are additive and default when absent, so existing payloads and plugin manifests continue to parse. `CHANNEL_PLUGIN_PROTOCOL_VERSION` is deliberately unchanged: it is an independent wire generation number that plugin manifests are matched against by exact equality, and bumping it would reject every currently released plugin.
+
+### Added
+
+- `InboundConversationRef.workspace_id` identifies the provider workspace, server, or guild that owns a conversation. It sits one level above the conversation identifier and is not interchangeable with it when checking policy scope.
+- `InboundConversationRef.parent_conversation_id` names the conversation a child thread descends from, so a host can resolve a thread back to the parent that policy was granted against.
+- `InboundEventEnvelope.activation` carries an `InboundActivation` describing why the plugin considers an event addressed to the agent, including the provider account the plugin authenticated as and the author of a replied-to message. Absent when the plugin reports no evidence, so a host that requires evidence rejects the event instead of inferring a reason. Reason values are `direct_mention`, `reply_to_agent`, `slash_command`, `direct_message`, and `all_messages`.
+- `ChannelPolicy.allowed_workspace_ids` scopes a binding to workspaces, servers, or guilds, checked separately from `allowed_conversation_ids`.
+- `ChannelPolicy.allowed_outbound_conversation_ids` scopes publication destinations. Empty means outbound is no wider than the inbound conversation scope, so an unset value never grants a destination that inbound scope excludes.
+- `ChannelPolicy.activation` and `ChannelPolicy.thread_policy` record the activation mode and child-thread treatment in force for a binding, so a host evaluates events against the mode the binding was granted rather than the mode a plugin reports.
+- `dispatch.toml` channel bindings support `mode = "websocket"` for local runtimes and managed cloud deployments. Cloud-targeted channel bindings can be attached directly to the deployment spec without requiring a local parcel path.
+
+### Changed
+
+- `ChannelPolicy.allowed_conversation_ids` is now documented as conversation-scoped only. Populating it with workspace, server, or guild identifiers matches no conversation, or the wrong one where a provider reuses the value; use `allowed_workspace_ids` instead.
+- Cloud-targeted channel bindings must reference a `seren-cloud` deployment whose `spec.workload.execution.type` is `"llm"`.
+
 ## [0.4.0] - 2026-05-04
 
 Plugin protocol expansion release.
