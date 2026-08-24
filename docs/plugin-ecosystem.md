@@ -93,11 +93,9 @@ These are the first-party and maintainer-published catalogs the Dispatch project
 | Catalog | URL |
 |---|---|
 | dispatch-plugins (channels) | `https://raw.githubusercontent.com/serenorg/dispatch-plugins/master/catalog/extensions.json` |
-| dispatch-channel-signal | `https://raw.githubusercontent.com/serenorg/dispatch-channel-signal/main/catalog/extensions.json` |
-| dispatch-channel-whatsapp | `https://raw.githubusercontent.com/serenorg/dispatch-channel-whatsapp/main/catalog/extensions.json` |
 | dispatch-courier-seren-cloud | `https://raw.githubusercontent.com/serenorg/dispatch-courier-seren-cloud/main/catalog/extensions.json` |
 
-Each catalog is self-contained: a plugin repository owns its own source, manifest, release pipeline, and catalog entry. `dispatch-plugins` is one such repository, not a meta-index; it does not carry pointers to plugins living in other repositories. To register additional first-party or third-party catalogs, run `dispatch extension catalog add <url>`.
+Each catalog is self-contained. A plugin repository owns its source, manifest, release process, and catalog entry. The `dispatch-plugins` catalog includes Signal, WhatsApp, and the other channels that its workspace releases. To register another catalog, run `dispatch extension catalog add <url>`.
 
 To propose adding a catalog here, open a pull request against Dispatch with the catalog URL and a one-line description.
 
