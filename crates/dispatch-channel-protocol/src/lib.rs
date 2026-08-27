@@ -102,6 +102,20 @@ pub enum PluginRequest<C, M> {
         config: C,
         message: M,
     },
+    /// Fetch a delivered message by receipt-bound reference.
+    ///
+    /// The host must authorize the conversation before issuing this request.
+    GetMessage {
+        config: C,
+        reference: MessageRef,
+    },
+    /// Resolve a message permalink by receipt-bound reference.
+    ///
+    /// The host must authorize the conversation before issuing this request.
+    GetPermalink {
+        config: C,
+        reference: MessageRef,
+    },
     Status {
         config: C,
         update: StatusFrame,
@@ -141,6 +155,18 @@ pub enum PluginResponse {
     },
     Pushed {
         delivery: DeliveryReceipt,
+    },
+    /// The message returned for the requested reference.
+    MessageFetched {
+        message: FetchedMessage,
+    },
+    /// No message exists for the requested reference.
+    MessageNotFound {
+        reference: MessageRef,
+    },
+    /// The permalink returned for the requested reference.
+    PermalinkResolved {
+        permalink: MessagePermalink,
     },
     StatusAccepted {
         status: StatusAcceptance,
@@ -309,10 +335,64 @@ pub struct IngressCallbackReply {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryReceipt {
-    pub message_id: String,
-    pub conversation_id: String,
+    /// Complete provider coordinates, flattened into the existing receipt fields.
+    #[serde(flatten)]
+    pub reference: MessageRef,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider-neutral coordinates for one delivered message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageRef {
+    /// Provider conversation or chat identifier.
+    pub conversation_id: String,
+    /// Provider message identifier.
+    pub message_id: String,
+    /// Provider thread parent identifier, when the provider requires it to
+    /// address the message: a Slack thread timestamp, a Telegram topic id, or
+    /// an email parent `Message-ID`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// A message returned for a receipt-bound reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FetchedMessage {
+    /// Complete provider coordinates, flattened into provider-neutral wire fields.
+    #[serde(flatten)]
+    pub reference: MessageRef,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<FetchedMessageAuthor>,
+    /// Canonical URL for the fetched message, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permalink: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider author identity, when available.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FetchedMessageAuthor {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub is_bot: bool,
+}
+
+/// A permalink resolved for one exact message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessagePermalink {
+    /// Complete provider coordinates for the resolved permalink.
+    #[serde(flatten)]
+    pub reference: MessageRef,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -583,6 +663,8 @@ pub fn request_method<C, M>(request: &PluginRequest<C, M>) -> &'static str {
         PluginRequest::IngressEvent { .. } => "channel.ingress_event",
         PluginRequest::Deliver { .. } => "channel.deliver",
         PluginRequest::Push { .. } => "channel.push",
+        PluginRequest::GetMessage { .. } => "channel.get_message",
+        PluginRequest::GetPermalink { .. } => "channel.get_permalink",
         PluginRequest::Status { .. } => "channel.status",
         PluginRequest::Shutdown => "channel.shutdown",
     }
@@ -1421,5 +1503,151 @@ mod tests {
         let json = serde_json::to_string(&policy).unwrap();
         let parsed: ChannelPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, policy);
+    }
+
+    #[test]
+    fn get_message_request_round_trips_jsonrpc() {
+        let request = JsonEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: PluginRequest::GetMessage {
+                config: serde_json::json!({ "bot_token_env": "TOKEN" }),
+                reference: MessageRef {
+                    conversation_id: "C0BJSQDLURY".to_string(),
+                    message_id: "1787796588.437149".to_string(),
+                    thread_id: Some("1787796500.000100".to_string()),
+                },
+            },
+        };
+
+        let rpc = request_to_jsonrpc(RequestId::integer(21), &request).unwrap();
+        let value: Value = serde_json::to_value(&rpc).unwrap();
+        assert_eq!(value["method"], "channel.get_message");
+        let json = serde_json::to_string(&rpc).unwrap();
+        let (id, parsed) =
+            parse_jsonrpc_request::<serde_json::Value, serde_json::Value>(&json).unwrap();
+        assert_eq!(id, RequestId::integer(21));
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn get_permalink_request_round_trips_jsonrpc() {
+        let request = JsonEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: PluginRequest::GetPermalink {
+                config: serde_json::json!({ "bot_token_env": "TOKEN" }),
+                reference: MessageRef {
+                    conversation_id: "C0BJSQDLURY".to_string(),
+                    message_id: "1787796588.437149".to_string(),
+                    thread_id: None,
+                },
+            },
+        };
+
+        let rpc = request_to_jsonrpc(RequestId::integer(22), &request).unwrap();
+        let value: Value = serde_json::to_value(&rpc).unwrap();
+        assert_eq!(value["method"], "channel.get_permalink");
+        let json = serde_json::to_string(&rpc).unwrap();
+        let (id, parsed) =
+            parse_jsonrpc_request::<serde_json::Value, serde_json::Value>(&json).unwrap();
+        assert_eq!(id, RequestId::integer(22));
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn message_fetched_response_round_trips_jsonrpc() {
+        let response = PluginResponse::MessageFetched {
+            message: FetchedMessage {
+                reference: MessageRef {
+                    conversation_id: "C0BJSQDLURY".to_string(),
+                    message_id: "1787796588.437149".to_string(),
+                    thread_id: Some("1787796500.000100".to_string()),
+                },
+                content: "hello".to_string(),
+                content_type: Some("text/plain".to_string()),
+                author: Some(FetchedMessageAuthor {
+                    id: "U0BOT".to_string(),
+                    display_name: Some("Seren".to_string()),
+                    username: None,
+                    is_bot: true,
+                }),
+                permalink: Some(
+                    "https://example.slack.com/archives/C0BJSQDLURY/p1787796588437149".to_string(),
+                ),
+                metadata: BTreeMap::new(),
+            },
+        };
+
+        let json = response_to_jsonrpc(&RequestId::integer(23), &response).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"]["message"]["conversation_id"], "C0BJSQDLURY");
+        assert_eq!(value["result"]["message"]["thread_id"], "1787796500.000100");
+        assert!(value["result"]["message"].get("reference").is_none());
+        let (id, parsed) = parse_jsonrpc_response(&json).unwrap();
+        assert_eq!(id, RequestId::integer(23));
+        assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn message_not_found_response_round_trips_jsonrpc() {
+        let response = PluginResponse::MessageNotFound {
+            reference: MessageRef {
+                conversation_id: "C0BJSQDLURY".to_string(),
+                message_id: "1787796588.437149".to_string(),
+                thread_id: None,
+            },
+        };
+
+        let json = response_to_jsonrpc(&RequestId::integer(24), &response).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"]["kind"], "message_not_found");
+        let (id, parsed) = parse_jsonrpc_response(&json).unwrap();
+        assert_eq!(id, RequestId::integer(24));
+        assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn permalink_resolved_response_round_trips_jsonrpc() {
+        let response = PluginResponse::PermalinkResolved {
+            permalink: MessagePermalink {
+                reference: MessageRef {
+                    conversation_id: "C0BJSQDLURY".to_string(),
+                    message_id: "1787796588.437149".to_string(),
+                    thread_id: Some("1787796500.000100".to_string()),
+                },
+                url: "https://example.slack.com/archives/C0BJSQDLURY/p1787796588437149".to_string(),
+            },
+        };
+
+        let json = response_to_jsonrpc(&RequestId::integer(25), &response).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["result"]["permalink"]["thread_id"],
+            "1787796500.000100"
+        );
+        assert!(value["result"]["permalink"].get("reference").is_none());
+        let (id, parsed) = parse_jsonrpc_response(&json).unwrap();
+        assert_eq!(id, RequestId::integer(25));
+        assert_eq!(parsed, response);
+    }
+
+    #[test]
+    fn delivery_receipt_round_trips_flattened_message_ref() {
+        let receipt = DeliveryReceipt {
+            reference: MessageRef {
+                conversation_id: "C0BJSQDLURY".to_string(),
+                message_id: "1787796588.437149".to_string(),
+                thread_id: Some("1787796500.000100".to_string()),
+            },
+            metadata: BTreeMap::from([("platform".to_string(), "slack".to_string())]),
+        };
+
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["conversation_id"], "C0BJSQDLURY");
+        assert_eq!(value["message_id"], "1787796588.437149");
+        assert_eq!(value["thread_id"], "1787796500.000100");
+        assert!(value.get("reference").is_none());
+
+        let parsed: DeliveryReceipt = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, receipt);
     }
 }

@@ -749,7 +749,7 @@ fn run_channel_poll_once(
                     if let Some(delivery) = &parcel_run.delivery {
                         println!(
                             "Delivered reply: {} -> {}",
-                            delivery.message_id, delivery.conversation_id
+                            delivery.reference.message_id, delivery.reference.conversation_id
                         );
                     }
                     if !parcel_run.output.is_empty() {
@@ -840,12 +840,36 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
         }
         ChannelPluginResponse::Delivered { delivery }
         | ChannelPluginResponse::Pushed { delivery } => {
-            println!("Message ID: {}", delivery.message_id);
-            println!("Conversation ID: {}", delivery.conversation_id);
+            println!("Message ID: {}", delivery.reference.message_id);
+            println!("Conversation ID: {}", delivery.reference.conversation_id);
             if !delivery.metadata.is_empty() {
                 println!("Metadata:");
                 println!("{}", serde_json::to_string_pretty(&delivery.metadata)?);
             }
+        }
+        ChannelPluginResponse::MessageFetched { message } => {
+            println!("Message ID: {}", message.reference.message_id);
+            println!("Conversation ID: {}", message.reference.conversation_id);
+            if let Some(thread_id) = &message.reference.thread_id {
+                println!("Thread ID: {thread_id}");
+            }
+            if let Some(permalink) = &message.permalink {
+                println!("Permalink: {permalink}");
+            }
+            println!("Content: {}", message.content);
+        }
+        ChannelPluginResponse::MessageNotFound { reference } => {
+            println!("Message not found");
+            println!("Conversation ID: {}", reference.conversation_id);
+            println!("Message ID: {}", reference.message_id);
+        }
+        ChannelPluginResponse::PermalinkResolved { permalink } => {
+            println!("Message ID: {}", permalink.reference.message_id);
+            println!("Conversation ID: {}", permalink.reference.conversation_id);
+            if let Some(thread_id) = &permalink.reference.thread_id {
+                println!("Thread ID: {thread_id}");
+            }
+            println!("Permalink: {}", permalink.url);
         }
         ChannelPluginResponse::StatusAccepted { status } => {
             println!("Accepted: {}", status.accepted);
@@ -1324,7 +1348,7 @@ fn emit_channel_runtime_events(
             if let Some(delivery) = &parcel_run.delivery {
                 println!(
                     "Delivered reply: {} -> {}",
-                    delivery.message_id, delivery.conversation_id
+                    delivery.reference.message_id, delivery.reference.conversation_id
                 );
             }
             if !parcel_run.output.is_empty() {
@@ -1670,6 +1694,9 @@ fn response_kind(response: &ChannelPluginResponse) -> &'static str {
         ChannelPluginResponse::IngressEventsReceived { .. } => "ingress_events_received",
         ChannelPluginResponse::Delivered { .. } => "delivered",
         ChannelPluginResponse::Pushed { .. } => "pushed",
+        ChannelPluginResponse::MessageFetched { .. } => "message_fetched",
+        ChannelPluginResponse::MessageNotFound { .. } => "message_not_found",
+        ChannelPluginResponse::PermalinkResolved { .. } => "permalink_resolved",
         ChannelPluginResponse::StatusAccepted { .. } => "status_accepted",
         ChannelPluginResponse::Ok => "ok",
         ChannelPluginResponse::Error { .. } => "error",

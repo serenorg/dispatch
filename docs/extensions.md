@@ -72,6 +72,7 @@ A channel plugin implements:
 - `ingress_event` - parse a raw webhook payload into normalized events
 - `deliver` - send a reply to an existing conversation
 - `push` - send a proactive message (broadcast, alert, scheduled)
+- `get_message` / `get_permalink` - read a delivered message, or its canonical permalink, back by the receipt-bound reference returned from `deliver` or `push` (optional; plugins without provider read-back return an `unsupported_request` error)
 - `status` - relay agent progress to the conversation (typing indicators, etc.)
 - `shutdown` - allow the host to terminate a persistent ingress process cleanly
 
