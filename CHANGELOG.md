@@ -2,6 +2,24 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.6.0] - 2026-08-27
+
+Receipt-bound channel read-back release.
+
+Channel plugins can now return typed provider coordinates with delivery receipts and accept read-back requests for the exact delivered message or its canonical permalink. The required receipt coordinates remain flattened into their existing JSON fields, and the optional thread coordinate is additive, so existing receipt payloads continue to parse and `CHANNEL_PLUGIN_PROTOCOL_VERSION` remains unchanged.
+
+### Added
+
+- `MessageRef` provides provider-neutral conversation, message, and thread coordinates for receipt-bound operations.
+- `channel.get_message` and `channel.get_permalink` requests retrieve the message or canonical permalink identified by a `MessageRef`.
+- `MessageFetched`, `MessageNotFound`, and `PermalinkResolved` responses provide typed outcomes for message read-back operations.
+- `FetchedMessage`, `FetchedMessageAuthor`, and `MessagePermalink` define normalized read-back payloads while preserving the complete requested reference.
+
+### Changed
+
+- **Breaking:** `DeliveryReceipt` now contains one required, flattened `MessageRef` instead of separate `message_id` and `conversation_id` fields. The JSON wire shape is unchanged; Rust consumers construct and read the receipt through `reference`.
+- The plugin ecosystem guide now lists Signal and WhatsApp as part of the consolidated `dispatch-plugins` catalog.
+
 ## [0.5.0] - 2026-08-24
 
 Channel provenance release.
