@@ -848,10 +848,13 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
             }
         }
         ChannelPluginResponse::MessageFetched { message } => {
-            println!("Message ID: {}", message.message_id);
-            println!("Conversation ID: {}", message.conversation_id);
-            if let Some(thread_id) = &message.thread_id {
+            println!("Message ID: {}", message.reference.message_id);
+            println!("Conversation ID: {}", message.reference.conversation_id);
+            if let Some(thread_id) = &message.reference.thread_id {
                 println!("Thread ID: {thread_id}");
+            }
+            if let Some(workspace_id) = &message.reference.workspace_id {
+                println!("Workspace ID: {workspace_id}");
             }
             if let Some(permalink) = &message.permalink {
                 println!("Permalink: {permalink}");
@@ -864,8 +867,14 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
             println!("Message ID: {}", reference.message_id);
         }
         ChannelPluginResponse::PermalinkResolved { permalink } => {
-            println!("Message ID: {}", permalink.message_id);
-            println!("Conversation ID: {}", permalink.conversation_id);
+            println!("Message ID: {}", permalink.reference.message_id);
+            println!("Conversation ID: {}", permalink.reference.conversation_id);
+            if let Some(thread_id) = &permalink.reference.thread_id {
+                println!("Thread ID: {thread_id}");
+            }
+            if let Some(workspace_id) = &permalink.reference.workspace_id {
+                println!("Workspace ID: {workspace_id}");
+            }
             println!("Permalink: {}", permalink.url);
         }
         ChannelPluginResponse::StatusAccepted { status } => {

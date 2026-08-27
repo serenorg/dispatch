@@ -384,12 +384,13 @@ pub struct MessageRef {
 /// [`PluginResponse::MessageNotFound`], never as a different nearby message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FetchedMessage {
-    pub conversation_id: String,
-    pub message_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
+    /// The exact provider coordinates resolved by the read-back.
+    ///
+    /// Flattened to keep the wire fields provider-neutral while ensuring Rust
+    /// consumers compare the complete reference rather than selecting a subset
+    /// of its conversation, message, thread, and workspace coordinates.
+    #[serde(flatten)]
+    pub reference: MessageRef,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
@@ -418,8 +419,9 @@ pub struct FetchedMessageAuthor {
 /// A permalink resolved for one exact message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessagePermalink {
-    pub conversation_id: String,
-    pub message_id: String,
+    /// The exact provider coordinates for the resolved permalink.
+    #[serde(flatten)]
+    pub reference: MessageRef,
     pub url: String,
 }
 
@@ -1587,10 +1589,12 @@ mod tests {
     fn message_fetched_response_round_trips_jsonrpc() {
         let response = PluginResponse::MessageFetched {
             message: FetchedMessage {
-                conversation_id: "C0BJSQDLURY".to_string(),
-                message_id: "1787796588.437149".to_string(),
-                thread_id: None,
-                workspace_id: Some("T0AAA".to_string()),
+                reference: MessageRef {
+                    conversation_id: "C0BJSQDLURY".to_string(),
+                    message_id: "1787796588.437149".to_string(),
+                    thread_id: None,
+                    workspace_id: Some("T0AAA".to_string()),
+                },
                 content: "hello".to_string(),
                 content_type: Some("text/plain".to_string()),
                 author: Some(FetchedMessageAuthor {
@@ -1607,6 +1611,10 @@ mod tests {
         };
 
         let json = response_to_jsonrpc(&RequestId::integer(23), &response).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"]["message"]["conversation_id"], "C0BJSQDLURY");
+        assert_eq!(value["result"]["message"]["workspace_id"], "T0AAA");
+        assert!(value["result"]["message"].get("reference").is_none());
         let (id, parsed) = parse_jsonrpc_response(&json).unwrap();
         assert_eq!(id, RequestId::integer(23));
         assert_eq!(parsed, response);
@@ -1635,13 +1643,23 @@ mod tests {
     fn permalink_resolved_response_round_trips_jsonrpc() {
         let response = PluginResponse::PermalinkResolved {
             permalink: MessagePermalink {
-                conversation_id: "C0BJSQDLURY".to_string(),
-                message_id: "1787796588.437149".to_string(),
+                reference: MessageRef {
+                    conversation_id: "C0BJSQDLURY".to_string(),
+                    message_id: "1787796588.437149".to_string(),
+                    thread_id: Some("1787796500.000100".to_string()),
+                    workspace_id: Some("T0AAA".to_string()),
+                },
                 url: "https://example.slack.com/archives/C0BJSQDLURY/p1787796588437149".to_string(),
             },
         };
 
         let json = response_to_jsonrpc(&RequestId::integer(25), &response).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["result"]["permalink"]["thread_id"],
+            "1787796500.000100"
+        );
+        assert_eq!(value["result"]["permalink"]["workspace_id"], "T0AAA");
         let (id, parsed) = parse_jsonrpc_response(&json).unwrap();
         assert_eq!(id, RequestId::integer(25));
         assert_eq!(parsed, response);
