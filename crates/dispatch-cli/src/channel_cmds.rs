@@ -847,6 +847,27 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
                 println!("{}", serde_json::to_string_pretty(&delivery.metadata)?);
             }
         }
+        ChannelPluginResponse::MessageFetched { message } => {
+            println!("Message ID: {}", message.message_id);
+            println!("Conversation ID: {}", message.conversation_id);
+            if let Some(thread_id) = &message.thread_id {
+                println!("Thread ID: {thread_id}");
+            }
+            if let Some(permalink) = &message.permalink {
+                println!("Permalink: {permalink}");
+            }
+            println!("Content: {}", message.content);
+        }
+        ChannelPluginResponse::MessageNotFound { reference } => {
+            println!("Message not found");
+            println!("Conversation ID: {}", reference.conversation_id);
+            println!("Message ID: {}", reference.message_id);
+        }
+        ChannelPluginResponse::PermalinkResolved { permalink } => {
+            println!("Message ID: {}", permalink.message_id);
+            println!("Conversation ID: {}", permalink.conversation_id);
+            println!("Permalink: {}", permalink.url);
+        }
         ChannelPluginResponse::StatusAccepted { status } => {
             println!("Accepted: {}", status.accepted);
             if !status.metadata.is_empty() {
@@ -1670,6 +1691,9 @@ fn response_kind(response: &ChannelPluginResponse) -> &'static str {
         ChannelPluginResponse::IngressEventsReceived { .. } => "ingress_events_received",
         ChannelPluginResponse::Delivered { .. } => "delivered",
         ChannelPluginResponse::Pushed { .. } => "pushed",
+        ChannelPluginResponse::MessageFetched { .. } => "message_fetched",
+        ChannelPluginResponse::MessageNotFound { .. } => "message_not_found",
+        ChannelPluginResponse::PermalinkResolved { .. } => "permalink_resolved",
         ChannelPluginResponse::StatusAccepted { .. } => "status_accepted",
         ChannelPluginResponse::Ok => "ok",
         ChannelPluginResponse::Error { .. } => "error",
