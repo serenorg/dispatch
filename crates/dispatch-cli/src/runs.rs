@@ -1402,7 +1402,7 @@ fn validate_service_parcel(parcel: &dispatch_core::LoadedParcel) -> Result<()> {
         Ok(())
     } else {
         bail!(
-            "`dispatch serve` requires parcels with `ENTRYPOINT heartbeat`, found {}",
+            "`dispatch serve` requires parcels with `agent.entrypoint = \"heartbeat\"`, found {}",
             parcel.config.entrypoint.as_deref().unwrap_or("<unset>")
         )
     }
@@ -2038,7 +2038,7 @@ mod tests {
                 schema: dispatch_core::PARCEL_SCHEMA_URL.to_string(),
                 format_version: dispatch_core::PARCEL_FORMAT_VERSION,
                 digest: "d".repeat(64),
-                source_agentfile: "Agentfile".to_string(),
+                source: "dispatch.toml".to_string(),
                 courier: dispatch_core::CourierTarget::from_reference(
                     "dispatch/native:latest".to_string(),
                 ),

@@ -24,9 +24,9 @@ Important behavior:
 - `dispatch depot pull --trust-policy ...` resolves public keys and signature requirements from matching rules
 - explicit `--public-key` values compose with trust-policy keys instead of replacing them
 
-## What `FRAMEWORK` Means
+## What `agent.framework` Means
 
-`FRAMEWORK` is provenance metadata, not a trust primitive.
+`agent.framework` is provenance metadata, not a trust primitive.
 
 Use it to record facts like:
 
@@ -34,9 +34,9 @@ Use it to record facts like:
 - which toolchain version produced it
 - which target the parcel was built for
 
-Do not use `FRAMEWORK` as proof that a parcel is safe to run.
+Do not use `agent.framework` as proof that a parcel is safe to run.
 
-`FRAMEWORK` does not:
+`agent.framework` does not:
 
 - prove who signed or published the parcel
 - prove reproducibility
@@ -92,7 +92,7 @@ Recommended patterns:
 - require signatures for every matched repository
 - pin specific publisher keys per repository or per namespace
 - avoid broad wildcard trust where one key authorizes unrelated publishers
-- review `FRAMEWORK` and labels as metadata only after signature policy passes
+- review `agent.framework` and labels as metadata only after signature policy passes
 
 ### Local Development
 

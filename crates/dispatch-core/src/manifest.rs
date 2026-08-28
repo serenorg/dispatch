@@ -6,8 +6,8 @@ pub use dispatch_courier_protocol::{
     ToolRiskLevel,
 };
 
-pub const PARCEL_SCHEMA_URL: &str = "https://serenorg.github.io/dispatch/schemas/parcel.v1.json";
-pub const PARCEL_FORMAT_VERSION: u32 = 1;
+pub const PARCEL_SCHEMA_URL: &str = "https://serenorg.github.io/dispatch/schemas/parcel.v2.json";
+pub const PARCEL_FORMAT_VERSION: u32 = 2;
 pub const DISPATCH_WASM_ABI: &str = dispatch_wasm_abi::ABI;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub struct ParcelManifest {
     pub schema: String,
     pub format_version: u32,
     pub digest: String,
-    pub source_agentfile: String,
+    pub source: String,
     pub courier: CourierTarget,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework: Option<FrameworkProvenance>,
@@ -296,14 +296,12 @@ pub struct CompactionConfig {
 pub struct LimitSpec {
     pub scope: String,
     pub value: String,
-    pub qualifiers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimeoutSpec {
     pub scope: String,
     pub duration: String,
-    pub qualifiers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

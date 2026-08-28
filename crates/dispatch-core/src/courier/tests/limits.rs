@@ -16,17 +16,14 @@ fn configured_context_token_limit_uses_last_valid_context_limit() {
         crate::manifest::LimitSpec {
             scope: "ITERATIONS".to_string(),
             value: "10".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "CONTEXT_TOKENS".to_string(),
             value: "16000".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "CONTEXT_TOKENS".to_string(),
             value: "32000".to_string(),
-            qualifiers: Vec::new(),
         },
     ];
 
@@ -39,17 +36,14 @@ fn configured_llm_timeout_ms_uses_last_matching_timeout() {
         crate::manifest::TimeoutSpec {
             scope: "LLM".to_string(),
             duration: "15s".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::TimeoutSpec {
             scope: "TOOL".to_string(),
             duration: "50ms".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::TimeoutSpec {
             scope: "LLM".to_string(),
             duration: "1200ms".to_string(),
-            qualifiers: Vec::new(),
         },
     ];
 
@@ -62,32 +56,26 @@ fn configured_tool_limits_use_last_valid_values() {
         crate::manifest::LimitSpec {
             scope: "TOOL_CALLS".to_string(),
             value: "2".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "TOOL_OUTPUT".to_string(),
             value: "0".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "TOOL_CALLS".to_string(),
             value: "5".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "TOOL_OUTPUT".to_string(),
             value: "1024".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "TOOL_ROUNDS".to_string(),
             value: "0".to_string(),
-            qualifiers: Vec::new(),
         },
         crate::manifest::LimitSpec {
             scope: "TOOL_ROUNDS".to_string(),
             value: "6".to_string(),
-            qualifiers: Vec::new(),
         },
     ];
 

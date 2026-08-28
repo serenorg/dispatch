@@ -1,0 +1,1017 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serenorg.github.io/dispatch/schemas/parcel.v2.json",
+  "title": "Dispatch Parcel Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "format_version",
+    "digest",
+    "source",
+    "courier",
+    "instructions",
+    "inline_prompts",
+    "env",
+    "secrets",
+    "mounts",
+    "tools",
+    "tests",
+    "models",
+    "limits",
+    "timeouts",
+    "network",
+    "labels",
+    "files"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://serenorg.github.io/dispatch/schemas/parcel.v2.json"
+    },
+    "format_version": {
+      "type": "integer",
+      "minimum": 1,
+      "const": 2
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source": {
+      "type": "string"
+    },
+    "courier": {
+      "$ref": "#/$defs/courierTarget"
+    },
+    "framework": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/framework"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "entrypoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schedules": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "listeners": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ingress": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ingress"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "instructions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/instruction"
+      }
+    },
+    "inline_prompts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "env": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/envVar"
+      }
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/secret"
+      }
+    },
+    "visibility": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "open",
+        "opaque",
+        null
+      ]
+    },
+    "mounts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mount"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tool"
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/test"
+      }
+    },
+    "models": {
+      "$ref": "#/$defs/models"
+    },
+    "compaction": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/compaction"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limits": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/limit"
+      }
+    },
+    "timeouts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/timeout"
+      }
+    },
+    "network": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/networkRule"
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    }
+  },
+  "$defs": {
+    "framework": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "methods"
+      ],
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shared_secret_env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_body_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "max_header_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "test": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/toolTest"
+        }
+      ]
+    },
+    "toolTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "tool"
+      ],
+      "properties": {
+        "kind": {
+          "const": "tool"
+        },
+        "tool": {
+          "type": "string"
+        }
+      }
+    },
+    "courierTarget": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/nativeCourierTarget"
+        },
+        {
+          "$ref": "#/$defs/dockerCourierTarget"
+        },
+        {
+          "$ref": "#/$defs/wasmCourierTarget"
+        },
+        {
+          "$ref": "#/$defs/customCourierTarget"
+        }
+      ]
+    },
+    "nativeCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "native"
+        },
+        "reference": {
+          "type": "string"
+        }
+      }
+    },
+    "dockerCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "docker"
+        },
+        "reference": {
+          "type": "string"
+        }
+      }
+    },
+    "wasmCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "wasm"
+        },
+        "reference": {
+          "type": "string"
+        },
+        "component": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/wasmComponent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "customCourierTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "const": "custom"
+        },
+        "reference": {
+          "type": "string"
+        }
+      }
+    },
+    "wasmComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "packaged_path",
+        "sha256",
+        "abi"
+      ],
+      "properties": {
+        "packaged_path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "abi": {
+          "type": "string"
+        }
+      }
+    },
+    "instruction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "packaged_path",
+        "sha256"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "identity",
+            "soul",
+            "skill",
+            "agents",
+            "user",
+            "tools",
+            "memory",
+            "heartbeat",
+            "eval"
+          ]
+        },
+        "packaged_path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "skill_name": {
+          "type": "string"
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "envVar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "required"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "driver",
+        "options"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "session",
+            "memory",
+            "artifacts"
+          ]
+        },
+        "driver": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "args"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "localTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "alias",
+        "packaged_path",
+        "runner"
+      ],
+      "properties": {
+        "kind": {
+          "const": "local"
+        },
+        "alias": {
+          "type": "string"
+        },
+        "packaged_path": {
+          "type": "string"
+        },
+        "runner": {
+          "$ref": "#/$defs/command"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "packaged_path",
+            "sha256"
+          ],
+          "properties": {
+            "packaged_path": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        },
+        "skill_source": {
+          "type": "string"
+        }
+      }
+    },
+    "builtinTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "capability"
+      ],
+      "properties": {
+        "kind": {
+          "const": "builtin"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "mcpTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "server"
+      ],
+      "properties": {
+        "kind": {
+          "const": "mcp"
+        },
+        "server": {
+          "type": "string"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "a2aTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "alias",
+        "url"
+      ],
+      "properties": {
+        "kind": {
+          "const": "a2a"
+        },
+        "alias": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "endpoint_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "auto",
+            "card",
+            "direct",
+            null
+          ]
+        },
+        "auth": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scheme",
+                "secret_name"
+              ],
+              "properties": {
+                "scheme": {
+                  "const": "bearer"
+                },
+                "secret_name": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scheme",
+                "header_name",
+                "secret_name"
+              ],
+              "properties": {
+                "scheme": {
+                  "const": "header"
+                },
+                "header_name": {
+                  "type": "string"
+                },
+                "secret_name": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scheme",
+                "username_secret_name",
+                "password_secret_name"
+              ],
+              "properties": {
+                "scheme": {
+                  "const": "basic"
+                },
+                "username_secret_name": {
+                  "type": "string"
+                },
+                "password_secret_name": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        },
+        "expected_agent_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_card_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "approval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "never",
+            "always",
+            "confirm",
+            "audit",
+            null
+          ]
+        },
+        "risk": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "packaged_path",
+            "sha256"
+          ],
+          "properties": {
+            "packaged_path": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "tool": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/localTool"
+        },
+        {
+          "$ref": "#/$defs/builtinTool"
+        },
+        {
+          "$ref": "#/$defs/mcpTool"
+        },
+        {
+          "$ref": "#/$defs/a2aTool"
+        }
+      ]
+    },
+    "modelReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fallbacks"
+      ],
+      "properties": {
+        "primary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/modelReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fallbacks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelReference"
+          }
+        },
+        "routing": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "compaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interval"
+      ],
+      "properties": {
+        "interval": {
+          "type": "string"
+        },
+        "overlap": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "value"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "timeout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "duration"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "duration": {
+          "type": "string"
+        }
+      }
+    },
+    "networkRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "target",
+        "qualifiers"
+      ],
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "qualifiers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "packaged_as",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "packaged_as": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

@@ -5,10 +5,10 @@ Dispatch packages agents into verifiable parcels and runs them through pluggable
 The core idea: an agent should be a self-describing, verifiable artifact - separate from the infrastructure that runs it. Build it once. Run it anywhere a courier exists.
 
 ```
-Agentfile  ->  dispatch parcel build  ->  parcel (artifact)  ->  dispatch run  ->  courier
+dispatch.toml  ->  dispatch parcel build  ->  parcel (artifact)  ->  dispatch run  ->  courier
 ```
 
-An `Agentfile` is the source definition; a **parcel** is the built artifact; a **courier** executes it; a **session** is the active run.
+`dispatch.toml` defines a Dispatch project. It either defines an agent under `[agent]` or references a built parcel. Its other fields and tables configure deployment. A **parcel** is the built artifact. A **courier** executes a parcel. A **session** is an active run.
 
 Available couriers today include native, Docker, WASM, and external plugins that speak JSON-RPC 2.0 over line-delimited JSON on stdio. The WASM path runs a guest component compiled against the [Dispatch WIT ABI](crates/dispatch-wasm-abi/wit/dispatch-courier.wit) in any host that implements the interface - local machine, cloud worker, edge node, or multi-tenant platform - with no container daemon required and with WebAssembly isolation by default.
 
@@ -25,7 +25,7 @@ Without a standard artifact format:
 
 With Dispatch:
 
-- `Agentfile` is the canonical authored spec - human-editable, diff-friendly, reviewable
+- the agent definition in `dispatch.toml` is the canonical authored source - human-editable, diff-friendly, reviewable
 - `dispatch parcel build` produces a content-addressed parcel with a verifiable manifest
 - `dispatch parcel verify` re-hashes every file and checks detached signatures
 - `dispatch run` selects a courier backend and executes - the parcel carries its contract with it
@@ -35,7 +35,7 @@ The practical applications: deploying untrusted third-party agents in a sandboxe
 
 ## Vocabulary
 
-- an `Agentfile` builds a **parcel**
+- Dispatch compiles an agent definition into a **parcel**
 - a parcel is described by `manifest.json`
 - `parcel.lock` records parcel integrity metadata
 - a **courier** executes a parcel
@@ -43,13 +43,13 @@ The practical applications: deploying untrusted third-party agents in a sandboxe
 - a running parcel execution is a **session**
 - the resolved prompt stack is the parcel's **brief** to the model
 
-## Agentfile
+## Agent configuration
 
-`Agentfile` is the authored build format inside Dispatch, similar to how `Dockerfile` fits inside Docker - line-oriented, diff-friendly, composable.
+An agent is defined under `[agent]` in `dispatch.toml`. This agent definition plays the same role as a Dockerfile in Docker. It is declarative, diff-friendly, and strictly typed.
 
 An agent project has:
 
-- an `Agentfile`
+- a `dispatch.toml` with an `[agent]` table
 - optional instruction files loaded into the agent's prompt stack:
 
 | File | Purpose |
@@ -63,67 +63,100 @@ An agent project has:
 | `MEMORY.md` | Memory policy: what to store, when, and in what format |
 | `HEARTBEAT.md` | Procedures to execute on each scheduled run |
 
-- optional [Agent Skills](https://agentskills.io/specification) bundles referenced with `SKILL path/to/skill-dir`
-- an explicit `COMPONENT` for `dispatch/wasm` parcels
+- optional [Agent Skills](https://agentskills.io/specification) bundles referenced in `agent.skills`
+- an explicit `agent.component` for `dispatch/wasm` parcels
 - local tools, reference assets, evals, and code
 
-Example (`examples/parcels/basic/Agentfile`):
+Example (`examples/parcels/basic/dispatch.toml`):
 
-```dockerfile
-FROM dispatch/native:latest
+```toml
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "basic-assistant"
+version = "0.1.0"
+entrypoint = "chat"
+visibility = "open"
+evals = ["evals/smoke.eval"]
 
-NAME basic-assistant
-VERSION 0.1.0
+[agent.instructions]
+identity = "IDENTITY.md"
+soul = "SOUL.md"
+skill = "SKILL.md"
+agents = "AGENTS.md"
+user = "USER.md"
+tools = "TOOLS.md"
+memory = "MEMORY.md"
 
-IDENTITY IDENTITY.md
-SOUL SOUL.md
-SKILL SKILL.md
-AGENTS AGENTS.md
-USER USER.md
-TOOLS TOOLS.md
-MEMORY POLICY MEMORY.md
+[agent.model]
+id = "gpt-5.6-luna"
+provider = "openai"
 
-MODEL gpt-5.4-mini PROVIDER openai
-FALLBACK claude-sonnet-4-6 PROVIDER anthropic
+[[agent.model.fallbacks]]
+id = "claude-sonnet-4-6"
+provider = "anthropic"
 
-TOOL BUILTIN system_time
-TOOL BUILTIN web_search
-TOOL BUILTIN topic_lookup
-TOOL BUILTIN human_approval
-TOOL BUILTIN memory_put
-TOOL BUILTIN memory_get
-SECRET PLANNER_TOKEN
-TOOL A2A planner URL https://planner.example.com DISCOVERY card AUTH bearer PLANNER_TOKEN EXPECT_AGENT_NAME planner-agent EXPECT_CARD_SHA256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef DESCRIPTION "Delegate planning to a remote agent."
-TOOL A2A search URL https://search.example.com AUTH header X-Api-Key SEARCH_TOKEN DESCRIPTION "Call a remote search agent with header auth."
-TOOL A2A backoffice URL https://backoffice.example.com AUTH basic BACKOFFICE_USER BACKOFFICE_PASSWORD DESCRIPTION "Call a remote backoffice agent with basic auth."
+[agent.env]
+TZ = "UTC"
 
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-MOUNT ARTIFACTS local
+[[agent.secrets]]
+name = "PLANNER_TOKEN"
 
-ENV TZ=UTC
-VISIBILITY open
+[[agent.tools]]
+kind = "builtin"
+name = "web_search"
 
-LIMIT ITERATIONS 20
-LIMIT TOOL_CALLS 12
-LIMIT TOOL_ROUNDS 8
-LIMIT TOOL_OUTPUT 10000
-LIMIT CONTEXT_TOKENS 16000
-COMPACTION 200 OVERLAP 32
-TIMEOUT RUN 300s
-TIMEOUT TOOL 60s
-TIMEOUT LLM 120s
-EVAL evals/smoke.eval
+[[agent.tools]]
+kind = "builtin"
+name = "memory_put"
 
-ENTRYPOINT chat
+[[agent.tools]]
+kind = "a2a"
+alias = "planner"
+url = "https://planner.example.com"
+discovery = "card"
+expect_agent_name = "planner-agent"
+expect_card_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+description = "Delegate planning to a remote agent."
+
+[agent.tools.auth]
+scheme = "bearer"
+secret_name = "PLANNER_TOKEN"
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "artifacts"
+driver = "local"
+
+[agent.limits]
+iterations = 20
+tool_calls = 12
+tool_rounds = 8
+tool_output = 10000
+context_tokens = 16000
+
+[agent.timeouts]
+run = "300s"
+tool = "60s"
+llm = "120s"
+
+[agent.compaction]
+interval = "200"
+overlap = 32
 ```
 
-`TOOL A2A` endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Dispatch requires `https://` for non-loopback A2A endpoints and rejects URLs with embedded credentials; plain `http://` is only accepted for loopback development targets such as `localhost` or `127.0.0.1`. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames, or with `DISPATCH_A2A_TRUST_POLICY`, a TOML policy file that can match by origin/hostname and require discovered agent-card identity fields such as `expected_agent_name` and `expected_card_sha256`. Command-scoped CLI A2A policy flags override inherited environment values for that one invocation without mutating the process environment. The current `TOOL A2A` contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout. For the full declaration and operator model, see [docs/a2a.md](./docs/a2a.md).
+A2A tool endpoints are declared in the parcel, and discovered agent cards are allowed to refine the RPC path but not pivot execution onto a different origin than the declared URL. Dispatch requires `https://` for non-loopback A2A endpoints and rejects URLs with embedded credentials; plain `http://` is only accepted for loopback development targets such as `localhost` or `127.0.0.1`. Operators can still constrain outbound calls at runtime with `DISPATCH_A2A_ALLOWED_ORIGINS`, using a comma-separated list of allowed origins or hostnames, or with `DISPATCH_A2A_TRUST_POLICY`, a TOML policy file that can match by origin/hostname and require discovered agent-card identity fields such as `expected_agent_name` and `expected_card_sha256`. Command-scoped CLI A2A policy flags override inherited environment values for that one invocation without mutating the process environment. The current A2A tool contract is synchronous: Dispatch will poll `tasks/get` for unfinished remote tasks until completion or the configured tool timeout. For the full declaration and operator model, see [docs/a2a.md](./docs/a2a.md).
 
-`TIMEOUT RUN` is enforced as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes. It does not currently preempt a turn that has already started.
-`TIMEOUT TOOL` is currently enforced for host-executed local tools and host-executed A2A tool calls.
+The `run` timeout is enforced as a persisted pre-turn session budget using accumulated elapsed runtime across successful runs and resumes. It does not currently preempt a turn that has already started.
+The `tool` timeout is currently enforced for host-executed local tools and host-executed A2A tool calls.
 
-`SECRET` values resolve from the environment first and then fall back to a repo-local encrypted store under `.dispatch/secrets`. Use `dispatch secret init .` once per project, `dispatch secret set NAME --value ...` or `--value-stdin` to store values locally, `dispatch secret ls` to inspect stored names, and `dispatch secret rm NAME` to remove one without printing plaintext back to the terminal.
+Declared secret values resolve from the environment first and then fall back to a repo-local encrypted store under `.dispatch/secrets`. Use `dispatch secret init .` once per project, `dispatch secret set NAME --value ...` or `--value-stdin` to store values locally, `dispatch secret ls` to inspect stored names, and `dispatch secret rm NAME` to remove one without printing plaintext back to the terminal.
 
 CLI-scoped A2A operator policy overrides are available on:
 
@@ -132,19 +165,14 @@ CLI-scoped A2A operator policy overrides are available on:
 - `dispatch courier conformance`
 
 Use `--a2a-allowed-origins ...` and `--a2a-trust-policy ...` when you want command-scoped A2A policy without exporting environment variables.
-Hosted model backends also receive `TIMEOUT LLM` as an HTTP request timeout when the parcel declares it.
+Hosted model backends also receive `agent.timeouts.llm` as an HTTP request timeout when the parcel declares it.
 Timeout durations must be positive integers ending in `ms`, `s`, `m`, or `h`.
 
 ## Agent Skills Compatibility
 
 Dispatch supports the [Agent Skills specification](https://agentskills.io/specification) as a first-class skill packaging layout.
 
-`SKILL` accepts either:
-
-- a markdown file such as `SKILL SKILL.md`
-- a skill directory such as `SKILL skills/file-analyst`
-
-When `SKILL` points at a directory, Dispatch expects:
+Use `agent.instructions.skill` for one standalone markdown instruction document. Use the `agent.skills` array for Agent Skills bundle directories. In each bundle directory, Dispatch expects:
 
 - `SKILL.md` for the skill instructions
 - an optional `skill.toml` sidecar for Dispatch-executable tool metadata
@@ -152,7 +180,7 @@ When `SKILL` points at a directory, Dispatch expects:
 
 `SKILL.md` stays Agent Skills compliant. Dispatch-specific execution metadata lives in `skill.toml`, or in a sidecar path referenced by `metadata.dispatch-manifest` in the skill frontmatter.
 `skill.toml` is a reserved filename inside skill directories: if it exists, Dispatch will try to load it as the sidecar unless frontmatter points at a different file.
-If you only want to work with a skill locally, `dispatch skill validate <path>` checks that Dispatch can synthesize a parcel from a `SKILL.md` file or skill bundle directory, and `dispatch skill run <path>` executes that synthesized parcel without requiring an authored `Agentfile`.
+If you only want to work with a skill locally, `dispatch skill validate <path>` checks that Dispatch can synthesize a parcel from a `SKILL.md` file or skill bundle directory, and `dispatch skill run <path>` executes that synthesized parcel without requiring an authored `[agent]` table.
 
 Example skill bundle:
 
@@ -169,15 +197,21 @@ skills/file-analyst/
     \-- REFERENCE.md
 ```
 
-Example `Agentfile`:
+Example `dispatch.toml`:
 
-```dockerfile
-FROM dispatch/native:latest
-NAME file-analyst-agent
-SOUL SOUL.md
-SKILL skills/file-analyst
-MODEL claude-sonnet-4-6 PROVIDER anthropic
-ENTRYPOINT chat
+```toml
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "file-analyst-agent"
+entrypoint = "chat"
+skills = ["skills/file-analyst"]
+
+[agent.instructions]
+soul = "SOUL.md"
+
+[agent.model]
+id = "claude-sonnet-4-6"
+provider = "anthropic"
 ```
 
 Example `skill.toml` sidecar:
@@ -199,7 +233,7 @@ risk = "low"
 description = "Find files matching a pattern."
 ```
 
-Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model for directory-based skill bundles, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. File-based `SKILL path/to/file.md` instructions are left unchanged even if they happen to contain YAML frontmatter. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `skill.toml` may also provide a default `entrypoint`, but an explicit `ENTRYPOINT` in the `Agentfile` still wins. Explicit `TOOL ...` declarations may override skill-generated tool aliases, but duplicate explicit aliases and conflicting aliases across skills fail the build.
+Dispatch packages the whole skill directory, strips `SKILL.md` frontmatter out of the prompt text seen by the model for directory-based skill bundles, and synthesizes the sidecar tool declarations into the parcel manifest as normal local tools. A `instructions.skill` file path is left unchanged even if they happen to contain YAML frontmatter. The built parcel preserves skill annotations such as `allowed-tools` as structured lists, and skill-generated tools retain `skill_source` provenance using the skill's canonical `name`. `skill.toml` may also provide a default `entrypoint`, but an explicit `entrypoint` in the `[agent]` table still wins. Explicit `[[agent.tools]]` declarations override skill-generated tool aliases, but duplicate explicit aliases and conflicting aliases across skills fail the build.
 
 `allowed-tools` is currently preserved as informational metadata for interoperability and downstream policy engines. The reference courier does not enforce it yet, but `dispatch parcel lint` and `dispatch parcel build` warn when a skill's `allowed-tools` entries do not line up with synthesized or declared tool aliases.
 
@@ -247,7 +281,7 @@ The commands below assume `dispatch` is installed and on your `PATH`. For local 
 Build and run the reference examples:
 
 ```bash
-# Lint an Agentfile
+# Lint an agent config
 dispatch parcel lint examples/parcels/basic
 dispatch parcel lint examples/parcels/wasm-reference
 dispatch parcel lint examples/skills/file-analyst
@@ -278,10 +312,10 @@ dispatch parcel verify examples/parcels/basic/.dispatch/parcels/<digest> --publi
 dispatch run examples/parcels/basic/.dispatch/parcels/<digest> --chat "hello"
 dispatch run examples/parcels/basic/.dispatch/parcels/<digest> --interactive
 
-# Run a skill bundle directly without authoring an Agentfile
+# Run a skill bundle directly without authoring an agent config
 dispatch skill validate examples/skills/file-analyst/skills/file-analyst
 dispatch skill run examples/skills/file-analyst/skills/file-analyst --list-tools
-dispatch skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5.4-mini --provider openai --chat "Summarize this repository."
+dispatch skill run examples/skills/file-analyst/skills/file-analyst --model gpt-5.6-luna --provider openai --chat "Summarize this repository."
 
 # Run a WASM parcel
 dispatch run examples/parcels/wasm-reference/.dispatch/parcels/<digest> --courier wasm --chat "hello"
@@ -363,10 +397,10 @@ A built parcel contains:
 
 - `manifest.json` - typed parcel manifest with `$schema` pointer
 - `parcel.lock` - file and digest integrity metadata
-- `context/` - packaged build content referenced by the `Agentfile`
+- `context/` - packaged build content referenced by the `[agent]` table
 - `signatures/<key_id>.json` - detached Ed25519 signatures (optional)
 
-The manifest is described by [`schemas/parcel.v1.json`](schemas/parcel.v1.json), published at `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`.
+The manifest is described by [`schemas/parcel.v2.json`](schemas/parcel.v2.json), published at `https://serenorg.github.io/dispatch/schemas/parcel.v2.json`.
 Schema publication and compatibility policy live in [`docs/schema-compatibility.md`](docs/schema-compatibility.md).
 
 Packaged eval files live under `context/` with the other authored inputs. A minimal eval file looks like:
@@ -394,12 +428,12 @@ expects_tool_stdout_contains = { tool = "system_time", contains = "2026-04-03" }
 expects_text_exact = "plugin reply"
 ```
 
-`dispatch parcel eval` runs packaged `EVAL` cases and `TEST` tool smoke checks against a live courier and reports pass/fail per case.
+`dispatch parcel eval` runs packaged `agent.evals` cases and `agent.tests` tool smoke checks against a live courier and reports pass/fail per case.
 Tool result assertions can be either a plain value or a tool-scoped object, so multi-tool evals can target one tool explicitly.
 `expects_no_tool = true` can be used for cases that should complete without invoking any tool.
 `expects_tool_stdout_matches_schema` validates JSON stdout from a tool against a packaged JSON schema file, and `expects_a2a_endpoint` asserts that an A2A tool alias resolved to the expected declared endpoint.
 
-For larger regression suites, keep the assertions inside packaged `EVAL` files and fan them out with a repo-local dataset:
+For larger regression suites, keep the assertions inside packaged eval files and fan them out with a repo-local dataset:
 
 ```toml
 version = 1
@@ -417,7 +451,7 @@ Add `--trace-dir .dispatch/traces` to persist one structured JSON trace per eval
 Parcel format compatibility:
 
 - `load_parcel` validates `manifest.json` against the bundled Dispatch JSON Schema before parsing
-- the reference implementation supports exactly `format_version: 1`
+- the reference implementation supports exactly `format_version: 2`
 - couriers must reject parcels whose `$schema` or `format_version` they do not support
 - published schema URLs are immutable; new manifest-shape changes require a new schema URL and `format_version`
 
@@ -435,9 +469,9 @@ The native courier runs the parcel directly on the local machine as a host proce
 
 Model backend selection:
 
-- if the parcel declares `MODEL <id> PROVIDER <backend>`, that provider is used
+- if `agent.model` declares `id` and `provider`, that provider is used
 - if no parcel-level provider, `LLM_BACKEND` selects the backend: `openai`, `anthropic`, `claude`, `gemini`, `openai_compatible`, `codex`
-- `FALLBACK <id> [PROVIDER <backend>]` entries are tried in order when the primary backend fails before producing a reply
+- `agent.model.fallbacks` entries are tried in order when the primary backend fails before producing a reply
 
 Supported backends:
 
@@ -452,9 +486,9 @@ Supported backends:
 
 `LLM_API_KEY` and `LLM_BASE_URL` take precedence over provider-specific vars. Provider-specific vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) are checked as fallbacks when the `LLM_*` vars are not set.
 
-`claude` uses the local `claude` CLI instead of a hosted HTTP API. Authentication is handled entirely by the local `claude` binary using whatever login, config, or environment-based credentials it already supports; Dispatch does not preflight or inject API keys for this backend. Dispatch does not load `CLAUDE.md` or Claude settings files from the working directory, which keeps the execution context explicit. By default Dispatch persists Claude session state and resumes that session on later turns. Parcel authors can declare `MODEL ... PROVIDER claude --persist-thread=false` to request ephemeral sessions instead, and may also set `--reasoning-effort=high` at the parcel level. Dispatch validates Claude effort overrides against the documented CLI values `low`, `medium`, `high`, and `max` before invoking the local binary. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. Set `CLAUDE_BINARY` to override the path to the `claude` executable (default: `claude` on `PATH`). To preserve Dispatch's capability boundary, ambient Claude tool actions are denied unless Dispatch grows an explicit tool bridge for them.
+`claude` uses the local `claude` CLI instead of a hosted HTTP API. Authentication is handled entirely by the local `claude` binary using whatever login, config, or environment-based credentials it already supports; Dispatch does not preflight or inject API keys for this backend. Dispatch does not load `CLAUDE.md` or Claude settings files from the working directory, which keeps the execution context explicit. By default Dispatch persists Claude session state and resumes that session on later turns. Parcel authors can set `agent.model.provider = "claude"` and `agent.model.options.persist-thread = "false"` to request ephemeral sessions, and can set `agent.model.options.reasoning-effort = "high"` at the parcel level. Dispatch validates Claude effort overrides against the documented CLI values `low`, `medium`, `high`, and `max` before invoking the local binary. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. Set `CLAUDE_BINARY` to override the path to the `claude` executable (default: `claude` on `PATH`). To preserve Dispatch's capability boundary, ambient Claude tool actions are denied unless Dispatch grows an explicit tool bridge for them.
 
-`codex` uses the local `codex app-server` process instead of a hosted HTTP API. Dispatch starts a fresh app-server process per model call, but by default it persists Codex thread state and resumes that thread on later turns when `--session-file` or interactive session state is present. Parcel authors can declare `MODEL ... PROVIDER codex --persist-thread=false` to request ephemeral Codex threads instead, and may also set `--reasoning-effort=high` at the parcel level. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. If neither the parcel nor the env sets a reasoning effort, Dispatch omits the override and lets Codex use the selected model's default effort. Dispatch leaves Codex using its normal home/config/auth location unless the environment already overrides `CODEX_HOME`. When persistence is disabled, no Codex rollout files are saved and follow-up context comes from Dispatch session history instead. To preserve Dispatch's capability boundary, app-server permission requests are denied by default in this backend, so ambient Codex command/file/MCP actions are not available unless Dispatch grows an explicit tool bridge for them. This backend intentionally preserves the user's Codex auth/config for both modes. On Unix the reference implementation uses a PTY-backed transport for Codex; other targets currently fall back to plain process pipes.
+`codex` uses the local `codex app-server` process instead of a hosted HTTP API. Dispatch starts a fresh app-server process per model call, but by default it persists Codex thread state and resumes that thread on later turns when `--session-file` or interactive session state is present. Parcel authors can set `agent.model.provider = "codex"` and `agent.model.options.persist-thread = "false"` to request ephemeral Codex threads, and can set `agent.model.options.reasoning-effort = "high"` at the parcel level. `DISPATCH_PERSIST_THREAD` remains the operator override and takes precedence over the parcel setting. If neither the parcel nor the env sets a reasoning effort, Dispatch omits the override and lets Codex use the selected model's default effort. Dispatch leaves Codex using its normal home/config/auth location unless the environment already overrides `CODEX_HOME`. When persistence is disabled, no Codex rollout files are saved and follow-up context comes from Dispatch session history instead. To preserve Dispatch's capability boundary, app-server permission requests are denied by default in this backend, so ambient Codex command/file/MCP actions are not available unless Dispatch grows an explicit tool bridge for them. This backend intentionally preserves the user's Codex auth/config for both modes. On Unix the reference implementation uses a PTY-backed transport for Codex; other targets currently fall back to plain process pipes.
 
 `run` flags:
 
@@ -467,7 +501,7 @@ Supported backends:
 - `--list-tools` - list declared tools
 - `--json` - when combined with `--list-tools`, print full tool metadata as JSON
 - `--tool <name>` - execute one declared local tool
-- `--tool-approval <ask|always|never>` - control how `APPROVAL confirm` tools are handled at the CLI
+- `--tool-approval <ask|always|never>` - control how tools with `approval = "confirm"` are handled at the CLI
 - `/prompt`, `/tools`, `/help` - handled locally during interactive sessions
 
 ## Long-Lived Runtime
@@ -483,24 +517,23 @@ Dispatch also has a local long-lived runtime for detached execution and always-o
 - `dispatch image ...` exposes Docker-style aliases for parcel artifact management commands
 - `dispatch container ...` exposes Docker-style aliases for the same run management commands
 
-`dispatch serve` currently requires a parcel authored with
-`ENTRYPOINT heartbeat`.
+`dispatch serve` currently requires `agent.entrypoint = "heartbeat"`.
 
 Service scheduling and ingress can be authored into the parcel:
 
-- `SCHEDULE "<cron>"`
-- `LISTEN "127.0.0.1:0"`
-- `LISTEN_PATH "/hook"`
-- `LISTEN_METHOD POST`
-- `LISTEN_SECRET DISPATCH_WEBHOOK_SECRET`
-- `LISTEN_MAX_BODY_BYTES 8192`
-- `LISTEN_MAX_HEADER_BYTES 4096`
+- `agent.schedules = ["<cron>"]`
+- `agent.listeners = ["127.0.0.1:0"]`
+- `agent.ingress.path = "/hook"`
+- `agent.ingress.methods = ["POST"]`
+- `agent.ingress.secret_env = "DISPATCH_WEBHOOK_SECRET"`
+- `agent.ingress.max_body_bytes = 8192`
+- `agent.ingress.max_header_bytes = 4096`
 
 CLI `dispatch serve` flags can also provide or override schedules, listeners, and ingress policy at runtime. For the full runtime contract, see [docs/runtime-and-serve.md](./docs/runtime-and-serve.md).
 
 `dispatch wait` prints the run exit code. Detached one-shot runs that complete normally return `0`; explicitly stopped runs and one-shot runs whose helper dies before recording terminal state return non-zero.
 
-`dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `Agentfile`, and run the same synthesis and parcel build that an authored `Agentfile` would use. `dispatch skill validate` stops after that build-time validation, while `dispatch skill run` then delegates to `dispatch run`. This means `validate` surfaces sidecar, frontmatter, packaging, and build errors directly and is suitable for CI, but it is intentionally heavier than a schema-only lint. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
+`dispatch skill validate` and `dispatch skill run` are convenience wrappers over the same build path. They copy the referenced `SKILL.md` file or skill bundle into a temporary workspace, synthesize a minimal `[agent]` table, and run the same synthesis and parcel build that an authored one would use. `dispatch skill validate` stops after that build-time validation, while `dispatch skill run` then delegates to `dispatch run`. This means `validate` surfaces sidecar, frontmatter, packaging, and build errors directly and is suitable for CI, but it is intentionally heavier than a schema-only lint. The current shortcuts support built-in `native` and `docker` couriers and accept `--model`, `--provider`, and `--entrypoint` overrides for the synthesized parcel.
 
 ## Courier Architecture
 
@@ -531,9 +564,9 @@ For courier implementers:
 
 Courier registry:
 
-The courier registry is host inventory, not parcel source. `Agentfile` remains the canonical authored spec, while `dispatch courier install` records which runtime backends are available on a given machine.
+The courier registry is host inventory, not parcel source. The agent definition remains the canonical parcel source. `dispatch courier install` records the runtime backends that are available on a machine.
 
-For project-scoped runtime wiring, use `dispatch.toml` with `dispatch up`. That path is separate from `Agentfile`: `Agentfile` defines the parcel, while `dispatch.toml` binds parcels to installed channels/couriers, declares managed deployment bindings, and reconciles extension manifests into project-local registries under `.dispatch/registries/`. Reply delivery through channel bindings requires a parcel; `deliver_replies` does not work on a channel-only runtime binding.
+For project-scoped runtime wiring, use `dispatch up`. The two halves of `dispatch.toml` stay separate: `[agent]` defines the parcel, while the deployment tables bind parcels to installed channels/couriers, declares managed deployment bindings, and reconciles extension manifests into project-local registries under `.dispatch/registries/`. Reply delivery through channel bindings requires a parcel; `deliver_replies` does not work on a channel-only runtime binding.
 
 - `dispatch parcel lint|build|inspect|verify|keygen|sign` - manage parcel sources, signatures, and built artifacts
 - `dispatch depot push|pull` - move parcels to and from depots
@@ -580,11 +613,11 @@ See [`docs/plugin-ecosystem.md`](docs/plugin-ecosystem.md) for the full roadmap,
 
 ## Mounts
 
-State is not baked into the parcel. Sessions, memory, and artifacts are mounts declared in the `Agentfile`.
+State is not baked into the parcel. Sessions, memory, and artifacts are mounts declared in `[[agent.mounts]]`.
 
-- `MOUNT SESSION sqlite` - session-scoped sqlite; persists `CourierSession` state per turn
-- `MOUNT MEMORY sqlite` - parcel-scoped sqlite; exposes `memory_get`, `memory_put`, `memory_delete`, `memory_list` to model-backed turns
-- `MOUNT ARTIFACTS local` - parcel-scoped artifact storage
+- `kind = "session"`, `driver = "sqlite"` - session-scoped sqlite; persists `CourierSession` state per turn
+- `kind = "memory"`, `driver = "sqlite"` - parcel-scoped sqlite; exposes `memory_get`, `memory_put`, `memory_delete`, `memory_list` to model-backed turns
+- `kind = "artifacts"`, `driver = "local"` - parcel-scoped artifact storage
 
 State layout:
 
@@ -622,12 +655,12 @@ State management:
   - `public_keys` from matching rules are merged and deduplicated
 - `--public-key` composes with `--trust-policy`; explicit keys are added to any matching policy keys
 - trust-policy verification happens before a pulled parcel is committed into the local parcel store
-- `FRAMEWORK` metadata is informational provenance, not a trust root; use signatures and trust policy for publisher authorization
+- `agent.framework` metadata is informational provenance, not a trust root; use signatures and trust policy for publisher authorization
 
 ## Design Principles
 
-- `Agentfile` is line-oriented and human-editable.
-- Dispatch owns the courier/parcel contract; `Agentfile` stays the authored format.
+- Agent definitions are declarative, typed, and human-editable.
+- Dispatch owns the courier and parcel contract. The agent definition remains the authored source.
 - State is not baked into the parcel. Sessions, memory, and artifacts are mounts.
 - Tools are declared capabilities, not implicit filesystem accidents.
 - A courier must not advertise or execute undeclared tools based on ambient prompt text.

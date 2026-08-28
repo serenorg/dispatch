@@ -182,7 +182,7 @@ pub fn load_eval_dataset(path: &std::path::Path) -> Result<EvalDatasetDocument, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BuildOptions, build_agentfile, load_parcel};
+    use crate::{BuildOptions, build_agent, load_parcel};
     use tempfile::tempdir;
 
     #[test]
@@ -191,8 +191,8 @@ mod tests {
         let context_dir = dir.path().join("image");
         fs::create_dir_all(context_dir.join("evals")).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nEVAL evals/single.eval\nEVAL evals/multi.eval\nENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nevals = [\"evals/single.eval\", \"evals/multi.eval\"]\n",
         )
         .unwrap();
         fs::write(
@@ -206,8 +206,8 @@ mod tests {
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },
@@ -230,8 +230,8 @@ mod tests {
         let context_dir = dir.path().join("image");
         fs::create_dir_all(context_dir.join("evals")).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nEVAL evals/scoped.eval\nENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nevals = [\"evals/scoped.eval\"]\n",
         )
         .unwrap();
         fs::write(
@@ -240,8 +240,8 @@ mod tests {
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },
@@ -273,8 +273,8 @@ mod tests {
         let context_dir = dir.path().join("image");
         fs::create_dir_all(context_dir.join("evals")).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nEVAL evals/no-tool.eval\nENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nevals = [\"evals/no-tool.eval\"]\n",
         )
         .unwrap();
         fs::write(
@@ -283,8 +283,8 @@ mod tests {
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },
@@ -303,8 +303,8 @@ mod tests {
         let context_dir = dir.path().join("image");
         fs::create_dir_all(context_dir.join("evals")).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nEVAL evals/expectations.eval\nENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nevals = [\"evals/expectations.eval\"]\n",
         )
         .unwrap();
         fs::write(
@@ -318,8 +318,8 @@ mod tests {
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },
@@ -350,14 +350,14 @@ mod tests {
         let context_dir = dir.path().join("image");
         fs::create_dir_all(context_dir.join("scripts")).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nTOOL LOCAL scripts/demo.sh AS demo\nTEST tool:demo\nENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"scripts/demo.sh\"\nalias = \"demo\"\n\n[[agent.tests]]\ntool = \"demo\"\n",
         )
         .unwrap();
         fs::write(context_dir.join("scripts/demo.sh"), "#!/bin/sh\necho ok\n").unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },

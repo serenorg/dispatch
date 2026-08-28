@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use dispatch_core::{BuildOptions, BuiltParcel, BuiltinCourier, build_agentfile};
+use dispatch_core::{BuildOptions, BuiltParcel, BuiltinCourier, build_agent};
 use std::{
     ffi::OsStr,
     fs,
@@ -83,13 +83,13 @@ fn synthesize_skill_parcel(args: &SkillSynthesisArgs<'_>) -> Result<SynthesizedS
     let workspace = tempfile::tempdir().context("failed to create temporary skill workspace")?;
     let source = resolve_skill_source(args.path)?;
     let copied_rel = copy_skill_source(&source.root, workspace.path(), &source.copied_name)?;
-    let agentfile_path = workspace.path().join("Agentfile");
+    let config_path = workspace.path().join("dispatch.toml");
     let output_root = workspace.path().join(".dispatch/parcels");
-    let agentfile = render_skill_agentfile(courier, &copied_rel, args)?;
-    fs::write(&agentfile_path, agentfile)
-        .with_context(|| format!("failed to write {}", agentfile_path.display()))?;
-    let built = build_agentfile(
-        &agentfile_path,
+    let config = render_skill_agent_config(courier, &copied_rel, args)?;
+    fs::write(&config_path, config)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let built = build_agent(
+        &config_path,
         &BuildOptions {
             output_root: output_root.clone(),
         },
@@ -118,7 +118,7 @@ fn parse_skill_courier(name: &str) -> Result<BuiltinCourier> {
         "native" => Ok(BuiltinCourier::Native),
         "docker" => Ok(BuiltinCourier::Docker),
         "wasm" => bail!(
-            "`dispatch skill` does not support `--courier wasm`; use an Agentfile with `FROM dispatch/wasm:...` and `COMPONENT ...`"
+            "`dispatch skill` does not support `--courier wasm`; use `dispatch.toml` with `agent.courier_reference = \"dispatch/wasm:...\"` and `agent.component`"
         ),
         other => bail!(
             "`dispatch skill` currently supports only built-in `native` and `docker` couriers, got `{other}`"
@@ -223,45 +223,49 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn render_skill_agentfile(
+fn render_skill_agent_config(
     courier: BuiltinCourier,
     skill_path: &str,
     args: &SkillSynthesisArgs<'_>,
 ) -> Result<String> {
-    let mut lines = vec![format!("FROM {}", synthesized_from_reference(courier))];
-    lines.push(format!("SKILL {}", render_agentfile_scalar(skill_path)?));
-    if let Some(model) = args.model {
-        let mut line = format!("MODEL {}", render_agentfile_scalar(model)?);
-        if let Some(provider) = args.provider {
-            line.push_str(&format!(" PROVIDER {}", render_agentfile_scalar(provider)?));
-        }
-        lines.push(line);
-    }
+    let mut lines = vec![
+        "[agent]".to_string(),
+        format!(
+            "courier_reference = {}",
+            toml_string(synthesized_from_reference(courier))?
+        ),
+    ];
     if let Some(entrypoint) = args.entrypoint {
-        lines.push(format!(
-            "ENTRYPOINT {}",
-            render_agentfile_scalar(entrypoint)?
-        ));
+        lines.push(format!("entrypoint = {}", toml_string(entrypoint)?));
+    }
+    // A bundle directory is a skill; a lone SKILL.md is an instruction document.
+    if skill_path.to_ascii_lowercase().ends_with(".md") {
+        lines.push(String::new());
+        lines.push("[agent.instructions]".to_string());
+        lines.push(format!("skill = {}", toml_string(skill_path)?));
+    } else {
+        lines.push(format!("skills = [{}]", toml_string(skill_path)?));
+    }
+    if let Some(model) = args.model {
+        lines.push(String::new());
+        lines.push("[agent.model]".to_string());
+        lines.push(format!("id = {}", toml_string(model)?));
+        if let Some(provider) = args.provider {
+            lines.push(format!("provider = {}", toml_string(provider)?));
+        }
     }
     lines.push(String::new());
     Ok(lines.join("\n"))
 }
 
-fn render_agentfile_scalar(value: &str) -> Result<String> {
-    if value.contains(['\n', '\r', '\0']) {
-        bail!(
-            "cannot synthesize an Agentfile scalar containing newline, carriage return, or NUL bytes"
-        );
+/// Render a TOML basic string. Control characters have no representation the
+/// build would round-trip, so they are rejected rather than escaped.
+fn toml_string(value: &str) -> Result<String> {
+    if value.chars().any(char::is_control) {
+        bail!("cannot synthesize an agent config value containing control characters");
     }
-    // Keep this aligned with `dispatch_core::parse::tokenize`: quoted scalars are only delimited
-    // by `"` and do not support backslash escapes, so unsupported values must be rejected here.
-    if !value.is_empty() && value.chars().all(|ch| !ch.is_whitespace()) && !value.starts_with('"') {
-        Ok(value.to_string())
-    } else if value.contains('"') {
-        bail!("cannot synthesize an Agentfile scalar containing `\"`")
-    } else {
-        Ok(format!("\"{value}\""))
-    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!("\"{escaped}\""))
 }
 
 fn synthesized_from_reference(courier: BuiltinCourier) -> &'static str {
@@ -294,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn render_skill_agentfile_uses_matching_courier_reference() {
+    fn render_skill_agent_config_uses_matching_courier_reference() {
         let args = sample_synthesis_args(
             Path::new("skills/file-analyst"),
             "docker",
@@ -302,12 +306,13 @@ mod tests {
             Some("openai"),
             Some("chat"),
         );
-        let agentfile =
-            render_skill_agentfile(BuiltinCourier::Docker, "file-analyst", &args).unwrap();
-        assert!(agentfile.contains("FROM dispatch/docker:latest"));
-        assert!(agentfile.contains("SKILL file-analyst"));
-        assert!(agentfile.contains("MODEL gpt-5-mini PROVIDER openai"));
-        assert!(agentfile.contains("ENTRYPOINT chat"));
+        let config =
+            render_skill_agent_config(BuiltinCourier::Docker, "file-analyst", &args).unwrap();
+        assert!(config.contains("courier_reference = \"dispatch/docker:latest\""));
+        assert!(config.contains("skills = [\"file-analyst\"]"));
+        assert!(config.contains("id = \"gpt-5-mini\""));
+        assert!(config.contains("provider = \"openai\""));
+        assert!(config.contains("entrypoint = \"chat\""));
     }
 
     #[test]
@@ -332,15 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn render_skill_agentfile_quotes_paths_with_spaces() {
+    fn render_skill_agent_config_routes_a_markdown_skill_to_instructions() {
         let args = sample_synthesis_args(Path::new("skill.md"), "native", None, None, None);
-        let agentfile =
-            render_skill_agentfile(BuiltinCourier::Native, "My Skill.md", &args).unwrap();
-        assert!(agentfile.contains("SKILL \"My Skill.md\""));
+        let config =
+            render_skill_agent_config(BuiltinCourier::Native, "My Skill.md", &args).unwrap();
+        assert!(config.contains("[agent.instructions]"));
+        assert!(config.contains("skill = \"My Skill.md\""));
+        assert!(!config.contains("skills = ["));
     }
 
     #[test]
-    fn render_skill_agentfile_quotes_model_provider_and_entrypoint() {
+    fn render_skill_agent_config_escapes_model_provider_and_entrypoint() {
         let args = sample_synthesis_args(
             Path::new("skill.md"),
             "native",
@@ -348,13 +355,14 @@ mod tests {
             Some("openai compatible"),
             Some("job runner"),
         );
-        let agentfile = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args).unwrap();
-        assert!(agentfile.contains("MODEL \"gpt 5\" PROVIDER \"openai compatible\""));
-        assert!(agentfile.contains("ENTRYPOINT \"job runner\""));
+        let config = render_skill_agent_config(BuiltinCourier::Native, "skill.md", &args).unwrap();
+        assert!(config.contains("id = \"gpt 5\""));
+        assert!(config.contains("provider = \"openai compatible\""));
+        assert!(config.contains("entrypoint = \"job runner\""));
     }
 
     #[test]
-    fn render_skill_agentfile_rejects_control_characters_in_scalars() {
+    fn render_skill_agent_config_rejects_control_characters_in_values() {
         let args = sample_synthesis_args(
             Path::new("skill.md"),
             "native",
@@ -362,16 +370,13 @@ mod tests {
             None,
             None,
         );
-        let error = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("newline, carriage return, or NUL bytes")
-        );
+        let error =
+            render_skill_agent_config(BuiltinCourier::Native, "skill.md", &args).unwrap_err();
+        assert!(error.to_string().contains("control characters"));
     }
 
     #[test]
-    fn render_skill_agentfile_rejects_quoted_scalars_that_cannot_round_trip() {
+    fn render_skill_agent_config_escapes_quotes_so_the_value_round_trips() {
         let args = sample_synthesis_args(
             Path::new("skill.md"),
             "native",
@@ -379,11 +384,11 @@ mod tests {
             None,
             None,
         );
-        let error = render_skill_agentfile(BuiltinCourier::Native, "skill.md", &args).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("cannot synthesize an Agentfile scalar containing `\"`")
+        let config = render_skill_agent_config(BuiltinCourier::Native, "skill.md", &args).unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("synthesized config must parse");
+        assert_eq!(
+            parsed["agent"]["model"]["id"].as_str(),
+            Some("gpt \"5\" mini")
         );
     }
 

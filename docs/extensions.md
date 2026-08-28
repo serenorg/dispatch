@@ -33,7 +33,7 @@ The practical rule is: deployment provisions the thing; courier runs or talks to
 
 Dispatch keeps authored parcel source separate from host-managed extension inventory.
 
-- `Agentfile` is the canonical authored source for a parcel. It defines the agent's prompt stack, tools, model policy, mounts, and generic runtime intent that should survive build, review, and signing.
+- the agent definition in `dispatch.toml` is the canonical authored source for a parcel. It defines the agent's prompt stack, tools, model policy, mounts, and generic runtime intent that survives build, review, and signing.
 - installed courier plugins, channel plugins, and deployment plugins are host inventory. They are local runtime capabilities available to an operator on a specific machine or environment.
 - extension install commands do not mutate parcel source. They populate a host registry that runtime commands can resolve by name.
 
@@ -190,7 +190,7 @@ dispatch channel call <name> --request-json '{"kind":"capabilities"}'
 dispatch channel call channel-telegram --request-file telegram-deliver.json
 dispatch channel ingress --path /telegram/updates --header X-Telegram-Bot-Api-Secret-Token=... --body-file update.json
 dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.toml
-dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.toml --parcel ./Agentfile --session-root ./.dispatch/channel-sessions --deliver-replies
+dispatch channel listen channel-telegram --listen 127.0.0.1:8787 --config-file telegram-config.toml --parcel ./dispatch.toml --session-root ./.dispatch/channel-sessions --deliver-replies
 dispatch channel poll channel-telegram --config-file telegram-config.toml --once
 dispatch up
 ```
@@ -214,7 +214,7 @@ Common ingress patterns:
 Minimal `dispatch.toml` example:
 
 ```toml
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 courier = "native"
 
 [[extensions]]
@@ -227,7 +227,7 @@ manifest = "../dispatch-seren-plugins/deployments/seren-agent/deployment-plugin.
 name = "research-monitor"
 plugin = "seren-agent"
 reconcile = "upsert"
-config = { api_origin = "https://api.serendb.com", api_key = "seren_test" }
+config_file = "./config/seren-agent.toml"
 spec_file = "./deployments/research-monitor.json"
 
 [[channels]]
@@ -239,7 +239,7 @@ deliver_replies = true
 config_file = "./config/telegram.toml"
 ```
 
-Channel and deployment binding config files may be JSON or TOML. Inline `config = { ... }` tables in `dispatch.toml` are also supported.
+Channel and deployment binding config files may be JSON or TOML. Inline `config = { ... }` tables in `dispatch.toml` are intended only for non-secret settings. The project loader rejects common credential-like keys in inline channel config. Keep all credential-bearing binding config in a separate `config_file`, because `dispatch.toml` can also be the shareable agent source. Keep those files outside directories referenced by `agent.files` or other parcel paths; explicit parcel references still package their targets.
 
 Deployment bindings carry two distinct payloads. `config` (or `config_file`) is the auth/endpoint setup sent through `deployment.configure` once before each operation, e.g. API base URL, API key, account id, workspace. `spec` (or `spec_file`) is the deployment definition the plugin validates, test-runs, deploys, or reconciles. Both accept inline tables or external JSON/TOML files.
 

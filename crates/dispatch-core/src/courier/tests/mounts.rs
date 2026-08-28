@@ -4,13 +4,7 @@ use std::path::MAIN_SEPARATOR;
 #[test]
 fn builtin_mounts_scope_session_state_per_session_and_memory_per_parcel() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-MOUNT ARTIFACTS local
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"artifacts\"\ndriver = \"local\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -41,13 +35,7 @@ fn builtin_mounts_use_explicit_state_root_for_custom_output_layouts() {
     let root = tempdir().unwrap();
     let output_root = root.path().join("pulled");
     let test_parcel = build_test_parcel_with_output_root(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-MOUNT ARTIFACTS local
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"artifacts\"\ndriver = \"local\"\n",
         &[],
         &output_root,
     );

@@ -5,12 +5,7 @@ use serde_json::Value;
 #[test]
 fn native_courier_memory_sqlite_persists_across_sessions() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -54,12 +49,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_memory_put_reports_updates_after_first_write() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -114,12 +104,7 @@ ENTRYPOINT chat
 #[test]
 fn native_memory_list_treats_underscore_as_literal_prefix_character() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -168,14 +153,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_executes_builtin_memory_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL BUILTIN memory_put
-TOOL BUILTIN memory_get
-MOUNT MEMORY sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_put\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_get\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend::with_replies(vec![
@@ -288,11 +266,7 @@ ENTRYPOINT chat
 #[test]
 fn execute_builtin_memory_range_and_batch_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT MEMORY sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -338,11 +312,7 @@ ENTRYPOINT chat
 #[test]
 fn execute_builtin_checkpoint_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -371,13 +341,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_inspect_reports_mounts_secrets_and_local_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo
-MOUNT SESSION sqlite
-SECRET CAST_SAMPLE_SECRET
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"CAST_SAMPLE_SECRET\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
     let courier = NativeCourier::default();
@@ -395,11 +359,7 @@ ENTRYPOINT job
 #[test]
 fn load_parcel_rejects_manifests_that_fail_schema_validation() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "You are schema-checked.")],
     );
 
@@ -417,13 +377,64 @@ ENTRYPOINT chat
 }
 
 #[test]
+fn load_parcel_reports_unsupported_format_before_current_schema_validation() {
+    let test_parcel = build_test_parcel(
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n",
+        &[],
+    );
+    let manifest_path = test_parcel.parcel.parcel_dir.join("manifest.json");
+    let mut manifest = serde_json::from_slice::<Value>(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["format_version"] = Value::from(1);
+    manifest["$schema"] =
+        Value::String("https://serenorg.github.io/dispatch/schemas/parcel.v1.json".to_string());
+    manifest.as_object_mut().unwrap().insert(
+        "source_agentfile".to_string(),
+        Value::String("Agentfile".to_string()),
+    );
+    manifest.as_object_mut().unwrap().remove("source");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error = load_parcel(&test_parcel.parcel.parcel_dir).unwrap_err();
+    assert!(matches!(
+        error,
+        CourierError::UnsupportedParcelFormatVersion {
+            found: 1,
+            supported: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn load_parcel_reports_unsupported_schema_before_current_schema_validation() {
+    let test_parcel = build_test_parcel(
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n",
+        &[],
+    );
+    let manifest_path = test_parcel.parcel.parcel_dir.join("manifest.json");
+    let mut manifest = serde_json::from_slice::<Value>(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["$schema"] = Value::String("https://example.com/parcel.json".to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error = load_parcel(&test_parcel.parcel.parcel_dir).unwrap_err();
+    assert!(matches!(
+        error,
+        CourierError::UnsupportedParcelSchema { .. }
+    ));
+}
+
+#[test]
 fn native_courier_persists_session_sqlite_mounts() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MOUNT SESSION sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n",
         &[],
     );
     let courier = NativeCourier::default();

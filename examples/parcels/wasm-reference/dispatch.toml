@@ -1,0 +1,44 @@
+[agent]
+courier_reference = "dispatch/wasm:latest"
+name = "wasm-reference"
+version = "0.1.0"
+entrypoint = "chat"
+visibility = "open"
+component = "components/reference-guest.wasm"
+
+[agent.instructions]
+identity = "IDENTITY.md"
+soul = "SOUL.md"
+agents = "AGENTS.md"
+user = "USER.md"
+tools = "TOOLS.md"
+memory = "MEMORY.md"
+
+[agent.model]
+id = "gpt-5.6-luna"
+provider = "openai"
+
+[[agent.tools]]
+kind = "builtin"
+name = "web_search"
+
+[[agent.tools]]
+kind = "local"
+path = "tools/echo.sh"
+alias = "echo"
+description = "Echo the provided input back for debugging."
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "artifacts"
+driver = "local"
+
+[agent.env]
+TZ = "UTC"

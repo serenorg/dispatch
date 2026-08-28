@@ -4,16 +4,17 @@ Dispatch publishes a JSON Schema for every supported parcel manifest format.
 
 Current published schema:
 
-- schema URL: `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`
-- canonical copy: [`schemas/parcel.v1.json`](../schemas/parcel.v1.json)
-- current `format_version`: `1`
+- schema URL: `https://serenorg.github.io/dispatch/schemas/parcel.v2.json`
+- canonical copy: [`schemas/parcel.v2.json`](../schemas/parcel.v2.json)
+- current `format_version`: `2`
 
 ## Publication Model
 
-Dispatch keeps one tracked copy of the current parcel schema in the repo:
+Dispatch keeps every published parcel schema in the repo:
 
-- `schemas/parcel.v1.json` is the canonical schema checked into the repo
-- GitHub Pages publishes that tracked copy at `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`
+- `schemas/parcel.v2.json` is the canonical schema checked into the repo
+- [`schemas/parcel.v1.json`](../schemas/parcel.v1.json) is the immutable historical schema published for Dispatch 0.6.0 and earlier
+- GitHub Pages publishes that tracked copy at `https://serenorg.github.io/dispatch/schemas/parcel.v2.json`
 
 ## Compatibility Rules
 
@@ -31,8 +32,9 @@ Courier compatibility rules:
 
 Reference implementation policy:
 
-- the Dispatch reference implementation currently supports exactly `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`
-- the Dispatch reference implementation currently supports exactly `format_version: 1`
+- the Dispatch reference implementation currently supports exactly `https://serenorg.github.io/dispatch/schemas/parcel.v2.json`
+- the Dispatch reference implementation currently supports exactly `format_version: 2`
+- published v1 schema availability does not imply that the current runtime executes v1 parcels
 
 ## Stability Promise
 
@@ -40,7 +42,7 @@ Published schema URLs are immutable release artifacts.
 
 That means:
 
-- once `parcel.v1.json` is published, its validation shape must not change in place
+- once a schema such as `parcel.v1.json` or `parcel.v2.json` is published, its validation shape must not change in place
 - clarifications that affect validation require a new schema file and a new `format_version`
 - adding new required manifest fields requires a new schema file and a new `format_version`
 - changing the meaning of an existing field in a way that could alter courier behavior requires a new schema file and a new `format_version`
@@ -62,7 +64,7 @@ Practical implications:
 
 When Dispatch introduces a new parcel manifest version:
 
-1. Add a new tracked schema file under `schemas/`, for example `schemas/parcel.v2.json`.
+1. Add a new tracked schema file under `schemas/`, for example `schemas/parcel.v3.json`.
 2. Update the manifest constants and parser/build/courier support for the new schema URL and `format_version`.
 3. Update the compatibility docs and any release notes to state which versions the reference implementation supports.
 4. Keep old schema files published and loadable by URL even after newer versions exist.

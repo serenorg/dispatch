@@ -4,12 +4,7 @@ use super::*;
 fn native_courier_enforces_tool_timeout_for_local_tools() {
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TIMEOUT TOOL 50ms
-TOOL LOCAL {} AS slow
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"slow\"\n\n[agent.timeouts]\ntool = \"50ms\"\n",
             test_tool_relative_path("slow")
         ),
         &[(
@@ -29,12 +24,7 @@ ENTRYPOINT job
 fn native_courier_caps_tool_timeout_by_remaining_run_budget() {
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TIMEOUT RUN 100ms
-TOOL LOCAL {} AS slow
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"slow\"\n\n[agent.timeouts]\nrun = \"100ms\"\n",
             test_tool_relative_path("slow")
         ),
         &[(
@@ -70,10 +60,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_open_session_sets_identity_and_zero_turns() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -93,10 +80,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_validate_parcel_rejects_foreign_courier_reference() {
     let test_parcel = build_test_parcel(
-        "\
-FROM example/remote-worker:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"example/remote-worker:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -114,11 +98,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_rejects_unenforced_network_rules() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-NETWORK allow api.example.com
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.network]]\naction = \"allow\"\ntarget = \"api.example.com\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -136,11 +116,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_prompt_run_emits_events_and_increments_turns() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "Soul body")],
     );
     let courier = NativeCourier::default();
@@ -166,10 +142,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_rejects_mismatched_entrypoint() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -196,18 +169,11 @@ ENTRYPOINT job
 #[test]
 fn native_courier_run_rejects_session_for_different_parcel() {
     let first_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let second_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "different")],
     );
     let courier = NativeCourier::default();
@@ -236,11 +202,7 @@ fn native_courier_tool_run_emits_started_and_finished_events() {
     let tool_body = test_tool_print_body("{\"ok\":true}");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL {tool_path} AS demo
-ENTRYPOINT job
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );
@@ -277,12 +239,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_chat_emits_assistant_message_and_records_history() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
     );
     let courier = NativeCourier::default();
@@ -316,10 +273,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_job_emits_assistant_message_and_records_history() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -353,10 +307,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_heartbeat_emits_assistant_message_and_records_history() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT heartbeat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -385,11 +336,7 @@ ENTRYPOINT heartbeat
 #[test]
 fn open_session_sets_label_and_zero_elapsed_budget() {
     let test_parcel = build_test_parcel(
-        "\
-NAME demo
-FROM dispatch/native:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"demo\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -403,11 +350,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_rejects_runs_that_exceed_timeout_budget() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TIMEOUT RUN 100ms
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.timeouts]\nrun = \"100ms\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -435,11 +378,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_inspection_helpers_do_not_consume_run_budget() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TIMEOUT RUN 100ms
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.timeouts]\nrun = \"100ms\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -466,12 +405,7 @@ ENTRYPOINT chat
 #[test]
 fn run_local_tool_requires_declared_secrets() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo
-SECRET CAST_TEST_SECRET_DOES_NOT_EXIST
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"CAST_TEST_SECRET_DOES_NOT_EXIST\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
 
@@ -485,12 +419,7 @@ ENTRYPOINT job
 #[test]
 fn open_session_prefers_secret_validation_to_late_tool_failure() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo
-SECRET CAST_TEST_SECRET_DOES_NOT_EXIST
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.secrets]]\nname = \"CAST_TEST_SECRET_DOES_NOT_EXIST\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
     let courier = NativeCourier::default();
@@ -508,12 +437,7 @@ fn run_local_tool_resolves_declared_secret_from_store() {
     let tool_body = test_tool_env_body(&[("visible_secret", "CAST_VISIBLE_SECRET")]);
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL {tool_path} AS envcheck
-SECRET CAST_VISIBLE_SECRET
-ENTRYPOINT job
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"CAST_VISIBLE_SECRET\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"envcheck\"\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );
@@ -533,11 +457,7 @@ ENTRYPOINT job
 #[test]
 fn open_session_accepts_required_secret_from_store() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SECRET CAST_TEST_SECRET_FROM_STORE
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.secrets]]\nname = \"CAST_TEST_SECRET_FROM_STORE\"\n",
         &[],
     );
     crate::init_secret_store(&test_parcel.parcel.parcel_dir, false).unwrap();
@@ -564,13 +484,7 @@ fn run_local_tool_only_forwards_declared_environment() {
     ]);
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL {tool_path} AS envcheck
-ENV CAST_VISIBLE_ENV=visible
-SECRET CAST_VISIBLE_SECRET
-ENTRYPOINT job
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[agent.env]\n\"CAST_VISIBLE_ENV\" = \"visible\"\n\n[[agent.secrets]]\nname = \"CAST_VISIBLE_SECRET\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"envcheck\"\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );

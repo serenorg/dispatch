@@ -3,12 +3,7 @@ use super::*;
 #[test]
 fn build_model_request_uses_primary_model_prompt_and_history() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-MODEL gpt-5-mini
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n",
         &[("SOUL.md", "Soul body")],
     );
 
@@ -35,11 +30,7 @@ ENTRYPOINT chat
 #[test]
 fn build_model_request_carries_model_persist_thread_setting() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex --persist-thread=false
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5.4\"\nprovider = \"codex\"\n\n[agent.model.options]\n\"persist-thread\" = \"false\"\n",
         &[],
     );
 
@@ -70,13 +61,7 @@ fn build_model_requests_only_passes_backend_state_to_dispatch_session_backends()
     // Codex and Claude, but not to hosted backends that interpret
     // previous_response_id as their own provider-owned continuation token.
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex
-FALLBACK claude-sonnet-4 PROVIDER claude
-FALLBACK gpt-5.4-mini PROVIDER openai
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5.4\"\nprovider = \"codex\"\n\n[[agent.model.fallbacks]]\nid = \"claude-sonnet-4\"\nprovider = \"claude\"\n\n[[agent.model.fallbacks]]\nid = \"gpt-5.6-luna\"\nprovider = \"openai\"\n",
         &[],
     );
 
@@ -113,12 +98,7 @@ ENTRYPOINT chat
 #[test]
 fn build_model_request_uses_declared_tool_description() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo DESCRIPTION \"Look up a record by id. Input: JSON with an id field.\"
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\ndescription = \"Look up a record by id. Input: JSON with an id field.\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
 
@@ -146,12 +126,7 @@ ENTRYPOINT chat
 #[test]
 fn build_model_request_loads_declared_tool_input_schema() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\nschema = \"schemas/demo.json\"\n",
         &[
             ("tools/demo.sh", "printf ok"),
             (
@@ -186,19 +161,7 @@ ENTRYPOINT chat
 #[test]
 fn list_native_builtin_tools_only_exposes_supported_memory_capabilities() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL BUILTIN memory_put
-TOOL BUILTIN memory_get DESCRIPTION \"Read remembered state.\"
-TOOL BUILTIN memory_list_range
-TOOL BUILTIN memory_delete_range
-TOOL BUILTIN memory_put_many
-TOOL BUILTIN checkpoint_put
-TOOL BUILTIN checkpoint_list
-TOOL BUILTIN web_search
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_put\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_get\"\ndescription = \"Read remembered state.\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_list_range\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_delete_range\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_put_many\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"checkpoint_put\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"checkpoint_list\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"web_search\"\n",
         &[],
     );
 
@@ -220,18 +183,7 @@ ENTRYPOINT chat
 #[test]
 fn build_model_request_includes_supported_builtin_memory_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL BUILTIN memory_put
-TOOL BUILTIN memory_get
-TOOL BUILTIN memory_list_range
-TOOL BUILTIN memory_delete_range
-TOOL BUILTIN memory_put_many
-TOOL BUILTIN checkpoint_put
-TOOL BUILTIN checkpoint_list
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_put\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_get\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_list_range\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_delete_range\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_put_many\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"checkpoint_put\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"checkpoint_list\"\n",
         &[],
     );
 
@@ -263,12 +215,7 @@ ENTRYPOINT chat
 #[test]
 fn build_model_request_rejects_tampered_packaged_tool_schema() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\nschema = \"schemas/demo.json\"\n",
         &[
             ("tools/demo.sh", "printf ok"),
             (

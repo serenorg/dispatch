@@ -19,7 +19,7 @@ They share one runtime model, one run registry, and one lifecycle contract.
 
 - Do not add a fake Docker-compatible surface for concepts Dispatch does not yet have.
 - Do not add detached interactive chat in the first runtime slice.
-- Do not add `ENTRYPOINT http` before the runtime trigger model exists.
+- Do not add an `http` agent entrypoint before the runtime trigger model exists.
 - Do not build a networked daemon API before the local process/runtime model is stable.
 
 ## Runtime Model
@@ -241,7 +241,7 @@ accept loop.
 
 ## Ingress Model
 
-Dispatch does not add `ENTRYPOINT http`.
+Dispatch does not add an `http` agent entrypoint.
 
 Ingress lands as:
 
@@ -274,30 +274,28 @@ expression.
 Schedules can originate from:
 
 - CLI flag: `dispatch serve <path> --schedule "*/5 * * * * * *"`
-- Agentfile declaration: `SCHEDULE "<cron>"`
+- agent declaration: `schedules = ["<cron>"]`
 - Runtime API: if Dispatch ever exposes a control socket
 
-The current implementation supports CLI flags and parcel-authored `SCHEDULE`
-directives. Runtime APIs remain a later follow-on.
-The built-in examples use the seconds-aware cron form accepted by the current runtime.
+The current implementation supports CLI flags and parcel-authored `agent.schedules` values. Runtime APIs remain a later follow-on. The built-in examples use the seconds-aware cron form accepted by the current runtime.
 
 ## Ingress Sources
 
 Listener bindings can originate from:
 
 - CLI flag: `dispatch serve <path> --listen 127.0.0.1:0`
-- Agentfile declaration: `LISTEN "127.0.0.1:0"`
+- agent declaration: `listeners = ["127.0.0.1:0"]`
 
 The current implementation supports both and merges them without duplication
 when a service run record is created.
 
 Additional ingress policy can also originate from the parcel:
 
-- `LISTEN_PATH "/hook"`
-- repeatable `LISTEN_METHOD POST`
-- `LISTEN_SECRET DISPATCH_WEBHOOK_SECRET`
-- `LISTEN_MAX_BODY_BYTES 8192`
-- `LISTEN_MAX_HEADER_BYTES 4096`
+- `agent.ingress.path = "/hook"`
+- `agent.ingress.methods = ["POST"]`
+- `agent.ingress.secret_env = "DISPATCH_WEBHOOK_SECRET"`
+- `agent.ingress.max_body_bytes = 8192`
+- `agent.ingress.max_header_bytes = 4096`
 
 Runtime CLI flags override the authored scalar policy (`path`, shared secret,
 size limits) while methods are merged without duplication.
@@ -334,8 +332,7 @@ new parcel entrypoint. The current envelope shape includes:
 Auth behavior:
 
 - shared secrets are accepted via `x-dispatch-secret` or `authorization: Bearer ...`
-- parcel-authored shared secrets reference a declared `SECRET` name and are
-  resolved from the environment first and then `.dispatch/secrets` when `dispatch serve` starts
+- parcel-authored shared secrets reference a name declared in `[[agent.secrets]]` and are resolved from the environment first and then `.dispatch/secrets` when `dispatch serve` starts
 - the run record stores only the SHA-256 digest of the configured secret
 - forwarded heartbeat payload headers redact auth-bearing headers before they
   reach parcel history/logs
@@ -508,7 +505,7 @@ pushed to a UI rather than polled via `dispatch ps`.
 ### Modal (declarative scheduling, ephemeral execution)
 
 Modal attaches schedules to function definitions declaratively. The equivalent
-for Dispatch would be Agentfile-level `SCHEDULE` directives that embed cron
+for Dispatch would be agent-level `schedules` entries that embed cron
 expressions into the parcel, so `dispatch serve` can read them without CLI flags.
 Modal's execution is fully ephemeral (no persistent container state between
 calls), which validates Dispatch's separation of run lifecycle from parcel state.

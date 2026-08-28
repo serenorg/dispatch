@@ -382,7 +382,7 @@ fn print_parcel_list(parcels_root: &Path, entries: &[ParcelListEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{collect_parcel_entries, resolve_parcel_prefix};
-    use dispatch_core::{BuildOptions, build_agentfile};
+    use dispatch_core::{BuildOptions, build_agent};
     use std::fs;
     use tempfile::tempdir;
 
@@ -392,18 +392,13 @@ mod tests {
         let source_dir = dir.path().join("agent");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-NAME parcel-list-test
-VERSION 1.2.3
-ENTRYPOINT chat
-",
+            source_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"parcel-list-test\"\nversion = \"1.2.3\"\nentrypoint = \"chat\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &source_dir.join("Agentfile"),
+        let built = build_agent(
+            &source_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: source_dir.join(".dispatch/parcels"),
             },

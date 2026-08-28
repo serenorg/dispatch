@@ -508,7 +508,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), DepotError> {
 mod tests {
     use super::http::set_test_depot_auth_token;
     use super::*;
-    use crate::{BuildOptions, BuiltParcel, ParcelManifest, build_agentfile, verify_parcel};
+    use crate::{BuildOptions, BuiltParcel, ParcelManifest, build_agent, verify_parcel};
     use std::{
         collections::HashMap,
         io::{BufRead, BufReader, Read, Write},
@@ -524,14 +524,14 @@ mod tests {
         let context_dir = root.join("fixture");
         fs::create_dir_all(&context_dir).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nNAME depot-test\nSKILL SKILL.md\nENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"depot-test\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nskill = \"SKILL.md\"\n",
         )
         .unwrap();
         fs::write(context_dir.join("SKILL.md"), "You are a depot test.\n").unwrap();
 
-        build_agentfile(
-            &context_dir.join("Agentfile"),
+        build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },

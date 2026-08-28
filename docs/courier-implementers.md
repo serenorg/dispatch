@@ -1,8 +1,8 @@
 # Courier Implementer Guide
 
-Dispatch is defined by three layers:
+An agent is defined under `[agent]` in `dispatch.toml`. Dispatch has three layers:
 
-- `Agentfile` as the authored build language
+- the agent definition as the authored build language
 - the built parcel manifest and packaged context as the portable artifact
 - the courier contract as the execution boundary
 
@@ -121,7 +121,7 @@ For couriers that execute packaged local tools:
 - couriers should avoid forwarding their full ambient environment to tools
 - tool execution results should preserve stdout, stderr, exit code, command, and args
 
-The reference native courier clears the child environment and only forwards a minimal system environment plus declared `ENV` and declared `SECRET` values.
+The reference native courier clears the child environment and only forwards a minimal system environment plus values declared through `agent.env` and `agent.secrets`.
 
 ## Conformance Tests
 
@@ -231,7 +231,7 @@ Use precise language when you document or market an external courier.
 
 Good compatibility claims look like:
 
-- "supports Dispatch parcel schema `https://serenorg.github.io/dispatch/schemas/parcel.v1.json`"
+- "supports Dispatch parcel schema `https://serenorg.github.io/dispatch/schemas/parcel.v2.json`"
 - "passes `dispatch courier conformance` against Dispatch v0.x.y"
 - "supports `dispatch/native` parcels for `chat`, `job`, and `heartbeat`, but not `dispatch/wasm`"
 
@@ -256,7 +256,7 @@ For `dispatch/wasm`, hosted-model access remains a host responsibility even when
 
 Minimum expectations:
 
-- `model-complete` should use the parcel's declared `MODEL` and `FALLBACK` policy unless the guest explicitly requests a model id
+- `model-complete` should use the parcel's declared primary model and fallback policy unless the guest explicitly requests a model id
 - guest-supplied model ids should be treated as model selection within the host's configured provider policy, not as authority to switch to arbitrary providers
 - if the primary hosted-model request fails before producing a reply, the courier should try declared fallback models in order
 - prompt resolution, declared tool exposure, and memory access remain host-owned even when the guest orchestrates the turn

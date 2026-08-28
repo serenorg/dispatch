@@ -70,7 +70,7 @@ use self::mounts::{ensure_mounts_supported, resolve_builtin_mounts};
 use self::parcel::run_local_tool_with_env;
 pub use self::parcel::{
     collect_skill_allowed_tools, list_local_tools, list_native_builtin_tools, load_parcel,
-    resolve_prompt_text, run_local_tool,
+    resolve_prompt_text, run_local_tool, validate_parcel_compatibility,
 };
 use self::plugin_process::{
     canonical_parcel_dir, describe_plugin_response, read_expected_plugin_response,
@@ -189,7 +189,7 @@ pub enum CourierError {
     MissingSecret { name: String },
     #[error("failed to resolve secret `{name}`: {message}")]
     SecretLookup { name: String, message: String },
-    #[error("tool `{tool}` requires APPROVAL confirm")]
+    #[error("tool `{tool}` requires `approval = \"confirm\"`")]
     ApprovalRequired { tool: String },
     #[error("tool `{tool}` was denied by the approval handler")]
     ApprovalDenied { tool: String },
@@ -204,7 +204,7 @@ pub enum CourierError {
         driver: String,
     },
     #[error(
-        "courier `{courier}` does not enforce NETWORK {action} {target}; NETWORK rules are parsed but not yet enforced by this courier"
+        "courier `{courier}` does not enforce `agent.network` rule {action} {target}; network rules are parsed but not yet enforced by this courier"
     )]
     UnsupportedNetworkPolicy {
         courier: String,
@@ -223,9 +223,9 @@ pub enum CourierError {
         #[source]
         source: std::io::Error,
     },
-    #[error("tool `{tool}` exceeded TIMEOUT TOOL `{timeout}`")]
+    #[error("tool `{tool}` exceeded `agent.timeouts.tool` `{timeout}`")]
     ToolTimedOut { tool: String, timeout: String },
-    #[error("session `{session_id}` exceeded TIMEOUT RUN `{timeout}`")]
+    #[error("session `{session_id}` exceeded `agent.timeouts.run` `{timeout}`")]
     RunTimedOut { session_id: String, timeout: String },
     #[error("failed to wait for tool `{tool}`: {source}")]
     WaitTool {

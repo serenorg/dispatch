@@ -26,6 +26,10 @@ const DEFAULT_DISPATCH_CONFIG_FILE: &str = "dispatch.toml";
 struct DispatchProjectConfig {
     #[serde(default)]
     parcel: Option<PathBuf>,
+    /// Inline agent definition. Compiled by the build, ignored by deployment
+    /// wiring, and mutually exclusive with `parcel`.
+    #[serde(default)]
+    agent: Option<toml::Value>,
     #[serde(default = "default_courier_name")]
     courier: String,
     #[serde(default)]
@@ -1330,9 +1334,19 @@ fn load_dispatch_project(path: &Path, target: Option<&str>) -> Result<ResolvedDi
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let parcel = parsed
-        .parcel
-        .map(|value| resolve_relative_path(&root_dir, value));
+    if parsed.parcel.is_some() && parsed.agent.is_some() {
+        bail!(
+            "{} declares both `parcel` and `[agent]`; inline the agent or reference a built one, not both",
+            config_path.display()
+        );
+    }
+    // An inline `[agent]` makes this file its own parcel source, so deployment
+    // wiring in the same document runs the agent it defines.
+    let parcel = match parsed.parcel {
+        Some(value) => Some(resolve_relative_path(&root_dir, value)),
+        None if parsed.agent.is_some() => Some(config_path.clone()),
+        None => None,
+    };
     let courier_registry = parsed
         .courier_registry
         .map(|value| resolve_relative_path(&root_dir, value))
@@ -1664,16 +1678,22 @@ fn resolve_channel_binding(
 
     if binding.deliver_replies && ctx.parcel.is_none() && !ctx.remote_target {
         bail!(
-            "channel `{label}` sets `deliver_replies = true`, but dispatch.toml does not declare `parcel`"
+            "channel `{label}` sets `deliver_replies = true`, but dispatch.toml declares neither `parcel` nor `[agent]`"
         );
     }
     if deployment.is_some() && ctx.parcel.is_none() && !ctx.remote_target {
         bail!(
-            "channel `{label}` references `deployment`, but dispatch.toml does not declare `parcel`"
+            "channel `{label}` references `deployment`, but dispatch.toml declares neither `parcel` nor `[agent]`"
         );
     }
 
+    let has_inline_config = binding.config.is_some();
     let config = load_channel_config(ctx.root_dir, binding.config, binding.config_file.as_deref())?;
+    if has_inline_config && let Some(key_path) = inline_credential_key_path(&config, "config") {
+        bail!(
+            "channel `{label}` places credential-like field `{key_path}` in inline `config`; move credential-bearing channel configuration to `config_file`"
+        );
+    }
     let session_root = binding
         .session_root
         .map(|value| resolve_relative_path(ctx.root_dir, value))
@@ -1782,6 +1802,69 @@ fn load_required_structured_config(
 
 fn toml_value_to_json(value: toml::Value) -> Result<Value> {
     serde_json::to_value(value).context("failed to convert TOML value into JSON-compatible config")
+}
+
+fn inline_credential_key_path(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::Object(entries) => entries.iter().find_map(|(key, value)| {
+            let next_path = format!("{path}.{key}");
+            credential_like_key(key)
+                .then_some(next_path.clone())
+                .or_else(|| inline_credential_key_path(value, &next_path))
+        }),
+        Value::Array(entries) => entries.iter().enumerate().find_map(|(index, value)| {
+            inline_credential_key_path(value, &format!("{path}[{index}]"))
+        }),
+        _ => None,
+    }
+}
+
+fn credential_like_key(key: &str) -> bool {
+    let normalized = normalize_config_key(key);
+    matches!(
+        normalized.as_str(),
+        "access_key"
+            | "api_key"
+            | "authorization"
+            | "credential"
+            | "credentials"
+            | "passphrase"
+            | "password"
+            | "private_key"
+            | "secret"
+            | "secret_key"
+            | "token"
+    ) || [
+        "_access_key",
+        "_api_key",
+        "_passphrase",
+        "_password",
+        "_private_key",
+        "_secret",
+        "_secret_key",
+        "_token",
+    ]
+    .iter()
+    .any(|suffix| normalized.ends_with(suffix))
+}
+
+/// Fold a config key to lower snake_case so `botToken`, `bot-token`, and
+/// `bot_token` are all recognized as the same name.
+fn normalize_config_key(key: &str) -> String {
+    let mut normalized = String::with_capacity(key.len() + 4);
+    let mut previous_lower = false;
+    for character in key.chars() {
+        if character.is_ascii_uppercase() && previous_lower {
+            normalized.push('_');
+        }
+        previous_lower = character.is_ascii_lowercase() || character.is_ascii_digit();
+        normalized.push(if character == '-' {
+            '_'
+        } else {
+            character.to_ascii_lowercase()
+        });
+    }
+    normalized
 }
 
 fn resolve_dispatch_config_path(path: &Path) -> Result<PathBuf> {
@@ -2167,7 +2250,7 @@ mod tests {
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 
 [[channels]]
 plugin = "channel-test"
@@ -2178,7 +2261,7 @@ once = true
         .unwrap();
 
         let project = load_dispatch_project(&config_path, None).unwrap();
-        assert_eq!(project.parcel, Some(dir.path().join("Agentfile")));
+        assert_eq!(project.parcel, Some(dir.path().join("agent.parcel")));
         assert_eq!(
             project.courier_registry,
             dir.path().join(".dispatch/registries/couriers.json")
@@ -2203,13 +2286,36 @@ once = true
     }
 
     #[test]
+    fn load_dispatch_project_uses_inline_agent_as_its_parcel_source() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(
+            &config_path,
+            r#"
+[agent]
+courier_reference = "dispatch/native:latest"
+entrypoint = "chat"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+once = true
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, None).unwrap();
+        assert_eq!(project.parcel, Some(config_path));
+    }
+
+    #[test]
     fn load_dispatch_project_rejects_channel_config_and_config_file_together() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 
 [[channels]]
 plugin = "channel-test"
@@ -2224,6 +2330,89 @@ config_file = "./channel.toml"
             .unwrap_err()
             .to_string();
         assert!(error.contains("use either `config` or `config_file`"));
+    }
+
+    #[test]
+    fn credential_like_key_folds_case_separators_and_common_names() {
+        for key in [
+            "bot_token",
+            "botToken",
+            "bot-token",
+            "apiKey",
+            "X-Api-Key",
+            "accessToken",
+            "clientSecret",
+            "secret_key",
+            "privateKey",
+            "passphrase",
+            "authorization",
+        ] {
+            assert!(credential_like_key(key), "expected `{key}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn credential_like_key_allows_ordinary_settings() {
+        for key in [
+            "chat_id",
+            "token_endpoint",
+            "secret_name",
+            "public_key",
+            "tokenizer",
+            "passwordPolicy",
+            "base_url",
+        ] {
+            assert!(!credential_like_key(key), "expected `{key}` to be allowed");
+        }
+    }
+
+    #[test]
+    fn load_dispatch_project_rejects_inline_channel_credentials() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(
+            &config_path,
+            r#"
+[agent]
+courier_reference = "native"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+config = { bot_token = "abc" }
+"#,
+        )
+        .unwrap();
+
+        let error = load_dispatch_project(&config_path, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential-like field `config.bot_token`"));
+        assert!(error.contains("move credential-bearing channel configuration to `config_file`"));
+    }
+
+    #[test]
+    fn load_dispatch_project_accepts_noncredential_inline_channel_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("dispatch.toml");
+        fs::write(
+            &config_path,
+            r#"
+parcel = "./agent.parcel"
+
+[[channels]]
+plugin = "channel-test"
+mode = "poll"
+config = { default_channel_id = "123" }
+"#,
+        )
+        .unwrap();
+
+        let project = load_dispatch_project(&config_path, None).unwrap();
+        assert_eq!(
+            project.channels[0].runtime.config["default_channel_id"],
+            "123"
+        );
     }
 
     #[test]
@@ -2245,7 +2434,7 @@ deliver_replies = true
             .unwrap_err()
             .to_string();
         assert!(error.contains("deliver_replies = true"));
-        assert!(error.contains("does not declare `parcel`"));
+        assert!(error.contains("declares neither `parcel` nor `[agent]`"));
     }
 
     #[test]
@@ -2255,7 +2444,7 @@ deliver_replies = true
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 courier = "seren-cloud"
 
 [[channels]]
@@ -2276,7 +2465,7 @@ once = true
         );
         assert_eq!(
             project.channels[0].runtime.parcel.as_deref(),
-            Some(dir.path().join("Agentfile").as_path())
+            Some(dir.path().join("agent.parcel").as_path())
         );
     }
 
@@ -2353,11 +2542,11 @@ config = { default_channel_id = "123" }
     fn cloud_target_rejects_local_only_channel_bindings() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
-        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(dir.path().join("agent.parcel"), "hello").unwrap();
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 
 [[deployments]]
 name = "cloud-bot"
@@ -2385,11 +2574,11 @@ mode = "poll"
     fn cloud_target_rejects_channel_binding_without_matching_deployment() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
-        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(dir.path().join("agent.parcel"), "hello").unwrap();
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 
 [[deployments]]
 name = "cloud-bot"
@@ -2418,11 +2607,11 @@ mode = "poll"
     fn cloud_target_rejects_channel_binding_for_non_cloud_deployment() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
-        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(dir.path().join("agent.parcel"), "hello").unwrap();
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 
 [[deployments]]
 name = "worker"
@@ -2455,11 +2644,11 @@ mode = "poll"
     fn cloud_target_rejects_channel_binding_for_non_llm_cloud_deployment() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("dispatch.toml");
-        fs::write(dir.path().join("Agentfile"), "hello").unwrap();
+        fs::write(dir.path().join("agent.parcel"), "hello").unwrap();
         fs::write(
             &config_path,
             r#"
-parcel = "./Agentfile"
+parcel = "./agent.parcel"
 
 [[deployments]]
 name = "cloud-bot"
@@ -2590,7 +2779,7 @@ mode = "poll"
             .unwrap_err()
             .to_string();
         assert!(error.contains("references `deployment`"));
-        assert!(error.contains("does not declare `parcel`"));
+        assert!(error.contains("declares neither `parcel` nor `[agent]`"));
     }
 
     #[test]
@@ -2703,8 +2892,8 @@ spec_file = {}
         let source_dir = dir.path().join("agent");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nNAME deployment-bound\nENTRYPOINT chat\n",
+            source_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"deployment-bound\"\nentrypoint = \"chat\"\n",
         )
         .unwrap();
         let state = DeploymentStateEntry {

@@ -244,7 +244,7 @@ fn next_turn(mut session: CourierSession) -> CourierSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch_core::{BuildOptions, build_agentfile};
+    use dispatch_core::{BuildOptions, build_agent};
     use tempfile::tempdir;
 
     #[test]
@@ -323,18 +323,14 @@ mod tests {
         let context_dir = root.join("parcel");
         std::fs::create_dir_all(&context_dir).unwrap();
         std::fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\n\
-NAME echo-plugin-test\n\
-VERSION 0.1.0\n\
-SKILL SKILL.md\n\
-ENTRYPOINT chat\n",
+            context_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"echo-plugin-test\"\nversion = \"0.1.0\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nskill = \"SKILL.md\"\n",
         )
         .unwrap();
         std::fs::write(context_dir.join("SKILL.md"), "You are a test agent.\n").unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },

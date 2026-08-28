@@ -39,6 +39,7 @@ pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
             source,
         }
     })?;
+    validate_parcel_compatibility(&manifest_path, &manifest_json)?;
     validate_parcel_schema(&manifest_path, &manifest_json)?;
     let config = serde_json::from_value::<ParcelManifest>(manifest_json).map_err(|source| {
         CourierError::ParseParcelManifest {
@@ -46,26 +47,46 @@ pub fn load_parcel(path: &Path) -> Result<LoadedParcel, CourierError> {
             source,
         }
     })?;
-    if config.schema != crate::manifest::PARCEL_SCHEMA_URL {
-        return Err(CourierError::UnsupportedParcelSchema {
-            path: manifest_path.display().to_string(),
-            found: config.schema.clone(),
-            expected: crate::manifest::PARCEL_SCHEMA_URL.to_string(),
-        });
-    }
-    if config.format_version != crate::manifest::PARCEL_FORMAT_VERSION {
-        return Err(CourierError::UnsupportedParcelFormatVersion {
-            path: manifest_path.display().to_string(),
-            found: config.format_version,
-            supported: crate::manifest::PARCEL_FORMAT_VERSION,
-        });
-    }
-
     Ok(LoadedParcel {
         parcel_dir,
         manifest_path,
         config,
     })
+}
+
+/// Check a raw manifest document against the supported parcel format before
+/// any typed deserialization, so a parcel from an older format reports the
+/// version mismatch rather than a missing-field error for a renamed field.
+pub fn validate_parcel_compatibility(
+    manifest_path: &Path,
+    manifest_json: &serde_json::Value,
+) -> Result<(), CourierError> {
+    if let Some(found) = manifest_json
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        && found != crate::manifest::PARCEL_FORMAT_VERSION
+    {
+        return Err(CourierError::UnsupportedParcelFormatVersion {
+            path: manifest_path.display().to_string(),
+            found,
+            supported: crate::manifest::PARCEL_FORMAT_VERSION,
+        });
+    }
+
+    if let Some(found) = manifest_json
+        .get("$schema")
+        .and_then(serde_json::Value::as_str)
+        && found != crate::manifest::PARCEL_SCHEMA_URL
+    {
+        return Err(CourierError::UnsupportedParcelSchema {
+            path: manifest_path.display().to_string(),
+            found: found.to_string(),
+            expected: crate::manifest::PARCEL_SCHEMA_URL.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 pub fn resolve_prompt_text(parcel: &LoadedParcel) -> Result<String, CourierError> {
@@ -492,7 +513,7 @@ fn validate_parcel_schema(
 fn parcel_schema_validator() -> &'static Validator {
     PARCEL_SCHEMA_VALIDATOR.get_or_init(|| {
         let schema = serde_json::from_str::<serde_json::Value>(include_str!(
-            "../../../../schemas/parcel.v1.json"
+            "../../../../schemas/parcel.v2.json"
         ))
         .expect("embedded parcel schema must be valid JSON");
         jsonschema::validator_for(&schema).expect("embedded parcel schema must compile")

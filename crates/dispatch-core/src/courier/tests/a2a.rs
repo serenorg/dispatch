@@ -6,11 +6,7 @@ fn native_courier_executes_a2a_tools_via_host_transport() {
     let server = start_test_a2a_server();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} DESCRIPTION \"Delegate to broker\"
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\ndescription = \"Delegate to broker\"\n",
             server.base_url
         ),
         &[],
@@ -27,11 +23,7 @@ fn native_courier_executes_a2a_tools_with_json_payloads() {
     let server = start_test_a2a_server();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} SCHEMA schemas/input.json
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\nschema = \"schemas/input.json\"\n",
             server.base_url
         ),
         &[(
@@ -56,11 +48,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_rejects_non_loopback_cleartext_a2a_urls() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL A2A broker URL http://example.com DISCOVERY direct
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"http://example.com\"\ndiscovery = \"direct\"\n",
         &[],
     );
 
@@ -75,11 +63,7 @@ ENTRYPOINT job
 #[test]
 fn native_courier_rejects_a2a_urls_with_embedded_credentials() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL A2A broker URL http://user:pass@127.0.0.1:7777 DISCOVERY direct
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"http://user:pass@127.0.0.1:7777\"\ndiscovery = \"direct\"\n",
         &[],
     );
 
@@ -99,12 +83,7 @@ fn native_courier_executes_a2a_tools_with_bearer_auth() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-SECRET A2A_TOKEN
-TOOL A2A broker URL {} AUTH bearer A2A_TOKEN
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"A2A_TOKEN\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n\n[agent.tools.auth]\nscheme = \"bearer\"\nsecret_name = \"A2A_TOKEN\"\n",
             server.base_url
         ),
         &[],
@@ -125,12 +104,7 @@ fn native_courier_executes_a2a_tools_with_store_backed_bearer_auth() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-SECRET A2A_TOKEN
-TOOL A2A broker URL {} AUTH bearer A2A_TOKEN
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"A2A_TOKEN\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n\n[agent.tools.auth]\nscheme = \"bearer\"\nsecret_name = \"A2A_TOKEN\"\n",
             server.base_url
         ),
         &[],
@@ -151,12 +125,7 @@ fn native_courier_executes_a2a_tools_with_header_auth() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-SECRET API_KEY
-TOOL A2A broker URL {} AUTH header X-Api-Key API_KEY
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"API_KEY\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n\n[agent.tools.auth]\nscheme = \"header\"\nheader_name = \"X-Api-Key\"\nsecret_name = \"API_KEY\"\n",
             server.base_url
         ),
         &[],
@@ -181,13 +150,7 @@ fn native_courier_executes_a2a_tools_with_basic_auth() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-SECRET A2A_USER
-SECRET A2A_PASSWORD
-TOOL A2A broker URL {} AUTH basic A2A_USER A2A_PASSWORD
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"A2A_USER\"\n\n[[agent.secrets]]\nname = \"A2A_PASSWORD\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n\n[agent.tools.auth]\nscheme = \"basic\"\nusername_secret_name = \"A2A_USER\"\npassword_secret_name = \"A2A_PASSWORD\"\n",
             server.base_url
         ),
         &[],
@@ -371,11 +334,7 @@ fn native_courier_rejects_a2a_agent_name_mismatch() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} EXPECT_AGENT_NAME expected-agent
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\nexpect_agent_name = \"expected-agent\"\n",
             server.base_url
         ),
         &[],
@@ -397,11 +356,7 @@ fn native_courier_rejects_a2a_agent_name_requirement_when_card_has_no_name() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} EXPECT_AGENT_NAME expected-agent
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\nexpect_agent_name = \"expected-agent\"\n",
             server.base_url
         ),
         &[],
@@ -420,11 +375,7 @@ fn native_courier_rejects_a2a_card_digest_mismatch() {
     let server = start_test_a2a_server();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} EXPECT_CARD_SHA256 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\nexpect_card_sha256 = \"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"\n",
             server.base_url
         ),
         &[],
@@ -451,11 +402,7 @@ fn native_courier_accepts_matching_a2a_card_digest() {
     ));
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} EXPECT_CARD_SHA256 {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\nexpect_card_sha256 = \"{}\"\n",
             server.base_url, expected_card_sha256
         ),
         &[],
@@ -473,11 +420,7 @@ fn native_courier_rejects_a2a_card_origin_pivot() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -499,12 +442,7 @@ fn native_courier_enforces_tool_timeout_for_a2a_tools() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TIMEOUT TOOL 200ms
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n\n[agent.timeouts]\ntool = \"200ms\"\n",
             server.base_url
         ),
         &[],
@@ -526,11 +464,7 @@ fn native_courier_requires_card_discovery_when_configured() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} DISCOVERY card
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\ndiscovery = \"card\"\n",
             server.base_url
         ),
         &[],
@@ -540,7 +474,7 @@ ENTRYPOINT job
     assert!(
         error
             .to_string()
-            .contains("agent card discovery failed for required `DISCOVERY card` mode")
+            .contains("agent card discovery failed for required `discovery = \"card\"` mode")
     );
 }
 
@@ -555,11 +489,7 @@ fn native_courier_polls_non_completed_a2a_tasks_until_completion() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -582,12 +512,7 @@ fn native_courier_times_out_polling_non_completed_a2a_tasks() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TIMEOUT TOOL 200ms
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n\n[agent.timeouts]\ntool = \"200ms\"\n",
             server.base_url
         ),
         &[],
@@ -610,11 +535,7 @@ fn native_courier_surfaces_a2a_json_rpc_errors() {
     });
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -633,11 +554,7 @@ fn native_courier_rejects_a2a_url_outside_operator_allowlist() {
     let server = start_test_a2a_server();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -662,11 +579,7 @@ fn native_courier_allows_a2a_url_with_matching_operator_allowlist_origin() {
     let origin = a2a_origin(&parsed).unwrap();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -684,11 +597,7 @@ fn native_courier_rejects_a2a_url_when_operator_allowlist_is_explicitly_empty() 
     let server = start_test_a2a_server();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -713,11 +622,7 @@ fn native_courier_rejects_a2a_url_outside_operator_trust_policy() {
     .unwrap();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -758,11 +663,7 @@ fn native_courier_enforces_operator_a2a_trust_policy_identity() {
     .unwrap();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {}
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\n",
             server.base_url
         ),
         &[],
@@ -787,11 +688,7 @@ fn native_courier_rejects_direct_a2a_with_operator_identity_requirement() {
     .unwrap();
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} DISCOVERY direct
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\ndiscovery = \"direct\"\n",
             server.base_url
         ),
         &[],

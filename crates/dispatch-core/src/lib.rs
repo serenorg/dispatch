@@ -1,4 +1,4 @@
-pub mod ast;
+pub mod agent_config;
 pub mod build;
 pub mod catalog;
 pub mod channel_plugin_protocol;
@@ -9,7 +9,6 @@ pub mod deployment_plugins;
 pub mod depot;
 pub mod eval;
 pub mod manifest;
-pub mod parse;
 pub mod plugin_protocol;
 pub mod plugins;
 pub mod provider_plugins;
@@ -19,10 +18,12 @@ mod skill;
 pub mod trace;
 pub mod trust;
 pub mod validate;
+pub use validate::{
+    Diagnostic, Level, ValidationReport, validate_agent_config, validate_agent_config_at_path,
+};
 
-pub use ast::{Instruction, ParsedAgentfile, Value};
 pub use build::{
-    BuildError, BuildOptions, BuiltParcel, ParcelLock, VerificationReport, build_agentfile,
+    BuildError, BuildOptions, BuiltParcel, ParcelLock, VerificationReport, build_agent,
     verify_parcel,
 };
 pub use catalog::{
@@ -79,7 +80,7 @@ pub use courier::{
     LocalToolSpec, LocalToolTarget, NativeCourier, StubCourier, ToolApprovalDecision,
     ToolApprovalRequest, ToolInvocation, ToolRunResult, WasmCourier, collect_skill_allowed_tools,
     list_local_tools, list_native_builtin_tools, load_parcel, resolve_prompt_text, run_local_tool,
-    with_a2a_operator_policy_overrides, with_tool_approval_handler,
+    validate_parcel_compatibility, with_a2a_operator_policy_overrides, with_tool_approval_handler,
 };
 pub use depot::{
     DepotError, DepotLocator, DepotReference, DepotTagRecord, PulledParcel, PushedParcel,
@@ -98,7 +99,6 @@ pub use manifest::{
     ParcelFileRecord, ParcelManifest, SecretSpec, TestSpec, TimeoutSpec, ToolApprovalPolicy,
     ToolConfig, ToolRiskLevel, Visibility, WasmComponentConfig,
 };
-pub use parse::{ParseError, parse_agentfile};
 pub use plugin_protocol::{
     COURIER_PLUGIN_PROTOCOL_VERSION, PluginErrorPayload, PluginRequest, PluginRequestEnvelope,
     PluginResponse, parse_jsonrpc_message, parse_jsonrpc_request, request_to_jsonrpc,
@@ -129,7 +129,4 @@ pub use trace::{DISPATCH_TRACE_VERSION, DispatchTraceArtifact, DispatchTraceStep
 pub use trust::{
     A2aTrustPolicy, A2aTrustRequirement, A2aTrustRule, PullTrustPolicy, PullTrustRequirement,
     PullTrustRule, TrustPolicyError,
-};
-pub use validate::{
-    Diagnostic, Level, ValidationReport, validate_agentfile, validate_agentfile_at_path,
 };

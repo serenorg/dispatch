@@ -3,14 +3,7 @@ use super::*;
 #[test]
 fn resolve_prompt_omits_eval_files() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-SKILL SKILL.md
-MEMORY POLICY MEMORY.md
-EVAL evals/smoke.eval
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nevals = [\"evals/smoke.eval\"]\n\n[agent.instructions]\nsoul = \"SOUL.md\"\nskill = \"SKILL.md\"\nmemory = \"MEMORY.md\"\n",
         &[
             ("SOUL.md", "Soul body"),
             ("SKILL.md", "Skill body"),
@@ -25,16 +18,28 @@ ENTRYPOINT chat
     assert!(prompt.contains("# MEMORY"));
     assert!(!prompt.contains("smoke.eval"));
     assert!(!prompt.contains("# EVAL"));
+    assert!(
+        test_parcel
+            .parcel
+            .config
+            .instructions
+            .iter()
+            .any(|instruction| instruction.kind == InstructionKind::Eval
+                && instruction.packaged_path == "evals/smoke.eval")
+    );
+    assert!(
+        test_parcel
+            .parcel
+            .parcel_dir
+            .join("context/evals/smoke.eval")
+            .is_file()
+    );
 }
 
 #[test]
 fn resolve_prompt_strips_agent_skill_frontmatter_for_skill_directories() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SKILL file-analyst
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         &[
             (
                 "file-analyst/SKILL.md",
@@ -62,11 +67,7 @@ ENTRYPOINT chat
 #[test]
 fn resolve_prompt_keeps_file_based_skill_frontmatter_unchanged() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SKILL SKILL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nskill = \"SKILL.md\"\n",
         &[(
             "SKILL.md",
             "---\nname: file-analyst\ndescription: Analyze files\n---\nUse the file tools before answering.\n",
@@ -82,11 +83,7 @@ ENTRYPOINT chat
 #[test]
 fn collect_skill_allowed_tools_returns_skill_annotations() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SKILL file-analyst
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         &[
             (
                 "file-analyst/SKILL.md",
@@ -113,16 +110,7 @@ ENTRYPOINT chat
 #[test]
 fn resolve_prompt_includes_extended_workspace_files() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-IDENTITY IDENTITY.md
-SOUL SOUL.md
-AGENTS AGENTS.md
-USER USER.md
-TOOLS TOOLS.md
-MEMORY POLICY MEMORY.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nidentity = \"IDENTITY.md\"\nsoul = \"SOUL.md\"\nagents = \"AGENTS.md\"\nuser = \"USER.md\"\ntools = \"TOOLS.md\"\nmemory = \"MEMORY.md\"\n",
         &[
             ("IDENTITY.md", "Name: Demo"),
             ("SOUL.md", "Soul body"),
@@ -145,11 +133,7 @@ ENTRYPOINT chat
 #[test]
 fn list_local_tools_uses_typed_manifest() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.py AS demo USING python3 -u
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.py\"\nalias = \"demo\"\nrunner = { command = \"python3\", args = [\"-u\"] }\n",
         &[("tools/demo.py", "print('ok')")],
     );
 
@@ -164,12 +148,7 @@ ENTRYPOINT job
 #[test]
 fn list_local_tools_includes_a2a_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SECRET A2A_TOKEN
-TOOL A2A broker URL https://broker.example.com DISCOVERY card AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker EXPECT_CARD_SHA256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa SCHEMA schemas/input.json DESCRIPTION \"Delegate to broker\"
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.secrets]]\nname = \"A2A_TOKEN\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\ndiscovery = \"card\"\nexpect_agent_name = \"remote-broker\"\nexpect_card_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\ndescription = \"Delegate to broker\"\nschema = \"schemas/input.json\"\n\n[agent.tools.auth]\nscheme = \"bearer\"\nsecret_name = \"A2A_TOKEN\"\n",
         &[(
             "schemas/input.json",
             "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"query\": { \"type\": \"string\" }\n  },\n  \"required\": [\"query\"]\n}\n",

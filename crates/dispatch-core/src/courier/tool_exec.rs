@@ -514,7 +514,10 @@ pub(super) fn denied_tool_run_result(request: &ToolApprovalRequest) -> ToolRunRe
         args: request.args.clone(),
         exit_code: 126,
         stdout: String::new(),
-        stderr: format!("tool `{}` was denied by APPROVAL confirm", request.tool),
+        stderr: format!(
+            "tool `{}` was denied by `approval = \"confirm\"`",
+            request.tool
+        ),
     }
 }
 

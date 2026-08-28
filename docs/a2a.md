@@ -1,45 +1,75 @@
 # A2A Tools
 
-Dispatch supports host-executed remote agent-to-agent tools through `TOOL A2A`.
+Dispatch supports host-executed remote agent-to-agent tools through A2A tools declared as `[[agent.tools]]` entries with `kind = "a2a"`.
 
 ## Parcel Contract
 
 Basic examples:
 
-```dockerfile
-SECRET PLANNER_TOKEN
-SECRET SEARCH_TOKEN
-SECRET BACKOFFICE_USER
-SECRET BACKOFFICE_PASSWORD
+```toml
+[[agent.secrets]]
+name = "PLANNER_TOKEN"
 
-TOOL A2A planner URL https://planner.example.com DISCOVERY card AUTH bearer PLANNER_TOKEN EXPECT_AGENT_NAME planner-agent
-TOOL A2A search URL https://search.example.com AUTH header X-Api-Key SEARCH_TOKEN
-TOOL A2A backoffice URL https://backoffice.example.com AUTH basic BACKOFFICE_USER BACKOFFICE_PASSWORD
+[[agent.secrets]]
+name = "SEARCH_TOKEN"
+
+[[agent.secrets]]
+name = "BACKOFFICE_USER"
+
+[[agent.secrets]]
+name = "BACKOFFICE_PASSWORD"
+
+[[agent.tools]]
+kind = "a2a"
+alias = "planner"
+url = "https://planner.example.com"
+discovery = "card"
+expect_agent_name = "planner-agent"
+
+[agent.tools.auth]
+scheme = "bearer"
+secret_name = "PLANNER_TOKEN"
+
+[[agent.tools]]
+kind = "a2a"
+alias = "search"
+url = "https://search.example.com"
+
+[agent.tools.auth]
+scheme = "header"
+header_name = "X-Api-Key"
+secret_name = "SEARCH_TOKEN"
+
+[[agent.tools]]
+kind = "a2a"
+alias = "backoffice"
+url = "https://backoffice.example.com"
+
+[agent.tools.auth]
+scheme = "basic"
+username_secret_name = "BACKOFFICE_USER"
+password_secret_name = "BACKOFFICE_PASSWORD"
 ```
 
-Supported clauses:
+Supported fields:
 
-- `URL <endpoint>`
-- `DISCOVERY auto|card|direct`
-- `AUTH bearer <secret_name>`
-- `AUTH header <header_name> <secret_name>`
-- `AUTH basic <username_secret_name> <password_secret_name>`
-- `EXPECT_AGENT_NAME <name>`
-- `EXPECT_CARD_SHA256 <digest>`
-- `SCHEMA <path>`
-- `APPROVAL ...`
-- `RISK ...`
-- `DESCRIPTION "..."`
+- `url` - required endpoint
+- `discovery` - `auto`, `card`, or `direct`
+- `schema` - JSON Schema path for the tool input
+- `expect_agent_name` and `expect_card_sha256` - discovered-card identity requirements
+- `approval`, `risk`, `description`
+
+Credentials bind through a nested `[agent.tools.auth]` table with a `scheme` of `bearer`, `header`, or `basic`. Every referenced secret must also be declared in `[[agent.secrets]]`.
 
 Semantics:
 
 - the endpoint is declared statically in the parcel; the model does not choose arbitrary remote URLs
-- `DISCOVERY auto` tries `/.well-known/agent.json` first, then falls back to `<url>/a2a`
-- `DISCOVERY card` requires successful card discovery
-- `DISCOVERY direct` skips discovery and targets the declared endpoint directly
-- discovered agent cards may refine the RPC path, but they may not pivot execution onto a different origin than the declared `URL`
-- `EXPECT_AGENT_NAME` fails closed if discovery succeeds without a matching `name`
-- `EXPECT_CARD_SHA256` pins the raw discovered agent-card body by lowercase SHA256
+- `discovery = "auto"` tries `/.well-known/agent.json` first, then falls back to `<url>/a2a`
+- `discovery = "card"` requires successful card discovery
+- `discovery = "direct"` skips discovery and targets the declared endpoint directly
+- discovered agent cards may refine the RPC path, but they may not pivot execution onto a different origin than the declared `url`
+- `expect_agent_name` fails closed if discovery succeeds without a matching `name`
+- `expect_card_sha256` pins the raw discovered agent-card body by lowercase SHA256
 
 ## Security Defaults
 
@@ -48,7 +78,7 @@ Dispatch enforces these transport rules:
 - non-loopback A2A endpoints must use `https://`
 - plain `http://` is only accepted for loopback development targets like `localhost` or `127.0.0.1`
 - A2A URLs must not embed credentials
-- bearer/header/basic credentials must come from declared `SECRET`s
+- bearer/header/basic credentials must come from names declared in `[[agent.secrets]]`
 
 ## Runtime Behavior
 
@@ -61,8 +91,8 @@ Dispatch currently exposes A2A as a synchronous tool surface:
 
 Timeout interaction:
 
-- `TIMEOUT TOOL` applies to host-executed A2A calls
-- `TIMEOUT RUN` can further cap the effective time available inside a turn
+- `agent.timeouts.tool` applies to host-executed A2A calls
+- the `run` timeout can further cap the effective time available inside a turn
 
 ## Operator Controls
 
@@ -127,7 +157,7 @@ Rule semantics:
 Discovery/auth note:
 
 - configured A2A auth headers are sent on the discovery request before card identity can be verified
-- `DISCOVERY direct` cannot satisfy parcel or operator discovered-identity requirements such as `EXPECT_AGENT_NAME` or `EXPECT_CARD_SHA256`
+- `discovery = "direct"` cannot satisfy parcel or operator discovered-identity requirements such as `expect_agent_name` or `expect_card_sha256`
 
 ## Inspection Surfaces
 

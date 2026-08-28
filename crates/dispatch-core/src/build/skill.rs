@@ -1,6 +1,7 @@
 use super::{
-    BuildError, ParcelFileRecord, ResolvedAgentSpec, hex_digest, infer_runner, package_path,
-    relative_display, resolve_path, validate_entrypoint_value, validate_tool_schema,
+    BuildError, ParcelFileRecord, ResolvedAgentSpec, hex_digest, package_path,
+    parsing::{infer_runner, validate_entrypoint_value, validate_tool_schema},
+    relative_display, resolve_path,
 };
 use crate::{
     manifest::{
@@ -18,8 +19,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) fn process_skill_instruction(
+pub(super) fn process_skill_bundle(
     context_dir: &Path,
+    config_path: &Path,
     source_path: &str,
     packaged: &mut BTreeMap<String, Vec<u8>>,
     files: &mut Vec<ParcelFileRecord>,
@@ -27,23 +29,16 @@ pub(super) fn process_skill_instruction(
 ) -> Result<(), BuildError> {
     let resolved_path = resolve_path(context_dir, source_path)?;
     if resolved_path.is_file() {
-        let file_record = package_path(context_dir, &resolved_path, packaged)?;
-        resolved.instructions.push(InstructionConfig {
-            kind: InstructionKind::Skill,
-            packaged_path: source_path.to_string(),
-            sha256: file_record.sha256.clone(),
-            skill_name: None,
-            allowed_tools: None,
-        });
-        files.extend(file_record.expand());
-        return Ok(());
+        return Err(BuildError::Validation(format!(
+            "`agent.skills` entry `{source_path}` must be a directory; use `agent.instructions.skill` for a standalone instruction file"
+        )));
     }
 
     let skill_dir = resolved_path;
     let skill_md_path = skill_dir.join("SKILL.md");
     if !skill_md_path.exists() {
         return Err(BuildError::Validation(format!(
-            "SKILL directory `{source_path}` must contain `SKILL.md`"
+            "`agent.skills` directory `{source_path}` must contain `SKILL.md`"
         )));
     }
 
@@ -61,7 +56,7 @@ pub(super) fn process_skill_instruction(
     validate_agent_skill_frontmatter(&skill_dir, &parsed_skill.frontmatter)
         .map_err(BuildError::Validation)?;
 
-    let bundle_record = package_path(context_dir, &skill_dir, packaged)?;
+    let bundle_record = package_path(context_dir, config_path, &skill_dir, packaged)?;
     let skill_md_packaged_path = relative_display(context_dir, &skill_md_path);
     let skill_file_record = bundle_record
         .entries
@@ -141,7 +136,7 @@ pub(super) fn process_skill_instruction(
                 &parsed_skill.frontmatter.name,
                 &skill_tool,
             )?;
-            package_tool_config(context_dir, packaged, files, &mut tool)?;
+            package_tool_config(context_dir, config_path, packaged, files, &mut tool)?;
             insert_resolved_tool(&mut resolved.tools, &mut resolved.warnings, tool)?;
         }
     }
@@ -256,6 +251,7 @@ fn synthesize_skill_tool(
 
 pub(super) fn package_tool_config(
     context_dir: &Path,
+    config_path: &Path,
     packaged: &mut BTreeMap<String, Vec<u8>>,
     files: &mut Vec<ParcelFileRecord>,
     tool: &mut ToolConfig,
@@ -263,12 +259,13 @@ pub(super) fn package_tool_config(
     match tool {
         ToolConfig::Local(local) => {
             let resolved_path = resolve_path(context_dir, &local.packaged_path)?;
-            let file_record = package_path(context_dir, &resolved_path, packaged)?;
+            let file_record = package_path(context_dir, config_path, &resolved_path, packaged)?;
             files.extend(file_record.expand());
             if let Some(schema) = &local.input_schema {
                 let resolved_schema_path = resolve_path(context_dir, &schema.packaged_path)?;
                 validate_tool_schema(&resolved_schema_path, &local.alias)?;
-                let schema_record = package_path(context_dir, &resolved_schema_path, packaged)?;
+                let schema_record =
+                    package_path(context_dir, config_path, &resolved_schema_path, packaged)?;
                 local.input_schema = Some(ToolInputSchemaRef {
                     packaged_path: schema.packaged_path.clone(),
                     sha256: schema_record.sha256.clone(),
@@ -280,7 +277,8 @@ pub(super) fn package_tool_config(
             if let Some(schema) = &tool.input_schema {
                 let resolved_schema_path = resolve_path(context_dir, &schema.packaged_path)?;
                 validate_tool_schema(&resolved_schema_path, &tool.alias)?;
-                let schema_record = package_path(context_dir, &resolved_schema_path, packaged)?;
+                let schema_record =
+                    package_path(context_dir, config_path, &resolved_schema_path, packaged)?;
                 tool.input_schema = Some(ToolInputSchemaRef {
                     packaged_path: schema.packaged_path.clone(),
                     sha256: schema_record.sha256.clone(),
@@ -317,22 +315,24 @@ pub(super) fn insert_resolved_tool(
                 };
                 return Err(BuildError::Validation(message));
             }
+            // Skills lower before `agent.tools`, so an explicit declaration is
+            // always the later one and always wins.
             (Some(previous_skill_source), None) => {
                 warnings.push(format!(
-                    "tool `{alias}` from skill `{previous_skill_source}` overridden by an explicit Agentfile tool declaration"
+                    "tool `{alias}` from skill `{previous_skill_source}` overridden by an explicit `agent.tools` declaration"
                 ));
                 *existing = tool;
                 return Ok(());
             }
             (None, Some(new_skill_source)) => {
                 warnings.push(format!(
-                    "tool `{alias}` from skill `{new_skill_source}` was shadowed by an explicit Agentfile tool declaration"
+                    "tool `{alias}` from skill `{new_skill_source}` overridden by an explicit `agent.tools` declaration"
                 ));
                 return Ok(());
             }
             (None, None) => {
                 return Err(BuildError::Validation(format!(
-                    "tool `{alias}` is declared more than once in the Agentfile"
+                    "tool `{alias}` is declared more than once in `agent.tools`"
                 )));
             }
         }

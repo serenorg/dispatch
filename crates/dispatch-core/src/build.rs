@@ -1,12 +1,11 @@
 use crate::{
-    Value,
+    agent_config::load_agent_config,
     manifest::{
         CompactionConfig, CourierTarget, EnvVar, FrameworkProvenance, IngressPolicyConfig,
-        InstructionConfig, InstructionKind, LimitSpec, ModelPolicy, MountConfig, NetworkRule,
-        PARCEL_FORMAT_VERSION, PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec,
-        TestSpec, TimeoutSpec, ToolConfig, Visibility,
+        InstructionConfig, LimitSpec, ModelPolicy, MountConfig, NetworkRule, PARCEL_FORMAT_VERSION,
+        PARCEL_SCHEMA_URL, ParcelFileRecord, ParcelManifest, SecretSpec, TestSpec, TimeoutSpec,
+        ToolConfig, Visibility,
     },
-    parse_agentfile,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,23 +18,17 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 mod component;
+mod lower;
 mod parsing;
 mod skill;
 mod verify;
 
-use component::process_component_instruction;
+use lower::lower_agent_config;
 use parsing::{
-    a2a_auth_secret_names, infer_runner, parse_compaction, parse_component, parse_env_var,
-    parse_framework, parse_label, parse_limit, parse_listener_size_limit, parse_model_reference,
-    parse_mount, parse_network_rule, parse_test_spec, parse_timeout, parse_tool, parse_visibility,
-    validate_courier_requirements, validate_entrypoint_value, validate_for_build,
-    validate_heartbeat_entrypoint, validate_listener_method, validate_listener_path,
-    validate_test_specs, validate_tool_schema,
+    a2a_auth_secret_names, validate_courier_requirements, validate_heartbeat_entrypoint,
+    validate_test_specs,
 };
-use skill::{
-    insert_resolved_tool, package_tool_config, process_skill_instruction,
-    skill_allowed_tool_build_warnings,
-};
+use skill::skill_allowed_tool_build_warnings;
 pub use verify::{ParcelLock, VerificationReport, verify_parcel};
 
 #[derive(Debug, Clone)]
@@ -72,12 +65,8 @@ pub enum BuildError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse `{path}`: {source}")]
-    Parse {
-        path: String,
-        #[source]
-        source: crate::ParseError,
-    },
+    #[error(transparent)]
+    AgentConfig(#[from] crate::agent_config::AgentConfigError),
     #[error("validation failed:\n{0}")]
     Validation(String),
     #[error("missing referenced file or directory `{path}`")]
@@ -105,7 +94,7 @@ struct ProvisionalParcelManifest {
     #[serde(rename = "$schema")]
     schema: String,
     format_version: u32,
-    source_agentfile: String,
+    source: String,
     courier: CourierTarget,
     framework: Option<FrameworkProvenance>,
     name: Option<String>,
@@ -176,254 +165,35 @@ impl PackagedPath {
     }
 }
 
-pub fn build_agentfile(
-    agentfile_path: &Path,
-    options: &BuildOptions,
-) -> Result<BuiltParcel, BuildError> {
-    let agentfile_path = agentfile_path
+pub fn build_agent(config_path: &Path, options: &BuildOptions) -> Result<BuiltParcel, BuildError> {
+    let config_path = config_path
         .canonicalize()
         .map_err(|source| BuildError::ReadFile {
-            path: agentfile_path.display().to_string(),
+            path: config_path.display().to_string(),
             source,
         })?;
-    let context_dir = agentfile_path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| BuildError::MissingPath {
-            path: agentfile_path.display().to_string(),
-        })?;
+    let context_dir =
+        config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| BuildError::MissingPath {
+                path: config_path.display().to_string(),
+            })?;
 
-    let source = fs::read_to_string(&agentfile_path).map_err(|source| BuildError::ReadFile {
-        path: agentfile_path.display().to_string(),
-        source,
-    })?;
-    let parsed = parse_agentfile(&source).map_err(|source| BuildError::Parse {
-        path: agentfile_path.display().to_string(),
-        source,
-    })?;
-    validate_for_build(&parsed)?;
+    let config = load_agent_config(&config_path)?;
 
     let mut packaged = BTreeMap::<String, Vec<u8>>::new();
     let mut files = Vec::new();
     let mut resolved = ResolvedAgentSpec::default();
 
-    for instruction in &parsed.instructions {
-        match instruction.keyword.as_str() {
-            "FROM" => {
-                resolved.courier =
-                    first_scalar(instruction.args.first()).map(CourierTarget::from_reference);
-            }
-            "COMPONENT" => {
-                process_component_instruction(
-                    &context_dir,
-                    &instruction.args,
-                    instruction.span.line_start,
-                    &mut packaged,
-                    &mut files,
-                    &mut resolved,
-                )?;
-            }
-            "NAME" => resolved.name = first_scalar(instruction.args.first()),
-            "VERSION" => resolved.version = first_scalar(instruction.args.first()),
-            "FRAMEWORK" => resolved.framework = parse_framework(&instruction.args),
-            "ENTRYPOINT" => {
-                if let Some(entrypoint) = first_scalar(instruction.args.first()) {
-                    resolved.entrypoint = Some(validate_entrypoint_value(
-                        &entrypoint,
-                        "Agentfile ENTRYPOINT",
-                    )?);
-                    resolved.entrypoint_declared = true;
-                }
-            }
-            "SCHEDULE" => {
-                if let Some(schedule) = first_scalar(instruction.args.first()) {
-                    resolved.schedules.push(schedule);
-                }
-            }
-            "LISTEN" => {
-                if let Some(listen_addr) = first_scalar(instruction.args.first()) {
-                    resolved.listeners.push(listen_addr);
-                }
-            }
-            "LISTEN_PATH" => {
-                if let Some(path) = first_scalar(instruction.args.first()) {
-                    resolved.ingress_path =
-                        Some(validate_listener_path(&path, "Agentfile LISTEN_PATH")?);
-                }
-            }
-            "LISTEN_METHOD" => {
-                if let Some(method) = first_scalar(instruction.args.first()) {
-                    resolved.ingress_methods.push(validate_listener_method(
-                        &method,
-                        "Agentfile LISTEN_METHOD",
-                    )?);
-                }
-            }
-            "LISTEN_SECRET" => {
-                if let Some(secret_name) = first_scalar(instruction.args.first()) {
-                    resolved.ingress_secret_env = Some(secret_name);
-                }
-            }
-            "LISTEN_MAX_BODY_BYTES" => {
-                if let Some(limit) = first_scalar(instruction.args.first()) {
-                    resolved.ingress_max_body_bytes = Some(parse_listener_size_limit(
-                        &limit,
-                        "Agentfile LISTEN_MAX_BODY_BYTES",
-                    )?);
-                }
-            }
-            "LISTEN_MAX_HEADER_BYTES" => {
-                if let Some(limit) = first_scalar(instruction.args.first()) {
-                    resolved.ingress_max_header_bytes = Some(parse_listener_size_limit(
-                        &limit,
-                        "Agentfile LISTEN_MAX_HEADER_BYTES",
-                    )?);
-                }
-            }
-            "VISIBILITY" => {
-                resolved.visibility = first_scalar(instruction.args.first())
-                    .and_then(|value| parse_visibility(&value))
-            }
-            "ENV" => {
-                if let Some(env_var) = parse_env_var(&instruction.args) {
-                    resolved.env.push(env_var);
-                }
-            }
-            "SECRET" => {
-                if let Some(name) = first_scalar(instruction.args.first()) {
-                    resolved.secrets.push(SecretSpec {
-                        name,
-                        required: true,
-                    });
-                }
-            }
-            "MOUNT" => {
-                if let Some(mount) = parse_mount(&instruction.args) {
-                    resolved.mounts.push(mount);
-                }
-            }
-            "TOOL" => {
-                if let Some(mut tool) = parse_tool(&instruction.args)? {
-                    package_tool_config(&context_dir, &mut packaged, &mut files, &mut tool)?;
-                    insert_resolved_tool(&mut resolved.tools, &mut resolved.warnings, tool)?;
-                }
-            }
-            "MODEL" => {
-                if let Some(model) =
-                    parse_model_reference(&instruction.args, instruction.span.line_start)?
-                {
-                    resolved.models.primary = Some(model);
-                }
-            }
-            "FALLBACK" => {
-                if let Some(model) =
-                    parse_model_reference(&instruction.args, instruction.span.line_start)?
-                {
-                    resolved.models.fallbacks.push(model);
-                }
-            }
-            "ROUTING" => resolved.models.routing = first_scalar(instruction.args.first()),
-            "COMPACTION" => resolved.compaction = parse_compaction(&instruction.args),
-            "LIMIT" => {
-                if let Some(limit) = parse_limit(&instruction.args)? {
-                    resolved.limits.push(limit);
-                }
-            }
-            "TIMEOUT" => {
-                if let Some(timeout) = parse_timeout(&instruction.args)? {
-                    resolved.timeouts.push(timeout);
-                }
-            }
-            "NETWORK" => {
-                if let Some(rule) = parse_network_rule(&instruction.args) {
-                    resolved.network.push(rule);
-                }
-            }
-            "LABEL" => {
-                if let Some((key, value)) = parse_label(&instruction.args) {
-                    resolved.labels.insert(key, value);
-                }
-            }
-            "PROMPT" => {
-                for value in &instruction.args {
-                    match value {
-                        Value::String(value) => resolved.inline_prompts.push(value.clone()),
-                        Value::Heredoc(doc) => resolved.inline_prompts.push(doc.body.clone()),
-                        Value::Token(value) => resolved.inline_prompts.push(value.clone()),
-                    }
-                }
-            }
-            "SKILL" => {
-                let source_path = scalar_at(&instruction.args, 0);
-                process_skill_instruction(
-                    &context_dir,
-                    &source_path,
-                    &mut packaged,
-                    &mut files,
-                    &mut resolved,
-                )?;
-            }
-            "IDENTITY" | "SOUL" | "AGENTS" | "USER" | "TOOLS" | "EVAL" => {
-                let source_path = scalar_at(&instruction.args, 0);
-                let resolved_path = resolve_path(&context_dir, &source_path)?;
-                let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
-                resolved.instructions.push(InstructionConfig {
-                    kind: instruction_kind_from_keyword(&instruction.keyword),
-                    packaged_path: source_path,
-                    sha256: file_record.sha256.clone(),
-                    skill_name: None,
-                    allowed_tools: None,
-                });
-                files.extend(file_record.expand());
-            }
-            "MEMORY" if instruction.args.len() >= 2 => {
-                let maybe_path = scalar_at(&instruction.args, instruction.args.len() - 1);
-                if looks_like_path(&maybe_path) {
-                    let resolved_path = resolve_path(&context_dir, &maybe_path)?;
-                    let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
-                    resolved.instructions.push(InstructionConfig {
-                        kind: InstructionKind::Memory,
-                        packaged_path: maybe_path,
-                        sha256: file_record.sha256.clone(),
-                        skill_name: None,
-                        allowed_tools: None,
-                    });
-                    files.extend(file_record.expand());
-                }
-            }
-            "HEARTBEAT" => {
-                let tokens = scalars(&instruction.args);
-                if let Some(file_index) = tokens.iter().position(|value| value == "FILE")
-                    && let Some(path_value) = instruction.args.get(file_index + 1)
-                {
-                    let source_path = scalar_value(path_value);
-                    let resolved_path = resolve_path(&context_dir, &source_path)?;
-                    let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
-                    resolved.instructions.push(InstructionConfig {
-                        kind: InstructionKind::Heartbeat,
-                        packaged_path: source_path,
-                        sha256: file_record.sha256.clone(),
-                        skill_name: None,
-                        allowed_tools: None,
-                    });
-                    files.extend(file_record.expand());
-                }
-            }
-            "TEST" => {
-                resolved.tests.push(parse_test_spec(
-                    &instruction.args,
-                    instruction.span.line_start,
-                )?);
-            }
-            "COPY" | "ADD" => {
-                let source_path = scalar_at(&instruction.args, 0);
-                let resolved_path = resolve_path(&context_dir, &source_path)?;
-                let file_record = package_path(&context_dir, &resolved_path, &mut packaged)?;
-                files.extend(file_record.expand());
-            }
-            _ => {}
-        }
-    }
+    lower_agent_config(
+        &config,
+        &context_dir,
+        &config_path,
+        &mut packaged,
+        &mut files,
+        &mut resolved,
+    )?;
 
     resolved.warnings.extend(skill_allowed_tool_build_warnings(
         &resolved.instructions,
@@ -455,7 +225,7 @@ pub fn build_agentfile(
                     .any(|secret| secret.name == secret_name)
                 {
                     return Err(BuildError::Validation(format!(
-                        "TOOL A2A `{}` references auth secret `{}` which is not declared via `SECRET`",
+                        "`agent.tools` A2A tool `{}` references auth secret `{}` which is not declared in `agent.secrets`",
                         tool.alias, secret_name
                     )));
                 }
@@ -470,7 +240,7 @@ pub fn build_agentfile(
             .any(|secret| secret.name == *secret_name)
     {
         return Err(BuildError::Validation(format!(
-            "LISTEN_SECRET `{secret_name}` is not declared via `SECRET`"
+            "`agent.ingress.secret_env` value `{secret_name}` is not declared in `agent.secrets`"
         )));
     }
 
@@ -479,9 +249,9 @@ pub fn build_agentfile(
     let provisional = ProvisionalParcelManifest {
         schema: PARCEL_SCHEMA_URL.to_string(),
         format_version: PARCEL_FORMAT_VERSION,
-        source_agentfile: relative_display(&context_dir, &agentfile_path),
+        source: relative_display(&context_dir, &config_path),
         courier: resolved.courier.ok_or_else(|| {
-            BuildError::Validation("line 1: missing required `FROM` instruction".to_string())
+            BuildError::Validation("missing required `agent.courier_reference`".to_string())
         })?,
         framework: resolved.framework,
         name: resolved.name,
@@ -537,7 +307,7 @@ pub fn build_agentfile(
         schema: provisional.schema,
         format_version: provisional.format_version,
         digest: digest.clone(),
-        source_agentfile: provisional.source_agentfile,
+        source: provisional.source,
         courier: provisional.courier,
         framework: provisional.framework,
         name: provisional.name,
@@ -604,7 +374,7 @@ fn provisional_digest(parcel: &ParcelManifest) -> Result<String, BuildError> {
     let provisional = ProvisionalParcelManifest {
         schema: parcel.schema.clone(),
         format_version: parcel.format_version,
-        source_agentfile: parcel.source_agentfile.clone(),
+        source: parcel.source.clone(),
         courier: parcel.courier.clone(),
         framework: parcel.framework.clone(),
         name: parcel.name.clone(),
@@ -653,10 +423,17 @@ fn resolved_ingress_policy(resolved: &ResolvedAgentSpec) -> Option<IngressPolicy
 
 fn package_path(
     context_dir: &Path,
+    config_path: &Path,
     resolved: &Path,
     packaged: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<PackagedPath, BuildError> {
     if resolved.is_file() {
+        if resolved == config_path {
+            return Err(BuildError::Validation(format!(
+                "source config `{}` cannot be packaged into the parcel context",
+                relative_display(context_dir, config_path)
+            )));
+        }
         let bytes = fs::read(resolved).map_err(|source| BuildError::ReadFile {
             path: resolved.display().to_string(),
             source,
@@ -693,6 +470,9 @@ fn package_path(
             continue;
         }
         let path = entry.path();
+        if path == config_path {
+            continue;
+        }
         let bytes = fs::read(path).map_err(|source| BuildError::ReadFile {
             path: path.display().to_string(),
             source,
@@ -738,55 +518,11 @@ fn resolve_path(context_dir: &Path, relative: &str) -> Result<PathBuf, BuildErro
     Ok(resolved)
 }
 
-fn instruction_kind_from_keyword(keyword: &str) -> InstructionKind {
-    match keyword {
-        "IDENTITY" => InstructionKind::Identity,
-        "SOUL" => InstructionKind::Soul,
-        "SKILL" => InstructionKind::Skill,
-        "AGENTS" => InstructionKind::Agents,
-        "USER" => InstructionKind::User,
-        "TOOLS" => InstructionKind::Tools,
-        "EVAL" => InstructionKind::Eval,
-        "MEMORY" => InstructionKind::Memory,
-        "HEARTBEAT" => InstructionKind::Heartbeat,
-        _ => unreachable!("unexpected instruction keyword `{keyword}`"),
-    }
-}
-
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn scalar_at(args: &[Value], index: usize) -> String {
-    args.get(index).map(scalar_value).unwrap_or_default()
-}
-
-fn scalar_value(value: &Value) -> String {
-    match value {
-        Value::Token(value) | Value::String(value) => value.clone(),
-        Value::Heredoc(doc) => doc.body.clone(),
-    }
-}
-
-fn first_scalar(value: Option<&Value>) -> Option<String> {
-    value.map(scalar_value)
-}
-
-fn scalars(args: &[Value]) -> Vec<String> {
-    args.iter().map(scalar_value).collect()
-}
-
-// Heuristic used when the MEMORY instruction's last argument might be either a
-// file path (MEMORY POLICY policy.md) or a bare driver/keyword token
-// (e.g. a future form that takes inline options). A value is treated as a path
-// if it contains a path separator or any dot - this catches all common file
-// extensions (.md, .txt, .json, .yaml, .toml, etc.) while excluding bare
-// alphanumeric driver names such as "sqlite" or "pgvector".
-fn looks_like_path(value: &str) -> bool {
-    value.contains('/') || value.contains('.')
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -808,9 +544,10 @@ fn encode_hex(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_config::AgentConfigError;
     use crate::{
-        A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, DISPATCH_WASM_ABI, ToolApprovalPolicy,
-        ToolRiskLevel,
+        A2aAuthConfig, A2aAuthScheme, A2aEndpointMode, DISPATCH_WASM_ABI, InstructionKind,
+        ToolApprovalPolicy, ToolRiskLevel,
     };
     use tempfile::tempdir;
 
@@ -818,29 +555,8 @@ mod tests {
     fn build_emits_typed_manifest() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-NAME demo
-VERSION 1.0.0
-FRAMEWORK adk-rust VERSION 0.5.0 TARGET wasm
-IDENTITY IDENTITY.md
-SOUL SOUL.md
-SKILL SKILL.md
-AGENTS AGENTS.md
-USER USER.md
-TOOLS TOOLS.md
-MODEL claude-sonnet-4 PROVIDER anthropic
-FALLBACK gpt-5-nano PROVIDER openai
-TOOL LOCAL tools/demo.py AS demo USING python3 -u RISK low DESCRIPTION \"Look up a record by id and print JSON.\"
-TOOL BUILTIN web_search APPROVAL required RISK medium DESCRIPTION \"Search the web for live information.\"
-MOUNT SESSION sqlite
-NETWORK allow api.example.com
-ENV TZ=UTC
-SECRET OPENAI_API_KEY
-LABEL org.example.team=platform
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"demo\"\nversion = \"1.0.0\"\nentrypoint = \"chat\"\n\n[agent.framework]\nname = \"adk-rust\"\nversion = \"0.5.0\"\ntarget = \"wasm\"\n\n[agent.instructions]\nidentity = \"IDENTITY.md\"\nsoul = \"SOUL.md\"\nskill = \"SKILL.md\"\nagents = \"AGENTS.md\"\nuser = \"USER.md\"\ntools = \"TOOLS.md\"\n\n[agent.model]\nid = \"claude-sonnet-4\"\nprovider = \"anthropic\"\n\n[[agent.model.fallbacks]]\nid = \"gpt-5-nano\"\nprovider = \"openai\"\n\n[agent.env]\n\"TZ\" = \"UTC\"\n\n[agent.labels]\n\"org.example.team\" = \"platform\"\n\n[[agent.secrets]]\nname = \"OPENAI_API_KEY\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.py\"\nalias = \"demo\"\nrunner = { command = \"python3\", args = [\"-u\"] }\nrisk = \"low\"\ndescription = \"Look up a record by id and print JSON.\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"web_search\"\napproval = \"confirm\"\nrisk = \"medium\"\ndescription = \"Search the web for live information.\"\n\n[[agent.network]]\naction = \"allow\"\ntarget = \"api.example.com\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("IDENTITY.md"), "identity").unwrap();
@@ -852,8 +568,8 @@ ENTRYPOINT chat
         fs::create_dir_all(dir.path().join("tools")).unwrap();
         fs::write(dir.path().join("tools/demo.py"), "print('ok')").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -949,6 +665,158 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn build_preserves_model_policy_without_a_primary_model() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"native\"\nentrypoint = \"chat\"\n\n[agent.model]\nrouting = \"balanced\"\n\n[[agent.model.fallbacks]]\nid = \"gpt-5-mini\"\nprovider = \"openai\"\n",
+        )
+        .unwrap();
+
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
+            &BuildOptions {
+                output_root: dir.path().join("parcels"),
+            },
+        )
+        .unwrap();
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        assert!(parcel.models.primary.is_none());
+        assert_eq!(parcel.models.routing.as_deref(), Some("balanced"));
+        assert_eq!(parcel.models.fallbacks[0].id, "gpt-5-mini");
+    }
+
+    #[test]
+    fn build_orders_skill_bundles_with_prompt_instruction_files() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("bundle")).unwrap();
+        fs::write(
+            dir.path().join("bundle/SKILL.md"),
+            "---\nname: bundle\ndescription: Bundled skill.\n---\nbundle",
+        )
+        .unwrap();
+        for (path, contents) in [
+            ("IDENTITY.md", "identity"),
+            ("SOUL.md", "soul"),
+            ("SKILL.md", "skill"),
+            ("AGENTS.md", "agents"),
+            ("USER.md", "user"),
+            ("TOOLS.md", "tools"),
+            ("MEMORY.md", "memory"),
+            ("HEARTBEAT.md", "heartbeat"),
+            ("evals/smoke.eval", "name = \"smoke\"\ninput = \"ok\"\n"),
+        ] {
+            let path = dir.path().join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
+        }
+        fs::write(
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"native\"\nentrypoint = \"heartbeat\"\nskills = [\"bundle\"]\nevals = [\"evals/smoke.eval\"]\n\n[agent.instructions]\nidentity = \"IDENTITY.md\"\nsoul = \"SOUL.md\"\nskill = \"SKILL.md\"\nagents = \"AGENTS.md\"\nuser = \"USER.md\"\ntools = \"TOOLS.md\"\nmemory = \"MEMORY.md\"\nheartbeat = \"HEARTBEAT.md\"\n",
+        )
+        .unwrap();
+
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
+            &BuildOptions {
+                output_root: dir.path().join("parcels"),
+            },
+        )
+        .unwrap();
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(built.manifest_path).unwrap()).unwrap();
+
+        assert_eq!(
+            parcel
+                .instructions
+                .iter()
+                .map(|instruction| instruction.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                InstructionKind::Identity,
+                InstructionKind::Soul,
+                InstructionKind::Skill,
+                InstructionKind::Skill,
+                InstructionKind::Agents,
+                InstructionKind::User,
+                InstructionKind::Tools,
+                InstructionKind::Memory,
+                InstructionKind::Heartbeat,
+                InstructionKind::Eval,
+            ]
+        );
+        assert_eq!(parcel.instructions[3].skill_name.as_deref(), Some("bundle"));
+    }
+
+    #[test]
+    fn build_excludes_source_config_from_directory_assets_and_digest() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("asset.txt"), "asset").unwrap();
+        let config_path = source_dir.join("dispatch.toml");
+        let config = |channel_id: &str| {
+            format!(
+                "[agent]\ncourier_reference = \"native\"\nentrypoint = \"chat\"\nfiles = [\".\"]\n\n[[channels]]\nplugin = \"channel-test\"\nmode = \"poll\"\nconfig = {{ channel_id = \"{channel_id}\", bot_token = \"must-not-package\" }}\n"
+            )
+        };
+
+        fs::write(&config_path, config("one")).unwrap();
+        let first = build_agent(
+            &config_path,
+            &BuildOptions {
+                output_root: dir.path().join("parcels-one"),
+            },
+        )
+        .unwrap();
+        fs::write(&config_path, config("two")).unwrap();
+        let second = build_agent(
+            &config_path,
+            &BuildOptions {
+                output_root: dir.path().join("parcels-two"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first.digest, second.digest);
+        assert!(!first.parcel_dir.join("context/dispatch.toml").exists());
+        let parcel: ParcelManifest =
+            serde_json::from_slice(&fs::read(first.manifest_path).unwrap()).unwrap();
+        assert!(
+            parcel
+                .files
+                .iter()
+                .all(|file| file.packaged_as != "dispatch.toml")
+        );
+    }
+
+    #[test]
+    fn build_rejects_direct_source_config_packaging() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"native\"\nfiles = [\"dispatch.toml\"]\n",
+        )
+        .unwrap();
+
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
+            &BuildOptions {
+                output_root: dir.path().join("parcels"),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "validation failed:\nsource config `dispatch.toml` cannot be packaged into the parcel context"
+        );
+    }
+
+    #[test]
     fn build_supports_agent_skill_directory_bundles() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
@@ -972,13 +840,13 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1025,6 +893,29 @@ ENTRYPOINT chat
     }
 
     #[test]
+    fn build_rejects_instruction_files_in_agent_skills() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), "skill").unwrap();
+        fs::write(
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"native\"\nskills = [\"SKILL.md\"]\n",
+        )
+        .unwrap();
+
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
+            &BuildOptions {
+                output_root: dir.path().join("parcels"),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "validation failed:\n`agent.skills` entry `SKILL.md` must be a directory; use `agent.instructions.skill` for a standalone instruction file"
+        );
+    }
+
+    #[test]
     fn build_skill_directory_records_allowed_tools_metadata() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
@@ -1035,13 +926,13 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1073,13 +964,13 @@ ENTRYPOINT chat
         .unwrap();
         fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1102,8 +993,8 @@ ENTRYPOINT chat
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("tools")).unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nTOOL LOCAL tools/demo.cmd AS demo\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.cmd\"\nalias = \"demo\"\n",
         )
         .unwrap();
         fs::write(
@@ -1112,8 +1003,8 @@ ENTRYPOINT chat
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1149,13 +1040,13 @@ ENTRYPOINT chat
         .unwrap();
         fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1169,7 +1060,7 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn build_agentfile_entrypoint_overrides_skill_sidecar_entrypoint() {
+    fn build_agent_entrypoint_overrides_skill_sidecar_entrypoint() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
         fs::create_dir_all(skill_dir.join("scripts")).unwrap();
@@ -1185,13 +1076,13 @@ ENTRYPOINT chat
         .unwrap();
         fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1224,13 +1115,13 @@ ENTRYPOINT chat
             fs::write(skill_dir.join("scripts/run.sh"), "echo ok\n").unwrap();
         }
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nSKILL web-search\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nskills = [\"file-analyst\", \"web-search\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1263,13 +1154,13 @@ ENTRYPOINT chat
             fs::write(skill_dir.join("scripts/run.sh"), "echo ok\n").unwrap();
         }
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nSKILL web-search\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\", \"web-search\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1298,13 +1189,13 @@ ENTRYPOINT chat
         fs::create_dir_all(dir.path().join("tools")).unwrap();
         fs::write(dir.path().join("tools/read_file.py"), "print('override')\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nTOOL LOCAL tools/read_file.py AS read_file RISK high\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/read_file.py\"\nalias = \"read_file\"\nrisk = \"high\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1326,14 +1217,14 @@ ENTRYPOINT chat
         assert_eq!(
             built.warnings,
             vec![
-                "tool `read_file` from skill `file-analyst` overridden by an explicit Agentfile tool declaration"
+                "tool `read_file` from skill `file-analyst` overridden by an explicit `agent.tools` declaration"
                     .to_string()
             ]
         );
     }
 
     #[test]
-    fn build_explicit_tool_declared_before_skill_still_wins() {
+    fn build_explicit_tool_overrides_a_skill_tool_regardless_of_declaration_order() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
         fs::create_dir_all(skill_dir.join("scripts")).unwrap();
@@ -1351,13 +1242,13 @@ ENTRYPOINT chat
         fs::create_dir_all(dir.path().join("tools")).unwrap();
         fs::write(dir.path().join("tools/read_file.py"), "print('override')\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nTOOL LOCAL tools/read_file.py AS read_file RISK high\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/read_file.py\"\nalias = \"read_file\"\nrisk = \"high\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1378,7 +1269,7 @@ ENTRYPOINT chat
         assert_eq!(
             built.warnings,
             vec![
-                "tool `read_file` from skill `file-analyst` was shadowed by an explicit Agentfile tool declaration"
+                "tool `read_file` from skill `file-analyst` overridden by an explicit `agent.tools` declaration"
                     .to_string()
             ]
         );
@@ -1391,13 +1282,13 @@ ENTRYPOINT chat
         fs::write(dir.path().join("tools/read_file.py"), "print('one')\n").unwrap();
         fs::write(dir.path().join("tools/read_file.sh"), "echo two\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nTOOL LOCAL tools/read_file.py AS read_file\nTOOL LOCAL tools/read_file.sh AS read_file\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/read_file.py\"\nalias = \"read_file\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/read_file.sh\"\nalias = \"read_file\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1407,7 +1298,7 @@ ENTRYPOINT chat
         assert!(
             error
                 .to_string()
-                .contains("tool `read_file` is declared more than once in the Agentfile")
+                .contains("tool `read_file` is declared more than once in `agent.tools`")
         );
     }
 
@@ -1429,13 +1320,13 @@ ENTRYPOINT chat
         fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
         fs::write(skill_dir.join("scripts/other.sh"), "echo other\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1461,13 +1352,13 @@ ENTRYPOINT chat
         .unwrap();
         fs::write(skill_dir.join("skill.toml"), "this is not toml\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1497,13 +1388,13 @@ ENTRYPOINT chat
         .unwrap();
         fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nTOOL LOCAL file-analyst/scripts/read_file.sh AS read_file_override\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n\n[[agent.tools]]\nkind = \"local\"\npath = \"file-analyst/scripts/read_file.sh\"\nalias = \"read_file_override\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1531,13 +1422,13 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1564,13 +1455,13 @@ ENTRYPOINT chat
         .unwrap();
         fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1604,13 +1495,13 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1624,21 +1515,14 @@ ENTRYPOINT chat
     fn build_preserves_heartbeat_mount_options_and_network_qualifiers() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-HEARTBEAT EVERY 30s FILE HEARTBEAT.md
-MOUNT MEMORY pgvector tenant=acme namespace=agents
-NETWORK allow api.example.com via-egress
-LABEL org.example.display=\"Market Monitor\"
-ENTRYPOINT heartbeat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\n\n[agent.instructions]\nheartbeat = \"HEARTBEAT.md\"\n\n[agent.labels]\n\"org.example.display\" = \"Market Monitor\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"pgvector\"\noptions = [\"tenant=acme\", \"namespace=agents\"]\n\n[[agent.network]]\naction = \"allow\"\ntarget = \"api.example.com\"\nqualifiers = [\"via-egress\"]\n",
         )
         .unwrap();
         fs::write(dir.path().join("HEARTBEAT.md"), "poll").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1667,18 +1551,14 @@ ENTRYPOINT heartbeat
     fn build_rejects_heartbeat_without_heartbeat_entrypoint() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-HEARTBEAT EVERY 30s FILE HEARTBEAT.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nheartbeat = \"HEARTBEAT.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("HEARTBEAT.md"), "poll").unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1687,7 +1567,7 @@ ENTRYPOINT chat
 
         assert_eq!(
             error.to_string(),
-            "validation failed:\n`HEARTBEAT` requires `ENTRYPOINT heartbeat`"
+            "validation failed:\n`agent.instructions.heartbeat` requires `agent.entrypoint = \"heartbeat\"`"
         );
     }
 
@@ -1695,18 +1575,13 @@ ENTRYPOINT chat
     fn build_preserves_authored_schedules_in_manifest() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SCHEDULE \"*/5 * * * * * *\"
-SCHEDULE \"0 */2 * * * * *\"
-ENTRYPOINT heartbeat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\nschedules = [\"*/5 * * * * * *\", \"0 */2 * * * * *\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1723,18 +1598,13 @@ ENTRYPOINT heartbeat
     fn build_preserves_authored_listeners_in_manifest() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-LISTEN \"127.0.0.1:0\"
-LISTEN \"127.0.0.1:9000\"
-ENTRYPOINT heartbeat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\nlisteners = [\"127.0.0.1:0\", \"127.0.0.1:9000\"]\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1751,24 +1621,13 @@ ENTRYPOINT heartbeat
     fn build_preserves_authored_ingress_policy_in_manifest() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SECRET DISPATCH_WEBHOOK_SECRET
-LISTEN \"127.0.0.1:0\"
-LISTEN_PATH \"/hook\"
-LISTEN_METHOD POST
-LISTEN_METHOD PUT
-LISTEN_SECRET DISPATCH_WEBHOOK_SECRET
-LISTEN_MAX_BODY_BYTES 8192
-LISTEN_MAX_HEADER_BYTES 4096
-ENTRYPOINT heartbeat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\nlisteners = [\"127.0.0.1:0\"]\n\n[agent.ingress]\npath = \"/hook\"\nsecret_env = \"DISPATCH_WEBHOOK_SECRET\"\nmax_body_bytes = 8192\nmax_header_bytes = 4096\nmethods = [\"POST\", \"PUT\"]\n\n[[agent.secrets]]\nname = \"DISPATCH_WEBHOOK_SECRET\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1793,17 +1652,13 @@ ENTRYPOINT heartbeat
     fn build_rejects_undeclared_listener_secret() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-LISTEN_SECRET DISPATCH_WEBHOOK_SECRET
-ENTRYPOINT heartbeat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\n\n[agent.ingress]\nsecret_env = \"DISPATCH_WEBHOOK_SECRET\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1812,7 +1667,7 @@ ENTRYPOINT heartbeat
 
         assert_eq!(
             error.to_string(),
-            "validation failed:\nLISTEN_SECRET `DISPATCH_WEBHOOK_SECRET` is not declared via `SECRET`"
+            "validation failed:\n`agent.ingress.secret_env` value `DISPATCH_WEBHOOK_SECRET` is not declared in `agent.secrets`"
         );
     }
 
@@ -1821,19 +1676,14 @@ ENTRYPOINT heartbeat
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("scripts")).unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL scripts/demo.sh AS demo
-TEST tool:demo
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"scripts/demo.sh\"\nalias = \"demo\"\n\n[[agent.tests]]\ntool = \"demo\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("scripts/demo.sh"), "#!/bin/sh\necho ok\n").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1856,19 +1706,14 @@ ENTRYPOINT chat
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("scripts")).unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL scripts/demo.sh AS demo
-TEST tool:missing
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"scripts/demo.sh\"\nalias = \"demo\"\n\n[[agent.tests]]\ntool = \"missing\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("scripts/demo.sh"), "#!/bin/sh\necho ok\n").unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1877,7 +1722,7 @@ ENTRYPOINT chat
 
         assert_eq!(
             error.to_string(),
-            "validation failed:\n`TEST tool:missing` references an unknown local or A2A tool alias"
+            "validation failed:\n`agent.tests.tool = \"missing\"` references an unknown local or A2A tool alias"
         );
     }
 
@@ -1885,17 +1730,13 @@ ENTRYPOINT chat
     fn build_records_compaction_config() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-COMPACTION 200 OVERLAP 32
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.compaction]\ninterval = \"200\"\noverlap = 32\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -1914,89 +1755,82 @@ ENTRYPOINT chat
     fn build_rejects_invalid_tool_approval_policy() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL BUILTIN web_search APPROVAL bogus
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"web_search\"\napproval = \"bogus\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("invalid tool approval policy"));
+        assert!(matches!(
+            error,
+            BuildError::AgentConfig(AgentConfigError::Parse { .. })
+        ));
     }
 
     #[test]
     fn build_rejects_invalid_tool_risk_level() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL BUILTIN web_search RISK dangerous
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"web_search\"\nrisk = \"dangerous\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("invalid tool risk level"));
+        assert!(matches!(
+            error,
+            BuildError::AgentConfig(AgentConfigError::Parse { .. })
+        ));
     }
 
     #[test]
     fn build_rejects_invalid_limit_scope() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-LIMIT TOOL_CALL 5
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.limits]\niteration = 5\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("invalid limit scope"));
+        assert!(matches!(
+            error,
+            BuildError::AgentConfig(AgentConfigError::Parse { .. })
+        ));
     }
 
     #[test]
     fn build_accepts_tool_round_limit() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-LIMIT TOOL_ROUNDS 4
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.limits]\ntool_rounds = 4\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2017,24 +1851,66 @@ ENTRYPOINT chat
     fn build_rejects_invalid_timeout_duration() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TIMEOUT TOOL sixty
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.timeouts]\ntool = \"sixty\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("invalid timeout duration"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid `agent.timeouts.tool` duration")
+        );
+    }
+
+    #[test]
+    fn build_rejects_zero_timeout_duration() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"native\"\n\n[agent.timeouts]\nrun = \"0s\"\n",
+        )
+        .unwrap();
+
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
+            &BuildOptions {
+                output_root: dir.path().join("parcels"),
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("invalid `agent.timeouts.run` duration"));
+        assert!(message.contains("expected a positive integer"));
+    }
+
+    #[test]
+    fn build_rejects_removed_required_tool_approval_alias_with_guidance() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"native\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"web_search\"\napproval = \"required\"\n",
+        )
+        .unwrap();
+
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
+            &BuildOptions {
+                output_root: dir.path().join("parcels"),
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("required"));
+        assert!(message.contains("confirm"));
     }
 
     #[test]
@@ -2047,18 +1923,13 @@ ENTRYPOINT chat
         )
         .unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SECRET A2A_TOKEN
-TOOL A2A broker_agent URL https://broker.example.com DISCOVERY card AUTH bearer A2A_TOKEN EXPECT_AGENT_NAME remote-broker EXPECT_CARD_SHA256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa APPROVAL confirm RISK medium SCHEMA schemas/a2a-input.json DESCRIPTION \"Delegate to a remote broker\"
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.secrets]]\nname = \"A2A_TOKEN\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker_agent\"\nurl = \"https://broker.example.com\"\ndiscovery = \"card\"\nexpect_agent_name = \"remote-broker\"\nexpect_card_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\napproval = \"confirm\"\nrisk = \"medium\"\ndescription = \"Delegate to a remote broker\"\nschema = \"schemas/a2a-input.json\"\n\n[agent.tools.auth]\nscheme = \"bearer\"\nsecret_name = \"A2A_TOKEN\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2104,17 +1975,13 @@ ENTRYPOINT chat
     fn build_rejects_a2a_tool_auth_secret_without_secret_declaration() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL https://broker.example.com AUTH bearer MISSING_TOKEN
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\n\n[agent.tools.auth]\nscheme = \"bearer\"\nsecret_name = \"MISSING_TOKEN\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2132,66 +1999,61 @@ ENTRYPOINT chat
     fn build_rejects_invalid_a2a_card_sha256() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL https://broker.example.com EXPECT_CARD_SHA256 not-a-digest
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\nexpect_card_sha256 = \"not-a-digest\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("EXPECT_CARD_SHA256"));
+        assert!(
+            error
+                .to_string()
+                .contains("`expect_card_sha256` must be a 64-character hex SHA256 digest")
+        );
     }
 
     #[test]
     fn build_rejects_direct_a2a_with_identity_requirements() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL https://broker.example.com DISCOVERY direct EXPECT_AGENT_NAME planner-agent
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\ndiscovery = \"direct\"\nexpect_agent_name = \"planner-agent\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("cannot use `DISCOVERY direct`"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use `discovery = \"direct\"`")
+        );
     }
 
     #[test]
     fn build_parses_a2a_header_auth() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SECRET API_KEY
-TOOL A2A broker URL https://broker.example.com AUTH header X-Api-Key API_KEY
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.secrets]]\nname = \"API_KEY\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\n\n[agent.tools.auth]\nscheme = \"header\"\nheader_name = \"X-Api-Key\"\nsecret_name = \"API_KEY\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2220,19 +2082,13 @@ ENTRYPOINT chat
     fn build_parses_a2a_basic_auth() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SECRET A2A_USER
-SECRET A2A_PASSWORD
-TOOL A2A broker URL https://broker.example.com AUTH basic A2A_USER A2A_PASSWORD
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.secrets]]\nname = \"A2A_USER\"\n\n[[agent.secrets]]\nname = \"A2A_PASSWORD\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\n\n[agent.tools.auth]\nscheme = \"basic\"\nusername_secret_name = \"A2A_USER\"\npassword_secret_name = \"A2A_PASSWORD\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2262,18 +2118,13 @@ ENTRYPOINT chat
     fn build_rejects_invalid_a2a_header_name() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SECRET API_KEY
-TOOL A2A broker URL https://broker.example.com AUTH header Bad:Header API_KEY
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.secrets]]\nname = \"API_KEY\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\n\n[agent.tools.auth]\nscheme = \"header\"\nheader_name = \"Bad:Header\"\nsecret_name = \"API_KEY\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2287,17 +2138,13 @@ ENTRYPOINT chat
     fn build_records_framework_provenance_without_optional_fields() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-FRAMEWORK adk-rust
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.framework]\nname = \"adk-rust\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2319,17 +2166,8 @@ ENTRYPOINT chat
     fn build_supports_extended_workspace_instruction_files() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-IDENTITY IDENTITY.md
-SOUL SOUL.md
-AGENTS AGENTS.md
-USER USER.md
-TOOLS TOOLS.md
-MEMORY POLICY MEMORY.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nidentity = \"IDENTITY.md\"\nsoul = \"SOUL.md\"\nagents = \"AGENTS.md\"\nuser = \"USER.md\"\ntools = \"TOOLS.md\"\nmemory = \"MEMORY.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("IDENTITY.md"), "name: demo").unwrap();
@@ -2339,8 +2177,8 @@ ENTRYPOINT chat
         fs::write(dir.path().join("TOOLS.md"), "tool notes").unwrap();
         fs::write(dir.path().join("MEMORY.md"), "memory").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2371,13 +2209,8 @@ ENTRYPOINT chat
     fn build_packages_tool_input_schema_and_records_hash() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\nschema = \"schemas/demo.json\"\n",
         )
         .unwrap();
         fs::create_dir_all(dir.path().join("tools")).unwrap();
@@ -2386,8 +2219,8 @@ ENTRYPOINT chat
         let schema_body = "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"id\": { \"type\": \"string\" }\n  },\n  \"required\": [\"id\"]\n}";
         fs::write(dir.path().join("schemas/demo.json"), schema_body).unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2417,21 +2250,16 @@ ENTRYPOINT chat
     fn build_records_wasm_component_in_courier_target() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/wasm:latest
-COMPONENT components/assistant.wat
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/assistant.wat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
         fs::create_dir_all(dir.path().join("components")).unwrap();
         fs::write(dir.path().join("components/assistant.wat"), "(component)").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2456,12 +2284,8 @@ ENTRYPOINT chat
     fn build_rejects_invalid_tool_input_schema() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\nschema = \"schemas/demo.json\"\n",
         )
         .unwrap();
         fs::create_dir_all(dir.path().join("tools")).unwrap();
@@ -2469,8 +2293,8 @@ ENTRYPOINT chat
         fs::write(dir.path().join("tools/demo.sh"), "printf ok").unwrap();
         fs::write(dir.path().join("schemas/demo.json"), "[1,2,3]").unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2487,18 +2311,14 @@ ENTRYPOINT chat
     fn verify_parcel_accepts_clean_built_parcel() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2517,18 +2337,13 @@ ENTRYPOINT chat
     fn build_records_model_persist_thread_setting() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex --persist-thread=false --reasoning-effort=high
-FALLBACK gpt-5.4-mini PROVIDER codex --persist-thread=true
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5.4\"\nprovider = \"codex\"\n\n[agent.model.options]\n\"persist-thread\" = \"false\"\n\"reasoning-effort\" = \"high\"\n\n[[agent.model.fallbacks]]\nid = \"gpt-5.6-luna\"\nprovider = \"codex\"\n\n[agent.model.fallbacks.options]\n\"persist-thread\" = \"true\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2560,17 +2375,13 @@ ENTRYPOINT chat
     fn build_rejects_invalid_model_persist_thread_setting() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex --persist-thread=maybe
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5.4\"\nprovider = \"codex\"\n\n[agent.model.options]\n\"persist-thread\" = \"maybe\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2580,25 +2391,21 @@ ENTRYPOINT chat
         assert!(
             error
                 .to_string()
-                .contains("`--persist-thread` must be one of `true` or `false`")
+                .contains("model option `persist-thread` must be `true` or `false`")
         );
     }
 
     #[test]
-    fn build_rejects_legacy_model_persist_history_syntax() {
+    fn build_rejects_an_unknown_model_option() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex PERSIST_HISTORY false
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5.4\"\nprovider = \"codex\"\n\n[agent.model.options]\npersist-history = \"true\"\n",
         )
         .unwrap();
 
-        let error = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let error = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2608,7 +2415,7 @@ ENTRYPOINT chat
         assert!(
             error
                 .to_string()
-                .contains("`PERSIST_HISTORY` is no longer supported")
+                .contains("unsupported model option `persist-history`")
         );
     }
 
@@ -2616,18 +2423,14 @@ ENTRYPOINT chat
     fn verify_parcel_detects_modified_packaged_file() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2645,18 +2448,14 @@ ENTRYPOINT chat
     fn verify_parcel_detects_lockfile_digest_mismatch() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },
@@ -2682,18 +2481,14 @@ ENTRYPOINT chat
     fn provisional_digest_excludes_embedded_manifest_digest_field() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         )
         .unwrap();
         fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
 
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },

@@ -1,0 +1,57 @@
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "file-analyst"
+version = "0.1.0"
+entrypoint = "chat"
+skills = ["skills/file-analyst"]
+evals = ["evals/smoke.eval"]
+
+[agent.instructions]
+soul = "SOUL.md"
+
+[agent.model]
+id = "claude-sonnet-4-6"
+provider = "anthropic"
+
+[[agent.model.fallbacks]]
+id = "gpt-4o"
+provider = "openai"
+
+[[agent.tools]]
+kind = "builtin"
+name = "memory_put"
+risk = "low"
+approval = "audit"
+description = "Remember something for later. Use to store file summaries and key findings."
+
+[[agent.tools]]
+kind = "builtin"
+name = "memory_get"
+risk = "low"
+
+[[agent.tools]]
+kind = "builtin"
+name = "memory_list"
+risk = "low"
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "artifacts"
+driver = "local"
+
+[agent.limits]
+iterations = 30
+tool_calls = 60
+tool_output = 32768
+
+[agent.timeouts]
+run = "300s"
+tool = "30s"
+llm = "120s"

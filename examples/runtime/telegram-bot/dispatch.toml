@@ -1,4 +1,4 @@
-parcel = "../../parcels/basic/Agentfile"
+parcel = "../../parcels/basic/dispatch.toml"
 courier = "native"
 
 # Uncomment and adjust this if you want `dispatch up` to reconcile a local

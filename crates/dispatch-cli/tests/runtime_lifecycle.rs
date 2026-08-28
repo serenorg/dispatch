@@ -1,5 +1,5 @@
 use dispatch_core::{
-    BuildOptions, CourierPluginExec, CourierPluginManifest, PluginTransport, build_agentfile,
+    BuildOptions, CourierPluginExec, CourierPluginManifest, PluginTransport, build_agent,
     install_courier_plugin,
 };
 use dispatch_process::run_command_with_file_capture;
@@ -45,19 +45,75 @@ fn dispatch_bin() -> PathBuf {
     cargo_bin
 }
 
+#[test]
+fn parcel_lint_json_writes_one_parseable_document_without_deployment_config() {
+    let workspace = tempdir().unwrap();
+    fs::write(
+        workspace.path().join("dispatch.toml"),
+        r#"courier = "native"
+
+[agent]
+courier_reference = "dispatch/native:latest"
+entrypoint = "chat"
+
+[[channels]]
+name = "telegram"
+plugin = "channel-telegram"
+mode = "listen"
+config = { bot_token = "must-not-leak" }
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(dispatch_bin())
+        .args(["parcel", "lint"])
+        .arg(workspace.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["courier_reference"], "dispatch/native:latest");
+    assert!(document.get("channels").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-leak"));
+}
+
 fn write_heartbeat_parcel(
     dir: &Path,
-    extra_agentfile_lines: &[&str],
+    listeners: &[&str],
+    extra_tables: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut agentfile = String::from(
-        "FROM dispatch/native:latest\n\nNAME runtime-lifecycle\nVERSION 0.1.0\n\nUSER USER.md\nHEARTBEAT EVERY 60s FILE HEARTBEAT.md\n",
+    let mut config = String::from(
+        "[agent]\n\
+courier_reference = \"dispatch/native:latest\"\n\
+name = \"runtime-lifecycle\"\n\
+version = \"0.1.0\"\n\
+entrypoint = \"heartbeat\"\n",
     );
-    for line in extra_agentfile_lines {
-        agentfile.push_str(line);
-        agentfile.push('\n');
+    if !listeners.is_empty() {
+        let rendered = listeners
+            .iter()
+            .map(|listener| format!("\"{listener}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        config.push_str(&format!("listeners = [{rendered}]\n"));
     }
-    agentfile.push_str("ENTRYPOINT heartbeat\n");
-    fs::write(dir.join("Agentfile"), agentfile)?;
+    config.push_str(
+        "\n[agent.instructions]\n\
+user = \"USER.md\"\n\
+heartbeat = \"HEARTBEAT.md\"\n",
+    );
+    for table in extra_tables {
+        config.push('\n');
+        config.push_str(table);
+        config.push('\n');
+    }
+    fs::write(dir.join("dispatch.toml"), config)?;
     fs::write(
         dir.join("USER.md"),
         "You are a local runtime lifecycle test parcel.\n",
@@ -864,17 +920,13 @@ fn build_chat_test_parcel(root: &Path) -> Result<(PathBuf, String), Box<dyn std:
     let context_dir = root.join("reply-parcel");
     fs::create_dir_all(&context_dir)?;
     fs::write(
-        context_dir.join("Agentfile"),
-        "FROM dispatch/native:latest\n\
-NAME reply-fixture\n\
-VERSION 0.1.0\n\
-SKILL SKILL.md\n\
-ENTRYPOINT chat\n",
+        context_dir.join("dispatch.toml"),
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"reply-fixture\"\nversion = \"0.1.0\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nskill = \"SKILL.md\"\n",
     )?;
     fs::write(context_dir.join("SKILL.md"), "Always reply briefly.\n")?;
 
-    let built = build_agentfile(
-        &context_dir.join("Agentfile"),
+    let built = build_agent(
+        &context_dir.join("dispatch.toml"),
         &BuildOptions {
             output_root: context_dir.join(".dispatch/parcels"),
         },
@@ -1281,7 +1333,7 @@ while (($line = $stdin.ReadLine()) -ne $null) {
 fn detached_service_persists_terminal_status_after_sigterm()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
-    write_heartbeat_parcel(dir.path(), &[])?;
+    write_heartbeat_parcel(dir.path(), &[], &[])?;
 
     let serve_output = require_success(
         run_dispatch(
@@ -1319,14 +1371,15 @@ fn detached_service_lifecycle_commands_work_end_to_end() -> Result<(), Box<dyn s
     let dir = tempdir()?;
     write_heartbeat_parcel(
         dir.path(),
+        &["127.0.0.1:0"],
         &[
-            "SECRET DISPATCH_WEBHOOK_SECRET",
-            "LISTEN \"127.0.0.1:0\"",
-            "LISTEN_PATH \"/hook\"",
-            "LISTEN_METHOD POST",
-            "LISTEN_SECRET DISPATCH_WEBHOOK_SECRET",
-            "LISTEN_MAX_BODY_BYTES 1024",
-            "LISTEN_MAX_HEADER_BYTES 1024",
+            "[[agent.secrets]]\nname = \"DISPATCH_WEBHOOK_SECRET\"",
+            "[agent.ingress]\n\
+path = \"/hook\"\n\
+methods = [\"POST\"]\n\
+secret_env = \"DISPATCH_WEBHOOK_SECRET\"\n\
+max_body_bytes = 1024\n\
+max_header_bytes = 1024",
         ],
     )?;
 
@@ -2837,7 +2890,7 @@ fn channel_listen_delivers_first_class_channel_reply_event()
 #[test]
 fn detached_heartbeat_wait_returns_exit_code() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
-    write_heartbeat_parcel(dir.path(), &[])?;
+    write_heartbeat_parcel(dir.path(), &[], &[])?;
 
     let run_output = require_success(
         run_dispatch(dir.path(), &[], &["run", ".", "--heartbeat", "--detach"])?,
@@ -2865,7 +2918,7 @@ fn detached_heartbeat_wait_returns_exit_code() -> Result<(), Box<dyn std::error:
 #[test]
 fn wait_timeout_returns_error_for_active_service() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
-    write_heartbeat_parcel(dir.path(), &["LISTEN \"127.0.0.1:0\""])?;
+    write_heartbeat_parcel(dir.path(), &["127.0.0.1:0"], &[])?;
 
     let serve_output = require_success(
         run_dispatch(
@@ -2916,7 +2969,7 @@ fn wait_timeout_returns_error_for_active_service() -> Result<(), Box<dyn std::er
 #[test]
 fn inspect_run_reconciles_dead_service_helpers() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
-    write_heartbeat_parcel(dir.path(), &["LISTEN \"127.0.0.1:0\""])?;
+    write_heartbeat_parcel(dir.path(), &["127.0.0.1:0"], &[])?;
 
     let serve_output = require_success(
         run_dispatch(

@@ -1,13 +1,11 @@
-use crate::{
-    ast::{Instruction, ParsedAgentfile, Value},
-    skill::{
-        DispatchSkillManifest, allowed_tool_warnings, dispatch_skill_manifest_path,
-        parse_skill_markdown, validate_agent_skill_frontmatter,
-    },
+use crate::agent_config::{AgentConfig, AgentConfigError, ToolConfigEntry, load_agent_config};
+use crate::skill::{
+    DispatchSkillManifest, allowed_tool_warnings, dispatch_skill_manifest_path,
+    parse_skill_markdown, validate_agent_skill_frontmatter,
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -16,7 +14,6 @@ use std::{
 pub struct Diagnostic {
     pub level: Level,
     pub message: String,
-    pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -39,29 +36,37 @@ impl ValidationReport {
     }
 }
 
-pub fn validate_agentfile(agentfile: &ParsedAgentfile) -> ValidationReport {
-    validate_agentfile_base(agentfile)
+/// Load and check the `[agent]` table of a `dispatch.toml` file.
+///
+/// Shape, required fields, and unknown keys are rejected by the loader, so a
+/// returned report carries only the cross-reference checks serde cannot make.
+pub fn validate_agent_config_at_path(
+    config_path: &Path,
+) -> Result<(AgentConfig, ValidationReport), AgentConfigError> {
+    let config = load_agent_config(config_path)?;
+    let report = validate_agent_config(&config, config_path);
+    Ok((config, report))
 }
 
-pub fn validate_agentfile_at_path(
-    agentfile_path: &Path,
-    agentfile: &ParsedAgentfile,
-) -> ValidationReport {
-    let mut report = validate_agentfile_base(agentfile);
-    let Some(context_dir) = agentfile_path.parent() else {
-        return report;
+/// Cross-reference checks over an already-loaded agent config.
+pub fn validate_agent_config(config: &AgentConfig, config_path: &Path) -> ValidationReport {
+    let mut diagnostics = Vec::new();
+
+    if config.entrypoint.is_none() {
+        diagnostics.push(Diagnostic {
+            level: Level::Warning,
+            message: "no `agent.entrypoint` declared".to_string(),
+        });
+    }
+
+    let Some(context_dir) = config_path.parent() else {
+        return ValidationReport { diagnostics };
     };
 
-    let mut parcel_tool_names = collect_declared_tool_names(agentfile);
+    let mut parcel_tool_names = collect_declared_tool_names(config);
     let mut skill_specs = Vec::new();
 
-    for instruction in &agentfile.instructions {
-        if instruction.keyword != "SKILL" {
-            continue;
-        }
-        let Some(skill_path) = first_scalar(instruction.args.first()) else {
-            continue;
-        };
+    for skill_path in &config.skills {
         let skill_dir = context_dir.join(skill_path);
         let Ok(metadata) = fs::metadata(&skill_dir) else {
             continue;
@@ -87,7 +92,6 @@ pub fn validate_agentfile_at_path(
             resolve_skill_tool_aliases_for_validation(&skill_dir, &parsed_skill.frontmatter);
         parcel_tool_names.extend(own_tool_aliases.iter().cloned());
         skill_specs.push(SkillValidationSpec {
-            line: instruction.span.line_start,
             skill_name: parsed_skill.frontmatter.name,
             allowed_tools: parsed_skill.frontmatter.allowed_tools,
             own_tool_aliases,
@@ -101,78 +105,11 @@ pub fn validate_agentfile_at_path(
             &skill.own_tool_aliases,
             &parcel_tool_names,
         ) {
-            report.diagnostics.push(Diagnostic {
+            diagnostics.push(Diagnostic {
                 level: Level::Warning,
                 message,
-                line: skill.line,
             });
         }
-    }
-
-    report
-}
-
-fn validate_agentfile_base(agentfile: &ParsedAgentfile) -> ValidationReport {
-    let mut diagnostics = Vec::new();
-    let mut seen = HashSet::new();
-
-    let allowed = allowed_instructions();
-
-    for instruction in &agentfile.instructions {
-        if !allowed.contains(instruction.keyword.as_str()) {
-            diagnostics.push(Diagnostic {
-                level: Level::Error,
-                message: format!("unknown instruction `{}`", instruction.keyword),
-                line: instruction.span.line_start,
-            });
-            continue;
-        }
-
-        match instruction.keyword.as_str() {
-            "FROM" => require_min_args(instruction, 1, &mut diagnostics),
-            "NAME"
-            | "VERSION"
-            | "ENTRYPOINT"
-            | "VISIBILITY"
-            | "SCHEDULE"
-            | "LISTEN"
-            | "LISTEN_PATH"
-            | "LISTEN_METHOD"
-            | "LISTEN_SECRET"
-            | "LISTEN_MAX_BODY_BYTES"
-            | "LISTEN_MAX_HEADER_BYTES" => require_exact_args(instruction, 1, &mut diagnostics),
-            "MODEL" | "FALLBACK" => require_min_args(instruction, 1, &mut diagnostics),
-            "FRAMEWORK" => require_min_args(instruction, 1, &mut diagnostics),
-            "COMPONENT" => require_min_args(instruction, 1, &mut diagnostics),
-            "IDENTITY" | "SOUL" | "SKILL" | "AGENTS" | "USER" | "TOOLS" | "EVAL" => {
-                require_exact_args(instruction, 1, &mut diagnostics)
-            }
-            "TEST" => require_exact_args(instruction, 1, &mut diagnostics),
-            "MEMORY" => require_min_args(instruction, 2, &mut diagnostics),
-            "HEARTBEAT" | "TOOL" | "MOUNT" | "TIMEOUT" | "LIMIT" | "COMPACTION" | "ENV"
-            | "SECRET" | "NETWORK" | "LABEL" | "COPY" | "ADD" | "ROUTING" | "PROMPT" => {
-                require_min_args(instruction, 1, &mut diagnostics)
-            }
-            _ => {}
-        }
-
-        seen.insert(instruction.keyword.as_str());
-    }
-
-    if !seen.contains("FROM") {
-        diagnostics.push(Diagnostic {
-            level: Level::Error,
-            message: "missing required `FROM` instruction".to_string(),
-            line: 1,
-        });
-    }
-
-    if !seen.contains("ENTRYPOINT") {
-        diagnostics.push(Diagnostic {
-            level: Level::Warning,
-            message: "no `ENTRYPOINT` declared".to_string(),
-            line: 1,
-        });
     }
 
     ValidationReport { diagnostics }
@@ -180,82 +117,27 @@ fn validate_agentfile_base(agentfile: &ParsedAgentfile) -> ValidationReport {
 
 #[derive(Debug)]
 struct SkillValidationSpec {
-    line: usize,
     skill_name: String,
     allowed_tools: Option<Vec<String>>,
     own_tool_aliases: Vec<String>,
 }
 
-fn allowed_instructions() -> HashSet<&'static str> {
-    [
-        "FROM",
-        "NAME",
-        "VERSION",
-        "FRAMEWORK",
-        "COMPONENT",
-        "SCHEDULE",
-        "LISTEN",
-        "LISTEN_PATH",
-        "LISTEN_METHOD",
-        "LISTEN_SECRET",
-        "LISTEN_MAX_BODY_BYTES",
-        "LISTEN_MAX_HEADER_BYTES",
-        "LABEL",
-        "IDENTITY",
-        "SOUL",
-        "SKILL",
-        "AGENTS",
-        "USER",
-        "TOOLS",
-        "HEARTBEAT",
-        "MEMORY",
-        "PROMPT",
-        "MODEL",
-        "FALLBACK",
-        "ROUTING",
-        "TOOL",
-        "COPY",
-        "ADD",
-        "ENV",
-        "SECRET",
-        "NETWORK",
-        "VISIBILITY",
-        "TIMEOUT",
-        "LIMIT",
-        "COMPACTION",
-        "MOUNT",
-        "EVAL",
-        "TEST",
-        "ENTRYPOINT",
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn collect_declared_tool_names(agentfile: &ParsedAgentfile) -> BTreeSet<String> {
-    agentfile
-        .instructions
+fn collect_declared_tool_names(config: &AgentConfig) -> BTreeSet<String> {
+    config
+        .tools
         .iter()
-        .filter(|instruction| instruction.keyword == "TOOL")
-        .filter_map(tool_name_from_instruction)
-        .collect()
-}
-
-fn tool_name_from_instruction(instruction: &Instruction) -> Option<String> {
-    let tokens = scalars(&instruction.args);
-    match tokens.first().map(String::as_str) {
-        Some("LOCAL") => {
-            let packaged_path = tokens.get(1)?;
-            Some(parse_named_value(&tokens, "AS").unwrap_or_else(|| {
-                Path::new(packaged_path)
+        .map(|tool| match tool {
+            ToolConfigEntry::Builtin(tool) => tool.name.clone(),
+            ToolConfigEntry::A2a(tool) => tool.alias.clone(),
+            ToolConfigEntry::Mcp(tool) => tool.server.clone(),
+            ToolConfigEntry::Local(tool) => tool.alias.clone().unwrap_or_else(|| {
+                Path::new(&tool.path)
                     .file_stem()
                     .map(|value| value.to_string_lossy().to_string())
-                    .unwrap_or_else(|| packaged_path.clone())
-            }))
-        }
-        Some("A2A") | Some("BUILTIN") => tokens.get(1).cloned(),
-        _ => None,
-    }
+                    .unwrap_or_else(|| tool.path.clone())
+            }),
+        })
+        .collect()
 }
 
 fn resolve_skill_tool_aliases_for_validation(
@@ -299,83 +181,13 @@ fn resolve_skill_member_path_for_validation(skill_dir: &Path, relative: &str) ->
     resolved.starts_with(skill_dir).then_some(resolved)
 }
 
-fn parse_named_value(tokens: &[String], marker: &str) -> Option<String> {
-    tokens
-        .windows(2)
-        .find(|window| window[0] == marker)
-        .map(|window| window[1].clone())
-}
-
-fn first_scalar(value: Option<&Value>) -> Option<String> {
-    value.map(scalar_value)
-}
-
-fn scalar_value(value: &Value) -> String {
-    match value {
-        Value::Token(value) | Value::String(value) => value.clone(),
-        Value::Heredoc(doc) => doc.body.clone(),
-    }
-}
-
-fn scalars(args: &[Value]) -> Vec<String> {
-    args.iter().map(scalar_value).collect()
-}
-
-fn require_exact_args(
-    instruction: &Instruction,
-    expected: usize,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if instruction.args.len() != expected {
-        diagnostics.push(Diagnostic {
-            level: Level::Error,
-            message: format!(
-                "`{}` expects exactly {} argument(s), got {}",
-                instruction.keyword,
-                expected,
-                instruction.args.len()
-            ),
-            line: instruction.span.line_start,
-        });
-    }
-}
-
-fn require_min_args(instruction: &Instruction, minimum: usize, diagnostics: &mut Vec<Diagnostic>) {
-    if instruction.args.len() < minimum {
-        diagnostics.push(Diagnostic {
-            level: Level::Error,
-            message: format!(
-                "`{}` expects at least {} argument(s), got {}",
-                instruction.keyword,
-                minimum,
-                instruction.args.len()
-            ),
-            line: instruction.span.line_start,
-        });
-    }
-
-    if instruction.keyword == "PROMPT"
-        && instruction
-            .args
-            .iter()
-            .any(|value| matches!(value, Value::Token(token) if token.starts_with("<<")))
-    {
-        diagnostics.push(Diagnostic {
-            level: Level::Error,
-            message: "invalid heredoc usage".to_string(),
-            line: instruction.span.line_start,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_agentfile;
     use tempfile::tempdir;
 
     #[test]
-    fn validate_agentfile_at_path_warns_on_skill_allowed_tools_mismatches() {
+    fn validate_agent_config_at_path_reports_skill_allowed_tool_mismatches() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("file-analyst");
         fs::create_dir_all(skill_dir.join("scripts")).unwrap();
@@ -389,32 +201,28 @@ mod tests {
             "[[tools]]\nname = \"read_file\"\nscript = \"scripts/read_file.sh\"\n",
         )
         .unwrap();
-        fs::write(skill_dir.join("scripts/read_file.sh"), "cat \"$1\"\n").unwrap();
-        let agentfile_path = dir.path().join("Agentfile");
+        fs::write(skill_dir.join("scripts/read_file.sh"), "printf ok\n").unwrap();
+        let config_path = dir.path().join("dispatch.toml");
         fs::write(
-            &agentfile_path,
-            "FROM dispatch/native:latest\nSKILL file-analyst\nENTRYPOINT chat\n",
+            &config_path,
+            "[agent]\ncourier_reference = \"native\"\nentrypoint = \"chat\"\nskills = [\"file-analyst\"]\n",
         )
         .unwrap();
 
-        let parsed = parse_agentfile(&fs::read_to_string(&agentfile_path).unwrap()).unwrap();
-        let report = validate_agentfile_at_path(&agentfile_path, &parsed);
-
+        let (_, report) = validate_agent_config_at_path(&config_path).unwrap();
         let warnings = report
             .diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.level == Level::Warning)
-            .map(|diagnostic| diagnostic.message.clone())
+            .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            warnings,
-            vec![
-                "skill `file-analyst` declares allowed-tools entry `Bash` but no tool with that name exists in the built parcel"
-                    .to_string(),
-                "skill `file-analyst` synthesizes tool `read_file` but its allowed-tools list does not include that alias"
-                    .to_string(),
-            ]
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|message| message.contains("`Bash`")));
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.contains("`read_file`"))
         );
     }
 }

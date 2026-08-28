@@ -1,0 +1,62 @@
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "basic-assistant"
+version = "0.1.0"
+entrypoint = "chat"
+visibility = "open"
+evals = ["evals/smoke.eval"]
+
+[agent.instructions]
+identity = "IDENTITY.md"
+soul = "SOUL.md"
+skill = "SKILL.md"
+agents = "AGENTS.md"
+user = "USER.md"
+tools = "TOOLS.md"
+memory = "MEMORY.md"
+
+[agent.model]
+id = "gpt-5.6-luna"
+provider = "openai"
+
+[[agent.model.fallbacks]]
+id = "gpt-5.4-nano"
+
+[[agent.tools]]
+kind = "builtin"
+name = "system_time"
+
+[[agent.tools]]
+kind = "builtin"
+name = "web_search"
+
+[[agent.tools]]
+kind = "builtin"
+name = "topic_lookup"
+
+[[agent.tools]]
+kind = "builtin"
+name = "human_approval"
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "none"
+
+[[agent.mounts]]
+kind = "artifacts"
+driver = "local"
+
+[agent.env]
+TZ = "UTC"
+
+[agent.limits]
+iterations = 20
+
+[agent.timeouts]
+run = "300s"
+tool = "60s"
+llm = "120s"

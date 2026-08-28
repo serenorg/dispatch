@@ -16,9 +16,10 @@ mod tool_display;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use dispatch_core::agent_config::{AGENT_CONFIG_FILE, declares_agent};
 use dispatch_core::{
-    A2aOperatorPolicyOverrides, BuildOptions, Level, build_agentfile, parse_agentfile,
-    validate_agentfile_at_path, with_a2a_operator_policy_overrides,
+    A2aOperatorPolicyOverrides, BuildOptions, Level, build_agent, validate_agent_config_at_path,
+    with_a2a_operator_policy_overrides,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,7 +30,7 @@ use std::{
 
 #[derive(Debug, Parser)]
 #[command(name = "dispatch")]
-#[command(about = "Build and dispatch Agentfile-based agent parcels")]
+#[command(about = "Build and dispatch declarative agent parcels")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -133,17 +134,17 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct LintArgs {
-    /// Path to an Agentfile or a directory containing one
+    /// Path to a dispatch.toml declaring [agent], or a directory containing one
     #[arg(default_value = ".")]
     path: PathBuf,
-    /// Print the parsed AST as JSON
+    /// Print the parsed agent configuration as JSON
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct BuildArgs {
-    /// Path to an Agentfile or a directory containing one
+    /// Path to a dispatch.toml declaring [agent], or a directory containing one
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Output directory for built parcels
@@ -153,7 +154,7 @@ struct BuildArgs {
 
 #[derive(Debug, Args)]
 struct ParcelListArgs {
-    /// Path to an Agentfile, directory containing one, parcel store root, or built parcel
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or built parcel
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Print full parcel inventory as JSON
@@ -163,7 +164,7 @@ struct ParcelListArgs {
 
 #[derive(Debug, Args)]
 struct EvalArgs {
-    /// Path to a built parcel, Agentfile, or directory containing one
+    /// Path to a built parcel, a dispatch.toml declaring [agent], or a directory containing one
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Courier backend to use for eval execution
@@ -175,7 +176,7 @@ struct EvalArgs {
     /// Print full eval report as JSON
     #[arg(long)]
     json: bool,
-    /// Output directory for built parcels when evaluating an Agentfile source
+    /// Output directory for built parcels when evaluating an agent source
     #[arg(long)]
     output_dir: Option<PathBuf>,
     /// Repo-local dataset file that fans out packaged EVAL cases into regression inputs
@@ -184,7 +185,7 @@ struct EvalArgs {
     /// Write structured eval traces under this directory
     #[arg(long)]
     trace_dir: Option<PathBuf>,
-    /// How to handle tools declared with `APPROVAL confirm`
+    /// How to handle tools declared with `approval = "confirm"`
     #[arg(long, value_enum)]
     tool_approval: Option<CliToolApprovalMode>,
     /// Override allowed outbound A2A origins or hostnames for this command
@@ -272,7 +273,7 @@ struct PullArgs {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// Path to a built parcel, Agentfile, directory containing one, or unique parcel id prefix
+    /// Path to a built parcel, a dispatch.toml declaring [agent], directory containing one, or unique parcel id prefix
     path: PathBuf,
     #[command(flatten)]
     exec: RunExecutionArgs,
@@ -280,7 +281,7 @@ struct RunArgs {
 
 #[derive(Debug, Args, Clone)]
 struct ServeArgs {
-    /// Path to a built parcel, Agentfile, directory containing one, or unique parcel id prefix
+    /// Path to a built parcel, a dispatch.toml declaring [agent], directory containing one, or unique parcel id prefix
     path: PathBuf,
     /// Courier backend to use for execution
     #[arg(long = "courier", default_value = "native")]
@@ -348,7 +349,7 @@ struct UpArgs {
 
 #[derive(Debug, Args, Clone)]
 struct PsArgs {
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Print full run inventory as JSON
@@ -360,7 +361,7 @@ struct PsArgs {
 struct LogsArgs {
     /// Run id or unique run id prefix
     run: String,
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Follow appended log output until the run exits
@@ -372,7 +373,7 @@ struct LogsArgs {
 struct WaitArgs {
     /// Run id or unique run id prefix
     run: String,
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Maximum time to wait before returning an error
@@ -384,7 +385,7 @@ struct WaitArgs {
 struct StopArgs {
     /// Run id or unique run id prefix
     run: String,
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Forcefully terminate the run
@@ -399,7 +400,7 @@ struct StopArgs {
 struct RestartArgs {
     /// Run id or unique run id prefix
     run: String,
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Forcefully terminate an active run before restarting it
@@ -412,7 +413,7 @@ struct RestartArgs {
 
 #[derive(Debug, Args, Clone)]
 struct PruneArgs {
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Remove inactive runs without prompting
@@ -424,7 +425,7 @@ struct PruneArgs {
 struct RemoveRunArgs {
     /// Run id or unique run id prefix
     run: String,
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Remove run files even when ancillary files are missing
@@ -436,7 +437,7 @@ struct RemoveRunArgs {
 struct InspectRunArgs {
     /// Run id or unique run id prefix
     run: String,
-    /// Path to an Agentfile, directory containing one, parcel store root, or runs root
+    /// Path to a dispatch.toml declaring [agent], directory containing one, parcel store root, or runs root
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Print the full run record as JSON
@@ -517,7 +518,7 @@ struct RunExecutionArgs {
     /// Pass raw input to the tool via stdin and `TOOL_INPUT`
     #[arg(long)]
     input: Option<String>,
-    /// How to handle tools declared with `APPROVAL confirm`
+    /// How to handle tools declared with `approval = "confirm"`
     #[arg(long, value_enum)]
     tool_approval: Option<CliToolApprovalMode>,
     /// Override allowed outbound A2A origins or hostnames for this command
@@ -533,7 +534,7 @@ struct RunExecutionArgs {
 
 #[derive(Debug, Subcommand)]
 enum ParcelCommand {
-    /// Validate an Agentfile
+    /// Validate the [agent] table of a dispatch.toml
     Lint(LintArgs),
     /// Build an immutable deployment parcel
     Build(BuildArgs),
@@ -556,7 +557,7 @@ enum ParcelCommand {
 enum SkillCommand {
     /// Validate a skill file or Agent Skills bundle without executing it
     Validate(Box<ValidateSkillArgs>),
-    /// Execute a skill file or Agent Skills bundle without an authored Agentfile
+    /// Execute a skill file or Agent Skills bundle without an authored agent
     Run(Box<RunSkillArgs>),
 }
 
@@ -736,7 +737,7 @@ enum ChannelCommand {
         /// Override the plugin-suggested delay between poll cycles in milliseconds
         #[arg(long = "interval-ms")]
         interval_ms: Option<u64>,
-        /// Optional parcel or Agentfile path to execute for each inbound event
+        /// Optional parcel or agent config path to execute for each inbound event
         #[arg(long)]
         parcel: Option<PathBuf>,
         /// Courier backend to use when `--parcel` is set
@@ -748,7 +749,7 @@ enum ChannelCommand {
         /// Root directory for per-conversation session files when `--parcel` is set
         #[arg(long = "session-root")]
         session_root: Option<PathBuf>,
-        /// How to handle tools declared with `APPROVAL confirm` during parcel execution
+        /// How to handle tools declared with `approval = "confirm"` during parcel execution
         #[arg(long, value_enum)]
         tool_approval: Option<CliToolApprovalMode>,
         /// Deliver assistant replies back through the channel plugin when possible
@@ -777,7 +778,7 @@ enum ChannelCommand {
         /// Listen address in HOST:PORT form
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
-        /// Optional parcel or Agentfile path to execute for each inbound event
+        /// Optional parcel or agent config path to execute for each inbound event
         #[arg(long)]
         parcel: Option<PathBuf>,
         /// Courier backend to use when `--parcel` is set
@@ -789,7 +790,7 @@ enum ChannelCommand {
         /// Root directory for per-conversation session files when `--parcel` is set
         #[arg(long = "session-root")]
         session_root: Option<PathBuf>,
-        /// How to handle tools declared with `APPROVAL confirm` during parcel execution
+        /// How to handle tools declared with `approval = "confirm"` during parcel execution
         #[arg(long, value_enum)]
         tool_approval: Option<CliToolApprovalMode>,
         /// Deliver assistant replies back through the channel plugin when possible
@@ -1226,7 +1227,7 @@ enum StateCommand {
 enum SecretCommand {
     /// Initialize a repo-local encrypted secret store under .dispatch/secrets
     Init {
-        /// Project root, Agentfile path, or parcel path
+        /// Project root, agent config path, or parcel path
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Replace an existing key/store pair
@@ -1238,7 +1239,7 @@ enum SecretCommand {
     },
     /// Store or update one secret value
     Set {
-        /// Secret name declared via `SECRET`
+        /// Secret name declared in `agent.secrets`
         name: String,
         /// Secret value to encrypt into the local store
         #[arg(
@@ -1250,22 +1251,22 @@ enum SecretCommand {
         /// Read the secret value from stdin instead of command-line arguments
         #[arg(long, conflicts_with = "value", required_unless_present = "value")]
         value_stdin: bool,
-        /// Project root, Agentfile path, or parcel path
+        /// Project root, agent config path, or parcel path
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Remove one secret from the local store
     Rm {
-        /// Secret name declared via `SECRET`
+        /// Secret name declared in `agent.secrets`
         name: String,
-        /// Project root, Agentfile path, or parcel path
+        /// Project root, agent config path, or parcel path
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// List stored secret names without printing values
     #[command(visible_alias = "ls")]
     List {
-        /// Project root, Agentfile path, or parcel path
+        /// Project root, agent config path, or parcel path
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Print the secret name list as JSON
@@ -1429,21 +1430,11 @@ pub(crate) fn with_cli_a2a_policy<T>(policy: CliA2aPolicy, f: impl FnOnce() -> T
 }
 
 fn lint(path: PathBuf, emit_json: bool) -> Result<()> {
-    let path = resolve_agentfile_path(path);
-    let source =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-
-    let parsed =
-        parse_agentfile(&source).with_context(|| format!("failed to parse {}", path.display()))?;
-    let report = validate_agentfile_at_path(&path, &parsed);
+    let path = resolve_agent_config_path(path);
+    let (config, report) = validate_agent_config_at_path(&path)?;
 
     if emit_json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
-    }
-
-    if report.diagnostics.is_empty() {
-        println!("OK {}", path.display());
-        return Ok(());
+        println!("{}", serde_json::to_string_pretty(&config)?);
     }
 
     for diagnostic in &report.diagnostics {
@@ -1451,42 +1442,49 @@ fn lint(path: PathBuf, emit_json: bool) -> Result<()> {
             Level::Error => "error",
             Level::Warning => "warning",
         };
-        println!(
-            "{level}: {}:{}: {}",
-            path.display(),
-            diagnostic.line,
-            diagnostic.message
-        );
+        if emit_json {
+            eprintln!("{level}: {}: {}", path.display(), diagnostic.message);
+        } else {
+            println!("{level}: {}: {}", path.display(), diagnostic.message);
+        }
     }
 
     if report.is_ok() {
-        println!("OK {}", path.display());
+        if !emit_json {
+            println!("OK {}", path.display());
+        }
         Ok(())
     } else {
         bail!("lint failed")
     }
 }
 
-fn resolve_agentfile_path(path: PathBuf) -> PathBuf {
+fn resolve_agent_config_path(path: PathBuf) -> PathBuf {
     if path.is_dir() {
-        path.join("Agentfile")
+        path.join(AGENT_CONFIG_FILE)
     } else {
         path
     }
 }
 
-pub(crate) fn is_agentfile_target(path: &Path) -> bool {
-    if path.is_dir() {
-        return path.join("Agentfile").exists();
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "Agentfile")
+/// Whether a path names an agent source: a `dispatch.toml` that declares
+/// `[agent]`, or a directory holding one.
+pub(crate) fn is_agent_config_target(path: &Path) -> bool {
+    let candidate = if path.is_dir() {
+        path.join(AGENT_CONFIG_FILE)
+    } else if path.file_name().and_then(|name| name.to_str()) == Some(AGENT_CONFIG_FILE) {
+        path.to_path_buf()
+    } else {
+        return false;
+    };
+    fs::read_to_string(&candidate)
+        .map(|source| declares_agent(&source))
+        .unwrap_or(false)
 }
 
 pub(crate) fn default_parcels_root_for_source(path: &Path) -> PathBuf {
-    let agentfile_path = resolve_agentfile_path(path.to_path_buf());
-    agentfile_path
+    let config_path = resolve_agent_config_path(path.to_path_buf());
+    config_path
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1494,7 +1492,7 @@ pub(crate) fn default_parcels_root_for_source(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn resolve_parcels_root(path: &Path) -> PathBuf {
-    if is_agentfile_target(path) {
+    if is_agent_config_target(path) {
         return default_parcels_root_for_source(path);
     }
 
@@ -1529,8 +1527,8 @@ pub(crate) fn resolve_parcels_root(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn resolve_runs_root(path: &Path) -> PathBuf {
-    if is_agentfile_target(path) {
-        return resolve_agentfile_path(path.to_path_buf())
+    if is_agent_config_target(path) {
+        return resolve_agent_config_path(path.to_path_buf())
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1581,37 +1579,37 @@ pub(crate) fn build_parcel_from_source(
     path: PathBuf,
     output_dir: Option<PathBuf>,
 ) -> Result<dispatch_core::LoadedParcel> {
-    let agentfile_path = resolve_agentfile_path(path);
+    let config_path = resolve_agent_config_path(path);
     let output_root =
-        output_dir.unwrap_or_else(|| default_parcels_root_for_source(agentfile_path.as_path()));
+        output_dir.unwrap_or_else(|| default_parcels_root_for_source(config_path.as_path()));
 
-    let built = build_agentfile(
-        &agentfile_path,
+    let built = build_agent(
+        &config_path,
         &BuildOptions {
             output_root: output_root.clone(),
         },
     )
-    .with_context(|| format!("failed to build {}", agentfile_path.display()))?;
+    .with_context(|| format!("failed to build {}", config_path.display()))?;
 
     dispatch_core::load_parcel(&built.parcel_dir)
         .with_context(|| format!("failed to load parcel {}", built.parcel_dir.display()))
 }
 
 fn build(path: PathBuf, output_dir: Option<PathBuf>) -> Result<()> {
-    let agentfile_path = resolve_agentfile_path(path);
-    let context_dir = agentfile_path
+    let config_path = resolve_agent_config_path(path);
+    let context_dir = config_path
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let output_root = output_dir.unwrap_or_else(|| context_dir.join(".dispatch/parcels"));
 
-    let built = build_agentfile(
-        &agentfile_path,
+    let built = build_agent(
+        &config_path,
         &BuildOptions {
             output_root: output_root.clone(),
         },
     )
-    .with_context(|| format!("failed to build {}", agentfile_path.display()))?;
+    .with_context(|| format!("failed to build {}", config_path.display()))?;
 
     println!("Built parcel {}", built.digest);
     println!("Parcel dir: {}", built.parcel_dir.display());
@@ -1660,18 +1658,20 @@ fn secret_command(command: SecretCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use dispatch_core::agent_config::AGENT_CONFIG_FILE;
+
     use super::{
         ChannelCommand, Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand,
         DeploymentCommand, DepotCommand, EvalArgs, ExtensionCommand, ImageCommand, InspectArgs,
         InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs,
         PullArgs, PushArgs, RemoveRunArgs, RestartArgs, SecretCommand, SignArgs, SkillCommand,
         SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs, VerifyArgs,
-        WaitArgs,
+        WaitArgs, is_agent_config_target,
     };
     use clap::Parser;
     use dispatch_core::{
         BuildOptions, ConversationMessage, CourierSession, ToolExitExpectation, ToolRunResult,
-        ToolTextExpectation, build_agentfile,
+        ToolTextExpectation, build_agent,
     };
     use std::{
         fs,
@@ -1958,8 +1958,8 @@ mod tests {
         let source_dir = dir.path().join("deployment");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\n",
+            source_dir.join(AGENT_CONFIG_FILE),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\n",
         )
         .unwrap();
 
@@ -2366,7 +2366,7 @@ mod tests {
             "--interval-ms",
             "1500",
             "--parcel",
-            "./Agentfile",
+            "./dispatch.toml",
             "--courier",
             "native",
             "--session-root",
@@ -2403,7 +2403,7 @@ mod tests {
         assert_eq!(config_json, None);
         assert_eq!(config_file, Some(PathBuf::from("telegram-config.json")));
         assert_eq!(interval_ms, Some(1500));
-        assert_eq!(parcel, Some(PathBuf::from("./Agentfile")));
+        assert_eq!(parcel, Some(PathBuf::from("./dispatch.toml")));
         assert_eq!(courier, "native");
         assert_eq!(courier_registry, None);
         assert_eq!(
@@ -2924,8 +2924,8 @@ mod tests {
         let source_dir = dir.path().join("deployment");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\n",
+            source_dir.join(AGENT_CONFIG_FILE),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\n",
         )
         .unwrap();
 
@@ -2933,6 +2933,23 @@ mod tests {
             crate::resolve_runs_root(&source_dir),
             source_dir.join(".dispatch/runs")
         );
+    }
+
+    #[test]
+    fn invalid_agent_config_is_still_classified_as_source() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join(AGENT_CONFIG_FILE);
+        fs::write(
+            &config_path,
+            "[agent]\ncourier_reference = \"native\"\nunknown = true\n",
+        )
+        .unwrap();
+
+        assert!(is_agent_config_target(dir.path()));
+        assert!(is_agent_config_target(&config_path));
+
+        fs::write(&config_path, "[agent]\ncourier_reference = \"native\n").unwrap();
+        assert!(is_agent_config_target(dir.path()));
     }
 
     #[cfg(unix)]
@@ -3085,8 +3102,8 @@ mod tests {
     fn eval_runs_packaged_evals_against_live_courier() {
         let dir = tempdir().unwrap();
         let source_dir = build_test_eval_source(dir.path());
-        let built = build_agentfile(
-            &source_dir.join("Agentfile"),
+        let built = build_agent(
+            &source_dir.join(AGENT_CONFIG_FILE),
             &BuildOptions {
                 output_root: source_dir.join(".dispatch/parcels"),
             },
@@ -3121,8 +3138,8 @@ mod tests {
     fn eval_rejects_session_digest_mismatch() {
         let dir = tempdir().unwrap();
         let source_dir = build_test_eval_source(dir.path());
-        let built = build_agentfile(
-            &source_dir.join("Agentfile"),
+        let built = build_agent(
+            &source_dir.join(AGENT_CONFIG_FILE),
             &BuildOptions {
                 output_root: source_dir.join(".dispatch/parcels"),
             },
@@ -3390,18 +3407,14 @@ mod tests {
         let context_dir = root.join("image");
         fs::create_dir_all(&context_dir).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\n\
-NAME plugin-cli-test\n\
-VERSION 0.1.0\n\
-SKILL SKILL.md\n\
-ENTRYPOINT chat\n",
+            context_dir.join(AGENT_CONFIG_FILE),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"plugin-cli-test\"\nversion = \"0.1.0\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nskill = \"SKILL.md\"\n",
         )
         .unwrap();
         fs::write(context_dir.join("SKILL.md"), "You are a test deployment.\n").unwrap();
 
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join(AGENT_CONFIG_FILE),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },
@@ -3472,13 +3485,8 @@ ENTRYPOINT chat\n",
         let context_dir = root.join("eval-source");
         fs::create_dir_all(context_dir.join("evals")).unwrap();
         fs::write(
-            context_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\n\
-NAME eval-fixture\n\
-VERSION 0.1.0\n\
-SKILL SKILL.md\n\
-EVAL evals/smoke.eval\n\
-ENTRYPOINT chat\n",
+            context_dir.join(AGENT_CONFIG_FILE),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"eval-fixture\"\nversion = \"0.1.0\"\nentrypoint = \"chat\"\nevals = [\"evals/smoke.eval\"]\n\n[agent.instructions]\nskill = \"SKILL.md\"\n",
         )
         .unwrap();
         fs::write(context_dir.join("SKILL.md"), "You are an eval fixture.\n").unwrap();

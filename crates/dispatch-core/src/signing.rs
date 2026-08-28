@@ -395,20 +395,20 @@ fn decode_hex(value: &str, path: &str) -> Result<Vec<u8>, SigningError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BuildOptions, build_agentfile};
+    use crate::{BuildOptions, build_agent};
     use tempfile::tempdir;
 
     #[test]
     fn generated_keypair_can_sign_and_verify_parcel() {
         let dir = tempdir().unwrap();
         std::fs::write(
-            dir.path().join("Agentfile"),
-            "FROM dispatch/native:latest\nSOUL SOUL.md\nENTRYPOINT chat\n",
+            dir.path().join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("SOUL.md"), "You are a signed test.\n").unwrap();
-        let built = build_agentfile(
-            &dir.path().join("Agentfile"),
+        let built = build_agent(
+            &dir.path().join("dispatch.toml"),
             &BuildOptions {
                 output_root: dir.path().join(".dispatch/parcels"),
             },

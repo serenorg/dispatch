@@ -1,7 +1,7 @@
 use dispatch_core::{
     BuildOptions, CourierBackend, CourierError, CourierEvent, CourierKind, CourierOperation,
     CourierRequest, CourierResponse, DockerCourier, LocalToolTarget, MountKind, NativeCourier,
-    ToolConfig, build_agentfile, load_parcel,
+    ToolConfig, build_agent, load_parcel,
 };
 use std::fs;
 #[cfg(unix)]
@@ -67,9 +67,9 @@ cat >/dev/null
     (dir, DockerCourier::new(&docker_bin, "python:3.13-alpine"))
 }
 
-fn build_fixture(agentfile: &str, files: &[(&str, &str)]) -> FixtureImage {
+fn build_fixture(config: &str, files: &[(&str, &str)]) -> FixtureImage {
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("Agentfile"), agentfile).unwrap();
+    fs::write(dir.path().join("dispatch.toml"), config).unwrap();
     for (relative, body) in files {
         let path = dir.path().join(relative);
         if let Some(parent) = path.parent() {
@@ -78,8 +78,8 @@ fn build_fixture(agentfile: &str, files: &[(&str, &str)]) -> FixtureImage {
         fs::write(path, body).unwrap();
     }
 
-    let built = build_agentfile(
-        &dir.path().join("Agentfile"),
+    let built = build_agent(
+        &dir.path().join("dispatch.toml"),
         &BuildOptions {
             output_root: dir.path().join(".dispatch/parcels"),
         },
@@ -234,12 +234,7 @@ fn write_test_http_response(writer: &mut TcpStream, status: u16, content_type: &
 fn native_courier_conformance_supports_prompt_tools_and_chat() {
     let fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-TOOL LOCAL {} AS demo
-ENTRYPOINT chat
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n",
             demo_tool_relative_path()
         ),
         &[
@@ -307,12 +302,7 @@ ENTRYPOINT chat
 fn native_courier_conformance_supports_job_heartbeat_and_direct_tools() {
     let job_fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-TOOL LOCAL {} AS demo
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n",
             demo_tool_relative_path()
         ),
         &[
@@ -322,12 +312,7 @@ ENTRYPOINT job
     );
     let heartbeat_fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-TOOL LOCAL {} AS demo
-ENTRYPOINT heartbeat
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"heartbeat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n",
             demo_tool_relative_path()
         ),
         &[
@@ -396,11 +381,7 @@ fn native_courier_conformance_supports_a2a_tools() {
     let server = start_test_a2a_server();
     let fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/native:latest
-TOOL A2A broker URL {} DISCOVERY card EXPECT_AGENT_NAME conformance-a2a
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\ndiscovery = \"card\"\nexpect_agent_name = \"conformance-a2a\"\n",
             server.base_url
         ),
         &[],
@@ -442,12 +423,7 @@ ENTRYPOINT job
 fn docker_courier_conformance_supports_prompt_tools_and_chat() {
     let fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/docker:latest
-SOUL SOUL.md
-TOOL LOCAL {} AS demo
-ENTRYPOINT chat
-",
+            "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n",
             demo_tool_relative_path()
         ),
         &[
@@ -514,11 +490,7 @@ fn docker_courier_conformance_supports_a2a_tools() {
     let server = start_test_a2a_server();
     let fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/docker:latest
-TOOL A2A broker URL {} DISCOVERY card EXPECT_AGENT_NAME conformance-a2a
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"{}\"\ndiscovery = \"card\"\nexpect_agent_name = \"conformance-a2a\"\n",
             server.base_url
         ),
         &[],
@@ -562,24 +534,14 @@ fn docker_courier_conformance_supports_job_heartbeat_and_direct_tools() {
     let tool_body = docker_demo_tool_body();
     let job_fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/docker:latest
-SOUL SOUL.md
-TOOL LOCAL {} AS demo
-ENTRYPOINT job
-",
+            "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"job\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n",
             tool_path
         ),
         &[("SOUL.md", "Soul body"), (tool_path, tool_body)],
     );
     let heartbeat_fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/docker:latest
-SOUL SOUL.md
-TOOL LOCAL {} AS demo
-ENTRYPOINT heartbeat
-",
+            "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"heartbeat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n",
             tool_path
         ),
         &[("SOUL.md", "Soul body"), (tool_path, tool_body)],
@@ -644,12 +606,7 @@ ENTRYPOINT heartbeat
 fn conformance_builds_schema_backed_local_tools_into_public_manifest_shape() {
     let fixture = build_fixture(
         &format!(
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini PROVIDER openai
-TOOL LOCAL {} AS demo SCHEMA schemas/demo.json DESCRIPTION \"Look up a record by id.\"
-ENTRYPOINT chat
-",
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\nprovider = \"openai\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\ndescription = \"Look up a record by id.\"\nschema = \"schemas/demo.json\"\n",
             demo_tool_relative_path()
         ),
         &[
@@ -683,14 +640,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_conformance_resolves_declared_mounts_on_open_session() {
     let fixture = build_fixture(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-MOUNT ARTIFACTS local
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"artifacts\"\ndriver = \"local\"\n",
         &[("SOUL.md", "Soul body")],
     );
     let courier = NativeCourier::default();
@@ -720,19 +670,11 @@ ENTRYPOINT chat
 #[test]
 fn conformance_validate_parcel_rejects_incompatible_courier_targets() {
     let native_fixture = build_fixture(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "Soul body")],
     );
     let docker_fixture = build_fixture(
-        "\
-FROM dispatch/docker:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "Soul body")],
     );
 
@@ -765,19 +707,11 @@ ENTRYPOINT chat
 #[test]
 fn conformance_run_rejects_sessions_bound_to_other_parcels() {
     let first = build_fixture(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "First soul")],
     );
     let second = build_fixture(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "Second soul")],
     );
     let courier = NativeCourier::default();

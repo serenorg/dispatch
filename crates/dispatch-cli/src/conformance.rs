@@ -3,7 +3,7 @@ use dispatch_core::{
     BuildOptions, BuiltinCourier, CourierBackend, CourierError, CourierEvent, CourierKind,
     CourierOperation, CourierRequest, CourierResponse, DockerCourier, JsonlCourierPlugin,
     LoadedParcel, MountKind, NativeCourier, ResolvedCourier, ToolInvocation, WasmCourier,
-    build_agentfile, load_parcel, resolve_courier,
+    build_agent, load_parcel, resolve_courier,
 };
 use futures::executor::block_on;
 use serde::Serialize;
@@ -663,7 +663,7 @@ fn build_conformance_fixtures(kind: CourierKind) -> Result<ConformanceFixtures> 
         dir.path(),
         "compatible",
         compatible_reference_for_kind(kind),
-        "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
+        "[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"artifacts\"\ndriver = \"local\"\n",
         "chat",
     )?;
     let incompatible = build_conformance_fixture(
@@ -677,14 +677,14 @@ fn build_conformance_fixtures(kind: CourierKind) -> Result<ConformanceFixtures> 
         dir.path(),
         "job",
         compatible_reference_for_kind(kind),
-        "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
+        "[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"artifacts\"\ndriver = \"local\"\n",
         "job",
     )?;
     let heartbeat = build_conformance_fixture(
         dir.path(),
         "heartbeat",
         compatible_reference_for_kind(kind),
-        "MOUNT SESSION sqlite\nMOUNT MEMORY sqlite\nMOUNT ARTIFACTS local\n",
+        "[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"artifacts\"\ndriver = \"local\"\n",
         "heartbeat",
     )?;
     let (a2a, a2a_server) = match kind {
@@ -738,28 +738,36 @@ fn build_conformance_fixture(
                 context_dir.join("components/reference.wasm").display()
             )
         })?;
-        "COMPONENT components/reference.wasm\n"
+        "component = \"components/reference.wasm\"\n"
     } else {
         ""
     };
     fs::write(
-        context_dir.join("Agentfile"),
+        context_dir.join("dispatch.toml"),
         format!(
-            "FROM {courier_reference}\n\
-NAME conformance-{name}\n\
-VERSION 0.1.0\n\
+            "[agent]\n\
+courier_reference = \"{courier_reference}\"\n\
+name = \"conformance-{name}\"\n\
+version = \"0.1.0\"\n\
+entrypoint = \"{entrypoint}\"\n\
 {component_line}\
-SOUL SOUL.md\n\
-TOOL LOCAL {} AS demo\n\
-{extra_lines}\
-ENTRYPOINT {entrypoint}\n",
+\n\
+[agent.instructions]\n\
+soul = \"SOUL.md\"\n\
+\n\
+[[agent.tools]]\n\
+kind = \"local\"\n\
+path = \"{}\"\n\
+alias = \"demo\"\n\
+\n\
+{extra_lines}",
             demo_tool_relative_path()
         ),
     )
     .with_context(|| {
         format!(
             "failed to write {}",
-            context_dir.join("Agentfile").display()
+            context_dir.join("dispatch.toml").display()
         )
     })?;
     fs::write(context_dir.join("SOUL.md"), "Soul body\n")
@@ -774,8 +782,8 @@ ENTRYPOINT {entrypoint}\n",
             context_dir.join(demo_tool_relative_path()).display()
         )
     })?;
-    let built = build_agentfile(
-        &context_dir.join("Agentfile"),
+    let built = build_agent(
+        &context_dir.join("dispatch.toml"),
         &BuildOptions {
             output_root: context_dir.join(".dispatch/parcels"),
         },
@@ -783,7 +791,7 @@ ENTRYPOINT {entrypoint}\n",
     .with_context(|| {
         format!(
             "failed to build {}",
-            context_dir.join("Agentfile").display()
+            context_dir.join("dispatch.toml").display()
         )
     })?;
     load_parcel(&built.parcel_dir)
@@ -800,26 +808,35 @@ fn build_conformance_a2a_fixture(
     fs::create_dir_all(&context_dir)
         .with_context(|| format!("failed to create {}", context_dir.display()))?;
     fs::write(
-        context_dir.join("Agentfile"),
+        context_dir.join("dispatch.toml"),
         format!(
-            "FROM {courier_reference}\n\
-NAME conformance-{name}\n\
-VERSION 0.1.0\n\
-SOUL SOUL.md\n\
-TOOL A2A broker URL {endpoint_url} DISCOVERY card EXPECT_AGENT_NAME conformance-a2a\n\
-ENTRYPOINT job\n"
+            "[agent]\n\
+courier_reference = \"{courier_reference}\"\n\
+name = \"conformance-{name}\"\n\
+version = \"0.1.0\"\n\
+entrypoint = \"job\"\n\
+\n\
+[agent.instructions]\n\
+soul = \"SOUL.md\"\n\
+\n\
+[[agent.tools]]\n\
+kind = \"a2a\"\n\
+alias = \"broker\"\n\
+url = \"{endpoint_url}\"\n\
+discovery = \"card\"\n\
+expect_agent_name = \"conformance-a2a\"\n"
         ),
     )
     .with_context(|| {
         format!(
             "failed to write {}",
-            context_dir.join("Agentfile").display()
+            context_dir.join("dispatch.toml").display()
         )
     })?;
     fs::write(context_dir.join("SOUL.md"), "Soul body\n")
         .with_context(|| format!("failed to write {}", context_dir.join("SOUL.md").display()))?;
-    let built = build_agentfile(
-        &context_dir.join("Agentfile"),
+    let built = build_agent(
+        &context_dir.join("dispatch.toml"),
         &BuildOptions {
             output_root: context_dir.join(".dispatch/parcels"),
         },
@@ -827,7 +844,7 @@ ENTRYPOINT job\n"
     .with_context(|| {
         format!(
             "failed to build {}",
-            context_dir.join("Agentfile").display()
+            context_dir.join("dispatch.toml").display()
         )
     })?;
     load_parcel(&built.parcel_dir)

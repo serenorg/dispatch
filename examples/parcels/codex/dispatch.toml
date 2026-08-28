@@ -1,0 +1,30 @@
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "codex"
+version = "0.1.0"
+entrypoint = "chat"
+visibility = "open"
+
+[agent.instructions]
+identity = "IDENTITY.md"
+soul = "SOUL.md"
+user = "USER.md"
+
+[agent.model]
+id = "gpt-5.4"
+provider = "codex"
+
+[agent.model.options]
+persist-thread = "true"
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "none"
+
+[agent.timeouts]
+run = "300s"
+llm = "120s"

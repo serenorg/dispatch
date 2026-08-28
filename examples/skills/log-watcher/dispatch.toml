@@ -1,0 +1,56 @@
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "log-watcher"
+version = "0.1.0"
+entrypoint = "heartbeat"
+skills = ["skills/log-watcher"]
+
+[agent.instructions]
+soul = "SOUL.md"
+heartbeat = "HEARTBEAT.md"
+
+[agent.model]
+id = "claude-sonnet-4-6"
+provider = "anthropic"
+
+[[agent.model.fallbacks]]
+id = "gpt-4o"
+provider = "openai"
+
+[[agent.tools]]
+kind = "builtin"
+name = "memory_put"
+risk = "low"
+
+[[agent.tools]]
+kind = "builtin"
+name = "memory_get"
+risk = "low"
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "artifacts"
+driver = "local"
+
+[[agent.secrets]]
+name = "LOG_PATH"
+
+[[agent.secrets]]
+name = "ALERTS_PATH"
+
+[agent.limits]
+iterations = 10
+tool_calls = 20
+tool_output = 16384
+
+[agent.timeouts]
+run = "90s"
+tool = "15s"
+llm = "60s"

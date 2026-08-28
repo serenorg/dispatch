@@ -1,5 +1,5 @@
 use super::*;
-use crate::{BuildOptions, build_agentfile};
+use crate::{BuildOptions, build_agent};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
@@ -303,39 +303,39 @@ fn write_test_http_response(writer: &mut TcpStream, status: u16, content_type: &
     let _ = writer.flush();
 }
 
-fn build_test_parcel(agentfile: &str, files: &[(&str, &str)]) -> TestParcel {
+fn build_test_parcel(config: &str, files: &[(&str, &str)]) -> TestParcel {
     let dir = tempdir().unwrap();
     let output_root = dir.path().join(".dispatch/parcels");
-    build_test_parcel_in_dir(dir, agentfile, files, &[], output_root)
+    build_test_parcel_in_dir(dir, config, files, &[], output_root)
 }
 
 fn build_test_parcel_with_output_root(
-    agentfile: &str,
+    config: &str,
     files: &[(&str, &str)],
     output_root: &Path,
 ) -> TestParcel {
     let dir = tempdir().unwrap();
-    build_test_parcel_in_dir(dir, agentfile, files, &[], output_root.to_path_buf())
+    build_test_parcel_in_dir(dir, config, files, &[], output_root.to_path_buf())
 }
 
 fn build_test_parcel_with_binary_files(
-    agentfile: &str,
+    config: &str,
     files: &[(&str, &str)],
     binary_files: &[(&str, &[u8])],
 ) -> TestParcel {
     let dir = tempdir().unwrap();
     let output_root = dir.path().join(".dispatch/parcels");
-    build_test_parcel_in_dir(dir, agentfile, files, binary_files, output_root)
+    build_test_parcel_in_dir(dir, config, files, binary_files, output_root)
 }
 
 fn build_test_parcel_in_dir(
     dir: tempfile::TempDir,
-    agentfile: &str,
+    config: &str,
     files: &[(&str, &str)],
     binary_files: &[(&str, &[u8])],
     output_root: PathBuf,
 ) -> TestParcel {
-    fs::write(dir.path().join("Agentfile"), agentfile).unwrap();
+    fs::write(dir.path().join("dispatch.toml"), config).unwrap();
     for (relative, body) in files {
         let path = dir.path().join(relative);
         if let Some(parent) = path.parent() {
@@ -351,8 +351,11 @@ fn build_test_parcel_in_dir(
         fs::write(path, body).unwrap();
     }
 
-    let built =
-        build_agentfile(&dir.path().join("Agentfile"), &BuildOptions { output_root }).unwrap();
+    let built = build_agent(
+        &dir.path().join("dispatch.toml"),
+        &BuildOptions { output_root },
+    )
+    .unwrap();
 
     TestParcel {
         parcel: load_parcel(&built.parcel_dir).unwrap(),

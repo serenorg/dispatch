@@ -94,7 +94,7 @@ fn load_or_build_parcel_for_eval(
     path: PathBuf,
     output_dir: Option<PathBuf>,
 ) -> Result<LoadedParcel> {
-    if crate::is_agentfile_target(&path) {
+    if crate::is_agent_config_target(&path) {
         return crate::build_parcel_from_source(path, output_dir);
     }
 
@@ -148,7 +148,7 @@ fn eval_with_courier<R: CourierBackend>(
     let (evals, dataset_label) = load_eval_cases(parcel, dataset)?;
     let tests = load_parcel_tests(parcel);
     if evals.is_empty() && tests.is_empty() {
-        bail!("parcel does not declare any EVAL files or TEST cases");
+        bail!("parcel does not declare any `agent.evals` files or `agent.tests` cases");
     }
 
     let mut results = evals
@@ -450,7 +450,7 @@ fn run_tool_test_case<R: CourierBackend>(
     }];
     let mut result = EvalCaseResult {
         name,
-        packaged_path: parcel.config.source_agentfile.clone(),
+        packaged_path: parcel.config.source.clone(),
         entrypoint: "tool".to_string(),
         passed: false,
         tool_calls: Vec::new(),
@@ -1031,7 +1031,7 @@ fn render_eval_report(report: &EvalReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch_core::{BuildOptions, build_agentfile};
+    use dispatch_core::{BuildOptions, build_agent};
     use tempfile::tempdir;
 
     fn sample_eval_report() -> EvalReport {
@@ -1118,21 +1118,21 @@ mod tests {
     }
 
     fn build_tool_test_parcel(script_body: &str) -> (tempfile::TempDir, LoadedParcel) {
-        let agentfile = format!(
-            "FROM dispatch/native:latest\nTOOL LOCAL {} AS demo\nTEST tool:demo\nENTRYPOINT chat\n",
+        let config = format!(
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{}\"\nalias = \"demo\"\n\n[[agent.tests]]\ntool = \"demo\"\n",
             smoke_test_tool_path()
         );
-        build_eval_parcel(&agentfile, &[(smoke_test_tool_path(), script_body)])
+        build_eval_parcel(&config, &[(smoke_test_tool_path(), script_body)])
     }
 
     fn build_eval_parcel(
-        agentfile: &str,
+        config: &str,
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, LoadedParcel) {
         let dir = tempdir().unwrap();
         let context_dir = dir.path().join("image");
         fs::create_dir_all(&context_dir).unwrap();
-        fs::write(context_dir.join("Agentfile"), agentfile).unwrap();
+        fs::write(context_dir.join("dispatch.toml"), config).unwrap();
         for (path, contents) in files {
             let full = context_dir.join(path);
             if let Some(parent) = full.parent() {
@@ -1140,8 +1140,8 @@ mod tests {
             }
             fs::write(full, contents).unwrap();
         }
-        let built = build_agentfile(
-            &context_dir.join("Agentfile"),
+        let built = build_agent(
+            &context_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: context_dir.join(".dispatch/parcels"),
             },
@@ -1155,9 +1155,10 @@ mod tests {
     fn load_eval_cases_applies_dataset_file() {
         let (dir, parcel) = build_eval_parcel(
             concat!(
-                "FROM dispatch/native:latest\n",
-                "EVAL evals/smoke.eval\n",
-                "ENTRYPOINT chat\n",
+                "[agent]\n",
+                "courier_reference = \"dispatch/native:latest\"\n",
+                "entrypoint = \"chat\"\n",
+                "evals = [\"evals/smoke.eval\"]\n",
             ),
             &[("evals/smoke.eval", "name = \"smoke\"\ninput = \"base\"\n")],
         );
@@ -1280,10 +1281,15 @@ mod tests {
     fn apply_eval_expectations_validates_tool_stdout_against_schema() {
         let (_dir, parcel) = build_eval_parcel(
             concat!(
-                "FROM dispatch/native:latest\n",
-                "TOOL LOCAL scripts/demo.sh AS demo SCHEMA schemas/output.json\n",
-                "EVAL evals/output.eval\n",
-                "ENTRYPOINT chat\n",
+                "[agent]\n",
+                "courier_reference = \"dispatch/native:latest\"\n",
+                "entrypoint = \"chat\"\n",
+                "evals = [\"evals/output.eval\"]\n\n",
+                "[[agent.tools]]\n",
+                "kind = \"local\"\n",
+                "path = \"scripts/demo.sh\"\n",
+                "alias = \"demo\"\n",
+                "schema = \"schemas/output.json\"\n",
             ),
             &[
                 ("evals/output.eval", "name = \"demo\"\ninput = \"hi\"\n"),
@@ -1344,10 +1350,14 @@ mod tests {
     fn apply_eval_expectations_rejects_wrong_a2a_endpoint() {
         let (_dir, parcel) = build_eval_parcel(
             concat!(
-                "FROM dispatch/native:latest\n",
-                "TOOL A2A broker URL https://broker.example.com\n",
-                "EVAL evals/output.eval\n",
-                "ENTRYPOINT chat\n",
+                "[agent]\n",
+                "courier_reference = \"dispatch/native:latest\"\n",
+                "entrypoint = \"chat\"\n",
+                "evals = [\"evals/output.eval\"]\n\n",
+                "[[agent.tools]]\n",
+                "kind = \"a2a\"\n",
+                "alias = \"broker\"\n",
+                "url = \"https://broker.example.com\"\n",
             ),
             &[("evals/output.eval", "name = \"demo\"\ninput = \"hi\"\n")],
         );

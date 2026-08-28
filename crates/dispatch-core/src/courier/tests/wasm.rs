@@ -9,13 +9,7 @@ static REFERENCE_GUEST: &[u8] = include_bytes!(concat!(
 #[test]
 fn wasm_courier_accepts_component_backed_wasm_parcel() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/wasm:latest
-COMPONENT components/assistant.wat
-SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/assistant.wat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[
             ("SOUL.md", "Soul body"),
             ("components/assistant.wat", "(component)"),
@@ -68,14 +62,7 @@ fn wasm_courier_executes_reference_guest_chat_with_model_and_tool_imports() {
     let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel_with_binary_files(
         &format!(
-            "\
-FROM dispatch/wasm:latest
-COMPONENT components/reference.wasm
-SOUL SOUL.md
-MODEL gpt-5-mini
-TOOL LOCAL {tool_path} AS demo
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/reference.wasm\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n"
         ),
         &[
             ("SOUL.md", "Soul body"),
@@ -153,12 +140,7 @@ fn wasm_courier_supports_direct_tool_invocation() {
     let tool_body = test_tool_close_stdin_and_print_body("direct-tool-ok");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/wasm:latest
-COMPONENT components/assistant.wat
-TOOL LOCAL {tool_path} AS demo
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/assistant.wat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n"
         ),
         &[
             ("components/assistant.wat", "(component)"),
@@ -199,14 +181,7 @@ ENTRYPOINT chat
 #[test]
 fn wasm_courier_host_model_complete_uses_fallback_models() {
     let test_parcel = build_test_parcel_with_binary_files(
-        "\
-FROM dispatch/wasm:latest
-COMPONENT components/reference.wasm
-SOUL SOUL.md
-MODEL primary-model
-FALLBACK fallback-model
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/reference.wasm\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[agent.model]\nid = \"primary-model\"\n\n[[agent.model.fallbacks]]\nid = \"fallback-model\"\n",
         &[("SOUL.md", "Soul body")],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
@@ -248,20 +223,12 @@ ENTRYPOINT chat
 #[test]
 fn wasm_courier_executes_reference_guest_job_and_heartbeat() {
     let job_parcel = build_test_parcel_with_binary_files(
-        "\
-FROM dispatch/wasm:latest
-COMPONENT components/reference.wasm
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"job\"\ncomponent = \"components/reference.wasm\"\n",
         &[],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
     let heartbeat_parcel = build_test_parcel_with_binary_files(
-        "\
-FROM dispatch/wasm:latest
-COMPONENT components/reference.wasm
-ENTRYPOINT heartbeat
-",
+        "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"heartbeat\"\ncomponent = \"components/reference.wasm\"\n",
         &[],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
@@ -318,13 +285,7 @@ ENTRYPOINT heartbeat
 #[test]
 fn wasm_courier_reference_guest_memory_persists_across_sessions() {
     let test_parcel = build_test_parcel_with_binary_files(
-        "\
-FROM dispatch/wasm:latest
-COMPONENT components/reference.wasm
-MOUNT SESSION sqlite
-MOUNT MEMORY sqlite
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/reference.wasm\"\n\n[[agent.mounts]]\nkind = \"session\"\ndriver = \"sqlite\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"sqlite\"\n",
         &[],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );
@@ -368,12 +329,7 @@ ENTRYPOINT chat
 #[test]
 fn wasm_courier_reference_guest_rejects_memory_ops_without_memory_mount() {
     let test_parcel = build_test_parcel_with_binary_files(
-        "\
-FROM dispatch/wasm:latest
-COMPONENT components/reference.wasm
-MOUNT MEMORY none
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/wasm:latest\"\nentrypoint = \"chat\"\ncomponent = \"components/reference.wasm\"\n\n[[agent.mounts]]\nkind = \"memory\"\ndriver = \"none\"\n",
         &[],
         &[("components/reference.wasm", REFERENCE_GUEST)],
     );

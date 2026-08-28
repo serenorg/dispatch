@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use dispatch_core::{
     BuiltinCourier, CourierBackend, CourierCapabilities, CourierCatalogEntry, CourierInspection,
     DockerCourier, JsonlCourierPlugin, LocalToolTarget, NativeCourier, ParcelManifest,
-    ResolvedCourier, WasmCourier, load_parcel, resolve_courier,
+    ResolvedCourier, WasmCourier, load_parcel, resolve_courier, validate_parcel_compatibility,
 };
 use futures::executor::block_on;
 use std::{
@@ -19,7 +19,10 @@ pub(crate) fn inspect(
     let manifest_path = resolve_manifest_path(path);
     let source = fs::read_to_string(&manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let parcel: ParcelManifest = serde_json::from_str(&source)
+    let manifest_json: serde_json::Value = serde_json::from_str(&source)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    validate_parcel_compatibility(&manifest_path, &manifest_json)?;
+    let parcel: ParcelManifest = serde_json::from_value(manifest_json)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
 
     if emit_json {

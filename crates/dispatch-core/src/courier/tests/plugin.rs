@@ -4,10 +4,7 @@ use super::*;
 #[cfg(unix)]
 fn jsonl_plugin_courier_supports_capabilities_inspect_and_run() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let (courier, _) =
@@ -51,11 +48,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_courier_rejects_unenforced_network_rules() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-NETWORK allow api.example.com
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n\n[[agent.network]]\naction = \"allow\"\ntarget = \"api.example.com\"\n",
         &[],
     );
     let (courier, _) =
@@ -75,10 +68,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_courier_surfaces_structured_errors() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let (courier, _) =
@@ -96,10 +86,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_reuses_persistent_process_across_turns() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let (courier, _plugin_path, starts_path) =
@@ -152,10 +139,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_resumes_persistent_session_after_new_host_process() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let (courier, _plugin_path, starts_path) =
@@ -206,10 +190,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_sends_shutdown_to_persistent_process_on_drop() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let dir = tempdir().unwrap();
@@ -238,11 +219,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_run_timeout_uses_remaining_run_budget() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-TIMEOUT RUN 50ms
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n\n[agent.timeouts]\nrun = \"50ms\"\n",
         &[],
     );
     let dir = tempdir().unwrap();
@@ -270,10 +247,7 @@ ENTRYPOINT chat
 #[cfg(unix)]
 fn jsonl_plugin_courier_detects_executable_drift() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/custom:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/custom:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let (courier, plugin_path) =

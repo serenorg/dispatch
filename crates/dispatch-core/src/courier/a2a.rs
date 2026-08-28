@@ -257,7 +257,8 @@ where
     if matches!(tool.endpoint_mode(), Some(A2aEndpointMode::Card)) {
         return Err(CourierError::A2aToolRequest {
             tool: tool.alias.clone(),
-            message: "agent card discovery failed for required `DISCOVERY card` mode".to_string(),
+            message: "agent card discovery failed for required `discovery = \"card\"` mode"
+                .to_string(),
         });
     }
     if let Some(requirement) =

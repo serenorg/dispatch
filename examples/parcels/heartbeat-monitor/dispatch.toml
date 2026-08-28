@@ -1,0 +1,65 @@
+[agent]
+courier_reference = "dispatch/native:latest"
+name = "room-mention-monitor"
+version = "0.1.0"
+entrypoint = "heartbeat"
+visibility = "opaque"
+
+[agent.instructions]
+identity = "IDENTITY.md"
+soul = "SOUL.md"
+skill = "SKILL.md"
+agents = "AGENTS.md"
+user = "USER.md"
+tools = "TOOLS.md"
+memory = "MEMORY.md"
+heartbeat = "HEARTBEAT.md"
+
+[agent.model]
+id = "gpt-5.6-luna"
+provider = "openai"
+
+[[agent.tools]]
+kind = "local"
+path = "tools/poll_mentions.sh"
+alias = "poll_mentions"
+description = "Poll the workspace for new room mentions. Input: optional JSON configuration."
+
+[[agent.tools]]
+kind = "local"
+path = "tools/respond.sh"
+alias = "respond"
+schema = "schemas/respond.json"
+description = "Send a response for a mention. Input: JSON payload describing the reply."
+
+[[agent.tools]]
+kind = "local"
+path = "tools/release.sh"
+alias = "release"
+schema = "schemas/release.json"
+description = "Mark a handled mention as released. Input: JSON payload identifying the mention."
+
+[[agent.mounts]]
+kind = "session"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "memory"
+driver = "sqlite"
+
+[[agent.mounts]]
+kind = "artifacts"
+driver = "local"
+
+[[agent.secrets]]
+name = "OZ_WORKSPACE_BASE_URL"
+
+[[agent.secrets]]
+name = "OZ_WORKSPACE_AGENT_ID"
+
+[[agent.secrets]]
+name = "OZ_WORKSPACE_AGENT_TOKEN"
+
+[[agent.network]]
+action = "allow"
+target = "workspace.example.com"

@@ -3,11 +3,7 @@ use super::*;
 #[test]
 fn native_courier_chat_uses_backend_when_model_is_declared() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend::with_reply("backend reply"));
@@ -39,11 +35,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_emits_first_class_channel_reply_for_tagged_envelope() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n",
         &[],
     );
     let structured_reply = serde_json::json!({
@@ -97,13 +89,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_caps_llm_timeout_by_remaining_run_budget() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TIMEOUT RUN 100ms
-TIMEOUT LLM 5s
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[agent.timeouts]\nrun = \"100ms\"\nllm = \"5s\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend::with_reply("backend reply"));
@@ -132,11 +118,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_streams_text_delta_without_duplicate_message() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend::with_streaming_reply(
@@ -199,11 +181,7 @@ fn native_courier_codex_backend_resumes_threads_and_denies_app_server_approvals(
     );
 
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5.4 PROVIDER codex
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5.4\"\nprovider = \"codex\"\n",
         &[],
     );
     let backend = Arc::new(CodexAppServerBackend::with_binary_path_for_tests(
@@ -271,12 +249,7 @@ fn native_courier_chat_executes_tool_calls_then_continues_model_turn() {
     let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL {tool_path} AS demo
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );
@@ -347,12 +320,7 @@ fn native_courier_chat_reconstructs_followup_without_response_threading() {
     let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL {tool_path} AS demo
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );
@@ -414,11 +382,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_falls_back_when_backend_is_unavailable() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend::default());
@@ -452,11 +416,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_emits_backend_fallback_event_on_backend_error() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend::with_error("http status: 401"));
@@ -490,12 +450,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_uses_fallback_model_after_primary_backend_error() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL primary-model
-FALLBACK fallback-model
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"primary-model\"\n\n[[agent.model.fallbacks]]\nid = \"fallback-model\"\n",
         &[],
     );
     let backend = Arc::new(FakeChatBackend {
@@ -550,12 +505,7 @@ fn native_courier_chat_emits_backend_fallback_when_tool_loop_is_exhausted() {
     let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL {tool_path} AS demo
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );
@@ -608,11 +558,7 @@ ENTRYPOINT chat
 #[test]
 fn run_local_tool_requires_approval_handler_for_confirm_policy() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\napproval = \"confirm\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
 
@@ -626,13 +572,7 @@ fn native_courier_respects_configured_tool_round_limit() {
     let tool_body = test_tool_print_body("ok");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-MODEL fake-model PROVIDER fake
-TOOL LOCAL {tool_path} AS demo
-LIMIT TOOL_ROUNDS 3
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"fake-model\"\nprovider = \"fake\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\n\n[agent.limits]\ntool_rounds = 3\n"
         ),
         &[(tool_path.as_str(), tool_body.as_str())],
     );
@@ -681,11 +621,7 @@ ENTRYPOINT chat
 #[test]
 fn run_local_tool_can_be_denied_by_approval_handler() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\napproval = \"confirm\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
 
@@ -700,12 +636,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_reports_denied_tool_calls() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo APPROVAL confirm
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\napproval = \"confirm\"\n",
         &[("tools/demo.sh", "printf 'tool-output'")],
     );
     let backend = Arc::new(FakeChatBackend::with_replies(vec![
@@ -751,7 +682,9 @@ ENTRYPOINT chat
         Some(CourierEvent::ToolCallFinished { result })
             if result.tool == "demo"
                 && result.exit_code == 126
-                && result.stderr.contains("denied by APPROVAL confirm")
+                && result
+                    .stderr
+                    .contains("denied by `approval = \"confirm\"`")
     ));
     assert!(matches!(
         response.events.iter().rev().nth(1),
@@ -765,12 +698,7 @@ fn native_courier_chat_executes_schema_tool_calls_as_function_outputs() {
     let tool_body = test_tool_print_body("tool-output");
     let test_parcel = build_test_parcel(
         &format!(
-            "\
-FROM dispatch/native:latest
-MODEL gpt-5-mini
-TOOL LOCAL {tool_path} AS demo SCHEMA schemas/demo.json
-ENTRYPOINT chat
-"
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"{tool_path}\"\nalias = \"demo\"\nschema = \"schemas/demo.json\"\n"
         ),
         &[
             (tool_path.as_str(), tool_body.as_str()),
@@ -828,10 +756,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_preserves_history_across_turns() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -872,11 +797,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_supports_prompt_command() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-SOUL SOUL.md
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n",
         &[("SOUL.md", "Soul body")],
     );
     let courier = NativeCourier::default();
@@ -902,12 +823,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_tools_command_lists_builtin_tools_when_no_local_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL BUILTIN memory_get
-TOOL BUILTIN checkpoint_list
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_get\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"checkpoint_list\"\n",
         &[],
     );
     let courier = NativeCourier::default();
@@ -935,12 +851,7 @@ ENTRYPOINT chat
 #[test]
 fn native_courier_chat_tools_command_lists_local_and_builtin_tools_separately() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/demo.sh AS demo
-TOOL BUILTIN memory_get
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_get\"\n",
         &[("tools/demo.sh", "printf demo")],
     );
     let courier = NativeCourier::default();

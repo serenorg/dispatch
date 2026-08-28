@@ -330,7 +330,7 @@ fn load_or_open_session(
 }
 
 pub(crate) fn load_or_build_parcel_for_run(path: PathBuf) -> Result<LoadedParcel> {
-    if crate::is_agentfile_target(&path) {
+    if crate::is_agent_config_target(&path) {
         return crate::build_parcel_from_source(path, None);
     }
 
@@ -713,7 +713,7 @@ fn load_input_schema_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch_core::{BuildOptions, build_agentfile, load_parcel};
+    use dispatch_core::{BuildOptions, build_agent, load_parcel};
     use tempfile::tempdir;
 
     #[test]
@@ -723,15 +723,8 @@ mod tests {
         fs::create_dir_all(root.join("tools")).unwrap();
         fs::create_dir_all(root.join("schemas")).unwrap();
         fs::write(
-            root.join("Agentfile"),
-            "\
-FROM dispatch/native:latest
-TOOL LOCAL tools/read_file.sh AS read_file SCHEMA schemas/read_file.json APPROVAL confirm RISK high DESCRIPTION \"Read a file\"
-TOOL BUILTIN memory_get APPROVAL audit RISK low DESCRIPTION \"Read memory\"
-TOOL A2A broker URL https://broker.example.com SCHEMA schemas/read_file.json APPROVAL confirm RISK medium DESCRIPTION \"Delegate to a broker\"
-TOOL MCP github APPROVAL never RISK medium DESCRIPTION \"GitHub MCP\"
-ENTRYPOINT chat
-",
+            root.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/read_file.sh\"\nalias = \"read_file\"\napproval = \"confirm\"\nrisk = \"high\"\ndescription = \"Read a file\"\nschema = \"schemas/read_file.json\"\n\n[[agent.tools]]\nkind = \"builtin\"\nname = \"memory_get\"\napproval = \"audit\"\nrisk = \"low\"\ndescription = \"Read memory\"\n\n[[agent.tools]]\nkind = \"a2a\"\nalias = \"broker\"\nurl = \"https://broker.example.com\"\napproval = \"confirm\"\nrisk = \"medium\"\ndescription = \"Delegate to a broker\"\nschema = \"schemas/read_file.json\"\n\n[[agent.tools]]\nkind = \"mcp\"\nserver = \"github\"\napproval = \"never\"\nrisk = \"medium\"\ndescription = \"GitHub MCP\"\n",
         )
         .unwrap();
         fs::write(root.join("tools/read_file.sh"), "printf ok").unwrap();
@@ -741,8 +734,8 @@ ENTRYPOINT chat
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &root.join("Agentfile"),
+        let built = build_agent(
+            &root.join("dispatch.toml"),
             &BuildOptions {
                 output_root: root.join(".dispatch/parcels"),
             },
@@ -794,13 +787,13 @@ ENTRYPOINT chat
     }
 
     #[test]
-    fn load_or_build_parcel_for_run_builds_agentfile_source() {
+    fn load_or_build_parcel_for_run_builds_agent_config_source() {
         let dir = tempdir().unwrap();
         let source_dir = dir.path().join("agent");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nNAME run-source-test\nENTRYPOINT chat\n",
+            source_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"run-source-test\"\nentrypoint = \"chat\"\n",
         )
         .unwrap();
 
@@ -816,13 +809,13 @@ ENTRYPOINT chat
         let source_dir = dir.path().join("agent");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nNAME run-prefix-test\nENTRYPOINT chat\n",
+            source_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"run-prefix-test\"\nentrypoint = \"chat\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &source_dir.join("Agentfile"),
+        let built = build_agent(
+            &source_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: source_dir.join(".dispatch/parcels"),
             },
@@ -843,13 +836,13 @@ ENTRYPOINT chat
         let source_dir = dir.path().join("agent");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(
-            source_dir.join("Agentfile"),
-            "FROM dispatch/native:latest\nNAME run-prefix-short-test\nENTRYPOINT chat\n",
+            source_dir.join("dispatch.toml"),
+            "[agent]\ncourier_reference = \"dispatch/native:latest\"\nname = \"run-prefix-short-test\"\nentrypoint = \"chat\"\n",
         )
         .unwrap();
 
-        let built = build_agentfile(
-            &source_dir.join("Agentfile"),
+        let built = build_agent(
+            &source_dir.join("dispatch.toml"),
             &BuildOptions {
                 output_root: source_dir.join(".dispatch/parcels"),
             },

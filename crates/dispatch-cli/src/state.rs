@@ -193,20 +193,22 @@ pub(crate) fn collect_state_entries(root: &Path, parcels_root: &Path) -> Result<
             }
             let digest = entry.file_name().to_string_lossy().to_string();
             let manifest_path = parcels_root.join(&digest).join("manifest.json");
-            let manifest = if manifest_path.exists() {
-                let body = fs::read_to_string(&manifest_path)
-                    .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-                Some(
-                    serde_json::from_str::<ParcelManifest>(&body)
-                        .with_context(|| format!("failed to parse {}", manifest_path.display()))?,
-                )
+            // A manifest this build cannot read still proves the parcel exists,
+            // so the entry stays present and only its metadata is unavailable.
+            // Failing here would break `state gc`, the command used to clear
+            // state left behind by parcels in an older format.
+            let parcel_present = manifest_path.exists();
+            let manifest = if parcel_present {
+                fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|body| serde_json::from_str::<ParcelManifest>(&body).ok())
             } else {
                 None
             };
             Ok(Some(StateEntry {
                 digest,
                 path,
-                parcel_present: manifest.is_some(),
+                parcel_present,
                 name: manifest.as_ref().and_then(|manifest| manifest.name.clone()),
                 version: manifest
                     .as_ref()
@@ -246,4 +248,47 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A parcel whose manifest this build cannot read must still count as
+    /// present, or `state gc` would collect state for a parcel that exists.
+    #[test]
+    fn state_entries_keep_parcels_whose_manifest_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_root = dir.path().join("state");
+        let parcels_root = dir.path().join("parcels");
+        let digest = "a".repeat(64);
+        fs::create_dir_all(state_root.join(&digest)).unwrap();
+        fs::create_dir_all(parcels_root.join(&digest)).unwrap();
+        fs::write(
+            parcels_root.join(&digest).join("manifest.json"),
+            "{\"format_version\":1,\"source_agentfile\":\"Agentfile\"}",
+        )
+        .unwrap();
+
+        let entries = collect_state_entries(&state_root, &parcels_root).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].parcel_present);
+        assert!(entries[0].name.is_none());
+    }
+
+    #[test]
+    fn state_entries_report_a_missing_parcel_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_root = dir.path().join("state");
+        let parcels_root = dir.path().join("parcels");
+        let digest = "b".repeat(64);
+        fs::create_dir_all(state_root.join(&digest)).unwrap();
+        fs::create_dir_all(&parcels_root).unwrap();
+
+        let entries = collect_state_entries(&state_root, &parcels_root).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].parcel_present);
+    }
 }

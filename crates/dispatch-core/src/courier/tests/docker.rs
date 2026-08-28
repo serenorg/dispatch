@@ -3,10 +3,7 @@ use super::*;
 #[test]
 fn docker_courier_accepts_docker_image_reference() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/docker:latest
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"job\"\n",
         &[],
     );
     let courier = DockerCourier::default();
@@ -24,10 +21,7 @@ ENTRYPOINT job
 #[test]
 fn docker_courier_rejects_native_image_reference() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/native:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/native:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let courier = DockerCourier::default();
@@ -45,12 +39,7 @@ ENTRYPOINT chat
 #[test]
 fn docker_courier_can_resolve_prompt_and_list_tools() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/docker:latest
-SOUL SOUL.md
-TOOL LOCAL tools/demo.sh AS demo
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"chat\"\n\n[agent.instructions]\nsoul = \"SOUL.md\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[("SOUL.md", "Soul body"), ("tools/demo.sh", "printf ok")],
     );
     let courier = DockerCourier::default();
@@ -86,10 +75,7 @@ ENTRYPOINT chat
 #[test]
 fn docker_courier_chat_executes_local_reply_and_records_history() {
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/docker:latest
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"chat\"\n",
         &[],
     );
     let courier = DockerCourier::default();
@@ -136,12 +122,7 @@ cat >/dev/null
     fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/docker:latest
-TOOL LOCAL tools/demo.sh AS demo
-ENV CAST_VISIBLE_ENV=visible
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"job\"\n\n[agent.env]\n\"CAST_VISIBLE_ENV\" = \"visible\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
     let courier = DockerCourier::new(&docker_bin, "python:3.13-alpine");
@@ -195,12 +176,7 @@ fn docker_courier_enforces_tool_timeout_for_local_tools() {
     fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/docker:latest
-TIMEOUT TOOL 50ms
-TOOL LOCAL tools/demo.sh AS demo
-ENTRYPOINT job
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"job\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\n\n[agent.timeouts]\ntool = \"50ms\"\n",
         &[("tools/demo.sh", "printf ok")],
     );
     let courier = DockerCourier::new(&docker_bin, "python:3.13-alpine");
@@ -240,12 +216,7 @@ fn docker_courier_chat_executes_model_tool_calls_via_docker_cli() {
     fs::set_permissions(&docker_bin, fs::Permissions::from_mode(0o755)).unwrap();
 
     let test_parcel = build_test_parcel(
-        "\
-FROM dispatch/docker:latest
-MODEL gpt-5-mini
-TOOL LOCAL tools/demo.sh AS demo SCHEMA schemas/demo.json
-ENTRYPOINT chat
-",
+        "[agent]\ncourier_reference = \"dispatch/docker:latest\"\nentrypoint = \"chat\"\n\n[agent.model]\nid = \"gpt-5-mini\"\n\n[[agent.tools]]\nkind = \"local\"\npath = \"tools/demo.sh\"\nalias = \"demo\"\nschema = \"schemas/demo.json\"\n",
         &[
             ("tools/demo.sh", "printf ok"),
             (
