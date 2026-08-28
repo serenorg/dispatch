@@ -2,6 +2,39 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.7.0] - 2026-08-28
+
+Declarative agent configuration release.
+
+The `Agentfile` DSL is replaced by an `[agent]` table in `dispatch.toml`. This file can hold both parts of a project. `[agent]` defines the parcel, and the other tables configure channels and couriers. The build reads only `[agent]`, so deployment-only edits do not change the parcel digest.
+
+The loader uses a strict `serde` schema that rejects unknown fields at every nested level. The old parser could accept a declaration's keyword and arity, then discard it without an error when a sub-parser failed. As a result, a `MOUNT`, `NETWORK`, or `TOOL` line could vanish from a signed manifest. The typed schema makes this failure mode impossible.
+
+### Added
+
+- `[agent]` table in `dispatch.toml` as the authored agent source, with `deny_unknown_fields` at every nested level and typed enums for mount kinds, tool kinds, approval policies, risk levels, A2A discovery modes, and visibility.
+- `agent.evals` packages multiple eval documents and preserves their declaration order.
+- `agent.skills` and `agent.instructions.skill` split the two meanings the single `SKILL` instruction carried: a bundle directory and a prompt document.
+
+### Changed
+
+- **Breaking:** `Agentfile` is removed. Author agents in `dispatch.toml` under `[agent]`. Every instruction has a typed equivalent; see the [migration map and field reference](docs/agent-config.md#migrating-from-agentfile). Existing sources must be converted and existing parcels must be rebuilt.
+- **Breaking:** `parcel` and `[agent]` are mutually exclusive in `dispatch.toml`. A file either defines an agent or references a built one. With `[agent]` present, the file is its own parcel source.
+- **Breaking:** parcel `format_version` is now `2` and the current published schema is `https://serenorg.github.io/dispatch/schemas/parcel.v2.json`. The immutable `parcel.v1.json` remains published for historical consumers. Parcels built by 0.6.0 and earlier are rejected with an unsupported-version error and must be rebuilt.
+- **Breaking:** the parcel manifest field `source_agentfile` is renamed to `source`.
+- **Breaking:** `LimitSpec.qualifiers` and `TimeoutSpec.qualifiers` are removed from the parcel manifest. The old DSL preserved arbitrary qualifier tokens, but no runtime consumer read them; the typed replacement exposes only the supported scope values. `NetworkRule.qualifiers` is unchanged and maps to `agent.network.qualifiers`.
+- **Breaking:** the `required` alias for the `confirm` tool approval policy is removed; set `approval = "confirm"` on the tool. The unrelated `required` field on secret declarations is unchanged.
+- **Breaking:** `build_agentfile` is renamed to `build_agent` and takes a `dispatch.toml` path. `parse_agentfile`, `validate_agentfile`, and `validate_agentfile_at_path` are removed; `validate_agent_config` and `validate_agent_config_at_path` replace the validator.
+- **Breaking:** `dispatch parcel lint --json` emits the parsed agent definition instead of the former Agentfile AST. Standard output contains exactly one JSON document, and diagnostics go to standard error.
+- Skill tools and explicit tools no longer depend on declaration order. Skills lower first, so an explicit `[[agent.tools]]` entry always overrides a skill tool of the same alias and the build warns once.
+- Timeout scopes are named `run`, `tool`, and `llm`; limit scopes are named `iterations`, `tool_calls`, `tool_output`, `context_tokens`, and `tool_rounds`.
+- The source `dispatch.toml` is excluded from parcel content even when a referenced directory contains it, and a direct attempt to package it fails the build. Project loading rejects common credential-like keys in inline channel `config`, matched across `snake_case`, `camelCase`, and `kebab-case`; put channel credentials in `config_file`.
+- `dispatch parcel inspect` reports an unsupported parcel format explicitly instead of failing on a renamed manifest field, and `dispatch state ls` and `dispatch state gc` keep working when a parcel store still holds a parcel from an older format.
+
+### Removed
+
+- The Agentfile parser, AST, and instruction validator, along with the hand-written per-instruction sub-parsers. No compatibility path is retained.
+
 ## [0.6.0] - 2026-08-27
 
 Receipt-bound channel read-back release.
