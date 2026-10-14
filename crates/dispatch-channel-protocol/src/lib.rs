@@ -1731,9 +1731,37 @@ mod tests {
             };
             assert!(storage.validate().is_err());
         }
+        // Host-absolute variants keep each rule covered where Unix literals
+        // are already rejected as relative (Windows).
+        let host_root = std::env::temp_dir();
+        let filesystem_root = host_root.ancestors().last().unwrap().to_path_buf();
+        for path in [
+            String::new(),
+            host_root
+                .join("..")
+                .join("other.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+            filesystem_root.to_string_lossy().into_owned(),
+            host_root.join("bad\nname").to_string_lossy().into_owned(),
+            host_root
+                .join("x".repeat(4097))
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert!(std::path::Path::new(&path).is_absolute() || path.is_empty());
+            let storage = ChannelIngressStorage {
+                recovery: None,
+                journal_path: path.clone(),
+            };
+            assert!(storage.validate().is_err(), "{path:?} must be refused");
+        }
         let good = ChannelIngressStorage {
             recovery: None,
-            journal_path: "/tmp/owned/incoming.sqlite".into(),
+            journal_path: std::env::temp_dir()
+                .join("owned/incoming.sqlite")
+                .to_string_lossy()
+                .into_owned(),
         };
         good.validate().unwrap();
         let request = JsonRequest::PollIngress {
@@ -1925,7 +1953,10 @@ mod tests {
             request: JsonRequest::StartIngress {
                 config: Value::Null,
                 storage: ChannelIngressStorage {
-                    journal_path: "/tmp/owned/producer.sqlite".into(),
+                    journal_path: std::env::temp_dir()
+                        .join("owned/producer.sqlite")
+                        .to_string_lossy()
+                        .into_owned(),
                     recovery: Some(recovery),
                 },
                 state: None,
@@ -2199,7 +2230,10 @@ mod tests {
                 config: serde_json::json!({ "channel": "slack" }),
                 storage: ChannelIngressStorage {
                     recovery: None,
-                    journal_path: "/tmp/dispatch-ingress.sqlite".into(),
+                    journal_path: std::env::temp_dir()
+                        .join("dispatch-ingress.sqlite")
+                        .to_string_lossy()
+                        .into_owned(),
                 },
                 state: Some(IngressState {
                     mode: IngressMode::Polling,
