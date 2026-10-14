@@ -6,10 +6,17 @@ use dispatch_plugin_rpc::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub const CHANNEL_PLUGIN_PROTOCOL_VERSION: u32 = 1;
-pub const CHANNEL_EVENT_NOTIFICATION_METHOD: &str = "channel.event";
+pub const CHANNEL_PLUGIN_PROTOCOL_VERSION: u32 = 2;
+pub const CHANNEL_EVENT_METHOD: &str = "channel.event";
+pub const CHANNEL_HEARTBEAT_METHOD: &str = "channel.heartbeat";
+pub const MAX_CHANNEL_BATCH_EVENTS: usize = 32;
+pub const MAX_CHANNEL_BATCH_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CHANNEL_EVENT_ID_BYTES: usize = 512;
+pub const MAX_CHANNEL_FRAME_BYTES: usize =
+    MAX_CHANNEL_BATCH_BYTES + 2 * MAX_CHANNEL_BATCH_EVENTS * MAX_CHANNEL_EVENT_ID_BYTES + 4 * 1024;
 
 pub use dispatch_plugin_rpc::{
     JsonRpcErrorObject, JsonRpcMessageError, RequestId as PluginRequestId,
@@ -63,8 +70,44 @@ pub struct PluginNotificationEnvelope<N> {
     pub notification: N,
 }
 
+/// Host-owned storage location for the plugin's pending ingress journal.
+///
+/// The host derives this path from its own storage scope. Provider
+/// configuration never supplies it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub struct ChannelIngressStorage {
+    pub journal_path: String,
+    /// Current authenticated host head, never provider-selected recovery data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ChannelIngressRecovery>,
+}
+
+impl ChannelIngressStorage {
+    pub fn validate(&self) -> Result<(), JsonRpcMessageError> {
+        let path = std::path::Path::new(&self.journal_path);
+        if self.journal_path.is_empty()
+            || self.journal_path.len() > 4096
+            || self.journal_path.chars().any(char::is_control)
+            || !path.is_absolute()
+            || path.file_name().is_none()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(JsonRpcMessageError::message(
+                "channel ingress journal must have an absolute host-owned path",
+            ));
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginRequest<C, M> {
     Capabilities,
     Configure {
@@ -75,11 +118,13 @@ pub enum PluginRequest<C, M> {
     },
     PollIngress {
         config: C,
+        storage: ChannelIngressStorage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<IngressState>,
     },
     StartIngress {
         config: C,
+        storage: ChannelIngressStorage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<IngressState>,
     },
@@ -90,6 +135,7 @@ pub enum PluginRequest<C, M> {
     },
     IngressEvent {
         config: C,
+        storage: ChannelIngressStorage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<IngressState>,
         payload: IngressPayload,
@@ -142,7 +188,6 @@ pub enum PluginResponse {
         state: IngressState,
     },
     IngressEventsReceived {
-        events: Vec<InboundEventEnvelope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         callback_reply: Option<IngressCallbackReply>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,7 +223,8 @@ pub enum PluginResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ChannelEventNotification {
+#[serde(deny_unknown_fields)]
+pub struct ChannelEventBatch {
     #[serde(default)]
     pub events: Vec<InboundEventEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,13 +233,299 @@ pub struct ChannelEventNotification {
     pub poll_after_ms: Option<u64>,
 }
 
+/// One immutable inbound batch sent by a plugin as an ID-bearing request.
+///
+/// The request ID is `channel:<batch_digest>`. The host answers with a
+/// [`ChannelEventAcceptance`] only after it durably stores the complete batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelEventRequest {
+    pub protocol_version: u32,
+    pub batch_digest: String,
+    pub batch: ChannelEventBatch,
+    /// Exact current-head receipt required for a newly constructed successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_acceptance: Option<ChannelEventAcceptance>,
+}
+
+impl ChannelEventRequest {
+    pub fn new(
+        batch: ChannelEventBatch,
+        previous_acceptance: Option<ChannelEventAcceptance>,
+    ) -> Result<Self, JsonRpcMessageError> {
+        let batch_digest = channel_batch_digest(&batch)?;
+        let request = Self {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            batch_digest,
+            batch,
+            previous_acceptance,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), JsonRpcMessageError> {
+        if self.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION
+            || self.batch_digest != channel_batch_digest(&self.batch)?
+        {
+            return Err(JsonRpcMessageError::message(
+                "channel batch identity does not match its original envelope",
+            ));
+        }
+        if let Some(previous) = &self.previous_acceptance {
+            previous.validate()?;
+            // A receipt at the final sequence can have no successor.
+            if previous.sequence() == u64::MAX {
+                return Err(JsonRpcMessageError::message(
+                    "channel acceptance sequence is exhausted",
+                ));
+            }
+        }
+        validate_batch_event_ids(&self.event_ids())
+    }
+
+    pub fn request_id(&self) -> RequestId {
+        channel_batch_request_id(&self.batch_digest)
+    }
+
+    pub fn event_ids(&self) -> Vec<String> {
+        self.batch
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect()
+    }
+
+    /// Expected receipt after checking the durable predecessor and committing
+    /// the entire original. This calculation does not authorize acceptance.
+    pub fn acceptance(&self) -> Result<ChannelEventAcceptance, JsonRpcMessageError> {
+        self.validate()?;
+        let sequence = match &self.previous_acceptance {
+            Some(previous) => previous.sequence().checked_add(1).ok_or_else(|| {
+                JsonRpcMessageError::message("channel acceptance sequence is exhausted")
+            })?,
+            None => 1,
+        };
+        Ok(ChannelEventAcceptance::Accepted {
+            batch_digest: self.batch_digest.clone(),
+            event_ids: self.event_ids(),
+            sequence,
+        })
+    }
+}
+
+/// Authenticated host head used to restore the producer's accepted original.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelIngressRecovery {
+    pub request: ChannelEventRequest,
+    pub acceptance: ChannelEventAcceptance,
+    /// Effective accepted cursor, including state inherited from a prior head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<IngressState>,
+}
+
+impl ChannelIngressRecovery {
+    pub fn validate(&self) -> Result<(), JsonRpcMessageError> {
+        self.request.validate()?;
+        self.acceptance.validate()?;
+        if !self.acceptance.matches(&self.request) {
+            return Err(JsonRpcMessageError::message(
+                "channel recovery receipt differs from its original request",
+            ));
+        }
+        if self
+            .request
+            .batch
+            .state
+            .as_ref()
+            .is_some_and(|state| self.state.as_ref() != Some(state))
+        {
+            return Err(JsonRpcMessageError::message(
+                "channel recovery state differs from its accepted original",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact durable-storage receipt for one [`ChannelEventRequest`].
+///
+/// A receipt confirms storage only. It does not confirm execution or delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChannelEventAcceptance {
+    Accepted {
+        batch_digest: String,
+        event_ids: Vec<String>,
+        /// Host-owned occurrence sequence; first 1, then predecessor plus 1.
+        sequence: u64,
+    },
+}
+
+impl ChannelEventAcceptance {
+    pub fn matches(&self, request: &ChannelEventRequest) -> bool {
+        request.acceptance().is_ok_and(|expected| self == &expected)
+    }
+
+    pub fn validate(&self) -> Result<(), JsonRpcMessageError> {
+        let Self::Accepted {
+            batch_digest,
+            event_ids,
+            sequence,
+        } = self;
+        if !is_channel_batch_digest(batch_digest) || *sequence == 0 {
+            return Err(JsonRpcMessageError::message(
+                "channel acceptance identity is invalid",
+            ));
+        }
+        validate_batch_event_ids(event_ids)
+    }
+
+    pub fn batch_digest(&self) -> &str {
+        let Self::Accepted { batch_digest, .. } = self;
+        batch_digest
+    }
+
+    pub fn sequence(&self) -> u64 {
+        let Self::Accepted { sequence, .. } = self;
+        *sequence
+    }
+
+    pub fn request_id(&self) -> RequestId {
+        channel_batch_request_id(self.batch_digest())
+    }
+}
+
+/// Liveness-only notification. It never carries cursor state or acceptance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelHeartbeat {
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// One line read by a plugin from its stdin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginInput<C, M> {
+    Request {
+        id: RequestId,
+        envelope: Box<PluginRequestEnvelope<PluginRequest<C, M>>>,
+    },
+    EventAcceptance {
+        id: RequestId,
+        acceptance: ChannelEventAcceptance,
+    },
+}
+
+/// One line read by the host from plugin stdout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginMessage {
     Response {
         id: RequestId,
         response: PluginResponse,
     },
-    Notification(PluginNotificationEnvelope<ChannelEventNotification>),
+    EventRequest {
+        id: RequestId,
+        request: ChannelEventRequest,
+    },
+    Heartbeat(PluginNotificationEnvelope<ChannelHeartbeat>),
+}
+
+/// Lowercase 64-character hexadecimal SHA-256 digest.
+pub fn is_channel_batch_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn channel_batch_request_id(batch_digest: &str) -> RequestId {
+    RequestId::String(format!("channel:{batch_digest}"))
+}
+
+fn validate_batch_event_ids(ids: &[String]) -> Result<(), JsonRpcMessageError> {
+    let mut distinct = BTreeSet::new();
+    if ids.len() > MAX_CHANNEL_BATCH_EVENTS
+        || ids.iter().any(|id| {
+            id.is_empty()
+                || id.trim() != id
+                || id.len() > MAX_CHANNEL_EVENT_ID_BYTES
+                || id.chars().any(char::is_control)
+                || !distinct.insert(id)
+        })
+    {
+        return Err(JsonRpcMessageError::message(
+            "channel batch event identities are invalid",
+        ));
+    }
+    Ok(())
+}
+
+/// Canonical batch bytes: compact serde_json output of the typed batch with
+/// recursively sorted object keys, raw UTF-8, and array order preserved.
+pub fn canonical_channel_batch_bytes(
+    batch: &ChannelEventBatch,
+) -> Result<Vec<u8>, JsonRpcMessageError> {
+    if batch.events.len() > MAX_CHANNEL_BATCH_EVENTS {
+        return Err(JsonRpcMessageError::message(
+            "channel batch exceeds its event bound",
+        ));
+    }
+    let value = serde_json::to_value(batch).map_err(JsonRpcMessageError::invalid_json)?;
+    let bytes = serde_json::to_vec(&canonical_channel_value(value))
+        .map_err(JsonRpcMessageError::invalid_json)?;
+    if bytes.len() > MAX_CHANNEL_BATCH_BYTES {
+        return Err(JsonRpcMessageError::message(
+            "channel batch exceeds its byte bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Canonical event content for retry identity. Only the top-level host
+/// observation `received_at` is excluded; the full original frame stays exact.
+pub fn canonical_channel_event_content_bytes(
+    event: &InboundEventEnvelope,
+) -> Result<Vec<u8>, JsonRpcMessageError> {
+    let Value::Object(mut fields) =
+        serde_json::to_value(event).map_err(JsonRpcMessageError::invalid_json)?
+    else {
+        return Err(JsonRpcMessageError::message(
+            "channel event must be an object",
+        ));
+    };
+    fields.remove("received_at");
+    let bytes = serde_json::to_vec(&canonical_channel_value(Value::Object(fields)))
+        .map_err(JsonRpcMessageError::invalid_json)?;
+    if bytes.len() > MAX_CHANNEL_BATCH_BYTES {
+        return Err(JsonRpcMessageError::message(
+            "channel event content exceeds its byte bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn canonical_channel_value(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (key, canonical_channel_value(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        Value::Array(array) => {
+            Value::Array(array.into_iter().map(canonical_channel_value).collect())
+        }
+        value => value,
+    }
+}
+
+fn channel_batch_digest(batch: &ChannelEventBatch) -> Result<String, JsonRpcMessageError> {
+    let digest = Sha256::digest(canonical_channel_batch_bytes(batch)?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -706,6 +1038,74 @@ pub fn parse_jsonrpc_request<C: DeserializeOwned, M: DeserializeOwned>(
     Ok((request.id, envelope))
 }
 
+/// Parse one plugin stdin line: a host request or an exact event receipt.
+pub fn parse_plugin_input<C: DeserializeOwned, M: DeserializeOwned>(
+    line: &str,
+) -> Result<PluginInput<C, M>, JsonRpcMessageError> {
+    // Host requests keep their existing size and envelope contract; only
+    // durable receipts are strict.
+    let (message, keys) = parse_channel_frame(line)?;
+    match message {
+        JsonRpcMessage::Request(request) => {
+            ensure_jsonrpc_version(&request.jsonrpc)?;
+            let params = request.params.ok_or(JsonRpcMessageError::MissingParams)?;
+            let envelope = decode_request_params(&request.method, params)?;
+            Ok(PluginInput::Request {
+                id: request.id,
+                envelope: Box::new(envelope),
+            })
+        }
+        JsonRpcMessage::Response(response) => {
+            ensure_exact_frame_keys(&keys, &["jsonrpc", "id", "result"])?;
+            ensure_jsonrpc_version(&response.jsonrpc)?;
+            let acceptance: ChannelEventAcceptance = serde_json::from_value(response.result)
+                .map_err(JsonRpcMessageError::invalid_json)?;
+            acceptance.validate()?;
+            if response.id != acceptance.request_id() {
+                return Err(JsonRpcMessageError::message(
+                    "channel acceptance response identity differs",
+                ));
+            }
+            Ok(PluginInput::EventAcceptance {
+                id: response.id,
+                acceptance,
+            })
+        }
+        JsonRpcMessage::Error(_) => Err(JsonRpcMessageError::message(
+            "host refused channel durable acceptance",
+        )),
+        JsonRpcMessage::Notification(_) => Err(JsonRpcMessageError::ExpectedRequest),
+    }
+}
+
+pub fn event_request_to_jsonrpc(
+    request: &ChannelEventRequest,
+) -> Result<String, JsonRpcMessageError> {
+    request.validate()?;
+    let params = serde_json::to_value(request).map_err(JsonRpcMessageError::invalid_json)?;
+    let message = JsonRpcMessage::Request(JsonRpcRequest::new(
+        request.request_id(),
+        CHANNEL_EVENT_METHOD,
+        Some(params),
+    ));
+    serde_json::to_string(&message).map_err(JsonRpcMessageError::invalid_json)
+}
+
+pub fn event_acceptance_to_jsonrpc(
+    id: &RequestId,
+    acceptance: &ChannelEventAcceptance,
+) -> Result<String, JsonRpcMessageError> {
+    acceptance.validate()?;
+    if id != &acceptance.request_id() {
+        return Err(JsonRpcMessageError::message(
+            "channel acceptance response identity differs",
+        ));
+    }
+    let result = serde_json::to_value(acceptance).map_err(JsonRpcMessageError::invalid_json)?;
+    let message = JsonRpcMessage::Response(JsonRpcSuccessResponse::new(id.clone(), result));
+    serde_json::to_string(&message).map_err(JsonRpcMessageError::invalid_json)
+}
+
 pub fn response_to_jsonrpc(
     id: &RequestId,
     response: &PluginResponse,
@@ -736,16 +1136,17 @@ pub fn parse_jsonrpc_response(
 ) -> Result<(RequestId, PluginResponse), JsonRpcMessageError> {
     match parse_jsonrpc_message(line)? {
         PluginMessage::Response { id, response } => Ok((id, response)),
-        PluginMessage::Notification(_) => Err(JsonRpcMessageError::UnexpectedNotification),
+        PluginMessage::Heartbeat(_) => Err(JsonRpcMessageError::UnexpectedNotification),
+        PluginMessage::EventRequest { .. } => Err(JsonRpcMessageError::UnexpectedRequest),
     }
 }
 
-pub fn notification_to_jsonrpc(
-    envelope: &PluginNotificationEnvelope<ChannelEventNotification>,
+pub fn heartbeat_to_jsonrpc(
+    envelope: &PluginNotificationEnvelope<ChannelHeartbeat>,
 ) -> Result<String, JsonRpcMessageError> {
     let params = notification_params_with_version(envelope)?;
     let message = JsonRpcMessage::Notification(JsonRpcNotification::new(
-        CHANNEL_EVENT_NOTIFICATION_METHOD,
+        CHANNEL_HEARTBEAT_METHOD,
         Some(params),
     ));
     serde_json::to_string(&message).map_err(|source| {
@@ -756,11 +1157,20 @@ pub fn notification_to_jsonrpc(
 }
 
 pub fn parse_jsonrpc_message(line: &str) -> Result<PluginMessage, JsonRpcMessageError> {
-    let message: JsonRpcMessage =
-        serde_json::from_str(line).map_err(JsonRpcMessageError::invalid_json)?;
+    let (message, keys) = parse_channel_frame(line)?;
     match message {
         JsonRpcMessage::Response(response) => {
             ensure_jsonrpc_version(&response.jsonrpc)?;
+            // Ordinary result extensions stay accepted, but batch data must
+            // arrive through a `channel.event` request and its receipt.
+            if response.result.get("kind").and_then(Value::as_str)
+                == Some("ingress_events_received")
+                && response.result.get("events").is_some()
+            {
+                return Err(JsonRpcMessageError::message(
+                    "ingress control response contains inline batch events",
+                ));
+            }
             let id = response.id;
             let response = serde_json::from_value(response.result).map_err(|source| {
                 JsonRpcMessageError::message(format!("invalid plugin result payload: {source}"))
@@ -782,14 +1192,83 @@ pub fn parse_jsonrpc_message(line: &str) -> Result<PluginMessage, JsonRpcMessage
         }
         JsonRpcMessage::Notification(notification) => {
             ensure_jsonrpc_version(&notification.jsonrpc)?;
-            Ok(PluginMessage::Notification(decode_notification_params(
+            Ok(PluginMessage::Heartbeat(decode_notification_params(
                 &notification.method,
                 notification
                     .params
                     .ok_or(JsonRpcMessageError::MissingParams)?,
             )?))
         }
-        JsonRpcMessage::Request(_) => Err(JsonRpcMessageError::UnexpectedRequest),
+        JsonRpcMessage::Request(request) => {
+            ensure_exact_frame_keys(&keys, &["jsonrpc", "id", "method", "params"])?;
+            ensure_jsonrpc_version(&request.jsonrpc)?;
+            // The complete line is already allocated here; this bound limits
+            // what a host accepts as one durable batch frame.
+            if line.len() > MAX_CHANNEL_FRAME_BYTES {
+                return Err(JsonRpcMessageError::message(
+                    "channel batch frame exceeds its byte bound",
+                ));
+            }
+            if request.method != CHANNEL_EVENT_METHOD {
+                return Err(JsonRpcMessageError::UnexpectedRequest);
+            }
+            let params = request.params.ok_or(JsonRpcMessageError::MissingParams)?;
+            let event: ChannelEventRequest = serde_json::from_value(params.clone())
+                .map_err(JsonRpcMessageError::invalid_json)?;
+            // The original request preserves its typed shape, including the
+            // predecessor, so retries cannot change absent fields into nulls.
+            let typed_request =
+                serde_json::to_value(&event).map_err(JsonRpcMessageError::invalid_json)?;
+            if canonical_channel_value(params) != canonical_channel_value(typed_request) {
+                return Err(JsonRpcMessageError::message(
+                    "channel batch wire shape differs from its exact typed envelope",
+                ));
+            }
+            event.validate()?;
+            if request.id != event.request_id() {
+                return Err(JsonRpcMessageError::message(
+                    "channel batch request identity differs",
+                ));
+            }
+            Ok(PluginMessage::EventRequest {
+                id: request.id,
+                request: event,
+            })
+        }
+    }
+}
+
+fn parse_channel_frame(line: &str) -> Result<(JsonRpcMessage, Vec<String>), JsonRpcMessageError> {
+    let value: Value = serde_json::from_str(line).map_err(JsonRpcMessageError::invalid_json)?;
+    let keys = value
+        .as_object()
+        .ok_or_else(|| JsonRpcMessageError::invalid_json("channel frame must be a JSON object"))?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let message: JsonRpcMessage =
+        serde_json::from_value(value).map_err(JsonRpcMessageError::invalid_json)?;
+    Ok((message, keys))
+}
+
+/// Durable batch requests and receipts carry no envelope extensions.
+fn ensure_exact_frame_keys(keys: &[String], allowed: &[&str]) -> Result<(), JsonRpcMessageError> {
+    if keys.iter().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(JsonRpcMessageError::message(
+            "channel durable frame contains incompatible or unknown fields",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ingress_storage<C, M>(
+    request: &PluginRequest<C, M>,
+) -> Result<(), JsonRpcMessageError> {
+    match request {
+        PluginRequest::StartIngress { storage, .. }
+        | PluginRequest::PollIngress { storage, .. }
+        | PluginRequest::IngressEvent { storage, .. } => storage.validate(),
+        _ => Ok(()),
     }
 }
 
@@ -797,6 +1276,7 @@ fn request_params_with_version<C: Serialize, M: Serialize>(
     protocol_version: u32,
     request: &PluginRequest<C, M>,
 ) -> Result<Value, JsonRpcMessageError> {
+    validate_ingress_storage(request)?;
     let mut params = serde_json::to_value(request).map_err(|source| {
         JsonRpcMessageError::message(format!("failed to serialize request: {source}"))
     })?;
@@ -813,7 +1293,7 @@ fn request_params_with_version<C: Serialize, M: Serialize>(
 }
 
 fn notification_params_with_version(
-    envelope: &PluginNotificationEnvelope<ChannelEventNotification>,
+    envelope: &PluginNotificationEnvelope<ChannelHeartbeat>,
 ) -> Result<Value, JsonRpcMessageError> {
     let mut params = serde_json::to_value(&envelope.notification).map_err(|source| {
         JsonRpcMessageError::message(format!("failed to serialize notification: {source}"))
@@ -841,11 +1321,13 @@ fn decode_request_params<C: DeserializeOwned, M: DeserializeOwned>(
         .remove("protocol_version")
         .ok_or(JsonRpcMessageError::MissingProtocolVersion)?
         .as_u64()
-        .ok_or(JsonRpcMessageError::InvalidProtocolVersion)? as u32;
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(JsonRpcMessageError::InvalidProtocolVersion)?;
     let request: PluginRequest<C, M> =
         serde_json::from_value(Value::Object(object)).map_err(|source| {
             JsonRpcMessageError::message(format!("invalid plugin request params: {source}"))
         })?;
+    validate_ingress_storage(&request)?;
     let expected_method = request_method(&request);
     if expected_method != method {
         return Err(JsonRpcMessageError::MethodMismatch {
@@ -862,8 +1344,8 @@ fn decode_request_params<C: DeserializeOwned, M: DeserializeOwned>(
 fn decode_notification_params(
     method: &str,
     params: Value,
-) -> Result<PluginNotificationEnvelope<ChannelEventNotification>, JsonRpcMessageError> {
-    if method != CHANNEL_EVENT_NOTIFICATION_METHOD {
+) -> Result<PluginNotificationEnvelope<ChannelHeartbeat>, JsonRpcMessageError> {
+    if method != CHANNEL_HEARTBEAT_METHOD {
         return Err(JsonRpcMessageError::UnexpectedNotificationMethod(
             method.to_string(),
         ));
@@ -876,7 +1358,11 @@ fn decode_notification_params(
         .remove("protocol_version")
         .ok_or(JsonRpcMessageError::MissingProtocolVersion)?
         .as_u64()
-        .ok_or(JsonRpcMessageError::InvalidProtocolVersion)? as u32;
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(JsonRpcMessageError::InvalidProtocolVersion)?;
+    if protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
+        return Err(JsonRpcMessageError::InvalidProtocolVersion);
+    }
     let notification = serde_json::from_value(Value::Object(object)).map_err(|source| {
         JsonRpcMessageError::message(format!("invalid channel notification payload: {source}"))
     })?;
@@ -917,6 +1403,543 @@ mod tests {
     use super::*;
 
     type JsonRequest = PluginRequest<serde_json::Value, serde_json::Value>;
+
+    fn empty_cursor_request(cursor: &str) -> ChannelEventRequest {
+        ChannelEventRequest::new(
+            ChannelEventBatch {
+                events: vec![],
+                state: Some(IngressState {
+                    mode: IngressMode::Polling,
+                    status: "running".into(),
+                    endpoint: None,
+                    metadata: BTreeMap::from([("cursor".into(), cursor.into())]),
+                }),
+                poll_after_ms: Some(100),
+            },
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_digest_is_lowercase_sha256_of_canonical_bytes() {
+        let empty = ChannelEventBatch {
+            events: vec![],
+            state: None,
+            poll_after_ms: None,
+        };
+        assert_eq!(
+            canonical_channel_batch_bytes(&empty).unwrap(),
+            br#"{"events":[]}"#
+        );
+        assert_eq!(
+            ChannelEventRequest::new(empty, None).unwrap().batch_digest,
+            "24de1c4a19c43ad41b013f13dcd858c17b0daa7f33a53f19913e5b11366d1c2e"
+        );
+        let paced = ChannelEventRequest::new(
+            ChannelEventBatch {
+                events: vec![],
+                state: None,
+                poll_after_ms: Some(100),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            paced.batch_digest,
+            "371e1d003b2839e4c815bbba85786f31954405ae611b6948424e9f771c7086fd"
+        );
+        assert_eq!(
+            paced.request_id(),
+            RequestId::String(format!("channel:{}", paced.batch_digest))
+        );
+    }
+
+    #[test]
+    fn event_content_excludes_only_the_top_level_host_observation() {
+        let value = serde_json::json!({
+            "event_id":"event", "platform":"test", "event_type":"message.received",
+            "received_at":"2026-10-14T00:00:00Z",
+            "conversation":{"id":"conversation", "kind":"private", "thread_id":"thread",
+                "parent_message_id":"parent", "workspace_id":"workspace", "parent_conversation_id":"root"},
+            "actor":{"id":"author", "display_name":"name", "username":"user", "is_bot":false,
+                "metadata":{"received_at":"actor time"}},
+            "message":{"id":"message", "content":"hello", "content_type":"text/plain",
+                "reply_to_message_id":"reply", "attachments":[{"id":"file", "kind":"image",
+                    "url":"https://example.invalid/file", "mime_type":"image/png", "size_bytes":1,
+                    "name":"image", "storage_key":"storage", "extracted_text":"text",
+                    "extras":{"received_at":"attachment time"}}],
+                "metadata":{"received_at":"message time"}},
+            "account_id":"account", "activation":{"reason":"direct_message",
+                "agent_account_id":"agent", "referenced_message_author_id":"agent"},
+            "metadata":{"received_at":"metadata time"}
+        });
+        let original: InboundEventEnvelope = serde_json::from_value(value.clone()).unwrap();
+        let expected = canonical_channel_event_content_bytes(&original).unwrap();
+        let mut observed = original.clone();
+        observed.received_at = "2026-10-15T00:00:00Z".into();
+        assert_eq!(
+            canonical_channel_event_content_bytes(&observed).unwrap(),
+            expected
+        );
+        let batch = |event| ChannelEventBatch {
+            events: vec![event],
+            state: None,
+            poll_after_ms: None,
+        };
+        assert_ne!(
+            channel_batch_digest(&batch(original)).unwrap(),
+            channel_batch_digest(&batch(observed)).unwrap()
+        );
+        for pointer in [
+            "/event_id",
+            "/platform",
+            "/event_type",
+            "/conversation/id",
+            "/conversation/kind",
+            "/conversation/thread_id",
+            "/conversation/parent_message_id",
+            "/conversation/workspace_id",
+            "/conversation/parent_conversation_id",
+            "/actor/id",
+            "/actor/display_name",
+            "/actor/username",
+            "/actor/is_bot",
+            "/actor/metadata/received_at",
+            "/message/id",
+            "/message/content",
+            "/message/content_type",
+            "/message/reply_to_message_id",
+            "/message/attachments/0/id",
+            "/message/attachments/0/kind",
+            "/message/attachments/0/url",
+            "/message/attachments/0/mime_type",
+            "/message/attachments/0/size_bytes",
+            "/message/attachments/0/name",
+            "/message/attachments/0/storage_key",
+            "/message/attachments/0/extracted_text",
+            "/message/attachments/0/extras/received_at",
+            "/message/metadata/received_at",
+            "/account_id",
+            "/activation/reason",
+            "/activation/agent_account_id",
+            "/activation/referenced_message_author_id",
+            "/metadata/received_at",
+        ] {
+            let mut changed = value.clone();
+            let field = changed.pointer_mut(pointer).unwrap();
+            let replacement = if field.is_boolean() {
+                Value::Bool(true)
+            } else if field.is_number() {
+                Value::from(2)
+            } else {
+                Value::String("changed".into())
+            };
+            *field = replacement;
+            let event = serde_json::from_value(changed).unwrap();
+            assert_ne!(
+                canonical_channel_event_content_bytes(&event).unwrap(),
+                expected,
+                "{pointer} must remain in content identity"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_progress_batches_require_exact_receipts_and_heartbeat_has_no_state() {
+        let original = empty_cursor_request("before");
+        let next = empty_cursor_request("after");
+        assert!(original.acceptance().unwrap().matches(&original));
+        assert!(!original.acceptance().unwrap().matches(&next));
+        let wire = event_request_to_jsonrpc(&original).unwrap();
+        assert!(matches!(
+            parse_jsonrpc_message(&wire).unwrap(),
+            PluginMessage::EventRequest { .. }
+        ));
+        let heartbeat = heartbeat_to_jsonrpc(&PluginNotificationEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            notification: ChannelHeartbeat {
+                metadata: BTreeMap::from([("status".into(), "alive".into())]),
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            parse_jsonrpc_message(&heartbeat).unwrap(),
+            PluginMessage::Heartbeat(_)
+        ));
+        let mut malformed: Value = serde_json::from_str(&heartbeat).unwrap();
+        malformed["params"]["state"] = serde_json::to_value(&original.batch.state).unwrap();
+        assert!(parse_jsonrpc_message(&malformed.to_string()).is_err());
+        malformed["params"].as_object_mut().unwrap().remove("state");
+        malformed["params"]["protocol_version"] = Value::from(1u64 + (1u64 << 32));
+        assert!(parse_jsonrpc_message(&malformed.to_string()).is_err());
+    }
+
+    #[test]
+    fn predecessor_is_part_of_the_original_frame_but_not_the_content_digest() {
+        let first = empty_cursor_request("1");
+        let bare = empty_cursor_request("2");
+        let next = ChannelEventRequest::new(bare.batch.clone(), Some(first.acceptance().unwrap()))
+            .unwrap();
+        assert_eq!(next.batch_digest, bare.batch_digest);
+        assert_ne!(next, bare);
+        let wire = event_request_to_jsonrpc(&next).unwrap();
+        assert!(
+            matches!(parse_jsonrpc_message(&wire).unwrap(), PluginMessage::EventRequest { request, .. } if request == next)
+        );
+        let recovery = ChannelIngressRecovery {
+            request: next.clone(),
+            acceptance: next.acceptance().unwrap(),
+            state: next.batch.state.clone(),
+        };
+        recovery.validate().unwrap();
+        let mut wrong = recovery.clone();
+        wrong.acceptance = first.acceptance().unwrap();
+        assert!(wrong.validate().is_err());
+        let mut wrong_state = recovery.clone();
+        wrong_state.state = None;
+        assert!(wrong_state.validate().is_err());
+        let recurring =
+            ChannelEventRequest::new(next.batch.clone(), Some(next.acceptance().unwrap())).unwrap();
+        assert_eq!(recurring.batch_digest, next.batch_digest);
+        assert_eq!(recurring.acceptance().unwrap().sequence(), 3);
+        // Occurrences of identical content share a request ID, so only the
+        // full sequence-bearing receipt identifies which one was accepted.
+        assert_eq!(recurring.request_id(), next.request_id());
+        assert_ne!(recurring.acceptance().unwrap(), next.acceptance().unwrap());
+        assert!(!next.acceptance().unwrap().matches(&recurring));
+        assert!(!recurring.acceptance().unwrap().matches(&next));
+        let mut wrong_version = first;
+        wrong_version.protocol_version = 1;
+        assert!(wrong_version.validate().is_err());
+        let mut null_predecessor: Value =
+            serde_json::from_str(&event_request_to_jsonrpc(&bare).unwrap()).unwrap();
+        null_predecessor["params"]["previous_acceptance"] = Value::Null;
+        assert!(parse_jsonrpc_message(&null_predecessor.to_string()).is_err());
+    }
+
+    #[test]
+    fn acceptance_sequences_are_positive_exact_and_fail_closed_at_overflow() {
+        let first = empty_cursor_request("first");
+        let receipt = first.acceptance().unwrap();
+        assert_eq!(receipt.sequence(), 1);
+        let next =
+            ChannelEventRequest::new(empty_cursor_request("next").batch, Some(receipt.clone()))
+                .unwrap();
+        let next_receipt = next.acceptance().unwrap();
+        assert_eq!(next_receipt.sequence(), 2);
+        let mut wire: Value = serde_json::from_str(
+            &event_acceptance_to_jsonrpc(&first.request_id(), &receipt).unwrap(),
+        )
+        .unwrap();
+        for sequence in [Value::from(0), Value::from(-1), Value::from(1.5)] {
+            wire["result"]["sequence"] = sequence;
+            assert!(parse_plugin_input::<Value, Value>(&wire.to_string()).is_err());
+        }
+        wire["result"].as_object_mut().unwrap().remove("sequence");
+        assert!(parse_plugin_input::<Value, Value>(&wire.to_string()).is_err());
+        let mut wrong = next_receipt.clone();
+        let ChannelEventAcceptance::Accepted { sequence, .. } = &mut wrong;
+        *sequence = 3;
+        assert!(!wrong.matches(&next));
+        let mut last = receipt;
+        let ChannelEventAcceptance::Accepted { sequence, .. } = &mut last;
+        *sequence = u64::MAX - 1;
+        let final_successor =
+            ChannelEventRequest::new(next.batch.clone(), Some(last.clone())).unwrap();
+        assert_eq!(final_successor.acceptance().unwrap().sequence(), u64::MAX);
+        let ChannelEventAcceptance::Accepted { sequence, .. } = &mut last;
+        *sequence = u64::MAX;
+        assert!(ChannelEventRequest::new(next.batch.clone(), Some(last.clone())).is_err());
+        // A decoded frame naming the final receipt is refused before any host work.
+        let mut overflow = final_successor;
+        overflow.previous_acceptance = Some(last);
+        assert!(overflow.validate().is_err());
+        assert!(overflow.acceptance().is_err());
+    }
+
+    #[test]
+    fn strict_frames_reject_legacy_inline_events_and_ambiguous_receipts() {
+        let request = empty_cursor_request("42");
+        let receipt =
+            event_acceptance_to_jsonrpc(&request.request_id(), &request.acceptance().unwrap())
+                .unwrap();
+        let mut mixed: Value = serde_json::from_str(&receipt).unwrap();
+        mixed["method"] = Value::String("channel.health".into());
+        assert!(parse_plugin_input::<Value, Value>(&mixed.to_string()).is_err());
+        let mut wrong_id: Value = serde_json::from_str(&receipt).unwrap();
+        wrong_id["id"] = Value::String("another-request".into());
+        assert!(parse_plugin_input::<Value, Value>(&wrong_id.to_string()).is_err());
+        let mut unknown: Value = serde_json::from_str(&receipt).unwrap();
+        unknown["result"]["extra"] = Value::Bool(true);
+        assert!(parse_plugin_input::<Value, Value>(&unknown.to_string()).is_err());
+        let mut partial: Value = serde_json::from_str(&receipt).unwrap();
+        partial["result"]["event_ids"] = serde_json::json!(["not-in-batch"]);
+        let PluginInput::EventAcceptance { acceptance, .. } =
+            parse_plugin_input::<Value, Value>(&partial.to_string()).unwrap()
+        else {
+            panic!("expected a receipt");
+        };
+        assert!(!acceptance.matches(&request));
+        let control = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"kind": "ingress_events_received", "events": []}
+        });
+        assert!(parse_jsonrpc_response(&control.to_string()).is_err());
+        let legacy = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": CHANNEL_EVENT_METHOD,
+            "params": {"protocol_version": 1, "events": []}
+        });
+        assert!(matches!(
+            parse_jsonrpc_message(&legacy.to_string()),
+            Err(JsonRpcMessageError::UnexpectedNotificationMethod(_))
+        ));
+        let mut request_wire: Value =
+            serde_json::from_str(&event_request_to_jsonrpc(&request).unwrap()).unwrap();
+        request_wire["params"]["batch"]["state"]["unknown"] = Value::Bool(true);
+        assert!(parse_jsonrpc_message(&request_wire.to_string()).is_err());
+        let mut null_default: Value =
+            serde_json::from_str(&event_request_to_jsonrpc(&request).unwrap()).unwrap();
+        null_default["params"]["batch"]["state"]["endpoint"] = Value::Null;
+        assert!(parse_jsonrpc_message(&null_default.to_string()).is_err());
+        let mut wrong_request_id: Value =
+            serde_json::from_str(&event_request_to_jsonrpc(&request).unwrap()).unwrap();
+        wrong_request_id["id"] = Value::from(1);
+        assert!(parse_jsonrpc_message(&wrong_request_id.to_string()).is_err());
+    }
+
+    #[test]
+    fn ingress_storage_is_required_checked_and_canonical_digest_preserves_arrays() {
+        let absent = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "channel.poll_ingress",
+            "params": {"protocol_version": 1, "kind": "poll_ingress", "config": {}}
+        });
+        assert!(parse_plugin_input::<Value, Value>(&absent.to_string()).is_err());
+        for path in [
+            "relative.sqlite",
+            "/tmp/../other.sqlite",
+            "/",
+            "/tmp/bad\nname",
+        ] {
+            let storage = ChannelIngressStorage {
+                recovery: None,
+                journal_path: path.into(),
+            };
+            assert!(storage.validate().is_err());
+        }
+        let good = ChannelIngressStorage {
+            recovery: None,
+            journal_path: "/tmp/owned/incoming.sqlite".into(),
+        };
+        good.validate().unwrap();
+        let request = JsonRequest::PollIngress {
+            config: Value::Null,
+            storage: good,
+            state: None,
+        };
+        let frame = request_to_jsonrpc(
+            RequestId::Integer(9),
+            &PluginRequestEnvelope {
+                protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                request,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_plugin_input::<Value, Value>(&serde_json::to_string(&frame).unwrap()).unwrap(),
+            PluginInput::Request { .. }
+        ));
+        let first = serde_json::json!({"z": [{"b": 2, "a": 1}, 3], "a": 0});
+        let reordered = serde_json::json!({"a": 0, "z": [{"a": 1, "b": 2}, 3]});
+        assert_eq!(
+            canonical_channel_value(first.clone()),
+            canonical_channel_value(reordered)
+        );
+        assert_ne!(
+            canonical_channel_value(first),
+            canonical_channel_value(serde_json::json!({"a": 0, "z": [3, {"a": 1, "b": 2}]}))
+        );
+        let mut too_large = empty_cursor_request("42").batch;
+        too_large
+            .state
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("huge".into(), "x".repeat(MAX_CHANNEL_BATCH_BYTES));
+        assert!(ChannelEventRequest::new(too_large, None).is_err());
+    }
+
+    #[test]
+    fn batch_frame_bound_does_not_change_ordinary_requests_or_responses() {
+        let deliver = JsonRequest::Deliver {
+            config: Value::Null,
+            message: serde_json::json!({"content": "x".repeat(MAX_CHANNEL_FRAME_BYTES)}),
+        };
+        let frame = serde_json::to_string(
+            &request_to_jsonrpc(
+                RequestId::Integer(3),
+                &PluginRequestEnvelope {
+                    protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                    request: deliver,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(frame.len() > MAX_CHANNEL_FRAME_BYTES);
+        assert!(matches!(
+            parse_plugin_input::<Value, Value>(&frame).unwrap(),
+            PluginInput::Request { .. }
+        ));
+        let oversized_output = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"kind":"ok","pad":"{}"}}}}"#,
+            "x".repeat(MAX_CHANNEL_FRAME_BYTES)
+        );
+        assert!(matches!(
+            parse_jsonrpc_message(&oversized_output).unwrap(),
+            PluginMessage::Response { .. }
+        ));
+        let request = empty_cursor_request("42");
+        let mut oversized_batch: Value =
+            serde_json::from_str(&event_request_to_jsonrpc(&request).unwrap()).unwrap();
+        oversized_batch["params"]["batch"]["state"]["metadata"]["padding"] =
+            Value::String("x".repeat(MAX_CHANNEL_FRAME_BYTES));
+        assert!(parse_jsonrpc_message(&oversized_batch.to_string()).is_err());
+    }
+
+    #[test]
+    fn ordinary_health_response_extensions_remain_accepted() {
+        let wire = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"kind": "health", "health": {"ok": true, "status": "ready"}, "extension": "provider metadata"}
+        });
+        assert!(matches!(
+            parse_jsonrpc_message(&wire.to_string()).unwrap(),
+            PluginMessage::Response {
+                response: PluginResponse::Health { .. },
+                ..
+            }
+        ));
+
+        // Ordinary JSON-RPC envelopes keep accepting top-level extensions.
+        let mut envelope = wire.clone();
+        envelope["trace"] = Value::String("provider-trace".into());
+        assert!(matches!(
+            parse_jsonrpc_message(&envelope.to_string()).unwrap(),
+            PluginMessage::Response {
+                response: PluginResponse::Health { .. },
+                ..
+            }
+        ));
+        let control = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "trace": "provider-trace",
+            "result": {"kind": "ingress_events_received", "poll_after_ms": 5, "extension": true}
+        });
+        assert!(matches!(
+            parse_jsonrpc_message(&control.to_string()).unwrap(),
+            PluginMessage::Response {
+                response: PluginResponse::IngressEventsReceived {
+                    poll_after_ms: Some(5),
+                    ..
+                },
+                ..
+            }
+        ));
+        let mut host_request = serde_json::to_value(
+            request_to_jsonrpc(
+                RequestId::Integer(4),
+                &PluginRequestEnvelope {
+                    protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                    request: JsonRequest::Health {
+                        config: Value::Null,
+                    },
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        host_request["trace"] = Value::String("host-trace".into());
+        assert!(matches!(
+            parse_plugin_input::<Value, Value>(&host_request.to_string()).unwrap(),
+            PluginInput::Request { .. }
+        ));
+
+        // Durable batch requests and receipts stay exact.
+        let request = empty_cursor_request("7");
+        let mut event: Value =
+            serde_json::from_str(&event_request_to_jsonrpc(&request).unwrap()).unwrap();
+        event["trace"] = Value::String("provider-trace".into());
+        assert!(parse_jsonrpc_message(&event.to_string()).is_err());
+        let mut receipt: Value = serde_json::from_str(
+            &event_acceptance_to_jsonrpc(&request.request_id(), &request.acceptance().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        receipt["trace"] = Value::String("host-trace".into());
+        assert!(parse_plugin_input::<Value, Value>(&receipt.to_string()).is_err());
+    }
+
+    #[test]
+    fn maximal_batch_and_escaped_predecessor_identities_fit_the_frame_bound() {
+        let mut batch = empty_cursor_request("cursor").batch;
+        batch
+            .state
+            .as_mut()
+            .unwrap()
+            .metadata
+            .insert("padding".into(), String::new());
+        let overhead = canonical_channel_batch_bytes(&batch).unwrap().len();
+        batch.state.as_mut().unwrap().metadata.insert(
+            "padding".into(),
+            "x".repeat(MAX_CHANNEL_BATCH_BYTES - overhead),
+        );
+        assert_eq!(
+            canonical_channel_batch_bytes(&batch).unwrap().len(),
+            MAX_CHANNEL_BATCH_BYTES
+        );
+        let previous = ChannelEventAcceptance::Accepted {
+            batch_digest: "1".repeat(64),
+            event_ids: (0..MAX_CHANNEL_BATCH_EVENTS)
+                .map(|index| format!("{index:02}{}", "\\".repeat(510)))
+                .collect(),
+            // The widest sequence that still admits a successor.
+            sequence: u64::MAX - 1,
+        };
+        let request = ChannelEventRequest::new(batch, Some(previous)).unwrap();
+        let wire = event_request_to_jsonrpc(&request).unwrap();
+        assert!(wire.len() <= MAX_CHANNEL_FRAME_BYTES);
+        assert!(
+            matches!(parse_jsonrpc_message(&wire).unwrap(), PluginMessage::EventRequest { request: decoded, .. } if decoded == request)
+        );
+        let recovery = ChannelIngressRecovery {
+            state: request.batch.state.clone(),
+            acceptance: request.acceptance().unwrap(),
+            request,
+        };
+        let start = PluginRequestEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: JsonRequest::StartIngress {
+                config: Value::Null,
+                storage: ChannelIngressStorage {
+                    journal_path: "/tmp/owned/producer.sqlite".into(),
+                    recovery: Some(recovery),
+                },
+                state: None,
+            },
+        };
+        let host_wire =
+            serde_json::to_string(&request_to_jsonrpc(RequestId::Integer(1), &start).unwrap())
+                .unwrap();
+        assert!(host_wire.len() > MAX_CHANNEL_FRAME_BYTES);
+        assert!(matches!(
+            parse_plugin_input::<Value, Value>(&host_wire).unwrap(),
+            PluginInput::Request { .. }
+        ));
+    }
     type JsonEnvelope = PluginRequestEnvelope<JsonRequest>;
 
     #[test]
@@ -1050,44 +2073,33 @@ mod tests {
 
     #[test]
     fn response_rejects_notification() {
-        let notification = JsonRpcNotification::new(
-            CHANNEL_EVENT_NOTIFICATION_METHOD,
-            Some(serde_json::json!({
-                "protocol_version": CHANNEL_PLUGIN_PROTOCOL_VERSION,
-                "events": [{
-                    "event_id": "evt-1",
-                    "platform": "telegram",
-                    "event_type": "message.received",
-                    "received_at": "2026-04-12T00:00:00Z",
-                    "conversation": {
-                        "id": "chat-1",
-                        "kind": "private"
-                    },
-                    "actor": {
-                        "id": "user-1",
-                        "is_bot": false,
-                        "metadata": {}
-                    },
-                    "message": {
-                        "id": "msg-1",
-                        "content": "hello",
-                        "content_type": "text/plain",
-                        "attachments": [],
-                        "metadata": {}
-                    },
-                    "metadata": {}
-                }],
-                "poll_after_ms": 25
-            })),
-        );
-        let json = serde_json::to_string(&notification).unwrap();
+        let heartbeat = heartbeat_to_jsonrpc(&PluginNotificationEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            notification: ChannelHeartbeat::default(),
+        })
+        .unwrap();
 
-        let error = parse_jsonrpc_response(&json).expect_err("expected notification to fail");
+        let error = parse_jsonrpc_response(&heartbeat).expect_err("expected notification to fail");
         assert!(
             error
                 .to_string()
                 .contains("expected JSON-RPC response, got notification")
         );
+
+        let legacy_event = JsonRpcNotification::new(
+            CHANNEL_EVENT_METHOD,
+            Some(serde_json::json!({
+                "protocol_version": CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                "events": [],
+                "poll_after_ms": 25
+            })),
+        );
+        let json = serde_json::to_string(&legacy_event).unwrap();
+        let error = parse_jsonrpc_response(&json).expect_err("expected legacy event to fail");
+        assert!(matches!(
+            error,
+            JsonRpcMessageError::UnexpectedNotificationMethod(_)
+        ));
     }
 
     #[test]
@@ -1096,6 +2108,10 @@ mod tests {
             protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             request: PluginRequest::IngressEvent {
                 config: serde_json::json!({ "channel": "twilio_sms" }),
+                storage: ChannelIngressStorage {
+                    recovery: None,
+                    journal_path: "/tmp/dispatch-ingress.sqlite".into(),
+                },
                 state: Some(IngressState {
                     mode: IngressMode::Webhook,
                     status: "running".to_string(),
@@ -1131,6 +2147,7 @@ mod tests {
             "request": {
                 "kind": "ingress_event",
                 "config": { "channel": "webhook" },
+                "storage": { "journal_path": "/tmp/dispatch-ingress.sqlite" },
                 "payload": {
                     "method": "POST",
                     "path": "/hook",
@@ -1156,6 +2173,10 @@ mod tests {
             protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             request: PluginRequest::StartIngress {
                 config: serde_json::json!({ "channel": "telegram" }),
+                storage: ChannelIngressStorage {
+                    recovery: None,
+                    journal_path: "/tmp/dispatch-ingress.sqlite".into(),
+                },
                 state: Some(IngressState {
                     mode: IngressMode::Polling,
                     status: "running".to_string(),
@@ -1176,6 +2197,10 @@ mod tests {
             protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
             request: PluginRequest::PollIngress {
                 config: serde_json::json!({ "channel": "slack" }),
+                storage: ChannelIngressStorage {
+                    recovery: None,
+                    journal_path: "/tmp/dispatch-ingress.sqlite".into(),
+                },
                 state: Some(IngressState {
                     mode: IngressMode::Polling,
                     status: "running".to_string(),
@@ -1196,7 +2221,6 @@ mod tests {
     #[test]
     fn polling_ingress_response_round_trips_json() {
         let response = PluginResponse::IngressEventsReceived {
-            events: Vec::new(),
             callback_reply: None,
             state: Some(IngressState {
                 mode: IngressMode::Polling,
@@ -1213,55 +2237,94 @@ mod tests {
     }
 
     #[test]
-    fn event_notification_round_trips_jsonrpc() {
-        let notification = PluginNotificationEnvelope {
-            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-            notification: ChannelEventNotification {
-                events: vec![InboundEventEnvelope {
-                    event_id: "evt-1".to_string(),
-                    platform: "signal".to_string(),
-                    event_type: "message.received".to_string(),
-                    received_at: "2026-04-12T00:00:00Z".to_string(),
-                    conversation: InboundConversationRef {
-                        id: "chat-1".to_string(),
-                        kind: "private".to_string(),
-                        thread_id: None,
-                        parent_message_id: None,
-                        workspace_id: None,
-                        parent_conversation_id: None,
-                    },
-                    actor: InboundActor {
-                        id: "user-1".to_string(),
-                        display_name: Some("User".to_string()),
-                        username: None,
-                        is_bot: false,
-                        metadata: BTreeMap::new(),
-                    },
-                    message: InboundMessage {
-                        id: "msg-1".to_string(),
-                        content: "hello".to_string(),
-                        content_type: "text/plain".to_string(),
-                        reply_to_message_id: None,
-                        attachments: Vec::new(),
-                        metadata: BTreeMap::new(),
-                    },
-                    account_id: None,
-                    activation: None,
+    fn event_request_and_exact_durable_acceptance_round_trip_in_both_directions() {
+        let batch = ChannelEventBatch {
+            events: vec![InboundEventEnvelope {
+                event_id: "evt-1".to_string(),
+                platform: "signal".to_string(),
+                event_type: "message.received".to_string(),
+                received_at: "2026-04-12T00:00:00Z".to_string(),
+                conversation: InboundConversationRef {
+                    id: "chat-1".to_string(),
+                    kind: "private".to_string(),
+                    thread_id: None,
+                    parent_message_id: None,
+                    workspace_id: None,
+                    parent_conversation_id: None,
+                },
+                actor: InboundActor {
+                    id: "user-1".to_string(),
+                    display_name: Some("User".to_string()),
+                    username: None,
+                    is_bot: false,
                     metadata: BTreeMap::new(),
-                }],
-                state: Some(IngressState {
-                    mode: IngressMode::Polling,
-                    status: "running".to_string(),
-                    endpoint: None,
-                    metadata: BTreeMap::from([("cursor".to_string(), "42".to_string())]),
-                }),
-                poll_after_ms: Some(250),
-            },
+                },
+                message: InboundMessage {
+                    id: "msg-1".to_string(),
+                    content: "hello".to_string(),
+                    content_type: "text/plain".to_string(),
+                    reply_to_message_id: None,
+                    attachments: Vec::new(),
+                    metadata: BTreeMap::new(),
+                },
+                account_id: None,
+                activation: None,
+                metadata: BTreeMap::new(),
+            }],
+            state: Some(IngressState {
+                mode: IngressMode::Polling,
+                status: "running".to_string(),
+                endpoint: None,
+                metadata: BTreeMap::from([("cursor".to_string(), "42".to_string())]),
+            }),
+            poll_after_ms: Some(250),
         };
-
-        let json = notification_to_jsonrpc(&notification).unwrap();
+        let request = ChannelEventRequest::new(batch, None).unwrap();
+        let json = event_request_to_jsonrpc(&request).unwrap();
         let parsed = parse_jsonrpc_message(&json).unwrap();
-        assert_eq!(parsed, PluginMessage::Notification(notification));
+        assert_eq!(
+            parsed,
+            PluginMessage::EventRequest {
+                id: request.request_id(),
+                request: request.clone(),
+            }
+        );
+        let acceptance = request.acceptance().unwrap();
+        let wire = event_acceptance_to_jsonrpc(&request.request_id(), &acceptance).unwrap();
+        assert_eq!(
+            parse_plugin_input::<Value, Value>(&wire).unwrap(),
+            PluginInput::EventAcceptance {
+                id: request.request_id(),
+                acceptance: acceptance.clone(),
+            }
+        );
+        assert!(acceptance.matches(&request));
+
+        let mut changed = request.clone();
+        changed.batch.events[0].message.content = "different original content".into();
+        assert!(changed.validate().is_err());
+        assert!(!acceptance.matches(&changed));
+        let changed = ChannelEventRequest::new(changed.batch, None).unwrap();
+        assert_ne!(changed.request_id(), request.request_id());
+        assert!(!acceptance.matches(&changed));
+
+        let mut duplicate = request.batch.clone();
+        duplicate.events.push(duplicate.events[0].clone());
+        assert!(ChannelEventRequest::new(duplicate, None).is_err());
+
+        let mut full = request.batch.clone();
+        full.events = (0..MAX_CHANNEL_BATCH_EVENTS)
+            .map(|index| {
+                let mut event = request.batch.events[0].clone();
+                event.event_id = format!("event-{index}");
+                event
+            })
+            .collect();
+        ChannelEventRequest::new(full.clone(), None).unwrap();
+        let mut extra = request.batch.events[0].clone();
+        extra.event_id = "extra".into();
+        full.events.push(extra);
+        assert!(ChannelEventRequest::new(full, None).is_err());
     }
 
     #[test]

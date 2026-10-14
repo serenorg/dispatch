@@ -1,16 +1,19 @@
+use crate::channel_inbox::{AcceptedBatch, ChannelInbox, InboxMode};
 use anyhow::{Context, Result, bail};
 use atomic_write_file::AtomicWriteFile;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use dispatch_core::{
-    AttachmentSource, ChannelEventNotification, ChannelPluginManifest, ChannelPluginRequest,
-    ChannelPluginResponse, DeliveryReceipt, InboundEventEnvelope, IngressCallbackReply,
-    IngressMode, IngressPayload, IngressState, OutboundAttachment, OutboundMessageEnvelope,
-    PersistentChannelPluginProcess, PluginNotificationEnvelope, build_channel_reply_envelope,
-    call_channel_plugin, call_channel_plugin_with_timeout, call_persistent_channel_plugin,
-    channel_event_session_file, default_channel_registry_path, drain_pending_channel_notifications,
+    AttachmentSource, ChannelIngressMessage, ChannelIngressStorage, ChannelPluginCallError,
+    ChannelPluginManifest, ChannelPluginRequest, ChannelPluginResponse, DeliveryReceipt,
+    InboundEventEnvelope, IngressCallbackReply, IngressMode, IngressPayload, IngressState,
+    OutboundAttachment, OutboundMessageEnvelope, PersistentChannelPluginProcess,
+    accept_persistent_channel_event, build_channel_reply_envelope, call_channel_plugin,
+    call_channel_plugin_with_sink, call_channel_plugin_with_timeout,
+    call_persistent_channel_plugin, call_persistent_channel_plugin_with_sink,
+    channel_event_session_file, default_channel_registry_path, drain_pending_channel_ingress,
     extract_assistant_channel_reply, install_channel_plugin, list_channel_catalog,
-    match_channel_ingress_endpoint, recv_persistent_channel_notification,
+    match_channel_ingress_endpoint, recv_persistent_channel_ingress,
     render_inbound_event_chat_input, resolve_channel_plugin, resolve_channel_plugin_for_ingress,
     shutdown_persistent_channel_plugin, spawn_persistent_channel_plugin,
     verify_host_managed_ingress_trust,
@@ -54,6 +57,7 @@ struct ChannelIngressArgs<'a> {
 
 struct IngressRequestParts<'a> {
     config: Value,
+    storage: ChannelIngressStorage,
     method: &'a str,
     path: &'a str,
     headers: &'a [String],
@@ -111,6 +115,7 @@ struct ActiveChannelRuntimePlugin {
     plugin: ChannelPluginManifest,
     process: PersistentChannelPluginProcess,
     ingress_state: Option<IngressState>,
+    inbox: ChannelInbox,
 }
 
 struct ChannelRuntimeEventContext<'a> {
@@ -223,6 +228,7 @@ impl ListenerStagedMedia {
 
 pub(crate) fn channel_command(command: crate::ChannelCommand) -> Result<()> {
     match command {
+        crate::ChannelCommand::Inbox { command } => channel_inbox_command(command),
         crate::ChannelCommand::Ls { json, registry } => channel_ls(registry.as_deref(), json),
         crate::ChannelCommand::Inspect {
             name,
@@ -396,6 +402,42 @@ fn channel_install(manifest: &Path, registry: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn channel_inbox_command(command: crate::ChannelInboxCommand) -> Result<()> {
+    match command {
+        crate::ChannelInboxCommand::List { path, after, limit } => {
+            let inbox = ChannelInbox::open(&absolute_inbox_path(&path)?, InboxMode::Inspect)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inbox.list(after, limit)?)?
+            );
+        }
+        crate::ChannelInboxCommand::Inspect { path, sequence } => {
+            let inbox = ChannelInbox::open(&absolute_inbox_path(&path)?, InboxMode::Inspect)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inbox.inspect(sequence)?)?
+            );
+        }
+        crate::ChannelInboxCommand::Retire { path, sequence } => {
+            let mut inbox = ChannelInbox::open(&absolute_inbox_path(&path)?, InboxMode::Retire)?;
+            inbox.retire(sequence)?;
+            println!(
+                "Retired channel batch payload; its event receipts remain for duplicate protection."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn absolute_inbox_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(env::current_dir()
+        .context("failed to resolve current working directory")?
+        .join(path))
+}
+
 fn channel_call(
     name: &str,
     request_json: Option<&str>,
@@ -404,7 +446,36 @@ fn channel_call(
     emit_json: bool,
 ) -> Result<()> {
     let plugin = resolve_channel_plugin(name, registry)?;
-    let request = load_request(request_json, request_file)?;
+    let mut request_value = load_request(request_json, request_file)?;
+    let ingress_config = match request_value.get("kind").and_then(Value::as_str) {
+        Some("start_ingress" | "poll_ingress" | "ingress_event") => {
+            Some(request_value.get("config").cloned().unwrap_or(Value::Null))
+        }
+        _ => None,
+    };
+    if let Some(config) = ingress_config {
+        let state_path = default_channel_ingress_state_path(&plugin.name, &plugin.name, &config)?;
+        let mut inbox = ChannelInbox::for_scope(&state_path)?;
+        // The journal location is host-owned, so request JSON never chooses it.
+        let Some(object) = request_value.as_object_mut() else {
+            bail!("channel request must be a JSON object");
+        };
+        object.insert(
+            "storage".to_string(),
+            serde_json::to_value(channel_ingress_storage(&state_path, &inbox)?)?,
+        );
+        let request: ChannelPluginRequest = serde_json::from_value(request_value)
+            .context("failed to parse channel ingress request")?;
+        let response = call_channel_plugin_with_sink(
+            &plugin,
+            request,
+            CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+            &mut inbox,
+        );
+        return print_channel_ingress_response(response, &mut inbox, emit_json);
+    }
+    let request: ChannelPluginRequest =
+        serde_json::from_value(request_value).context("failed to parse channel request")?;
     let response = call_channel_plugin(&plugin, request)?;
 
     print_channel_response(response, emit_json)
@@ -416,8 +487,11 @@ fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
         None => resolve_channel_plugin_for_ingress(args.method, args.path, args.registry)?,
     };
     let config = load_structured_value(args.config_json, args.config_file, "channel config")?;
+    let state_path = default_channel_ingress_state_path(&plugin.name, &plugin.name, &config)?;
+    let mut inbox = ChannelInbox::for_scope(&state_path)?;
     let request = build_ingress_request(IngressRequestParts {
         config,
+        storage: channel_ingress_storage(&state_path, &inbox)?,
         method: args.method,
         path: args.path,
         headers: args.headers,
@@ -428,13 +502,75 @@ fn channel_ingress(args: ChannelIngressArgs<'_>) -> Result<()> {
         trust_verified: args.trust_verified,
         received_at: args.received_at,
     })?;
-    let response = call_channel_plugin(&plugin, request)?;
+    let response = call_channel_plugin_with_sink(
+        &plugin,
+        request,
+        CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+        &mut inbox,
+    );
 
     if args.name.is_none() && !args.emit_json {
         println!("Resolved Plugin: {}", plugin.name);
     }
 
-    print_channel_response(response, args.emit_json)
+    print_channel_ingress_response(response, &mut inbox, args.emit_json)
+}
+
+/// Print the batches accepted by a one-shot call, then retire them as handled.
+fn print_channel_ingress_response(
+    response: Result<ChannelPluginResponse, ChannelPluginCallError>,
+    inbox: &mut ChannelInbox,
+    emit_json: bool,
+) -> Result<()> {
+    let accepted = inbox.take_accepted();
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "{} newly accepted channel batch(es) remain pending in {}",
+                accepted
+                    .iter()
+                    .filter(|batch| batch.event_count > 0)
+                    .count(),
+                inbox.path().display()
+            )));
+        }
+    };
+    let mut events = Vec::new();
+    for batch in &accepted {
+        events.extend(inbox.accepted_events(batch)?);
+    }
+    if emit_json {
+        let mut projection = serde_json::to_value(&response)?;
+        projection["events"] = serde_json::to_value(&events)?;
+        println!("{}", serde_json::to_string_pretty(&projection)?);
+    } else {
+        println!("Events: {}", events.len());
+        print_channel_response(response, false)?;
+        if !events.is_empty() {
+            println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+    }
+    for batch in &accepted {
+        inbox.retire_handled(batch)?;
+    }
+    Ok(())
+}
+
+fn channel_ingress_storage(
+    state_path: &Path,
+    inbox: &ChannelInbox,
+) -> Result<ChannelIngressStorage> {
+    let journal_path = state_path.with_extension("producer.sqlite");
+    let storage = ChannelIngressStorage {
+        recovery: inbox.recovery()?,
+        journal_path: journal_path
+            .to_str()
+            .context("channel journal path is not UTF-8")?
+            .to_owned(),
+    };
+    storage.validate()?;
+    Ok(storage)
 }
 
 fn channel_poll(args: ChannelPollArgs<'_>) -> Result<()> {
@@ -489,7 +625,15 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
     )?;
     let ingress_state_path =
         default_channel_ingress_state_path(&args.label, &plugin.name, &args.config)?;
-    let restored_state = load_channel_ingress_state(&ingress_state_path)?;
+    // Opening the inbox first restores the state file from the last accepted
+    // cursor, so the restored state never runs ahead of durable acceptance.
+    let inbox = ChannelInbox::for_scope(&ingress_state_path)?;
+    report_pending_channel_inbox(&inbox)?;
+    // The authenticated head is the effective cursor once one exists.
+    let restored_state = match inbox.recovery()? {
+        Some(head) => head.state,
+        None => load_channel_ingress_state(&ingress_state_path)?,
+    };
 
     if matches!(&args.mode, ChannelRuntimeMode::Poll { .. }) && args.once {
         return run_channel_poll_once(
@@ -497,15 +641,19 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
             &args.config,
             restored_state,
             &ingress_state_path,
+            inbox,
             parcel_bridge.as_ref(),
             args.emit_json,
         );
     }
 
-    let mut runtime = start_channel_runtime_plugin(&plugin, &args.config, restored_state)?;
-    if let Some(state) = &runtime.ingress_state {
-        save_channel_ingress_state(&ingress_state_path, state)?;
-    }
+    let mut runtime = start_channel_runtime_plugin(
+        &plugin,
+        &args.config,
+        restored_state,
+        &ingress_state_path,
+        inbox,
+    )?;
 
     let explicit_websocket = matches!(&args.mode, ChannelRuntimeMode::Websocket);
     match &args.mode {
@@ -567,26 +715,28 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
 
             let run_result = (|| -> Result<()> {
                 loop {
-                    let Some(notification) = recv_persistent_channel_notification(
+                    // Batches accepted while starting or delivering are handled
+                    // before waiting for more ingress.
+                    let handled = process_pending_channel_ingress(&mut runtime, &event_context)?;
+                    if args.once && handled.batches > 0 {
+                        break;
+                    }
+
+                    let Some(message) = recv_persistent_channel_ingress(
                         &mut runtime.process,
                         &runtime.plugin,
                         None,
                     )?
                     else {
                         bail!(
-                            "channel plugin `{}` closed its ingress notification stream",
+                            "channel plugin `{}` closed its ingress stream",
                             runtime.plugin.name
                         );
                     };
 
-                    let _handled = handle_channel_runtime_notification(
-                        &mut runtime,
-                        notification,
-                        &event_context,
-                    )?;
-                    let _handled_pending =
-                        process_pending_channel_notifications(&mut runtime, &event_context)?;
-                    if args.once {
+                    let received_batch = matches!(&message, ChannelIngressMessage::Events { .. });
+                    handle_channel_runtime_ingress(&mut runtime, message, &event_context)?;
+                    if args.once && received_batch {
                         break;
                     }
                 }
@@ -651,9 +801,9 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
 
             let run_result = (|| -> Result<()> {
                 loop {
-                    let handled_notifications =
-                        process_pending_channel_notifications(&mut runtime, &event_context)?;
-                    if args.once && handled_notifications > 0 {
+                    let handled_pending =
+                        process_pending_channel_ingress(&mut runtime, &event_context)?;
+                    if args.once && handled_pending.events > 0 {
                         break;
                     }
 
@@ -671,8 +821,8 @@ pub(crate) fn run_channel_runtime_binding(args: ChannelRuntimeBindingArgs) -> Re
                     }
 
                     let handled_pending =
-                        process_pending_channel_notifications(&mut runtime, &event_context)?;
-                    if args.once && handled_pending > 0 {
+                        process_pending_channel_ingress(&mut runtime, &event_context)?;
+                    if args.once && handled_pending.events > 0 {
                         break;
                     }
                 }
@@ -698,67 +848,82 @@ fn run_channel_poll_once(
     config: &Value,
     restored_state: Option<IngressState>,
     ingress_state_path: &Path,
+    mut inbox: ChannelInbox,
     parcel_bridge: Option<&ChannelParcelBridge>,
     emit_json: bool,
 ) -> Result<()> {
     let staged_media = ListenerStagedMedia::from_config(&Value::Null);
     let timeout = poll_request_timeout(config);
-    let response = call_channel_plugin_with_timeout(
+    let response = call_channel_plugin_with_sink(
         plugin,
         ChannelPluginRequest::PollIngress {
             config: config.clone(),
+            storage: channel_ingress_storage(ingress_state_path, &inbox)?,
             state: restored_state,
         },
         timeout,
-    )?;
+        &mut inbox,
+    );
 
-    match response {
-        ChannelPluginResponse::IngressEventsReceived {
-            events,
-            callback_reply: _,
-            state,
-            poll_after_ms,
-        } => {
-            if let Some(state) = &state {
-                save_channel_ingress_state(ingress_state_path, state)?;
-            }
-            let parcel_runs =
-                execute_channel_parcel_runs(plugin, parcel_bridge, &events, |event, reply| {
-                    deliver_channel_reply_once(plugin, event, config, &staged_media, reply)
-                })?;
-
-            if emit_json {
+    // Accepted batches are handled even when the control exchange fails after
+    // their receipts, because the producer may already have released them.
+    let accepted = inbox.take_accepted();
+    let mut events = Vec::new();
+    for batch in &accepted {
+        events.extend(inbox.accepted_events(batch)?);
+    }
+    // Report the head's effective cursor, which a cursorless batch inherits.
+    let state = if accepted.is_empty() {
+        None
+    } else {
+        inbox.recovery()?.and_then(|head| head.state)
+    };
+    let parcel_runs =
+        execute_channel_parcel_runs(plugin, parcel_bridge, &events, |event, reply| {
+            deliver_channel_reply_once(plugin, event, config, &staged_media, reply)
+        })?;
+    let poll_after_ms = match &response {
+        Ok(ChannelPluginResponse::IngressEventsReceived { poll_after_ms, .. }) => *poll_after_ms,
+        _ => None,
+    };
+    if response.is_ok() || !events.is_empty() {
+        if emit_json {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "plugin": plugin.name,
+                    "events": events,
+                    "parcel_runs": parcel_runs,
+                    "state": state,
+                    "poll_after_ms": poll_after_ms,
+                }))?
+            );
+        } else {
+            println!("Poll {} -> {} event(s)", plugin.name, events.len());
+            for parcel_run in &parcel_runs {
                 println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "plugin": plugin.name,
-                        "events": events,
-                        "parcel_runs": parcel_runs,
-                        "state": state,
-                        "poll_after_ms": poll_after_ms,
-                    }))?
+                    "Parcel {} -> {}",
+                    parcel_run.event_id,
+                    parcel_run.session_file.display()
                 );
-            } else {
-                println!("Poll {} -> {} event(s)", plugin.name, events.len());
-                for parcel_run in &parcel_runs {
+                if let Some(delivery) = &parcel_run.delivery {
                     println!(
-                        "Parcel {} -> {}",
-                        parcel_run.event_id,
-                        parcel_run.session_file.display()
+                        "Delivered reply: {} -> {}",
+                        delivery.reference.message_id, delivery.reference.conversation_id
                     );
-                    if let Some(delivery) = &parcel_run.delivery {
-                        println!(
-                            "Delivered reply: {} -> {}",
-                            delivery.reference.message_id, delivery.reference.conversation_id
-                        );
-                    }
-                    if !parcel_run.output.is_empty() {
-                        print!("{}", parcel_run.output);
-                    }
+                }
+                if !parcel_run.output.is_empty() {
+                    print!("{}", parcel_run.output);
                 }
             }
-            Ok(())
         }
+    }
+    for batch in &accepted {
+        inbox.retire_handled(batch)?;
+    }
+
+    match response? {
+        ChannelPluginResponse::IngressEventsReceived { .. } => Ok(()),
         ChannelPluginResponse::Error { error } => bail!(
             "channel plugin error {} while polling ingress: {}",
             error.code,
@@ -769,6 +934,21 @@ fn run_channel_poll_once(
             response_kind(&other)
         ),
     }
+}
+
+/// Warn about accepted batches whose handling did not complete. They are
+/// never rerun automatically because their side effects are uncertain.
+fn report_pending_channel_inbox(inbox: &ChannelInbox) -> Result<()> {
+    let pending = inbox.pending_count()?;
+    if pending > 0 {
+        eprintln!(
+            "warning: channel inbox {} retains {pending} accepted batch(es) whose handling did \
+            not complete; review them with `dispatch channel inbox list` and retire finished \
+            or abandoned work explicitly",
+            inbox.path().display()
+        );
+    }
+    Ok(())
 }
 
 fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> Result<()> {
@@ -817,12 +997,10 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
         ChannelPluginResponse::IngressEventsReceived {
-            events,
             callback_reply,
             state,
             poll_after_ms,
         } => {
-            println!("Events: {}", events.len());
             if let Some(callback_reply) = callback_reply {
                 println!("Callback Reply:");
                 println!("{}", serde_json::to_string_pretty(&callback_reply)?);
@@ -833,9 +1011,6 @@ fn print_channel_response(response: ChannelPluginResponse, emit_json: bool) -> R
             }
             if let Some(poll_after_ms) = poll_after_ms {
                 println!("Poll After: {poll_after_ms}ms");
-            }
-            if !events.is_empty() {
-                println!("{}", serde_json::to_string_pretty(&events)?);
             }
         }
         ChannelPluginResponse::Delivered { delivery }
@@ -899,10 +1074,7 @@ struct ParsedHttpRequest {
     body: Option<String>,
 }
 
-fn load_request(
-    request_json: Option<&str>,
-    request_file: Option<&Path>,
-) -> Result<ChannelPluginRequest> {
+fn load_request(request_json: Option<&str>, request_file: Option<&Path>) -> Result<Value> {
     match (request_json, request_file) {
         (Some(_), Some(_)) => bail!("use either --request-json or --request-file, not both"),
         (None, None) => bail!("channel call requires --request-json or --request-file"),
@@ -973,6 +1145,7 @@ fn build_ingress_request(parts: IngressRequestParts<'_>) -> Result<ChannelPlugin
 
     Ok(ChannelPluginRequest::IngressEvent {
         config: parts.config,
+        storage: parts.storage,
         state: None,
         payload: IngressPayload {
             endpoint_id: parts.endpoint_id,
@@ -1066,11 +1239,12 @@ fn handle_channel_listener_connection(
         }
     };
 
-    let response = call_persistent_channel_plugin(
+    let response = call_persistent_channel_plugin_with_sink(
         &mut runtime.process,
         &runtime.plugin,
         ChannelPluginRequest::IngressEvent {
             config: event_context.config.clone(),
+            storage: channel_ingress_storage(event_context.ingress_state_path, &runtime.inbox)?,
             state: runtime.ingress_state.clone(),
             payload: IngressPayload {
                 endpoint_id: Some(format!("{}:{}", runtime.plugin.name, matched_endpoint.path)),
@@ -1085,30 +1259,26 @@ fn handle_channel_listener_connection(
             },
         },
         CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+        &mut runtime.inbox,
     );
 
-    match response {
-        Ok(ChannelPluginResponse::IngressEventsReceived {
-            events,
-            callback_reply,
-            state,
-            ..
-        }) => {
-            if let Some(state) = state {
-                save_channel_ingress_state(event_context.ingress_state_path, &state)?;
-                runtime.ingress_state = Some(state);
-            }
-            let _handled_events = emit_channel_runtime_events(
-                runtime,
-                event_context,
-                events,
-                None,
-                Some(format!(
-                    "Ingress {} {} from {}",
-                    parsed.method, parsed.path, remote_addr
-                )),
-            )?;
+    // Batches accepted during this exchange are handled whatever its outcome.
+    let source = format!(
+        "Ingress {} {} from {}",
+        parsed.method, parsed.path, remote_addr
+    );
+    if let Err(error) = handle_accepted_channel_batches(runtime, event_context, &source) {
+        respond_http_request(
+            request,
+            500,
+            Some("text/plain; charset=utf-8"),
+            "failed to handle accepted channel batch\n",
+        )?;
+        return Err(error);
+    }
 
+    match response {
+        Ok(ChannelPluginResponse::IngressEventsReceived { callback_reply, .. }) => {
             let reply = callback_reply.unwrap_or(IngressCallbackReply {
                 status: 200,
                 content_type: Some("text/plain; charset=utf-8".to_string()),
@@ -1150,7 +1320,8 @@ fn handle_channel_listener_connection(
                 Some("text/plain; charset=utf-8"),
                 &format!("failed to call channel plugin: {error}\n"),
             )?;
-            Ok(true)
+            // A failed exchange stops the plugin process, so the binding ends.
+            Err(error.into())
         }
     }
 }
@@ -1203,22 +1374,30 @@ fn start_channel_runtime_plugin(
     plugin: &ChannelPluginManifest,
     config: &Value,
     restored_state: Option<IngressState>,
+    ingress_state_path: &Path,
+    mut inbox: ChannelInbox,
 ) -> Result<ActiveChannelRuntimePlugin> {
+    let storage = channel_ingress_storage(ingress_state_path, &inbox)?;
     let mut process = spawn_persistent_channel_plugin(plugin)?;
-    let response = call_persistent_channel_plugin(
+    // Replayed batches can arrive before `ingress_started`; accepting them
+    // inline lets a plugin wait for receipts without stalling the start.
+    let response = call_persistent_channel_plugin_with_sink(
         &mut process,
         plugin,
         ChannelPluginRequest::StartIngress {
             config: config.clone(),
+            storage,
             state: restored_state,
         },
         CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+        &mut inbox,
     )?;
     match response {
         ChannelPluginResponse::IngressStarted { state } => Ok(ActiveChannelRuntimePlugin {
             plugin: plugin.clone(),
             process,
             ingress_state: Some(state),
+            inbox,
         }),
         ChannelPluginResponse::Error { error } => bail!(
             "channel plugin error {} while starting ingress: {}",
@@ -1273,34 +1452,82 @@ fn stop_channel_runtime_plugin(
     }
 }
 
-fn process_pending_channel_notifications(
-    runtime: &mut ActiveChannelRuntimePlugin,
-    event_context: &ChannelRuntimeEventContext<'_>,
-) -> Result<usize> {
-    let mut handled_events = 0;
-    for notification in drain_pending_channel_notifications(&mut runtime.process) {
-        handled_events +=
-            handle_channel_runtime_notification(runtime, notification, event_context)?;
-    }
-    Ok(handled_events)
+#[derive(Debug, Default, Clone, Copy)]
+struct HandledIngress {
+    batches: usize,
+    events: usize,
 }
 
-fn handle_channel_runtime_notification(
+fn process_pending_channel_ingress(
     runtime: &mut ActiveChannelRuntimePlugin,
-    notification: PluginNotificationEnvelope<ChannelEventNotification>,
     event_context: &ChannelRuntimeEventContext<'_>,
-) -> Result<usize> {
-    if let Some(state) = notification.notification.state {
-        save_channel_ingress_state(event_context.ingress_state_path, &state)?;
-        runtime.ingress_state = Some(state);
+) -> Result<HandledIngress> {
+    let mut handled = HandledIngress::default();
+    for message in drain_pending_channel_ingress(&mut runtime.process) {
+        let current = handle_channel_runtime_ingress(runtime, message, event_context)?;
+        handled.batches += current.batches;
+        handled.events += current.events;
     }
-    emit_channel_runtime_events(
-        runtime,
-        event_context,
-        notification.notification.events,
-        notification.notification.poll_after_ms,
-        Some(event_context.source.to_string()),
-    )
+    let current = handle_accepted_channel_batches(runtime, event_context, event_context.source)?;
+    handled.batches += current.batches;
+    handled.events += current.events;
+    Ok(handled)
+}
+
+fn handle_channel_runtime_ingress(
+    runtime: &mut ActiveChannelRuntimePlugin,
+    message: ChannelIngressMessage,
+    event_context: &ChannelRuntimeEventContext<'_>,
+) -> Result<HandledIngress> {
+    match message {
+        ChannelIngressMessage::Heartbeat(_) => Ok(HandledIngress::default()),
+        ChannelIngressMessage::Events { request, .. } => {
+            let accepted = accept_persistent_channel_event(
+                &mut runtime.process,
+                &runtime.plugin,
+                &request,
+                &mut runtime.inbox,
+            );
+            // A committed batch is handled even if writing its receipt failed;
+            // a replayed batch is acknowledged again but never handled twice.
+            let handled =
+                handle_accepted_channel_batches(runtime, event_context, event_context.source)?;
+            accepted?;
+            Ok(handled)
+        }
+    }
+}
+
+/// Handle every batch newly accepted by this host, retiring each one only
+/// after its events were emitted and every parcel run and reply succeeded.
+fn handle_accepted_channel_batches(
+    runtime: &mut ActiveChannelRuntimePlugin,
+    event_context: &ChannelRuntimeEventContext<'_>,
+    source: &str,
+) -> Result<HandledIngress> {
+    let mut handled = HandledIngress::default();
+    loop {
+        // Replies delivered while handling can accept further batches.
+        let accepted: Vec<AcceptedBatch> = runtime.inbox.take_accepted();
+        if accepted.is_empty() {
+            return Ok(handled);
+        }
+        for batch in accepted {
+            let events = runtime.inbox.accepted_events(&batch)?;
+            if let Some(state) = &batch.state {
+                runtime.ingress_state = Some(state.clone());
+            }
+            handled.events += emit_channel_runtime_events(
+                runtime,
+                event_context,
+                events,
+                batch.poll_after_ms,
+                Some(source.to_string()),
+            )?;
+            runtime.inbox.retire_handled(&batch)?;
+            handled.batches += 1;
+        }
+    }
 }
 
 fn emit_channel_runtime_events(
@@ -1422,7 +1649,9 @@ fn deliver_channel_reply(
     let message = serde_json::to_value(build_channel_reply_envelope(event, reply))
         .context("failed to serialize channel reply envelope")?;
 
-    let response = call_persistent_channel_plugin(
+    // The plugin may wait for a batch receipt before it answers, so batches
+    // received during delivery are accepted here and handled afterwards.
+    let response = call_persistent_channel_plugin_with_sink(
         &mut runtime.process,
         &runtime.plugin,
         ChannelPluginRequest::Deliver {
@@ -1430,6 +1659,7 @@ fn deliver_channel_reply(
             message,
         },
         CHANNEL_RUNTIME_REQUEST_TIMEOUT,
+        &mut runtime.inbox,
     )?;
     match response {
         ChannelPluginResponse::Delivered { delivery } => Ok(Some(delivery)),
@@ -1788,6 +2018,14 @@ fn default_channel_ingress_state_path(
     plugin_name: &str,
     config: &Value,
 ) -> Result<PathBuf> {
+    if plugin_name.is_empty()
+        || matches!(plugin_name, "." | "..")
+        || plugin_name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | ':'))
+    {
+        bail!("channel plugin name cannot select a storage path");
+    }
     let cwd = env::current_dir().context("failed to resolve current working directory")?;
     let mut config_hasher = Sha256::new();
     config_hasher.update(
@@ -1819,7 +2057,7 @@ fn sanitize_path_component(value: &str) -> String {
     }
 }
 
-fn load_channel_ingress_state(path: &Path) -> Result<Option<IngressState>> {
+pub(crate) fn load_channel_ingress_state(path: &Path) -> Result<Option<IngressState>> {
     let body = match fs::read_to_string(path) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1833,7 +2071,7 @@ fn load_channel_ingress_state(path: &Path) -> Result<Option<IngressState>> {
     Ok(Some(state))
 }
 
-fn save_channel_ingress_state(path: &Path, state: &IngressState) -> Result<()> {
+pub(crate) fn save_channel_ingress_state(path: &Path, state: &IngressState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1853,13 +2091,32 @@ fn save_channel_ingress_state(path: &Path, state: &IngressState) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn plugin_names_cannot_redirect_host_owned_ingress_storage() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "/tmp/foreign",
+            "../foreign",
+            "parent\\foreign",
+            "C:foreign",
+            "bad\nname",
+        ] {
+            assert!(default_channel_ingress_state_path("binding", name, &Value::Null).is_err());
+        }
+        assert!(
+            default_channel_ingress_state_path("binding", "channel-demo", &Value::Null).is_ok()
+        );
+    }
+
     fn test_plugin_with_attachment_sources(
         attachment_sources: Vec<AttachmentSource>,
     ) -> ChannelPluginManifest {
         ChannelPluginManifest {
             name: "channel-test".to_string(),
             version: "0.1.0".to_string(),
-            protocol_version: 1,
+            protocol_version: dispatch_core::CHANNEL_PLUGIN_PROTOCOL_VERSION,
             transport: dispatch_core::PluginTransport::Jsonl,
             description: None,
             exec: dispatch_core::ChannelPluginExec {
@@ -1901,6 +2158,10 @@ mod tests {
     fn build_ingress_request_defaults_to_empty_body_and_config() {
         let request = build_ingress_request(IngressRequestParts {
             config: json!({}),
+            storage: ChannelIngressStorage {
+                recovery: None,
+                journal_path: "/tmp/dispatch-ingress.sqlite".into(),
+            },
             method: "POST",
             path: "/hook",
             headers: &["Content-Type=application/json".to_string()],
@@ -1917,10 +2178,12 @@ mod tests {
             config,
             state,
             payload,
+            storage,
         } = request
         else {
             panic!("expected ingress request");
         };
+        assert_eq!(storage.journal_path, "/tmp/dispatch-ingress.sqlite");
         assert_eq!(config, json!({}));
         assert_eq!(state, None);
         assert_eq!(payload.method, "POST");

@@ -845,6 +845,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "nix 0.31.2",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
@@ -865,6 +866,7 @@ dependencies = [
  "dispatch-plugin-rpc",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

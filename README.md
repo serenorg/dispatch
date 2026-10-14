@@ -582,6 +582,8 @@ For project-scoped runtime wiring, use `dispatch up`. The two halves of `dispatc
 
 See `examples/runtime/telegram-bot/dispatch.toml` for a concrete project-level runtime config example.
 
+Channel protocol 2 plugins deliver inbound batches through a durable receipt chain in persistent sessions, one-shot polling, and webhook calls; rebuild older channel plugins and update their manifest protocol before installation. Before a binding receives channel batches, run `dispatch secret init` for the project: the CLI stores one accepted original head and unfinished work in an encrypted inbox under `.dispatch/channel-state/` with that existing key. Preserve the inbox, the plugin journal, and the key across restarts. The CLI retires completed payloads after successful handling and retains event-identity receipts to prevent repeat side effects. It never reruns interrupted work automatically; review that work with `dispatch channel inbox list` and `dispatch channel inbox inspect`, then retire it explicitly. See [durable event requests](docs/extensions.md#durable-event-requests) and [CLI acceptance inbox](docs/extensions.md#cli-acceptance-inbox) for the protocol contract, storage paths, capacity, and owner commands.
+
 ### Extension discovery
 
 Third-party couriers and channels live in their own repositories. Dispatch discovers them through **catalogs** - JSON index documents at stable URLs, analogous to Homebrew taps. Each repo publishes its own catalog at `catalog/extensions.json`, users register the catalog URL once, and the entries become searchable locally.
