@@ -2073,6 +2073,9 @@ pub(crate) fn load_channel_ingress_state(path: &Path) -> Result<Option<IngressSt
 
 pub(crate) fn save_channel_ingress_state(path: &Path, state: &IngressState) -> Result<()> {
     if let Some(parent) = path.parent() {
+        #[cfg(windows)]
+        crate::channel_inbox::ensure_private_scope_directory(parent)?;
+        #[cfg(not(windows))]
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }

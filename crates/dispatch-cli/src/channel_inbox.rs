@@ -1,4 +1,7 @@
 use crate::channel_cmds::{load_channel_ingress_state, save_channel_ingress_state};
+
+#[cfg(windows)]
+mod windows_scope;
 use anyhow::{Context, Result, bail};
 use dispatch_core::{
     ChannelEventAcceptance, ChannelEventRequest, ChannelIngressRecovery, DurableChannelEventSink,
@@ -279,6 +282,16 @@ impl ChannelInbox {
                 .any(|part| matches!(part, Component::ParentDir))
         {
             bail!("channel inbox requires an absolute owned path");
+        }
+        #[cfg(windows)]
+        {
+            let parent = path
+                .parent()
+                .context("channel inbox has no parent directory")?;
+            match mode {
+                InboxMode::Host => ensure_private_scope_directory(parent)?,
+                InboxMode::Inspect | InboxMode::Retire => windows_scope::validate(parent)?,
+            }
         }
         if mode != InboxMode::Inspect {
             encrypt_local_payload(&secrets, KEY_CHECK_CONTEXT, b"").context(
@@ -798,8 +811,15 @@ fn ensure_inbox_schema(connection: &mut Connection, path: &Path, mode: InboxMode
     sync_parent_directory(path)
 }
 
-/// Create the host-owned scope directory, restricting it to its owner on Unix.
-fn ensure_private_scope_directory(directory: &Path) -> Result<()> {
+/// Provision the channel scope without adopting shared Windows directories.
+#[cfg(windows)]
+pub(crate) fn ensure_private_scope_directory(directory: &Path) -> Result<()> {
+    windows_scope::ensure(directory)
+}
+
+/// Keep the existing Unix scope-directory permission behavior.
+#[cfg(not(windows))]
+pub(crate) fn ensure_private_scope_directory(directory: &Path) -> Result<()> {
     fs::create_dir_all(directory)
         .with_context(|| format!("failed to create {}", directory.display()))?;
     let metadata = fs::symlink_metadata(directory)
@@ -825,6 +845,9 @@ fn create_private_inbox_file(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("channel inbox has no parent directory")?;
+    #[cfg(windows)]
+    ensure_private_scope_directory(parent)?;
+    #[cfg(not(windows))]
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1608,7 +1631,7 @@ mod tests {
     fn first_cursorless_head_inherits_saved_state_and_file_mirrors_the_head() {
         let fixture = Fixture::new();
         let state_path = fixture.state_path("binding");
-        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        ensure_private_scope_directory(state_path.parent().unwrap()).unwrap();
         fs::write(&state_path, serde_json::to_vec(&cursor_state(7)).unwrap()).unwrap();
         let cursorless = |inbox: &ChannelInbox, poll_after_ms| {
             successor(
@@ -1635,7 +1658,7 @@ mod tests {
 
         // Without any saved cursor, the head has none and the file is removed.
         let other = fixture.state_path("fresh");
-        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        ensure_private_scope_directory(other.parent().unwrap()).unwrap();
         let mut fresh = fixture.host("fresh");
         let first = cursorless(&fresh, 1);
         fresh.accept(&first).unwrap();
@@ -1744,9 +1767,10 @@ mod tests {
         assert!(fixture.owner("absent", InboxMode::Retire).is_err());
         assert!(fixture.owner("absent", InboxMode::Inspect).is_err());
         assert!(!fixture.inbox_path("absent").exists());
+        assert!(!fixture.inbox_path("absent").parent().unwrap().exists());
 
         let empty = fixture.inbox_path("empty");
-        fs::create_dir_all(empty.parent().unwrap()).unwrap();
+        ensure_private_scope_directory(empty.parent().unwrap()).unwrap();
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
