@@ -80,7 +80,7 @@ Examples: Telegram, Discord, Slack, WhatsApp, Signal, Twilio SMS, generic webhoo
 
 Channel plugins vary by platform, but the protocol covers the full inbound and outbound lifecycle: configuration, health, ingress setup, webhook forwarding or background receive loops, delivery, push, and status frames.
 
-Dispatch keeps channel plugins alive as persistent subprocesses while a listener, long-running poller, or plugin-owned websocket connection is active. The host still speaks JSON-RPC 2.0 messages over JSONL stdio, but inbound channel activity is delivered back to the host as `channel.event` notifications during persistent ingress sessions. Dispatch also supports a one-shot `poll_ingress` request for explicit single-cycle polling.
+Dispatch keeps channel plugins alive during active listeners, pollers, and websocket connections. Plugins send inbound batches as `channel.event` JSON-RPC requests. The host returns an exact receipt only after it saves the complete batch durably. One-shot polling and webhook calls use the same receipt exchange before their control response.
 
 For channel ingress, `start_ingress` is the primary session-oriented contract. `poll_ingress` remains as the auxiliary one-shot receive primitive used when the host explicitly wants a single fetch cycle rather than a long-lived ingress session.
 
@@ -92,7 +92,7 @@ For channel plugins specifically:
 
 - The long-lived process is scoped to an active channel ingress session, not to a single agent turn and not to the entire host forever.
 - Host-initiated operations such as `configure`, `health`, `deliver`, `push`, `status`, `poll_ingress`, `stop_ingress`, and `shutdown` remain ordinary JSON-RPC requests with terminal responses.
-- Spontaneous inbound activity is modeled as `channel.event` notifications because the host did not initiate those events at a specific moment.
+- Spontaneous inbound activity uses `channel.event` requests so the plugin can confirm durable host acceptance.
 
 ### Provider plugins
 
@@ -207,7 +207,7 @@ Common ingress patterns:
 
 - Telegram polling uses the Bot API `getUpdates` HTTP flow inside the plugin.
 - Signal polling uses either upstream HTTP receive (`native` / `normal`) or websocket-backed receive (`json-rpc`) inside the plugin.
-- Slack polling uses Socket Mode: the plugin opens Slack's websocket via `apps.connections.open`, acknowledges each `envelope_id`, and emits normalized ingress notifications to the host.
+- Slack polling uses Socket Mode through `apps.connections.open`. The plugin saves each consumed envelope in its pending journal before provider acknowledgment. It sends normalized batches through the exact durable host receipt exchange.
 
 `dispatch up` is the project-level runtime binding command. It reads `dispatch.toml`, reconciles declared extension manifests into project-local registries under `.dispatch/registries/`, validates or applies declared deployment bindings, and starts the configured channel bindings without mutating the global registries under `~/.config/dispatch/`. Use `dispatch up --dry-run` to preview installs, deployment bindings, and channel bindings without mutating registries, invoking deployment plugins, or starting listeners/pollers.
 
@@ -282,7 +282,7 @@ Channel plugin manifest example (`channel-plugin.json`):
   "name": "channel-telegram",
   "version": "0.1.0",
   "protocol": "jsonl",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "description": "Telegram channel plugin for Dispatch.",
   "entrypoint": {
     "command": "./target/release/channel-telegram",
@@ -376,7 +376,7 @@ Each request from the host is a JSON-RPC request line:
   "id": 1,
   "method": "channel.capabilities",
   "params": {
-    "protocol_version": 1,
+    "protocol_version": 2,
     "kind": "capabilities"
   }
 }
@@ -402,7 +402,7 @@ Errors are returned as JSON-RPC error responses. Dispatch-specific structured er
 
 Dispatch keeps the manifest transport value as `"jsonl"` because the framing is still one JSON message per line on stdio. JSON-RPC defines the message shape; the manifest transport defines how those messages are carried between host and plugin.
 
-Dispatch does not currently use JSON-RPC batch requests for channel plugins. The host keeps at most one request in flight per plugin stream and expects each terminal response `id` to match the active request.
+Dispatch does not use JSON-RPC batch requests for channel plugins. Each direction has at most one active request: the host sends one control request at a time with increasing integer IDs, and the plugin has at most one unacknowledged `channel.event` request. The plugin's stdin reader separates host requests from event receipts by their checked message shape and exact ID (`parse_plugin_input`). A plugin that waits for an event receipt must keep reading stdin and must still answer host control requests, because a host can send a control request before it acknowledges a batch. After any failed exchange on a persistent session, the host stops that plugin process instead of reusing a stream whose position is unknown. Ordinary requests, responses, errors, and heartbeats keep accepting additional top-level JSON-RPC members and additional result members, as before. Only `channel.event` requests and their receipts must contain exactly their defined members.
 
 ### Request types
 
@@ -411,10 +411,10 @@ Dispatch does not currently use JSON-RPC batch requests for channel plugins. The
 | `capabilities` | (none) | Query plugin features |
 | `configure` | `config` | Validate config, report metadata |
 | `health` | `config` | Verify credentials and connectivity |
-| `poll_ingress` | `config`, `state?` | Perform one polling cycle and return events directly |
-| `start_ingress` | `config`, `state?` | Start or resume an ingress session |
+| `poll_ingress` | `config`, `storage`, `state?` | Perform one polling cycle through the durable batch exchange |
+| `start_ingress` | `config`, `storage`, `state?` | Start or resume an ingress session |
 | `stop_ingress` | `config`, `state?` | Deregister webhook / stop listening |
-| `ingress_event` | `config`, `state?`, `payload` | Parse a raw webhook into events |
+| `ingress_event` | `config`, `storage`, `state?`, `payload` | Parse a raw webhook through the durable batch exchange |
 | `deliver` | `config`, `message` | Send reply to existing conversation |
 | `push` | `config`, `message` | Send proactive/broadcast message |
 | `status` | `config`, `update` | Relay agent progress to channel |
@@ -458,21 +458,34 @@ These are the typed response payloads carried in JSON-RPC success responses:
 | `health` | `health` | Connectivity report |
 | `ingress_started` | `state` | Webhook registered |
 | `ingress_stopped` | `state` | Webhook deregistered |
-| `ingress_events_received` | `events`, `callback_reply?`, `state?`, `poll_after_ms?` | Parsed inbound events |
+| `ingress_events_received` | `callback_reply?`, `state?`, `poll_after_ms?` | Control response after the batch receipt |
 | `delivered` | `delivery` | Delivery receipt |
 | `pushed` | `delivery` | Push delivery receipt |
 | `status_accepted` | `status` | Status acknowledgment |
 | `ok` | (none) | Generic success for shutdown/ack-only operations |
 
-### Notification types
+### Durable event requests
 
-Channel plugins may emit JSON-RPC notifications between requests while an ingress session is active:
+`ChannelEventRequest` contains `protocol_version`, `batch_digest`, `batch`, and optional `previous_acceptance`. The batch contains ordered `events`, optional original `state`, and optional `poll_after_ms`. The request ID is exactly `channel:<batch_digest>`. Channel protocol 2 replaces the released inline-notification contract: rebuild plugins against this protocol and declare `protocol_version: 2`; the host rejects older manifests before launch.
 
-| Method | Params | Purpose |
-|---|---|---|
-| `channel.event` | `protocol_version`, `events`, `state?`, `poll_after_ms?` | Deliver normalized inbound events from a persistent ingress session |
+The digest is the lowercase hexadecimal SHA-256 of the canonical batch bytes: compact `serde_json` serialization of the typed `ChannelEventBatch` with recursively sorted object keys, raw UTF-8 strings, and unchanged array order. The predecessor receipt does not affect the content digest, but it belongs to the immutable original request. The wire request must equal its typed shape: include default fields, omit absent optional fields instead of sending `null`, and omit unknown fields. Producers outside Rust must reproduce these bytes, including `serde_json` string escaping; the host ends a persistent session when the frame differs.
 
-Dispatch does not currently use JSON-RPC batch requests for channel plugins, and the host never pipelines multiple concurrent requests into the same plugin process. Notifications are therefore the only async message shape on the channel side of the protocol.
+The host returns `ChannelEventAcceptance::Accepted` with `kind: "accepted"`, the exact digest, the exact ordered `event_ids`, and a required positive `sequence`. The response ID matches the request ID. This receipt confirms durable storage only. It does not confirm execution or delivery, and it does not permit the host to erase accepted work. Unknown fields, partial receipts, and mismatched IDs fail closed. The host assigns sequence 1 to the first head. After checking the actual durable predecessor, it assigns the checked predecessor sequence plus 1 to a successor; an exhausted sequence fails without a receipt. An exact current-head replay keeps its original sequence. Identical batch content has an identical request ID, but a later recurrence gets a new sequence, so delayed intermediate frames cannot match the current receipt. Because occurrences can share a request ID, a producer applies a receipt only when it equals the full expected receipt of its outstanding frame, including `sequence`; a receipt for an earlier occurrence is not an acknowledgment of the current one. A producer may compute the expected receipt with `ChannelEventRequest::acceptance()`, which returns a `Result`; that calculation does not authorize acceptance or choose host state.
+
+Each batch has at most 32 events, unique non-empty event IDs, and 2 MiB of canonical JSON. The host limits a batch request line to 2 MiB plus 36 KiB, including the bounded predecessor receipt; ordinary requests and responses keep their existing size contract. The generic SDK reader reads a complete line before the batch parser enforces that limit, so it does not promise bounded allocation for stdout from a local plugin. Empty progress batches require a durable receipt before cursor progress. The producer retains one original pending batch and replays it without changing its predecessor, state, order, or grouping. After receiving the exact receipt, the producer persists the accepted original request and receipt before clearing pending work or advancing its cursor. A successor must carry the exact current-head receipt. The host returns the same receipt only for an exact current-head replay and rejects old frames after a successor replaces the head. A successor can reuse a content digest already present in the current head or pending work: its new sequence owns the occurrence, and event receipts prevent reoffering prior work. The host preserves older pending originals and stores a duplicate-only occurrence as a retired head. Pruned older digests are not remembered, so permanent duplicate protection comes from the per-event receipts described under the CLI acceptance inbox. The sequence identifies each accepted occurrence even when earlier completed batch records have been pruned; a delayed frame with an older predecessor receipt is refused. An unchanged poll has the same digest as the current head; producers replay the saved original for efficiency rather than constructing a new occurrence. In a `poll_ingress` or `ingress_event` call, it replays the saved original head frame and waits for its receipt, because the host rejects those control responses without a batch receipt. In a persistent session, it may instead send nothing or a liveness heartbeat. A host does not bound how long it takes to return a receipt; the producer waits for the session or call to end rather than timing out and re-sending, and treats a repeated exact sequence-bearing receipt as idempotent. If the producer journal holds an accepted head but `storage.recovery` is absent, the host has no matching head (for example, after its inbox was lost) and refuses every successor. The producer then fails closed, keeping its journal, until the owner restores the host inbox or explicitly resets the producer journal. The producer must save consumed provider data before the provider acknowledges it, or rely on a verified provider replay guarantee. This SDK cannot recover data that a provider library acknowledges before the plugin's first durable journal write.
+
+`storage` is a required `ChannelIngressStorage` object with an absolute `journal_path` and optional checked `recovery` in `start_ingress`, `poll_ingress`, and `ingress_event` requests. `ChannelIngressRecovery` carries the host's accepted original `request`, matching `acceptance`, and effective accepted `state`. The host commits that state with each head: use the original batch state when present, or retain the preceding durable head's accepted state when the original omits it. Recovery validation requires equality when the original includes state; an absent effective state means no accepted cursor. Producers restore this checked accepted state, including inherited state, rather than using a control-response cursor. The host derives the storage path and recovery from its authenticated storage scope; provider configuration and request JSON cannot choose them. The producer restores an accepted original and cursor only when it has no conflicting pending original. A pending original that matches the recovered request can accept that same receipt; a pending successor whose predecessor matches the recovered receipt remains pending. Other conflicts fail without erasing the journal. Relative paths, parent traversal, control characters, and paths without a file name are rejected. The plugin journal needs storage that survives the failures its provider cannot replay. A generic host cannot infer whether a deployment volume is durable or encrypted, so the deployment owner must provide that guarantee.
+
+`channel.heartbeat` is a notification containing `protocol_version` and string `metadata` only. It reports liveness, never advances a cursor, and never confirms acceptance. A busy host may drop heartbeats. An `ingress_events_received` result that carries inline `events`, and notification-form `channel.event`, are rejected; other result members are ignored as before.
+
+Generic SDK hosts implement `DurableChannelEventSink`. Its `accept` method returns the exact receipt only after the complete original batch is durable; an error leaves the batch unacknowledged. The host writes receipt bytes only after `accept` returns a matching receipt:
+
+- `call_channel_plugin_with_sink` runs one request in a fresh plugin process and keeps plugin stdin open until the control response, so the plugin can wait for each receipt.
+- `call_persistent_channel_plugin_with_sink` accepts batches that arrive during any persistent control request, including `start_ingress` and `deliver`.
+- `call_persistent_channel_plugin` queues batches that arrive during a control request without acknowledging them; the host acknowledges them later with `accept_persistent_channel_event`.
+- `recv_persistent_channel_ingress` returns spontaneous batches and heartbeats.
+
+A call accepts at most 32 batches. A `poll_ingress` or `ingress_event` success without at least one batch receipt is rejected, and those requests require a sink. A batch sent during a one-shot call without a sink is a protocol error.
 
 ### Ingress event flow
 
@@ -482,24 +495,55 @@ When the host receives a webhook POST for a channel:
 2. Host may validate a declared host-managed trust policy and set `trust_verified`
 3. Plugin validates the signature only when `trust_verified` is false
 4. Plugin parses the platform-specific payload
-5. Plugin responds with normalized `InboundEventEnvelope`s
-6. Host returns the optional `callback_reply` to the webhook caller
+5. Plugin sends the original normalized batch, which may be empty, in an ID-bearing `channel.event` request
+6. Host saves the complete batch and returns its exact receipt
+7. Plugin returns the control response
+8. Host handles the accepted events and returns the optional `callback_reply` to the webhook caller
 
 Installed channel manifests may also retain ingress endpoint declarations so the host can match a request path and method before forwarding the payload to the plugin.
 
 When using `dispatch channel listen`, the host sends `start_ingress` before entering the HTTP serve loop, forwards webhook payloads through `ingress_event` requests, and finally sends `stop_ingress` followed by `shutdown` when the listener exits cleanly.
 
-For long-running polling or websocket bindings, the host sends `start_ingress` with the last saved opaque state (if any), then waits for `channel.event` notifications from the plugin. Each notification carries:
+For long-running polling or websocket bindings, the host sends `start_ingress` with its journal storage and the last accepted opaque state. It then receives `channel.event` requests. Each batch carries:
 
 - `events` - zero or more normalized inbound events
 - `state?` - updated opaque ingress state such as cursors
 - `poll_after_ms?` - plugin-provided advisory pacing metadata
 
-The host checkpoints `state` between runs. This lets repeated `dispatch channel poll --once` invocations resume from the last plugin cursor without replaying old events.
+The host saves cursor progress only from a durably accepted original batch. State in `ingress_started`, `ingress_stopped`, `ingress_events_received`, or a heartbeat is not acceptance evidence and never becomes the saved cursor.
 
-For CLI-driven one-shot polling, Dispatch sends `poll_ingress` with the last saved opaque state, expects a single `ingress_events_received` response, saves any returned `state`, and exits. This path is useful when the plugin's upstream transport is itself long-poll or websocket-backed and a true one-shot fetch is more appropriate than starting a persistent ingress session only to tear it down immediately.
+For one-shot polling, Dispatch keeps plugin stdin open while it saves and acknowledges batches. The plugin then returns `ingress_events_received` and exits. A replayed batch receives the same exact receipt without starting another parcel turn.
 
-`callback_reply` is only valid for webhook `ingress_event` handling. Polling and websocket notifications should leave it unset because they are not a direct HTTP callback path.
+`callback_reply` is only valid for webhook `ingress_event` handling. Polling and websocket control responses leave it unset.
+
+### CLI acceptance inbox
+
+Channel plugins own provider sessions, provider I/O, and their producer journals, and they keep each batch, including its cursor state, in that journal until a runtime accepts it durably. After that receipt, the runtime owns the accepted work and its accepted cursor. Dispatch's library defines the durable-acceptance interface, `DurableChannelEventSink`, without choosing a storage engine; the standalone CLI runtime implements it with the inbox described in this section.
+
+The CLI host stores accepted batches in an encrypted SQLite inbox. Run `dispatch secret init` for the project before receiving channel batches; the inbox uses that existing Dispatch secrets key and never creates a key. The key resolves from the inbox path like other project secrets: the nearest `.dispatch` directory above the inbox, or `DISPATCH_SECRET_STORE_ROOT` when set. Use the same setting for the host and for owner commands. Replacing the key, for example with `dispatch secret init --force`, makes the existing inbox unreadable.
+
+Each binding stores its cursor state at `<project>/.dispatch/channel-state/<plugin>/<label>-<config-hash>.json`. The inbox is the same path with the `.inbox.sqlite` extension, and the plugin journal path sent as `storage.journal_path` uses `.producer.sqlite`. On Unix, the host keeps that `<plugin>` scope directory private to its owner (mode 0700) because it also holds the producer journal, and the inbox file must stay private (mode 0600) and must not be a symbolic link. Each encrypted record is authenticated against its location below the Dispatch root and its batch digest, so the project directory can move, but an inbox file copied to another binding path cannot be read there. Preserve the inbox, the plugin journal, and the secrets key across host restarts. A temporary filesystem does not provide restart durability, and restoring an older inbox backup rolls back its acceptance history.
+
+On Windows, Dispatch does not configure or validate ACLs. Before a binding receives channel messages, place the project on persistent storage and restrict its `.dispatch` directory, and the `.dispatch` directory under `DISPATCH_SECRET_STORE_ROOT` when that variable is set, to the account that runs Dispatch and trusted administrators. Directories and files that Dispatch and channel plugins create below it, including the scope directories, state files, inbox, and producer journals, normally inherit those access controls. The host inbox is encrypted, but plugins can store message contents in their producer journals, so inbox encryption does not protect a shared scope directory or secrets key. Plugins built on `dispatch-channel-runtime` validate their journal directory, the `<plugin>` scope directory, separately and refuse it without repair: it must be owned by the account running the plugin and allow access only to that account, SYSTEM, and the built-in Administrators group. Use a filesystem with persistent ACLs, a path without junctions or other reparse points, and plain path components without alternate data streams, trailing dots or spaces, or DOS device names such as `NUL`. Ownership is not inherited: Dispatch creates a missing scope directory with the process's default owner, which for an elevated process is normally the Administrators group. For elevated runs, create the scope directory in advance and set its owner to the running account explicitly; granting access alone is insufficient.
+
+When the host accepts a batch, it commits the encrypted original, receipt, event-identity receipts, and effective cursor in one transaction before returning the receipt. That committed head is the durable cursor. The host then projects it to the state file; if that projection fails, the host warns and the next open repairs it. Once a head exists, the state file mirrors the head's effective cursor exactly: opening the inbox rewrites the file, or removes it when the head has no accepted cursor, and bindings start from the head's cursor. The first head inherits a cursor that a host saved in the state file before the inbox existed when its original batch has no state. The poll, listen, and runtime paths handle newly accepted events even when the control response fails afterwards. The `call` and `ingress` commands instead leave accepted work pending when the control response fails. After the host emits the events and confirms successful configured parcel runs and reply delivery, it retires their pending payload. The inbox retains one encrypted current head, including the full original and receipt, for recovery and exact replay. A successor replaces that head and removes completed predecessor records. Empty progress therefore retains one head rather than a growing batch history.
+
+Accepted batches remain pending when handling fails, is interrupted, or never starts. The CLI does not distinguish these cases and never reruns retained work automatically, because an interrupted turn can have unknown side effects. It warns about pending batches when a binding starts; durable acceptance preserves the work for owner inspection but does not guarantee automatic completion. If the owner retires a batch before the host that accepted it handles it, that host skips the batch with a warning. `list` and `inspect` open the inbox read-only; after a host crash leaves an SQLite rollback journal, they can fail until a host or `retire` opens the inbox read-write. The inbox retains at most 256 pending batches. When it is full, occurrences with new executable events are refused without a receipt, so the producer keeps them, until the owner retires pending work. Descriptor pages contain at most 32 records and no batch content; each descriptor exposes its positive receipt `sequence` and content digest. Owner inspection and retirement use that sequence because several retained occurrences can share a digest. Every encrypted record authenticates its digest and sequence.
+
+Inspect pending work before retiring it:
+
+```sh
+dispatch channel inbox list .dispatch/channel-state/<plugin>/<label>-<config-hash>.inbox.sqlite --limit 32
+dispatch channel inbox inspect .dispatch/channel-state/<plugin>/<label>-<config-hash>.inbox.sqlite <sequence>
+```
+
+Retirement clears pending work. The current head retains its full encrypted original for producer recovery until a successor replaces it. Before you retire a batch, verify that its work finished or decide explicitly to abandon it:
+
+```sh
+dispatch channel inbox retire .dispatch/channel-state/<plugin>/<label>-<config-hash>.inbox.sqlite <sequence>
+```
+
+Retirement restores pending capacity. It preserves the full current head until a successor replaces it, and removes completed older batch records entirely, so no batch-level marker remains for them. Event-identity and content receipts remain as durable side-effect idempotency receipts. They are HMAC-SHA256 tags under a key derived from the existing Dispatch key, so they reveal nothing about event content without that key, but they are not encrypted records: anyone who can modify the inbox file can delete or corrupt them. Those rows grow with actual events, not empty polls, and the CLI has no command to prune them. A batch refused for changed content under an accepted event ID stops that binding until the producer or owner resolves it. If a later successor regroups an identical accepted event, the host receipts the full batch but does not offer that event for execution again. It refuses changed original content under an accepted event ID. `canonical_channel_event_content_bytes` defines event retry identity as the compact canonical JSON of the complete typed event object, excluding only its top-level `received_at` host observation. It retains actor, routing, activation, content, attachments, and all metadata, including nested observation-like fields. Hosts apply their keyed event-content tag to those bytes. A later observation of the same semantic event adds no executable work and does not replace its first stored original. Full canonical batch bytes, batch digests, and original frames still include `received_at` and remain exact. Producers retain stable provider fields and metadata across retries. Preserve the inbox file to preserve those receipts; restoring an older backup also rolls back its acceptance history. `dispatch channel call` and `dispatch channel ingress` use the binding scope whose label is the plugin name, so they share the inbox and cursor of `dispatch channel poll <plugin>`. The `events` field in CLI JSON output is local output, not part of the plugin wire response.
 
 ### Parcel reply bridge
 

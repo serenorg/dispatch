@@ -1,18 +1,15 @@
 use crate::{
     channel_plugin_protocol::{
-        AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventNotification,
-        ChannelPluginRequest, ChannelPluginRequestEnvelope, ChannelPluginResponse,
-        InboundEventEnvelope, OutboundMessageEnvelope, PluginMessage, PluginNotificationEnvelope,
-        PluginRequestId, parse_jsonrpc_message, parse_jsonrpc_response, parse_tagged_channel_reply,
-        request_to_jsonrpc,
+        AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventAcceptance,
+        ChannelEventRequest, ChannelHeartbeat, ChannelPluginRequest, ChannelPluginRequestEnvelope,
+        ChannelPluginResponse, InboundEventEnvelope, OutboundMessageEnvelope, PluginMessage,
+        PluginNotificationEnvelope, PluginRequestId, event_acceptance_to_jsonrpc,
+        parse_jsonrpc_message, parse_tagged_channel_reply, request_to_jsonrpc,
     },
     courier::CourierEvent,
     plugins::{PluginRegistryError, PluginTransport, hash_file_sha256, resolve_plugin_exec_path},
 };
-use dispatch_process::{
-    RecvLineError, kill_child_and_wait, recv_line_with_child_exit, spawn_line_reader,
-    wait_for_child_timeout,
-};
+use dispatch_process::{kill_child_and_wait, wait_for_child_timeout};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,6 +27,7 @@ use thiserror::Error;
 const CHANNEL_REGISTRY_RELATIVE_PATH: &str = ".config/dispatch/channels.json";
 const CHANNEL_PLUGIN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const CHANNEL_PLUGIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_PENDING_CHANNEL_FRAMES: usize = 32;
 
 fn user_home_dir() -> Result<PathBuf, PluginRegistryError> {
     std::env::var_os("HOME")
@@ -229,6 +227,13 @@ pub enum ChannelPluginCallError {
     },
     #[error("channel plugin `{channel}` protocol error: {message}")]
     PluginProtocol { channel: String, message: String },
+    #[error("durable sink refused channel plugin `{channel}` batch {batch_digest}: {source}")]
+    DurableSink {
+        channel: String,
+        batch_digest: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("channel plugin `{channel}` exited with status {status}: {stderr}")]
     PluginExit {
         channel: String,
@@ -247,8 +252,115 @@ pub struct PersistentChannelPluginProcess {
     child: Child,
     stdin: ChildStdin,
     stderr: Arc<Mutex<String>>,
+    stderr_reader: thread::JoinHandle<()>,
     outputs: mpsc::Receiver<Result<PluginMessage, ChannelPluginCallError>>,
-    pending_notifications: VecDeque<PluginNotificationEnvelope<ChannelEventNotification>>,
+    pending_ingress: VecDeque<ChannelIngressMessage>,
+    next_request_id: i64,
+    unusable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelIngressMessage {
+    Events {
+        id: PluginRequestId,
+        request: ChannelEventRequest,
+    },
+    Heartbeat(PluginNotificationEnvelope<ChannelHeartbeat>),
+}
+
+/// Host storage that accepts complete channel batches.
+///
+/// `accept` returns the exact receipt only after the complete original batch
+/// is durable. Returning an error leaves the batch unacknowledged.
+/// Implementations atomically replace a binding's head only for a successor
+/// proving its exact receipt, or return the receipt for an exact head replay.
+/// The host assigns the checked next sequence after verifying that head and
+/// commits it with the original before returning the receipt.
+pub trait DurableChannelEventSink {
+    fn accept(
+        &mut self,
+        request: &ChannelEventRequest,
+    ) -> Result<ChannelEventAcceptance, std::io::Error>;
+}
+
+/// Store one received batch through `sink`, then write its exact receipt.
+pub fn accept_persistent_channel_event<S: DurableChannelEventSink + ?Sized>(
+    process: &mut PersistentChannelPluginProcess,
+    manifest: &ChannelPluginManifest,
+    request: &ChannelEventRequest,
+    sink: &mut S,
+) -> Result<(), ChannelPluginCallError> {
+    ensure_usable_channel_process(process, &manifest.name)?;
+    let result =
+        write_durable_channel_acceptance(&mut process.stdin, &manifest.name, request, sink);
+    if result.is_err() {
+        mark_channel_process_unusable(process);
+    }
+    result
+}
+
+fn write_durable_channel_acceptance<W: std::io::Write, S: DurableChannelEventSink + ?Sized>(
+    writer: &mut W,
+    channel: &str,
+    request: &ChannelEventRequest,
+    sink: &mut S,
+) -> Result<(), ChannelPluginCallError> {
+    let protocol_error = |message: String| ChannelPluginCallError::PluginProtocol {
+        channel: channel.to_owned(),
+        message,
+    };
+    request
+        .validate()
+        .map_err(|error| protocol_error(error.to_string()))?;
+    let receipt = sink
+        .accept(request)
+        .map_err(|source| ChannelPluginCallError::DurableSink {
+            channel: channel.to_owned(),
+            batch_digest: request.batch_digest.clone(),
+            source,
+        })?;
+    if !receipt.matches(request) {
+        return Err(protocol_error(
+            "durable sink returned another channel batch receipt".into(),
+        ));
+    }
+    let line = event_acceptance_to_jsonrpc(&request.request_id(), &receipt)
+        .map_err(|error| protocol_error(error.to_string()))?;
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|source| ChannelPluginCallError::WritePluginRequest {
+            channel: channel.to_owned(),
+            source,
+        })
+}
+
+fn requires_durable_batch(request: &ChannelPluginRequest) -> bool {
+    matches!(
+        request,
+        ChannelPluginRequest::PollIngress { .. } | ChannelPluginRequest::IngressEvent { .. }
+    )
+}
+
+fn ensure_usable_channel_process(
+    process: &PersistentChannelPluginProcess,
+    channel: &str,
+) -> Result<(), ChannelPluginCallError> {
+    if process.unusable {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_owned(),
+            message: "channel plugin process was stopped after an earlier exchange failure".into(),
+        });
+    }
+    Ok(())
+}
+
+// After a failed exchange the stream position is unknown, so the process
+// cannot be reused without risking a stale response or receipt.
+fn mark_channel_process_unusable(process: &mut PersistentChannelPluginProcess) {
+    process.unusable = true;
+    kill_child_and_wait(&mut process.child);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,7 +576,8 @@ impl PersistentChannelPluginProcess {
         manifest: &ChannelPluginManifest,
         request: ChannelPluginRequest,
     ) -> Result<PluginRequestId, ChannelPluginCallError> {
-        let request_id = PluginRequestId::Integer(1);
+        let request_id = PluginRequestId::Integer(self.next_request_id);
+        self.next_request_id += 1;
         write_channel_plugin_request_to(
             &mut self.stdin,
             manifest.name.as_str(),
@@ -512,89 +625,212 @@ pub fn spawn_persistent_channel_plugin(
             channel: manifest.name.clone(),
             message: "channel plugin stderr was not captured".to_string(),
         })?;
+    let (stderr, stderr_reader) = spawn_channel_plugin_stderr_reader(stderr);
 
     Ok(PersistentChannelPluginProcess {
         child,
         stdin,
-        stderr: spawn_channel_plugin_stderr_reader(stderr),
+        stderr,
+        stderr_reader,
         outputs: spawn_channel_plugin_output_reader(stdout, manifest.name.clone()),
-        pending_notifications: VecDeque::new(),
+        pending_ingress: VecDeque::new(),
+        next_request_id: 1,
+        unusable: false,
     })
 }
 
+/// Send one control request on a persistent session without accepting batches.
+///
+/// Batches that arrive during the call are queued without a receipt. Use
+/// [`call_persistent_channel_plugin_with_sink`] when the plugin may wait for a
+/// batch receipt before it answers the control request.
 pub fn call_persistent_channel_plugin(
     process: &mut PersistentChannelPluginProcess,
     manifest: &ChannelPluginManifest,
     request: ChannelPluginRequest,
     timeout: Duration,
 ) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
-    let deadline = Instant::now() + timeout;
-    let request_id = process.write_request(manifest, request)?;
+    call_persistent_channel_plugin_inner(process, manifest, request, timeout, None)
+}
 
-    while let Some(message) =
-        recv_channel_plugin_message(process, manifest.name.as_str(), Some(deadline))?
-    {
-        match message {
-            PluginMessage::Notification(notification) => {
-                process.pending_notifications.push_back(notification);
-            }
-            PluginMessage::Response { id, response } => {
-                ensure_matching_channel_request_id(manifest.name.as_str(), &request_id, &id)?;
-                return Ok(response);
+/// Send one control request and store every batch received meanwhile through
+/// `sink` before its receipt is written.
+pub fn call_persistent_channel_plugin_with_sink(
+    process: &mut PersistentChannelPluginProcess,
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+    timeout: Duration,
+    sink: &mut dyn DurableChannelEventSink,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    call_persistent_channel_plugin_inner(process, manifest, request, timeout, Some(sink))
+}
+
+fn call_persistent_channel_plugin_inner(
+    process: &mut PersistentChannelPluginProcess,
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+    timeout: Duration,
+    mut sink: Option<&mut dyn DurableChannelEventSink>,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    ensure_usable_channel_process(process, &manifest.name)?;
+    let requires_batch = requires_durable_batch(&request);
+    if requires_batch && sink.is_none() {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: manifest.name.clone(),
+            message: "channel ingress requires an explicit durable sink".into(),
+        });
+    }
+    let deadline = Instant::now() + timeout;
+    let result = (|| -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+        let request_id = process.write_request(manifest, request)?;
+        let mut accepted_batches = 0usize;
+        while let Some(message) =
+            recv_channel_plugin_message(process, manifest.name.as_str(), Some(deadline))?
+        {
+            match message {
+                PluginMessage::EventRequest { id, request } => match sink.as_deref_mut() {
+                    Some(sink) => {
+                        ensure_channel_acceptance_page(&manifest.name, accepted_batches)?;
+                        write_durable_channel_acceptance(
+                            &mut process.stdin,
+                            &manifest.name,
+                            &request,
+                            sink,
+                        )?;
+                        accepted_batches += 1;
+                    }
+                    None => queue_channel_ingress(
+                        process,
+                        &manifest.name,
+                        ChannelIngressMessage::Events { id, request },
+                    )?,
+                },
+                PluginMessage::Heartbeat(_) => {}
+                PluginMessage::Response { id, response } => {
+                    ensure_matching_channel_request_id(manifest.name.as_str(), &request_id, &id)?;
+                    ensure_durable_batch_received(
+                        &manifest.name,
+                        requires_batch,
+                        accepted_batches,
+                        &response,
+                    )?;
+                    return Ok(response);
+                }
             }
         }
+
+        // Kill before taking the stderr snapshot so a still-running child
+        // cannot keep the timeout path waiting.
+        kill_child_and_wait(&mut process.child);
+        Err(ChannelPluginCallError::PluginTimedOut {
+            channel: manifest.name.clone(),
+            timeout_ms: timeout.as_millis(),
+            stderr: collect_persistent_channel_stderr(process, manifest.name.as_str())?,
+        })
+    })();
+    if result.is_err() {
+        mark_channel_process_unusable(process);
     }
-
-    // The child is still running after a timeout. Kill it before draining
-    // stderr, otherwise `read_to_string` below blocks waiting for the still-
-    // open stderr pipe to close.
-    kill_child_and_wait(&mut process.child);
-    Err(ChannelPluginCallError::PluginTimedOut {
-        channel: manifest.name.clone(),
-        timeout_ms: timeout.as_millis(),
-        stderr: collect_persistent_channel_stderr(process, manifest.name.as_str())?,
-    })
+    result
 }
 
-pub fn drain_pending_channel_notifications(
+fn ensure_channel_acceptance_page(
+    channel: &str,
+    accepted_batches: usize,
+) -> Result<(), ChannelPluginCallError> {
+    if accepted_batches >= MAX_PENDING_CHANNEL_FRAMES {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_owned(),
+            message: "channel ingress exceeded its bounded acceptance page".into(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_durable_batch_received(
+    channel: &str,
+    requires_batch: bool,
+    accepted_batches: usize,
+    response: &ChannelPluginResponse,
+) -> Result<(), ChannelPluginCallError> {
+    if requires_batch
+        && accepted_batches == 0
+        && !matches!(response, ChannelPluginResponse::Error { .. })
+    {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_owned(),
+            message: "ingress control response arrived without a durable batch acceptance".into(),
+        });
+    }
+    Ok(())
+}
+
+pub fn drain_pending_channel_ingress(
     process: &mut PersistentChannelPluginProcess,
-) -> Vec<PluginNotificationEnvelope<ChannelEventNotification>> {
-    process.pending_notifications.drain(..).collect()
+) -> Vec<ChannelIngressMessage> {
+    process.pending_ingress.drain(..).collect()
 }
 
-pub fn recv_persistent_channel_notification(
+pub fn recv_persistent_channel_ingress(
     process: &mut PersistentChannelPluginProcess,
     manifest: &ChannelPluginManifest,
     timeout: Option<Duration>,
-) -> Result<Option<PluginNotificationEnvelope<ChannelEventNotification>>, ChannelPluginCallError> {
-    if let Some(notification) = process.pending_notifications.pop_front() {
-        return Ok(Some(notification));
+) -> Result<Option<ChannelIngressMessage>, ChannelPluginCallError> {
+    if let Some(message) = process.pending_ingress.pop_front() {
+        return Ok(Some(message));
     }
+    ensure_usable_channel_process(process, &manifest.name)?;
 
     let deadline = timeout.map(|duration| Instant::now() + duration);
-    let Some(message) = recv_channel_plugin_message(process, manifest.name.as_str(), deadline)?
-    else {
-        return Ok(None);
+    let result = match recv_channel_plugin_message(process, manifest.name.as_str(), deadline) {
+        Ok(None) => Ok(None),
+        Ok(Some(PluginMessage::EventRequest { id, request })) => {
+            Ok(Some(ChannelIngressMessage::Events { id, request }))
+        }
+        Ok(Some(PluginMessage::Heartbeat(heartbeat))) => {
+            Ok(Some(ChannelIngressMessage::Heartbeat(heartbeat)))
+        }
+        Ok(Some(PluginMessage::Response { response, .. })) => {
+            Err(ChannelPluginCallError::PluginProtocol {
+                channel: manifest.name.clone(),
+                message: format!(
+                    "channel plugin returned unexpected response while waiting for ingress events: {}",
+                    describe_channel_plugin_response(&response)
+                ),
+            })
+        }
+        Err(error) => Err(error),
     };
-    match message {
-        PluginMessage::Notification(notification) => Ok(Some(notification)),
-        PluginMessage::Response { response, .. } => Err(ChannelPluginCallError::PluginProtocol {
-            channel: manifest.name.clone(),
-            message: format!(
-                "channel plugin returned unexpected response while waiting for ingress events: {}",
-                describe_channel_plugin_response(&response)
-            ),
-        }),
+    if result.is_err() {
+        mark_channel_process_unusable(process);
     }
+    result
+}
+
+fn queue_channel_ingress(
+    process: &mut PersistentChannelPluginProcess,
+    channel: &str,
+    message: ChannelIngressMessage,
+) -> Result<(), ChannelPluginCallError> {
+    if process.pending_ingress.len() >= MAX_PENDING_CHANNEL_FRAMES {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.into(),
+            message: "pending channel ingress frame bound reached without durable acceptance"
+                .into(),
+        });
+    }
+    process.pending_ingress.push_back(message);
+    Ok(())
 }
 
 pub fn shutdown_persistent_channel_plugin(
     process: &mut PersistentChannelPluginProcess,
     manifest: &ChannelPluginManifest,
 ) -> Result<(), ChannelPluginCallError> {
-    if process
-        .write_request(manifest, ChannelPluginRequest::Shutdown)
-        .is_ok()
+    if !process.unusable
+        && process
+            .write_request(manifest, ChannelPluginRequest::Shutdown)
+            .is_ok()
     {
         let _ = recv_channel_plugin_message(
             process,
@@ -612,17 +848,31 @@ fn spawn_channel_plugin_output_reader(
     stdout: ChildStdout,
     channel: String,
 ) -> mpsc::Receiver<Result<PluginMessage, ChannelPluginCallError>> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(MAX_PENDING_CHANNEL_FRAMES);
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
-            let result = read_channel_plugin_message(&mut reader, channel.as_str());
-            let should_break = result.is_err();
-            if tx.send(result).is_err() {
-                break;
-            }
-            if should_break {
-                break;
+            match read_channel_plugin_message(&mut reader, channel.as_str()) {
+                // Dropping the sender reports the closed stream.
+                Ok(None) => break,
+                // Liveness frames are dropped when the host is busy so they
+                // never block plugin stdout behind host work.
+                Ok(Some(PluginMessage::Heartbeat(heartbeat))) => {
+                    if let Err(mpsc::TrySendError::Disconnected(_)) =
+                        tx.try_send(Ok(PluginMessage::Heartbeat(heartbeat)))
+                    {
+                        break;
+                    }
+                }
+                Ok(Some(message)) => {
+                    if tx.send(Ok(message)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    break;
+                }
             }
         }
     });
@@ -632,8 +882,10 @@ fn spawn_channel_plugin_output_reader(
 fn read_channel_plugin_message<R: std::io::BufRead>(
     reader: &mut R,
     channel: &str,
-) -> Result<PluginMessage, ChannelPluginCallError> {
+) -> Result<Option<PluginMessage>, ChannelPluginCallError> {
     let mut line = String::new();
+    // Ordinary responses retain their existing size contract. Batch bounds
+    // are checked by the protocol parser after reading the complete line.
     let bytes = reader.read_line(&mut line).map_err(|source| {
         ChannelPluginCallError::ReadPluginResponse {
             channel: channel.to_string(),
@@ -641,17 +893,46 @@ fn read_channel_plugin_message<R: std::io::BufRead>(
         }
     })?;
     if bytes == 0 {
-        return Err(ChannelPluginCallError::PluginProtocol {
-            channel: channel.to_string(),
-            message: "channel plugin produced no response".to_string(),
-        });
+        return Ok(None);
     }
-    parse_jsonrpc_message(line.trim_end()).map_err(|message| {
-        ChannelPluginCallError::PluginProtocol {
+    let frame = line.strip_suffix('\n').unwrap_or(&line);
+    parse_jsonrpc_message(frame.trim_end())
+        .map(Some)
+        .map_err(|message| ChannelPluginCallError::PluginProtocol {
             channel: channel.to_string(),
             message: message.to_string(),
+        })
+}
+
+// Short-lived and consumed immediately, so the payload is not boxed.
+#[allow(clippy::large_enum_variant)]
+enum ChannelPluginFrame {
+    Message(PluginMessage),
+    TimedOut,
+    Closed,
+}
+
+fn recv_channel_plugin_frame(
+    process: &mut PersistentChannelPluginProcess,
+    deadline: Option<Instant>,
+) -> Result<ChannelPluginFrame, ChannelPluginCallError> {
+    let received = match deadline {
+        Some(deadline) => {
+            match process
+                .outputs
+                .recv_timeout(remaining_channel_plugin_timeout(deadline))
+            {
+                Ok(result) => Some(result),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(ChannelPluginFrame::TimedOut),
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            }
         }
-    })
+        None => process.outputs.recv().ok(),
+    };
+    match received {
+        Some(result) => result.map(ChannelPluginFrame::Message),
+        None => Ok(ChannelPluginFrame::Closed),
+    }
 }
 
 fn recv_channel_plugin_message(
@@ -659,23 +940,12 @@ fn recv_channel_plugin_message(
     channel: &str,
     deadline: Option<Instant>,
 ) -> Result<Option<PluginMessage>, ChannelPluginCallError> {
-    let result = match deadline {
-        Some(deadline) => {
-            let timeout = remaining_channel_plugin_timeout(deadline);
-            match process.outputs.recv_timeout(timeout) {
-                Ok(result) => Some(result),
-                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
-                Err(mpsc::RecvTimeoutError::Disconnected) => None,
-            }
-        }
-        None => process.outputs.recv().ok(),
-    };
-
-    match result {
-        Some(result) => result.map(Some),
-        None => Err(ChannelPluginCallError::PluginProtocol {
+    match recv_channel_plugin_frame(process, deadline)? {
+        ChannelPluginFrame::Message(message) => Ok(Some(message)),
+        ChannelPluginFrame::TimedOut => Ok(None),
+        ChannelPluginFrame::Closed => Err(ChannelPluginCallError::PluginProtocol {
             channel: channel.to_string(),
-            message: "channel plugin output reader disconnected".to_string(),
+            message: "channel plugin produced no response".to_string(),
         }),
     }
 }
@@ -688,17 +958,37 @@ fn collect_persistent_channel_stderr(
     // (see `spawn_channel_plugin_stderr_reader`). We snapshot what has been
     // captured so far without blocking, which keeps timeouts prompt even if a
     // descendant process is still holding the pipe's write end open.
-    let stderr = match process.stderr.lock() {
+    Ok(snapshot_channel_stderr(&process.stderr))
+}
+
+fn snapshot_channel_stderr(stderr: &Mutex<String>) -> String {
+    let stderr = match stderr.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
-    Ok(stderr.trim().to_string())
+    stderr.trim().to_string()
 }
 
-fn spawn_channel_plugin_stderr_reader(mut stderr: ChildStderr) -> Arc<Mutex<String>> {
+// Give the stderr reader a bounded window to observe pipe closure after the
+// child exits; a descendant can keep the pipe open indefinitely.
+fn settled_channel_stderr(
+    stderr: &Mutex<String>,
+    stderr_reader: &thread::JoinHandle<()>,
+    window: Duration,
+) -> String {
+    let until = Instant::now() + window;
+    while !stderr_reader.is_finished() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    snapshot_channel_stderr(stderr)
+}
+
+fn spawn_channel_plugin_stderr_reader(
+    mut stderr: ChildStderr,
+) -> (Arc<Mutex<String>>, thread::JoinHandle<()>) {
     let buffer = Arc::new(Mutex::new(String::new()));
     let writer = Arc::clone(&buffer);
-    thread::spawn(move || {
+    let reader = thread::spawn(move || {
         let mut chunk = [0u8; 4096];
         loop {
             match stderr.read(&mut chunk) {
@@ -712,7 +1002,7 @@ fn spawn_channel_plugin_stderr_reader(mut stderr: ChildStderr) -> Arc<Mutex<Stri
             }
         }
     });
-    buffer
+    (buffer, reader)
 }
 
 fn write_channel_plugin_request_to<W: std::io::Write>(
@@ -784,94 +1074,114 @@ pub fn call_channel_plugin_with_timeout(
     request: ChannelPluginRequest,
     timeout: Duration,
 ) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
-    let deadline = Instant::now() + timeout;
-    let mut command = Command::new(&manifest.exec.command);
-    command
-        .args(&manifest.exec.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    call_channel_plugin_once(manifest, request, timeout, None)
+}
 
-    let mut child = command
-        .spawn()
-        .map_err(|source| ChannelPluginCallError::SpawnPlugin {
-            channel: manifest.name.clone(),
-            source,
-        })?;
+/// Run one request in a fresh plugin process, storing every ingress batch
+/// through `sink` before its receipt and before the control response.
+///
+/// Plugin stdin stays open until the control response arrives, so the plugin
+/// can wait for each receipt.
+pub fn call_channel_plugin_with_sink(
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+    timeout: Duration,
+    sink: &mut dyn DurableChannelEventSink,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    call_channel_plugin_once(manifest, request, timeout, Some(sink))
+}
 
-    {
-        let mut stdin =
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
-                    channel: manifest.name.clone(),
-                    message: "channel plugin stdin was not captured".to_string(),
-                })?;
-        write_channel_plugin_request_to(
-            &mut stdin,
-            manifest.name.as_str(),
-            PluginRequestId::Integer(1),
-            request,
-        )?;
+const CHANNEL_PLUGIN_STDERR_SETTLE: Duration = Duration::from_secs(1);
+const CHANNEL_PLUGIN_TIMEOUT_STDERR_SETTLE: Duration = Duration::from_millis(50);
+
+#[allow(clippy::large_enum_variant)]
+enum OneShotOutcome {
+    Response(ChannelPluginResponse),
+    Closed,
+    TimedOut,
+}
+
+fn call_channel_plugin_once(
+    manifest: &ChannelPluginManifest,
+    request: ChannelPluginRequest,
+    timeout: Duration,
+    mut sink: Option<&mut dyn DurableChannelEventSink>,
+) -> Result<ChannelPluginResponse, ChannelPluginCallError> {
+    let channel = manifest.name.as_str();
+    let requires_batch = requires_durable_batch(&request);
+    if requires_batch && sink.is_none() {
+        return Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_owned(),
+            message: "channel ingress requires an explicit durable sink".into(),
+        });
     }
+    let deadline = Instant::now() + timeout;
+    let mut process = spawn_persistent_channel_plugin(manifest)?;
+    let outcome = (|| -> Result<OneShotOutcome, ChannelPluginCallError> {
+        let request_id = process.write_request(manifest, request)?;
+        let mut accepted_batches = 0usize;
+        loop {
+            match recv_channel_plugin_frame(&mut process, Some(deadline))? {
+                ChannelPluginFrame::Message(PluginMessage::EventRequest { request, .. }) => {
+                    let Some(sink) = sink.as_deref_mut() else {
+                        return Err(ChannelPluginCallError::PluginProtocol {
+                            channel: channel.to_owned(),
+                            message:
+                                "channel plugin sent an ingress batch during a non-ingress call"
+                                    .into(),
+                        });
+                    };
+                    ensure_channel_acceptance_page(channel, accepted_batches)?;
+                    write_durable_channel_acceptance(&mut process.stdin, channel, &request, sink)?;
+                    accepted_batches += 1;
+                }
+                ChannelPluginFrame::Message(PluginMessage::Heartbeat(_)) => {}
+                ChannelPluginFrame::Message(PluginMessage::Response { id, response }) => {
+                    ensure_matching_channel_request_id(channel, &request_id, &id)?;
+                    ensure_durable_batch_received(
+                        channel,
+                        requires_batch,
+                        accepted_batches,
+                        &response,
+                    )?;
+                    return Ok(OneShotOutcome::Response(response));
+                }
+                ChannelPluginFrame::Closed => return Ok(OneShotOutcome::Closed),
+                ChannelPluginFrame::TimedOut => return Ok(OneShotOutcome::TimedOut),
+            }
+        }
+    })();
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ChannelPluginCallError::PluginProtocol {
-            channel: manifest.name.clone(),
-            message: "channel plugin stdout was not captured".to_string(),
-        })?;
-    let stderr_reader = child.stderr.take().map(|mut stderr_pipe| {
-        thread::spawn(move || -> std::io::Result<String> {
-            let mut stderr = String::new();
-            stderr_pipe.read_to_string(&mut stderr)?;
-            Ok(stderr)
-        })
-    });
-    let (stdout_receiver, stdout_reader) = spawn_line_reader(BufReader::new(stdout));
-    let (bytes, line) = match recv_line_with_child_exit(
-        &stdout_receiver,
-        &mut child,
-        Some(remaining_channel_plugin_timeout(deadline)),
-        CHANNEL_PLUGIN_POLL_INTERVAL,
-    ) {
-        Ok(Some((bytes, line))) => (bytes, line),
-        Ok(None) => (0, String::new()),
-        Err(RecvLineError::Timeout) => {
-            let stderr = timeout_channel_plugin(
-                &mut child,
-                stderr_reader,
-                stdout_reader,
-                manifest.name.as_str(),
-            )?;
+    let PersistentChannelPluginProcess {
+        mut child,
+        stdin,
+        stderr,
+        stderr_reader,
+        ..
+    } = process;
+    let response = match outcome {
+        Ok(OneShotOutcome::Response(response)) => Some(response),
+        Ok(OneShotOutcome::Closed) => None,
+        Ok(OneShotOutcome::TimedOut) => {
+            kill_child_and_wait(&mut child);
             return Err(ChannelPluginCallError::PluginTimedOut {
-                channel: manifest.name.clone(),
+                channel: channel.to_owned(),
                 timeout_ms: timeout.as_millis(),
-                stderr,
+                stderr: settled_channel_stderr(
+                    &stderr,
+                    &stderr_reader,
+                    CHANNEL_PLUGIN_TIMEOUT_STDERR_SETTLE,
+                ),
             });
         }
-        Err(RecvLineError::Disconnected) => {
-            return Err(ChannelPluginCallError::PluginProtocol {
-                channel: manifest.name.clone(),
-                message: "channel plugin stdout reader disconnected".to_string(),
-            });
-        }
-        Err(RecvLineError::Read(message)) => {
-            return Err(ChannelPluginCallError::PluginProtocol {
-                channel: manifest.name.clone(),
-                message: format!("failed to read channel plugin response: {message}"),
-            });
-        }
-        Err(RecvLineError::ChildWait(source)) => {
-            return Err(ChannelPluginCallError::WaitPlugin {
-                channel: manifest.name.clone(),
-                source,
-            });
+        Err(error) => {
+            kill_child_and_wait(&mut child);
+            return Err(error);
         }
     };
 
+    // Closing stdin tells the plugin that no further requests or receipts follow.
+    drop(stdin);
     let status = match wait_for_child_timeout(
         &mut child,
         Some(remaining_channel_plugin_timeout(deadline)),
@@ -879,62 +1189,37 @@ pub fn call_channel_plugin_with_timeout(
     ) {
         Ok(Some(status)) => status,
         Ok(None) => {
-            let stderr = timeout_channel_plugin(
-                &mut child,
-                stderr_reader,
-                stdout_reader,
-                manifest.name.as_str(),
-            )?;
+            kill_child_and_wait(&mut child);
             return Err(ChannelPluginCallError::PluginTimedOut {
-                channel: manifest.name.clone(),
+                channel: channel.to_owned(),
                 timeout_ms: timeout.as_millis(),
-                stderr,
+                stderr: settled_channel_stderr(
+                    &stderr,
+                    &stderr_reader,
+                    CHANNEL_PLUGIN_TIMEOUT_STDERR_SETTLE,
+                ),
             });
         }
         Err(source) => {
+            kill_child_and_wait(&mut child);
             return Err(ChannelPluginCallError::WaitPlugin {
-                channel: manifest.name.clone(),
+                channel: channel.to_owned(),
                 source,
             });
         }
     };
-    join_stdout_reader(stdout_reader, manifest.name.as_str())?;
-    let stderr = collect_stderr(stderr_reader, manifest.name.as_str())?;
-    if bytes == 0 {
-        if status.success() {
-            return Err(ChannelPluginCallError::PluginProtocol {
-                channel: manifest.name.clone(),
-                message: "channel plugin produced no response".to_string(),
-            });
-        }
-
-        return Err(ChannelPluginCallError::PluginExit {
-            channel: manifest.name.clone(),
+    match (response, status.success()) {
+        (Some(response), true) => Ok(response),
+        (None, true) => Err(ChannelPluginCallError::PluginProtocol {
+            channel: channel.to_owned(),
+            message: "channel plugin produced no response".to_string(),
+        }),
+        (_, false) => Err(ChannelPluginCallError::PluginExit {
+            channel: channel.to_owned(),
             status: status.code().unwrap_or(-1),
-            stderr: stderr.trim().to_string(),
-        });
+            stderr: settled_channel_stderr(&stderr, &stderr_reader, CHANNEL_PLUGIN_STDERR_SETTLE),
+        }),
     }
-
-    let (response_id, response) = parse_jsonrpc_response(line.trim_end()).map_err(|message| {
-        ChannelPluginCallError::PluginProtocol {
-            channel: manifest.name.clone(),
-            message: message.to_string(),
-        }
-    })?;
-    ensure_matching_channel_request_id(
-        manifest.name.as_str(),
-        &PluginRequestId::Integer(1),
-        &response_id,
-    )?;
-    if status.success() {
-        return Ok(response);
-    }
-
-    Err(ChannelPluginCallError::PluginExit {
-        channel: manifest.name.clone(),
-        status: status.code().unwrap_or(-1),
-        stderr: stderr.trim().to_string(),
-    })
 }
 
 fn remaining_channel_plugin_timeout(deadline: Instant) -> Duration {
@@ -958,48 +1243,6 @@ fn describe_channel_plugin_response(response: &ChannelPluginResponse) -> &'stati
         ChannelPluginResponse::Ok => "ok",
         ChannelPluginResponse::Error { .. } => "error",
     }
-}
-
-fn join_stdout_reader(
-    stdout_reader: thread::JoinHandle<()>,
-    channel: &str,
-) -> Result<(), ChannelPluginCallError> {
-    stdout_reader
-        .join()
-        .map_err(|_| ChannelPluginCallError::PluginProtocol {
-            channel: channel.to_string(),
-            message: "channel plugin stdout reader thread panicked".to_string(),
-        })
-}
-
-fn collect_stderr(
-    stderr_reader: Option<thread::JoinHandle<std::io::Result<String>>>,
-    channel: &str,
-) -> Result<String, ChannelPluginCallError> {
-    match stderr_reader {
-        Some(reader) => reader
-            .join()
-            .map_err(|_| ChannelPluginCallError::PluginProtocol {
-                channel: channel.to_string(),
-                message: "channel plugin stderr reader thread panicked".to_string(),
-            })?
-            .map_err(|source| ChannelPluginCallError::ReadPluginResponse {
-                channel: channel.to_string(),
-                source,
-            }),
-        None => Ok(String::new()),
-    }
-}
-
-fn timeout_channel_plugin(
-    child: &mut std::process::Child,
-    stderr_reader: Option<thread::JoinHandle<std::io::Result<String>>>,
-    stdout_reader: thread::JoinHandle<()>,
-    channel: &str,
-) -> Result<String, ChannelPluginCallError> {
-    kill_child_and_wait(child);
-    join_stdout_reader(stdout_reader, channel)?;
-    collect_stderr(stderr_reader, channel)
 }
 
 pub fn channel_event_session_file(
@@ -1392,15 +1635,438 @@ pub fn verify_host_managed_ingress_trust(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::channel_plugin_protocol::MAX_CHANNEL_FRAME_BYTES;
     use crate::channel_plugin_protocol::{
         InboundActor, InboundConversationRef, InboundEventEnvelope, InboundMessage,
     };
-    use std::sync::{Mutex, OnceLock};
+    use serde_json::Value;
+    use std::sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    };
     use tempfile::tempdir;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn empty_event_request() -> ChannelEventRequest {
+        ChannelEventRequest::new(
+            crate::channel_plugin_protocol::ChannelEventBatch {
+                events: vec![],
+                state: None,
+                poll_after_ms: Some(100),
+            },
+            None,
+        )
+        .unwrap()
+    }
+
+    struct RecordingSink {
+        committed: Arc<AtomicBool>,
+        fail: bool,
+        mismatch: bool,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                committed: Arc::new(AtomicBool::new(false)),
+                fail: false,
+                mismatch: false,
+            }
+        }
+
+        fn committed(&self) -> bool {
+            self.committed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DurableChannelEventSink for RecordingSink {
+        fn accept(
+            &mut self,
+            request: &ChannelEventRequest,
+        ) -> Result<ChannelEventAcceptance, std::io::Error> {
+            if self.fail {
+                return Err(std::io::Error::other("durable write failed"));
+            }
+            self.committed.store(true, Ordering::SeqCst);
+            if self.mismatch {
+                let mut other = request.batch.clone();
+                other.poll_after_ms = Some(999);
+                return Ok(ChannelEventRequest::new(other, None)
+                    .unwrap()
+                    .acceptance()
+                    .unwrap());
+            }
+            Ok(request.acceptance().unwrap())
+        }
+    }
+
+    #[test]
+    fn positive_receipt_bytes_follow_durable_sink_commit_and_failures_emit_nothing() {
+        struct CommitCheckedWriter {
+            committed: Arc<AtomicBool>,
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for CommitCheckedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(self.committed.load(Ordering::SeqCst));
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let request = empty_event_request();
+        let mut sink = RecordingSink::new();
+        let mut writer = CommitCheckedWriter {
+            committed: sink.committed.clone(),
+            bytes: vec![],
+        };
+        write_durable_channel_acceptance(&mut writer, "test", &request, &mut sink).unwrap();
+        let parsed = crate::channel_plugin_protocol::parse_plugin_input::<Value, Value>(
+            std::str::from_utf8(&writer.bytes).unwrap().trim_end(),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            crate::channel_plugin_protocol::PluginInput::EventAcceptance { acceptance, .. }
+                if acceptance.matches(&request)
+        ));
+        for (fail, mismatch) in [(true, false), (false, true)] {
+            let mut bytes = Vec::new();
+            let mut sink = RecordingSink {
+                fail,
+                mismatch,
+                ..RecordingSink::new()
+            };
+            let error = write_durable_channel_acceptance(&mut bytes, "test", &request, &mut sink)
+                .unwrap_err();
+            assert_eq!(
+                matches!(error, ChannelPluginCallError::DurableSink { .. }),
+                fail
+            );
+            assert!(bytes.is_empty());
+        }
+    }
+
+    fn handshake_manifest(script: &Path) -> ChannelPluginManifest {
+        ChannelPluginManifest {
+            name: "receipt-test".into(),
+            version: "0.1.0".into(),
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            transport: PluginTransport::Jsonl,
+            description: None,
+            exec: ChannelPluginExec {
+                command: "/bin/sh".into(),
+                args: vec![script.display().to_string()],
+            },
+            platform: None,
+            attachment_sources: vec![],
+            ingress: None,
+            installed_sha256: None,
+        }
+    }
+
+    #[test]
+    fn released_inline_notification_manifests_are_rejected_before_launch() {
+        let mut manifest = handshake_manifest(Path::new("/tmp/unused-plugin"));
+        manifest.protocol_version = 1;
+        assert!(
+            validate_channel_plugin_manifest(Path::new("channel-plugin.json"), &manifest).is_err()
+        );
+        manifest.protocol_version = CHANNEL_PLUGIN_PROTOCOL_VERSION;
+        validate_channel_plugin_manifest(Path::new("channel-plugin.json"), &manifest).unwrap();
+    }
+
+    fn poll_request(directory: &Path) -> ChannelPluginRequest {
+        ChannelPluginRequest::PollIngress {
+            config: Value::Null,
+            storage: crate::channel_plugin_protocol::ChannelIngressStorage {
+                recovery: None,
+                journal_path: directory.join("producer.sqlite").display().to_string(),
+            },
+            state: None,
+        }
+    }
+
+    fn write_plugin_script(directory: &Path, body: &str) -> PathBuf {
+        let script = directory.join("plugin.sh");
+        fs::write(&script, body).unwrap();
+        script
+    }
+
+    const READ_REQUEST_ID: &str = r#"read request
+request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+"#;
+
+    #[test]
+    fn one_shot_poll_keeps_stdin_open_until_empty_batch_is_durably_accepted() {
+        let directory = tempdir().unwrap();
+        let event = empty_event_request();
+        let wire = crate::channel_plugin_protocol::event_request_to_jsonrpc(&event).unwrap();
+        let receipt =
+            event_acceptance_to_jsonrpc(&event.request_id(), &event.acceptance().unwrap()).unwrap();
+        let program = format!(
+            r#"{READ_REQUEST_ID}printf '%s\n' '{wire}'
+read receipt || exit 3
+[ "$receipt" = '{receipt}' ] || exit 4
+printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{{\"kind\":\"ingress_events_received\"}}}}"
+"#
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let mut sink = RecordingSink::new();
+        let response = call_channel_plugin_with_sink(
+            &manifest,
+            poll_request(directory.path()),
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            ChannelPluginResponse::IngressEventsReceived { .. }
+        ));
+        assert!(sink.committed());
+    }
+
+    #[test]
+    fn one_shot_poll_rejects_control_only_success_without_any_batch_receipt() {
+        let directory = tempdir().unwrap();
+        let program = format!(
+            r#"{READ_REQUEST_ID}printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{{\"kind\":\"ingress_events_received\"}}}}"
+"#
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let mut sink = RecordingSink::new();
+        let error = call_channel_plugin_with_sink(
+            &manifest,
+            poll_request(directory.path()),
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { ref message, .. }
+                if message.contains("without a durable batch acceptance")
+        ));
+        assert!(!sink.committed());
+    }
+
+    #[test]
+    fn one_shot_ingress_without_sink_and_batch_during_ordinary_call_are_refused() {
+        let directory = tempdir().unwrap();
+        let event = empty_event_request();
+        let wire = crate::channel_plugin_protocol::event_request_to_jsonrpc(&event).unwrap();
+        let program = format!(
+            r#"{READ_REQUEST_ID}printf '%s\n' '{wire}'
+read receipt && exit 5
+printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{{\"kind\":\"ok\"}}}}"
+"#
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let error = call_channel_plugin_with_timeout(
+            &manifest,
+            poll_request(directory.path()),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { ref message, .. }
+                if message.contains("explicit durable sink")
+        ));
+        let error = call_channel_plugin_with_timeout(
+            &manifest,
+            ChannelPluginRequest::Health {
+                config: Value::Null,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { ref message, .. }
+                if message.contains("during a non-ingress call")
+        ));
+    }
+
+    #[test]
+    fn persistent_control_preserves_interleaved_original_batch_until_explicit_sink_commit() {
+        let directory = tempdir().unwrap();
+        let event = empty_event_request();
+        let wire = crate::channel_plugin_protocol::event_request_to_jsonrpc(&event).unwrap();
+        let receipt =
+            event_acceptance_to_jsonrpc(&event.request_id(), &event.acceptance().unwrap()).unwrap();
+        let program = format!(
+            r#"{READ_REQUEST_ID}printf '%s\n' '{wire}'
+printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{{\"kind\":\"health\",\"health\":{{\"ok\":true,\"status\":\"healthy\"}}}}}}"
+read receipt || exit 3
+[ "$receipt" = '{receipt}' ] || exit 4
+read request || exit 5
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"kind":"ok"}}}}'
+"#
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let mut process = spawn_persistent_channel_plugin(&manifest).unwrap();
+        let response = call_persistent_channel_plugin(
+            &mut process,
+            &manifest,
+            ChannelPluginRequest::Health {
+                config: Value::Null,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(matches!(response, ChannelPluginResponse::Health { .. }));
+        let pending = drain_pending_channel_ingress(&mut process);
+        assert_eq!(pending.len(), 1);
+        let ChannelIngressMessage::Events { request, .. } = &pending[0] else {
+            panic!("original batch disappeared");
+        };
+        assert_eq!(request, &event);
+        let mut sink = RecordingSink::new();
+        assert!(!sink.committed());
+        accept_persistent_channel_event(&mut process, &manifest, request, &mut sink).unwrap();
+        assert!(sink.committed());
+        shutdown_persistent_channel_plugin(&mut process, &manifest).unwrap();
+    }
+
+    #[test]
+    fn persistent_sink_call_writes_receipt_before_waiting_for_control_response() {
+        let directory = tempdir().unwrap();
+        let event = empty_event_request();
+        let wire = crate::channel_plugin_protocol::event_request_to_jsonrpc(&event).unwrap();
+        let receipt =
+            event_acceptance_to_jsonrpc(&event.request_id(), &event.acceptance().unwrap()).unwrap();
+        // The plugin blocks on the receipt before it answers the control request.
+        let program = format!(
+            r#"{READ_REQUEST_ID}printf '%s\n' '{wire}'
+read receipt || exit 3
+[ "$receipt" = '{receipt}' ] || exit 4
+printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{{\"kind\":\"health\",\"health\":{{\"ok\":true,\"status\":\"healthy\"}}}}}}"
+read request
+"#
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let mut process = spawn_persistent_channel_plugin(&manifest).unwrap();
+        let mut sink = RecordingSink::new();
+        let response = call_persistent_channel_plugin_with_sink(
+            &mut process,
+            &manifest,
+            ChannelPluginRequest::Health {
+                config: Value::Null,
+            },
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(matches!(response, ChannelPluginResponse::Health { .. }));
+        assert!(sink.committed());
+        assert!(drain_pending_channel_ingress(&mut process).is_empty());
+        shutdown_persistent_channel_plugin(&mut process, &manifest).unwrap();
+    }
+
+    #[test]
+    fn persistent_heartbeats_do_not_consume_pending_batch_capacity() {
+        let directory = tempdir().unwrap();
+        let heartbeat =
+            crate::channel_plugin_protocol::heartbeat_to_jsonrpc(&PluginNotificationEnvelope {
+                protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                notification: ChannelHeartbeat::default(),
+            })
+            .unwrap();
+        let program = format!(
+            r#"{READ_REQUEST_ID}i=0
+while [ "$i" -lt 80 ]; do printf '%s\n' '{heartbeat}'; i=$((i + 1)); done
+printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$request_id,\"result\":{{\"kind\":\"health\",\"health\":{{\"ok\":true,\"status\":\"healthy\"}}}}}}"
+read request
+"#
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let mut process = spawn_persistent_channel_plugin(&manifest).unwrap();
+        let response = call_persistent_channel_plugin(
+            &mut process,
+            &manifest,
+            ChannelPluginRequest::Health {
+                config: Value::Null,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(matches!(response, ChannelPluginResponse::Health { .. }));
+        assert!(drain_pending_channel_ingress(&mut process).is_empty());
+        shutdown_persistent_channel_plugin(&mut process, &manifest).unwrap();
+    }
+
+    #[test]
+    fn persistent_sink_failure_sends_no_receipt_and_retires_the_process() {
+        let directory = tempdir().unwrap();
+        let event = empty_event_request();
+        let wire = crate::channel_plugin_protocol::event_request_to_jsonrpc(&event).unwrap();
+        let receipt_log = directory.path().join("receipt.log");
+        let program = format!(
+            r#"{READ_REQUEST_ID}printf '%s\n' '{wire}'
+read receipt && printf '%s\n' "$receipt" >> '{log}'
+sleep 5
+"#,
+            log = receipt_log.display()
+        );
+        let manifest = handshake_manifest(&write_plugin_script(directory.path(), &program));
+        let mut process = spawn_persistent_channel_plugin(&manifest).unwrap();
+        let mut sink = RecordingSink {
+            fail: true,
+            ..RecordingSink::new()
+        };
+        let error = call_persistent_channel_plugin_with_sink(
+            &mut process,
+            &manifest,
+            poll_request(directory.path()),
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ChannelPluginCallError::DurableSink { .. }));
+        assert!(!receipt_log.exists());
+        let error = call_persistent_channel_plugin(
+            &mut process,
+            &manifest,
+            ChannelPluginRequest::Health {
+                config: Value::Null,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { ref message, .. }
+                if message.contains("earlier exchange failure")
+        ));
+        shutdown_persistent_channel_plugin(&mut process, &manifest).unwrap();
+    }
+
+    #[test]
+    fn invalid_plugin_lines_are_refused_and_ordinary_responses_keep_their_size_contract() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; MAX_CHANNEL_FRAME_BYTES + 20]);
+        assert!(matches!(
+            read_channel_plugin_message(&mut reader, "test"),
+            Err(ChannelPluginCallError::PluginProtocol { .. })
+        ));
+        assert_eq!(reader.position(), (MAX_CHANNEL_FRAME_BYTES + 20) as u64);
+
+        let mut maximal = vec![b' '; MAX_CHANNEL_FRAME_BYTES];
+        let frame = br#"{"jsonrpc":"2.0","id":1,"result":{"kind":"ok"}}"#;
+        maximal[..frame.len()].copy_from_slice(frame);
+        maximal.push(b'\n');
+        let mut reader = std::io::Cursor::new(maximal);
+        assert!(matches!(
+            read_channel_plugin_message(&mut reader, "test"),
+            Ok(Some(PluginMessage::Response { .. }))
+        ));
     }
 
     #[test]
@@ -1423,7 +2089,7 @@ mod tests {
 "name": "telegram-bridge",
 "version": "0.1.0",
 "protocol": "jsonl",
-"protocol_version": 1,
+"protocol_version": 2,
 "description": "Demo channel plugin for Telegram",
 "entrypoint": {{
     "command": "{}",
@@ -1512,7 +2178,7 @@ mod tests {
 "name": "slack-bridge",
 "version": "0.1.0",
 "protocol": "jsonl",
-"protocol_version": 1,
+"protocol_version": 2,
 "description": "Slack channel plugin",
 "entrypoint": {{
     "command": "{}",
@@ -1563,7 +2229,7 @@ mod tests {
 "name": "webhook-demo",
 "version": "0.1.0",
 "protocol": "jsonl",
-"protocol_version": 1,
+"protocol_version": 2,
 "entrypoint": {{
     "command": "{}",
     "args": []
@@ -1736,7 +2402,7 @@ mod tests {
 "name": "exec-alias-demo",
 "version": "0.1.0",
 "protocol": "jsonl",
-"protocol_version": 1,
+"protocol_version": 2,
 "exec": {{
     "command": "{}",
     "args": ["--stdio"]
@@ -1777,7 +2443,7 @@ mod tests {
 "name": "wrong-kind",
 "version": "0.1.0",
 "protocol": "jsonl",
-"protocol_version": 1,
+"protocol_version": 2,
 "entrypoint": {{
     "command": "{}",
     "args": []
@@ -2045,10 +2711,10 @@ sleep 5
             Duration::from_millis(50),
         )
         .unwrap_err();
-        assert!(matches!(
-            error,
-            ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
-        ));
+        assert!(
+            matches!(&error, ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if *timeout_ms == 50),
+            "expected a 50 ms timeout from the silent plugin, got {error:?}"
+        );
     }
 
     #[test]
@@ -2201,6 +2867,19 @@ sleep 5
         assert!(matches!(
             error,
             ChannelPluginCallError::PluginTimedOut { timeout_ms, .. } if timeout_ms == 50
+        ));
+        // A late response could otherwise answer the next request.
+        let error = call_persistent_channel_plugin(
+            &mut process,
+            &manifest,
+            ChannelPluginRequest::Capabilities,
+            Duration::from_millis(50),
+        )
+        .expect_err("timed-out process must not be reused");
+        assert!(matches!(
+            error,
+            ChannelPluginCallError::PluginProtocol { ref message, .. }
+                if message.contains("earlier exchange failure")
         ));
     }
 

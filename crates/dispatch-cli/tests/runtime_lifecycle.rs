@@ -1,6 +1,7 @@
 use dispatch_core::{
-    BuildOptions, CourierPluginExec, CourierPluginManifest, PluginTransport, build_agent,
-    install_courier_plugin,
+    BuildOptions, ChannelEventBatch, ChannelEventRequest, CourierPluginExec, CourierPluginManifest,
+    PluginTransport, build_agent, event_acceptance_to_jsonrpc, event_request_to_jsonrpc,
+    init_secret_store, install_courier_plugin,
 };
 use dispatch_process::run_command_with_file_capture;
 #[cfg(unix)]
@@ -316,7 +317,7 @@ fn write_channel_manifest(
         "name": name,
         "version": "0.1",
         "protocol": "jsonl",
-        "protocol_version": 1,
+        "protocol_version": dispatch_core::CHANNEL_PLUGIN_PROTOCOL_VERSION,
         "description": description,
         "entrypoint": {
             "command": command,
@@ -382,19 +383,270 @@ fn write_channel_entrypoint_script(
     Ok((path_string(&wrapper_path), Vec::new()))
 }
 
-#[cfg(windows)]
 fn powershell_single_quote_literal(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// One typed inbound batch with its exact wire request and expected durable receipt.
+struct ChannelEventFixture {
+    wire: String,
+    receipt: String,
+    digest: String,
+}
+
+impl ChannelEventFixture {
+    fn new(batch: Value) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_previous(batch, None)
+    }
+
+    fn with_previous(
+        batch: Value,
+        previous: Option<dispatch_core::ChannelEventAcceptance>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let batch: ChannelEventBatch = serde_json::from_value(batch)?;
+        let request = ChannelEventRequest::new(batch, previous)?;
+        Ok(Self {
+            wire: event_request_to_jsonrpc(&request)?,
+            receipt: event_acceptance_to_jsonrpc(
+                &request.request_id(),
+                &request.acceptance().unwrap(),
+            )?,
+            digest: request.batch_digest.clone(),
+        })
+    }
+
+    fn shell_wire(&self) -> String {
+        shell_single_quote_literal(&self.wire)
+    }
+
+    fn acceptance(&self) -> Result<dispatch_core::ChannelEventAcceptance, serde_json::Error> {
+        serde_json::from_value(serde_json::from_str::<Value>(&self.receipt)?["result"].clone())
+    }
+
+    fn shell_receipt(&self) -> String {
+        shell_single_quote_literal(&self.receipt)
+    }
+
+    fn powershell_wire(&self) -> String {
+        powershell_single_quote_literal(&self.wire)
+    }
+
+    fn powershell_receipt(&self) -> String {
+        powershell_single_quote_literal(&self.receipt)
+    }
+}
+
+fn webhook_test_event(thread_id: Option<&str>) -> Value {
+    let mut conversation = serde_json::json!({
+        "id": "conv-1",
+        "kind": "private",
+    });
+    if let Some(thread_id) = thread_id {
+        conversation["thread_id"] = Value::from(thread_id);
+    }
+    serde_json::json!({
+        "event_id": "evt-1",
+        "platform": "webhook",
+        "event_type": "message",
+        "received_at": "2026-04-12T00:00:00Z",
+        "conversation": conversation,
+        "actor": {
+            "id": "user-1",
+            "is_bot": false,
+            "metadata": {},
+        },
+        "message": {
+            "id": "msg-1",
+            "content": "hello",
+            "content_type": "text/plain",
+            "attachments": [],
+            "metadata": {},
+        },
+        "metadata": {},
+    })
+}
+
+fn poll_test_event(event_id: &str) -> Value {
+    serde_json::json!({
+        "event_id": event_id,
+        "platform": "telegram",
+        "event_type": "message.received",
+        "received_at": "2026-04-12T00:00:00Z",
+        "conversation": {
+            "id": "chat-1",
+            "kind": "private",
+        },
+        "actor": {
+            "id": "user-1",
+            "is_bot": false,
+            "metadata": {},
+        },
+        "message": {
+            "id": "msg-1",
+            "content": "hello from poll",
+            "content_type": "text/plain",
+            "attachments": [],
+            "metadata": {},
+        },
+        "metadata": {
+            "transport": "polling",
+        },
+    })
+}
+
+fn polling_test_state(cursor: &str) -> Value {
+    serde_json::json!({
+        "mode": "polling",
+        "status": "running",
+        "metadata": {
+            "cursor": cursor,
+        },
+    })
+}
+
+fn empty_channel_event_fixture() -> Result<ChannelEventFixture, Box<dyn std::error::Error>> {
+    ChannelEventFixture::new(serde_json::json!({ "events": [] }))
+}
+
+fn init_channel_inbox_key(project_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(project_dir.join(".dispatch"))?;
+    init_secret_store(project_dir, false)?;
+    Ok(())
+}
+
+fn channel_state_entries(
+    project_dir: &Path,
+    plugin: &str,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let state_dir = project_dir.join(".dispatch/channel-state").join(plugin);
+    if !state_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = fs::read_dir(&state_dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(entries)
+}
+
+fn channel_state_json_files(
+    project_dir: &Path,
+    plugin: &str,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    Ok(channel_state_entries(project_dir, plugin)?
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect())
+}
+
+fn channel_inbox_files(
+    project_dir: &Path,
+    plugin: &str,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    Ok(channel_state_entries(project_dir, plugin)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".inbox.sqlite"))
+        })
+        .collect())
+}
+
+fn assert_host_owned_journal(request: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    let journal_path = request["request"]["storage"]["journal_path"]
+        .as_str()
+        .ok_or_else(|| format!("channel ingress request missing storage journal: {request}"))?;
+    assert!(
+        Path::new(journal_path).is_absolute(),
+        "journal path is not absolute: {journal_path}"
+    );
+    assert!(
+        journal_path.ends_with(".producer.sqlite"),
+        "unexpected journal path: {journal_path}"
+    );
+    Ok(journal_path.to_string())
+}
+
+fn install_channel_test_plugin(
+    project_dir: &Path,
+    manifest_path: &Path,
+    registry_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_success(
+        run_dispatch(
+            project_dir,
+            &[],
+            &[
+                "channel",
+                "install",
+                manifest_path
+                    .to_str()
+                    .ok_or("manifest path is not valid UTF-8")?,
+                "--registry",
+                registry_path
+                    .to_str()
+                    .ok_or("registry path is not valid UTF-8")?,
+            ],
+        )?,
+        "dispatch channel install",
+    )?;
+    Ok(())
+}
+
+fn run_channel_poll_once_json(
+    project_dir: &Path,
+    plugin: &str,
+    registry_path: &Path,
+    extra_args: &[&str],
+) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    let mut args = vec![
+        "channel",
+        "poll",
+        plugin,
+        "--once",
+        "--json",
+        "--registry",
+        registry_path
+            .to_str()
+            .ok_or("registry path is not valid UTF-8")?,
+    ];
+    args.extend_from_slice(extra_args);
+    run_dispatch(project_dir, &[], &args)
+}
+
+fn last_json_object(stdout: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("missing JSON payload in output:\n{stdout}"))?;
+    Ok(serde_json::from_str(json_line)?)
+}
+
+fn read_lines(path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .map(str::to_string)
+        .collect())
 }
 
 fn write_channel_test_plugin(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let plugin_dir = dir.join("channel-plugin");
     fs::create_dir_all(&plugin_dir)?;
 
+    let event = ChannelEventFixture::new(serde_json::json!({
+        "events": [webhook_test_event(None)],
+    }))?;
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
-        r#"#!/bin/sh
+        &r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -411,15 +663,20 @@ case "$line" in
         break
         ;;
     *'"method":"channel.ingress_event"'*)
-        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}}'
+        printf '%s\n' '__EVENT_REQUEST__'
+        IFS= read -r receipt
+        [ "$receipt" = '__EVENT_RECEIPT__' ] || exit 1
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"kind":"ingress_events_received","callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}}'
         ;;
     *)
         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}'
         ;;
 esac
 done
-"#,
-        r#"$stdin = [Console]::In
+"#
+        .replace("__EVENT_REQUEST__", &event.shell_wire())
+        .replace("__EVENT_RECEIPT__", &event.shell_receipt()),
+        &r#"$stdin = [Console]::In
 while (($line = $stdin.ReadLine()) -ne $null) {
     $requestId = "1"
     if ($line -match '"id":([0-9]+)') {
@@ -433,12 +690,19 @@ while (($line = $stdin.ReadLine()) -ne $null) {
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
         break
     } elseif ($line -like '*"method":"channel.ingress_event"*') {
-        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_events_received","events":[{"event_id":"evt-1","platform":"webhook","event_type":"message","received_at":"2026-04-12T00:00:00Z","conversation":{"id":"conv-1","kind":"private"},"actor":{"id":"user-1","is_bot":false,"metadata":{}},"message":{"id":"msg-1","content":"hello","content_type":"text/plain","attachments":[],"metadata":{}},"metadata":{}}],"callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}}')
+        Write-Output ('__EVENT_REQUEST__')
+        $receipt = $stdin.ReadLine()
+        if ($receipt -cne '__EVENT_RECEIPT__') {
+            exit 1
+        }
+        Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ingress_events_received","callback_reply":{"status":202,"content_type":"text/plain; charset=utf-8","body":"accepted\n"}}}')
     } else {
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}')
     }
 }
-"#,
+"#
+        .replace("__EVENT_REQUEST__", &event.powershell_wire())
+        .replace("__EVENT_RECEIPT__", &event.powershell_receipt()),
     )?;
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
@@ -471,6 +735,12 @@ fn write_lifecycle_channel_test_plugin(
     let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
     #[cfg(not(windows))]
     let windows_log_path = String::new();
+    let shell_log_path = shell_path_string(log_path);
+    let event = empty_channel_event_fixture()?;
+    let event_wire = event.shell_wire();
+    let event_receipt = event.shell_receipt();
+    let windows_event_wire = event.powershell_wire();
+    let windows_event_receipt = event.powershell_receipt();
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
@@ -478,7 +748,7 @@ fn write_lifecycle_channel_test_plugin(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
-printf '%s\n' "$line" >> "{}"
+printf '%s\n' "$line" >> "{shell_log_path}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
@@ -493,15 +763,17 @@ case "$line" in
         break
         ;;
     *'"method":"channel.ingress_event"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
+        printf '%s\n' '{event_wire}'
+        IFS= read -r receipt
+        [ "$receipt" = '{event_receipt}' ] || exit 1
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
         ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
         ;;
 esac
 done
-"#,
-            shell_path_string(log_path)
+"#
         ),
         &format!(
             r#"$stdin = [Console]::In
@@ -519,7 +791,12 @@ while (($line = $stdin.ReadLine()) -ne $null) {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
         break
     }} elseif ($line -like '*"method":"channel.ingress_event"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
+        Write-Output ('{windows_event_wire}')
+        $receipt = $stdin.ReadLine()
+        if ($receipt -cne '{windows_event_receipt}') {{
+            exit 1
+        }}
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
     }} else {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
     }}
@@ -555,6 +832,16 @@ fn write_polling_channel_test_plugin(
     let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
     #[cfg(not(windows))]
     let windows_log_path = String::new();
+    let shell_log_path = shell_path_string(log_path);
+    let event = ChannelEventFixture::new(serde_json::json!({
+        "events": [poll_test_event("poll-evt-1")],
+        "state": polling_test_state("1"),
+        "poll_after_ms": 25,
+    }))?;
+    let event_wire = event.shell_wire();
+    let event_receipt = event.shell_receipt();
+    let windows_event_wire = event.powershell_wire();
+    let windows_event_receipt = event.powershell_receipt();
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
@@ -562,16 +849,24 @@ fn write_polling_channel_test_plugin(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
-printf '%s\n' "$line" >> "{}"
+case "$line" in
+    *'"kind":"accepted"'*)
+        continue
+        ;;
+esac
+printf '%s\n' "$line" >> "{shell_log_path}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
     *'"method":"channel.poll_ingress"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
+        printf '%s\n' '{event_wire}'
+        IFS= read -r receipt
+        [ "$receipt" = '{event_receipt}' ] || exit 1
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","poll_after_ms":25}}}}'
         ;;
     *'"method":"channel.start_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}'
-        printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
+        printf '%s\n' '{event_wire}'
         ;;
     *'"method":"channel.stop_ingress"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}'
@@ -585,22 +880,29 @@ case "$line" in
         ;;
 esac
 done
-"#,
-            shell_path_string(log_path)
+"#
         ),
         &format!(
             r#"$stdin = [Console]::In
 while (($line = $stdin.ReadLine()) -ne $null) {{
+    if ($line -like '*"kind":"accepted"*') {{
+        continue
+    }}
     Add-Content -Path '{windows_log_path}' -Value $line
     $requestId = "1"
     if ($line -match '"id":([0-9]+)') {{
         $requestId = $Matches[1]
     }}
     if ($line -like '*"method":"channel.poll_ingress"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
+        Write-Output ('{windows_event_wire}')
+        $receipt = $stdin.ReadLine()
+        if ($receipt -cne '{windows_event_receipt}') {{
+            exit 1
+        }}
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","poll_after_ms":25}}}}')
     }} elseif ($line -like '*"method":"channel.start_ingress"*') {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}')
-        Write-Output ('{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
+        Write-Output ('{windows_event_wire}')
     }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}')
     }} elseif ($line -like '*"method":"channel.shutdown"*') {{
@@ -630,17 +932,36 @@ while (($line = $stdin.ReadLine()) -ne $null) {{
     Ok(manifest_path)
 }
 
-fn write_stateful_polling_channel_test_plugin(
+/// Polling fixture that logs every request and every receipt line it receives.
+///
+/// A poll without a persisted cursor sends `first_batch`; a poll that carries
+/// cursor `1` sends `resumed_batch`. Passing the same fixture twice models a
+/// plugin that lost its acknowledgment and replays the original batch.
+fn write_batch_polling_channel_test_plugin(
     dir: &Path,
-    log_path: &Path,
+    name: &str,
+    request_log: &Path,
+    receipt_log: &Path,
+    first_batch: &ChannelEventFixture,
+    resumed_batch: &ChannelEventFixture,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let plugin_dir = dir.join("stateful-polling-channel-plugin");
+    let plugin_dir = dir.join(format!("{name}-plugin"));
     fs::create_dir_all(&plugin_dir)?;
 
     #[cfg(windows)]
-    let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
+    let windows_request_log = powershell_single_quote_literal(&path_string(request_log));
     #[cfg(not(windows))]
-    let windows_log_path = String::new();
+    let windows_request_log = String::new();
+    #[cfg(windows)]
+    let windows_receipt_log = powershell_single_quote_literal(&path_string(receipt_log));
+    #[cfg(not(windows))]
+    let windows_receipt_log = String::new();
+    let shell_request_log = shell_path_string(request_log);
+    let shell_receipt_log = shell_path_string(receipt_log);
+    let first_wire = first_batch.shell_wire();
+    let resumed_wire = resumed_batch.shell_wire();
+    let windows_first_wire = first_batch.powershell_wire();
+    let windows_resumed_wire = resumed_batch.powershell_wire();
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
@@ -648,29 +969,21 @@ fn write_stateful_polling_channel_test_plugin(
             r#"#!/bin/sh
 set -eu
 while IFS= read -r line; do
-printf '%s\n' "$line" >> "{}"
+printf '%s\n' "$line" >> "{shell_request_log}"
 request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 [ -n "$request_id" ] || request_id=1
 case "$line" in
     *'"method":"channel.poll_ingress"'*'"cursor":"1"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}'
+        printf '%s\n' '{resumed_wire}'
+        IFS= read -r receipt || exit 1
+        printf '%s\n' "$receipt" >> "{shell_receipt_log}"
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","poll_after_ms":25}}}}'
         ;;
     *'"method":"channel.poll_ingress"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
-        ;;
-    *'"method":"channel.start_ingress"'*'"cursor":"1"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}}}}}}'
-        printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}'
-        ;;
-    *'"method":"channel.start_ingress"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}'
-        printf '%s\n' '{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}'
-        ;;
-    *'"method":"channel.stop_ingress"'*'"cursor":"2"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"2"}}}}}}}}'
-        ;;
-    *'"method":"channel.stop_ingress"'*)
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}'
+        printf '%s\n' '{first_wire}'
+        IFS= read -r receipt || exit 1
+        printf '%s\n' "$receipt" >> "{shell_receipt_log}"
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","poll_after_ms":25}}}}'
         ;;
     *'"method":"channel.shutdown"'*)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ok"}}}}'
@@ -681,31 +994,32 @@ case "$line" in
         ;;
 esac
 done
-"#,
-            shell_path_string(log_path)
+"#
         ),
         &format!(
             r#"$stdin = [Console]::In
 while (($line = $stdin.ReadLine()) -ne $null) {{
-    Add-Content -Path '{windows_log_path}' -Value $line
+    Add-Content -Path '{windows_request_log}' -Value $line
     $requestId = "1"
     if ($line -match '"id":([0-9]+)') {{
         $requestId = $Matches[1]
     }}
     if ($line -like '*"method":"channel.poll_ingress"*' -and $line -like '*"cursor":"1"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}')
+        Write-Output ('{windows_resumed_wire}')
+        $receipt = $stdin.ReadLine()
+        if ($null -eq $receipt) {{
+            exit 1
+        }}
+        Add-Content -Path '{windows_receipt_log}' -Value $receipt
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","poll_after_ms":25}}}}')
     }} elseif ($line -like '*"method":"channel.poll_ingress"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
-    }} elseif ($line -like '*"method":"channel.start_ingress"*' -and $line -like '*"cursor":"1"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}}}}}}')
-        Write-Output ('{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"2"}}}},"poll_after_ms":25}}}}')
-    }} elseif ($line -like '*"method":"channel.start_ingress"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_started","state":{{"mode":"polling","status":"running","metadata":{{"cursor":"0"}}}}}}}}')
-        Write-Output ('{{"jsonrpc":"2.0","method":"channel.event","params":{{"protocol_version":1,"events":[{{"event_id":"poll-evt-1","platform":"telegram","event_type":"message.received","received_at":"2026-04-12T00:00:00Z","conversation":{{"id":"chat-1","kind":"private"}},"actor":{{"id":"user-1","is_bot":false,"metadata":{{}}}},"message":{{"id":"msg-1","content":"hello from poll","content_type":"text/plain","attachments":[],"metadata":{{}}}},"metadata":{{"transport":"polling"}}}}],"state":{{"mode":"polling","status":"running","metadata":{{"cursor":"1"}}}},"poll_after_ms":25}}}}')
-    }} elseif ($line -like '*"method":"channel.stop_ingress"*' -and $line -like '*"cursor":"2"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"2"}}}}}}}}')
-    }} elseif ($line -like '*"method":"channel.stop_ingress"*') {{
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_stopped","state":{{"mode":"polling","status":"stopped","metadata":{{"cursor":"1"}}}}}}}}')
+        Write-Output ('{windows_first_wire}')
+        $receipt = $stdin.ReadLine()
+        if ($null -eq $receipt) {{
+            exit 1
+        }}
+        Add-Content -Path '{windows_receipt_log}' -Value $receipt
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","poll_after_ms":25}}}}')
     }} elseif ($line -like '*"method":"channel.shutdown"*') {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ok"}}}}')
         break
@@ -720,8 +1034,8 @@ while (($line = $stdin.ReadLine()) -ne $null) {{
     let manifest_path = plugin_dir.join("channel-plugin.json");
     write_channel_manifest(
         &manifest_path,
-        "channel-polling-stateful-test",
-        "Stateful polling test channel plugin",
+        name,
+        "Batch replay polling test channel plugin",
         &command,
         &args,
         serde_json::json!({
@@ -744,6 +1058,12 @@ fn write_logging_channel_test_plugin(
     let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
     #[cfg(not(windows))]
     let windows_log_path = String::new();
+    let shell_log_path = shell_path_string(log_path);
+    let event = empty_channel_event_fixture()?;
+    let event_wire = event.shell_wire();
+    let event_receipt = event.shell_receipt();
+    let windows_event_wire = event.powershell_wire();
+    let windows_event_receipt = event.powershell_receipt();
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
@@ -765,16 +1085,18 @@ case "$line" in
         break
         ;;
     *'"method":"channel.ingress_event"'*)
-        printf '%s\n' "$line" > "{}"
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
+        printf '%s\n' "$line" > "{shell_log_path}"
+        printf '%s\n' '{event_wire}'
+        IFS= read -r receipt
+        [ "$receipt" = '{event_receipt}' ] || exit 1
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
         ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
         ;;
 esac
 done
-"#,
-            shell_path_string(log_path)
+"#
         ),
         &format!(
             r#"$stdin = [Console]::In
@@ -792,7 +1114,12 @@ while (($line = $stdin.ReadLine()) -ne $null) {{
         break
     }} elseif ($line -like '*"method":"channel.ingress_event"*') {{
         Set-Content -Path '{windows_log_path}' -Value $line
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
+        Write-Output ('{windows_event_wire}')
+        $receipt = $stdin.ReadLine()
+        if ($receipt -cne '{windows_event_receipt}') {{
+            exit 1
+        }}
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
     }} else {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
     }}
@@ -829,6 +1156,12 @@ fn write_trusted_channel_test_plugin(
     let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
     #[cfg(not(windows))]
     let windows_log_path = String::new();
+    let shell_log_path = shell_path_string(log_path);
+    let event = empty_channel_event_fixture()?;
+    let event_wire = event.shell_wire();
+    let event_receipt = event.shell_receipt();
+    let windows_event_wire = event.powershell_wire();
+    let windows_event_receipt = event.powershell_receipt();
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
@@ -850,16 +1183,18 @@ case "$line" in
         break
         ;;
     *'"method":"channel.ingress_event"'*)
-        echo invoked >> "{}"
-        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
+        echo invoked >> "{shell_log_path}"
+        printf '%s\n' '{event_wire}'
+        IFS= read -r receipt
+        [ "$receipt" = '{event_receipt}' ] || exit 1
+        printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"result":{{"kind":"ingress_events_received","callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}'
         ;;
     *)
         printf '%s\n' '{{"jsonrpc":"2.0","id":'"$request_id"',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}'
         ;;
 esac
 done
-"#,
-            shell_path_string(log_path)
+"#
         ),
         &format!(
             r#"$stdin = [Console]::In
@@ -877,7 +1212,12 @@ while (($line = $stdin.ReadLine()) -ne $null) {{
         break
     }} elseif ($line -like '*"method":"channel.ingress_event"*') {{
         Add-Content -Path '{windows_log_path}' -Value 'invoked'
-        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","events":[],"callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
+        Write-Output ('{windows_event_wire}')
+        $receipt = $stdin.ReadLine()
+        if ($receipt -cne '{windows_event_receipt}') {{
+            exit 1
+        }}
+        Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"result":{{"kind":"ingress_events_received","callback_reply":{{"status":200,"content_type":"text/plain; charset=utf-8","body":"ok\n"}}}}}}')
     }} else {{
         Write-Output ('{{"jsonrpc":"2.0","id":' + $requestId + ',"error":{{"code":-32000,"message":"unexpected request kind","data":{{"dispatch_error":{{"code":"unexpected_request","message":"unexpected request kind"}}}}}}}}')
     }}
@@ -1208,6 +1548,9 @@ fn write_reply_channel_test_plugin(
     let windows_log_path = powershell_single_quote_literal(&path_string(log_path));
     #[cfg(not(windows))]
     let windows_log_path = String::new();
+    let event = ChannelEventFixture::new(serde_json::json!({
+        "events": [webhook_test_event(Some("thread-1"))],
+    }))?;
     let (command, args) = write_channel_entrypoint_script(
         &plugin_dir,
         "channel-test",
@@ -1225,7 +1568,10 @@ fn write_reply_channel_test_plugin(
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ok\\\"}}\"\n",
             "  break\n",
             "elif printf '%s' \"$line\" | grep -q '\"method\":\"channel.ingress_event\"'; then\n",
-            "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ingress_events_received\\\",\\\"events\\\":[{\\\"event_id\\\":\\\"evt-1\\\",\\\"platform\\\":\\\"webhook\\\",\\\"event_type\\\":\\\"message\\\",\\\"received_at\\\":\\\"2026-04-12T00:00:00Z\\\",\\\"conversation\\\":{\\\"id\\\":\\\"conv-1\\\",\\\"kind\\\":\\\"private\\\",\\\"thread_id\\\":\\\"thread-1\\\"},\\\"actor\\\":{\\\"id\\\":\\\"user-1\\\",\\\"is_bot\\\":false,\\\"metadata\\\":{}},\\\"message\\\":{\\\"id\\\":\\\"msg-1\\\",\\\"content\\\":\\\"hello\\\",\\\"content_type\\\":\\\"text/plain\\\",\\\"attachments\\\":[],\\\"metadata\\\":{}},\\\"metadata\\\":{}}],\\\"callback_reply\\\":{\\\"status\\\":200,\\\"content_type\\\":\\\"text/plain; charset=utf-8\\\",\\\"body\\\":\\\"ok\\\\n\\\"}}}\"\n",
+            "  printf '%s\\n' '__EVENT_REQUEST__'\n",
+            "  IFS= read -r receipt\n",
+            "  [ \"$receipt\" = '__EVENT_RECEIPT__' ] || exit 1\n",
+            "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"ingress_events_received\\\",\\\"callback_reply\\\":{\\\"status\\\":200,\\\"content_type\\\":\\\"text/plain; charset=utf-8\\\",\\\"body\\\":\\\"ok\\\\n\\\"}}}\"\n",
             "elif printf '%s' \"$line\" | grep -q '\"method\":\"channel.deliver\"'; then\n",
             "  printf '%s\\n' \"$line\" >> \"__DELIVERY_LOG__\"\n",
             "  printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$request_id,\\\"result\\\":{\\\"kind\\\":\\\"delivered\\\",\\\"delivery\\\":{\\\"message_id\\\":\\\"delivery-1\\\",\\\"conversation_id\\\":\\\"conv-1\\\",\\\"metadata\\\":{\\\"delivered_by\\\":\\\"test\\\"}}}}\"\n",
@@ -1234,7 +1580,9 @@ fn write_reply_channel_test_plugin(
             "fi\n",
             "done\n"
         )
-        .replace("__DELIVERY_LOG__", &shell_path_string(log_path)),
+        .replace("__DELIVERY_LOG__", &shell_path_string(log_path))
+        .replace("__EVENT_REQUEST__", &event.shell_wire())
+        .replace("__EVENT_RECEIPT__", &event.shell_receipt()),
         &r#"$stdin = [Console]::In
 while (($line = $stdin.ReadLine()) -ne $null) {
     $requestId = "1"
@@ -1249,37 +1597,16 @@ while (($line = $stdin.ReadLine()) -ne $null) {
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"result":{"kind":"ok"}}')
         break
     } elseif ($line -like '*"method":"channel.ingress_event"*') {
+        Write-Output ('__EVENT_REQUEST__')
+        $receipt = $stdin.ReadLine()
+        if ($receipt -cne '__EVENT_RECEIPT__') {
+            exit 1
+        }
         $response = @{
             jsonrpc = "2.0"
             id = [int]$requestId
             result = @{
                 kind = "ingress_events_received"
-                events = @(
-                    @{
-                        event_id = "evt-1"
-                        platform = "webhook"
-                        event_type = "message"
-                        received_at = "2026-04-12T00:00:00Z"
-                        conversation = @{
-                            id = "conv-1"
-                            kind = "private"
-                            thread_id = "thread-1"
-                        }
-                        actor = @{
-                            id = "user-1"
-                            is_bot = $false
-                            metadata = @{}
-                        }
-                        message = @{
-                            id = "msg-1"
-                            content = "hello"
-                            content_type = "text/plain"
-                            attachments = @()
-                            metadata = @{}
-                        }
-                        metadata = @{}
-                    }
-                )
                 callback_reply = @{
                     status = 200
                     content_type = "text/plain; charset=utf-8"
@@ -1309,7 +1636,10 @@ while (($line = $stdin.ReadLine()) -ne $null) {
         Write-Output ('{"jsonrpc":"2.0","id":' + $requestId + ',"error":{"code":-32000,"message":"unhandled request","data":{"dispatch_error":{"code":"unexpected_request","message":"unhandled request"}}}}')
     }
 }
-"#.replace("__WINDOWS_LOG_PATH__", &windows_log_path),
+"#
+        .replace("__WINDOWS_LOG_PATH__", &windows_log_path)
+        .replace("__EVENT_REQUEST__", &event.powershell_wire())
+        .replace("__EVENT_RECEIPT__", &event.powershell_receipt()),
     )?;
 
     let manifest_path = plugin_dir.join("channel-plugin.json");
@@ -1522,6 +1852,7 @@ max_header_bytes = 1024",
 #[serial_test::file_serial(channel_listener)]
 fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let manifest_path = write_channel_test_plugin(dir.path())?;
 
@@ -1591,6 +1922,7 @@ fn channel_listen_handles_http_request_end_to_end() -> Result<(), Box<dyn std::e
 #[serial_test::file_serial(channel_listener)]
 fn dispatch_up_uses_project_local_channel_registry() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let manifest_path = write_channel_test_plugin(dir.path())?;
     let listen_addr = reserve_loopback_addr()?;
     fs::write(
@@ -1640,6 +1972,7 @@ once = true
 #[serial_test::file_serial(channel_listener)]
 fn dispatch_up_loads_channel_toml_config_file() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let request_log = dir.path().join("request.json");
     let manifest_path = write_logging_channel_test_plugin(dir.path(), &request_log)?;
     let listen_addr = reserve_loopback_addr()?;
@@ -1867,6 +2200,7 @@ once = true
 fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dyn std::error::Error>>
 {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let request_log = dir.path().join("request.json");
     let manifest_path = write_logging_channel_test_plugin(dir.path(), &request_log)?;
@@ -1936,6 +2270,7 @@ fn channel_listen_decodes_query_params_before_plugin_call() -> Result<(), Box<dy
 #[serial_test::file_serial(channel_listener)]
 fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let lifecycle_log = dir.path().join("lifecycle.log");
     let manifest_path = write_lifecycle_channel_test_plugin(dir.path(), &lifecycle_log)?;
@@ -2008,6 +2343,10 @@ fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::erro
     assert_eq!(ingress_request["request"]["kind"], "ingress_event");
     assert_eq!(stop_request["request"]["kind"], "stop_ingress");
     assert_eq!(shutdown_request["request"]["kind"], "shutdown");
+    let start_journal = assert_host_owned_journal(&start_request)?;
+    let ingress_journal = assert_host_owned_journal(&ingress_request)?;
+    assert_eq!(start_journal, ingress_journal);
+    assert!(stop_request["request"].get("storage").is_none());
     assert_eq!(stop_request["request"]["state"]["status"], "registered");
     assert_eq!(
         stop_request["request"]["state"]["endpoint"],
@@ -2020,6 +2359,7 @@ fn channel_listen_calls_start_and_stop_ingress() -> Result<(), Box<dyn std::erro
 #[test]
 fn channel_poll_once_issues_poll_ingress() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let poll_log = dir.path().join("poll.log");
     let manifest_path = write_polling_channel_test_plugin(dir.path(), &poll_log)?;
@@ -2085,6 +2425,26 @@ fn channel_poll_once_issues_poll_ingress() -> Result<(), Box<dyn std::error::Err
 
     assert_eq!(poll_request["request"]["kind"], "poll_ingress");
     assert_eq!(poll_request["request"]["state"], Value::Null);
+    let journal_path = assert_host_owned_journal(&poll_request)?;
+
+    let state_files = channel_state_json_files(dir.path(), "channel-polling-test")?;
+    assert_eq!(
+        state_files.len(),
+        1,
+        "unexpected state files: {state_files:?}"
+    );
+    let inbox_files = channel_inbox_files(dir.path(), "channel-polling-test")?;
+    assert_eq!(
+        inbox_files,
+        vec![state_files[0].with_extension("inbox.sqlite")],
+        "unexpected inbox files"
+    );
+    assert_eq!(
+        Path::new(&journal_path).file_name(),
+        state_files[0].with_extension("producer.sqlite").file_name()
+    );
+    let persisted_state: Value = serde_json::from_str(&fs::read_to_string(&state_files[0])?)?;
+    assert_eq!(persisted_state["metadata"]["cursor"], "1");
 
     Ok(())
 }
@@ -2092,9 +2452,31 @@ fn channel_poll_once_issues_poll_ingress() -> Result<(), Box<dyn std::error::Err
 #[test]
 fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let poll_log = dir.path().join("poll.log");
-    let manifest_path = write_stateful_polling_channel_test_plugin(dir.path(), &poll_log)?;
+    let receipt_log = dir.path().join("receipts.log");
+    let first_batch = ChannelEventFixture::new(serde_json::json!({
+        "events": [poll_test_event("poll-evt-1")],
+        "state": polling_test_state("1"),
+        "poll_after_ms": 25,
+    }))?;
+    let resumed_batch = ChannelEventFixture::with_previous(
+        serde_json::json!({
+            "events": [],
+            "state": polling_test_state("2"),
+            "poll_after_ms": 25,
+        }),
+        Some(first_batch.acceptance()?),
+    )?;
+    let manifest_path = write_batch_polling_channel_test_plugin(
+        dir.path(),
+        "channel-polling-stateful-test",
+        &poll_log,
+        &receipt_log,
+        &first_batch,
+        &resumed_batch,
+    )?;
 
     require_success(
         run_dispatch(
@@ -2141,6 +2523,7 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
     let first_output: Value = serde_json::from_str(first_json_line)?;
     assert_eq!(first_output["events"][0]["event_id"], "poll-evt-1");
     assert_eq!(first_output["state"]["metadata"]["cursor"], "1");
+    assert_eq!(read_lines(&receipt_log)?, vec![first_batch.receipt.clone()]);
 
     let second_stdout = require_success(
         run_dispatch(
@@ -2172,6 +2555,10 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
             .is_some_and(|events| events.is_empty())
     );
     assert_eq!(second_output["state"]["metadata"]["cursor"], "2");
+    assert_eq!(
+        read_lines(&receipt_log)?,
+        vec![first_batch.receipt, resumed_batch.receipt]
+    );
 
     let logged_requests = fs::read_to_string(&poll_log)?;
     let request_lines = logged_requests.lines().collect::<Vec<_>>();
@@ -2199,6 +2586,10 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         state_files.len(),
@@ -2213,10 +2604,442 @@ fn channel_poll_once_reuses_persisted_ingress_state() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn channel_poll_once_replays_lost_acknowledgment_without_rerunning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
+    let plugin = "channel-polling-replay-test";
+    let registry_path = dir.path().join("channels.json");
+    let courier_registry_path = dir.path().join("couriers.json");
+    let request_log = dir.path().join("poll.log");
+    let receipt_log = dir.path().join("receipts.log");
+    let batch = ChannelEventFixture::new(serde_json::json!({
+        "events": [poll_test_event("poll-evt-1")],
+        "state": polling_test_state("1"),
+        "poll_after_ms": 25,
+    }))?;
+    let manifest_path = write_batch_polling_channel_test_plugin(
+        dir.path(),
+        plugin,
+        &request_log,
+        &receipt_log,
+        &batch,
+        &batch,
+    )?;
+    let (parcel_dir, parcel_digest) = build_chat_test_parcel(dir.path())?;
+    install_test_courier_plugin(
+        dir.path(),
+        &courier_registry_path,
+        "poll-test-courier",
+        &parcel_digest,
+    )?;
+    install_channel_test_plugin(dir.path(), &manifest_path, &registry_path)?;
+    let parcel_args = [
+        "--parcel",
+        parcel_dir
+            .to_str()
+            .ok_or("parcel path is not valid UTF-8")?,
+        "--courier",
+        "poll-test-courier",
+        "--courier-registry",
+        courier_registry_path
+            .to_str()
+            .ok_or("courier registry path is not valid UTF-8")?,
+    ];
+
+    let first = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &parcel_args)?,
+        "dispatch channel poll --once (first)",
+    )?)?;
+    assert_eq!(first["plugin"], plugin);
+    assert_eq!(first["events"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["events"][0]["event_id"], "poll-evt-1");
+    assert_eq!(first["parcel_runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["parcel_runs"][0]["event_id"], "poll-evt-1");
+    assert_eq!(first["state"]["metadata"]["cursor"], "1");
+
+    let replay = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &parcel_args)?,
+        "dispatch channel poll --once (replay)",
+    )?)?;
+    assert_eq!(replay["plugin"], plugin);
+    assert_eq!(replay["events"], Value::Array(Vec::new()));
+    assert_eq!(replay["parcel_runs"], Value::Array(Vec::new()));
+
+    let receipts = read_lines(&receipt_log)?;
+    assert_eq!(receipts.len(), 2, "unexpected receipts: {receipts:?}");
+    assert_eq!(receipts[0], receipts[1]);
+    assert_eq!(receipts[0], batch.receipt);
+
+    let requests = read_lines(&request_log)?;
+    assert_eq!(requests.len(), 2, "unexpected poll log: {requests:?}");
+    let first_request = decode_logged_channel_request(&requests[0])?;
+    let replay_request = decode_logged_channel_request(&requests[1])?;
+    assert_eq!(first_request["request"]["kind"], "poll_ingress");
+    assert_eq!(first_request["request"]["state"], Value::Null);
+    assert_eq!(replay_request["request"]["kind"], "poll_ingress");
+    assert_eq!(first_request["request"]["storage"]["recovery"], Value::Null);
+    assert_eq!(
+        replay_request["request"]["storage"]["recovery"]["request"],
+        serde_json::from_str::<Value>(&batch.wire)?["params"]
+    );
+    assert_eq!(
+        replay_request["request"]["storage"]["recovery"]["acceptance"],
+        serde_json::to_value(batch.acceptance().unwrap())?
+    );
+    assert_eq!(
+        replay_request["request"]["storage"]["recovery"]["state"],
+        polling_test_state("1")
+    );
+    assert_eq!(
+        replay_request["request"]["state"]["metadata"]["cursor"],
+        "1"
+    );
+
+    let state_files = channel_state_json_files(dir.path(), plugin)?;
+    assert_eq!(
+        state_files.len(),
+        1,
+        "unexpected state files: {state_files:?}"
+    );
+    let persisted_state: Value = serde_json::from_str(&fs::read_to_string(&state_files[0])?)?;
+    assert_eq!(persisted_state["metadata"]["cursor"], "1");
+
+    Ok(())
+}
+
+#[test]
+fn channel_inbox_owner_commands_keep_current_head_after_handling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
+    let plugin = "channel-polling-inbox-test";
+    let registry_path = dir.path().join("channels.json");
+    let request_log = dir.path().join("poll.log");
+    let receipt_log = dir.path().join("receipts.log");
+    let batch = ChannelEventFixture::new(serde_json::json!({
+        "events": [poll_test_event("poll-evt-1")],
+        "state": polling_test_state("1"),
+        "poll_after_ms": 25,
+    }))?;
+    let manifest_path = write_batch_polling_channel_test_plugin(
+        dir.path(),
+        plugin,
+        &request_log,
+        &receipt_log,
+        &batch,
+        &batch,
+    )?;
+    install_channel_test_plugin(dir.path(), &manifest_path, &registry_path)?;
+
+    let first = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?,
+        "dispatch channel poll --once (first)",
+    )?)?;
+    assert_eq!(first["events"][0]["event_id"], "poll-evt-1");
+
+    let state_files = channel_state_json_files(dir.path(), plugin)?;
+    assert_eq!(
+        state_files.len(),
+        1,
+        "unexpected state files: {state_files:?}"
+    );
+    let inbox_files = channel_inbox_files(dir.path(), plugin)?;
+    assert_eq!(
+        inbox_files,
+        vec![state_files[0].with_extension("inbox.sqlite")],
+        "unexpected inbox files"
+    );
+    let inbox_path = inbox_files[0]
+        .to_str()
+        .ok_or("inbox path is not valid UTF-8")?
+        .to_string();
+
+    let listed: Value = serde_json::from_str(&require_success(
+        run_dispatch(dir.path(), &[], &["channel", "inbox", "list", &inbox_path])?,
+        "dispatch channel inbox list",
+    )?)?;
+    let descriptors = listed.as_array().ok_or("expected inbox descriptor array")?;
+    assert_eq!(descriptors.len(), 1, "unexpected descriptors: {listed}");
+    assert_eq!(descriptors[0]["batch_digest"], batch.digest.as_str());
+    assert_eq!(descriptors[0]["state"], "retired");
+    let sequence = descriptors[0]["sequence"]
+        .as_u64()
+        .ok_or("missing receipt sequence")?
+        .to_string();
+
+    let paged: Value = serde_json::from_str(&require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &[
+                "channel",
+                "inbox",
+                "list",
+                &inbox_path,
+                "--after",
+                &sequence,
+                "--limit",
+                "1",
+            ],
+        )?,
+        "dispatch channel inbox list --after",
+    )?)?;
+    assert_eq!(paged, Value::Array(Vec::new()));
+
+    let inspected: Value = serde_json::from_str(&require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &["channel", "inbox", "inspect", &inbox_path, &sequence],
+        )?,
+        "dispatch channel inbox inspect",
+    )?)?;
+    assert_eq!(inspected, Value::Null);
+
+    let retired = require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &["channel", "inbox", "retire", &inbox_path, &sequence],
+        )?,
+        "dispatch channel inbox retire",
+    )?;
+    assert!(
+        retired.contains(
+            "Retired channel batch payload; its event receipts remain for duplicate protection."
+        ),
+        "unexpected retire output:\n{retired}"
+    );
+
+    let replay = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?,
+        "dispatch channel poll --once (replay after retire)",
+    )?)?;
+    assert_eq!(replay["events"], Value::Array(Vec::new()));
+    assert_eq!(replay["parcel_runs"], Value::Array(Vec::new()));
+
+    let receipts = read_lines(&receipt_log)?;
+    assert_eq!(receipts.len(), 2, "unexpected receipts: {receipts:?}");
+    assert_eq!(receipts[0], batch.receipt);
+    assert_eq!(receipts[1], batch.receipt);
+
+    let relisted: Value = serde_json::from_str(&require_success(
+        run_dispatch(dir.path(), &[], &["channel", "inbox", "list", &inbox_path])?,
+        "dispatch channel inbox list (after replay)",
+    )?)?;
+    let descriptors = relisted
+        .as_array()
+        .ok_or("expected inbox descriptor array")?;
+    assert_eq!(descriptors.len(), 1, "unexpected descriptors: {relisted}");
+    assert_eq!(descriptors[0]["batch_digest"], batch.digest.as_str());
+    assert_eq!(descriptors[0]["state"], "retired");
+
+    let reinspected: Value = serde_json::from_str(&require_success(
+        run_dispatch(
+            dir.path(),
+            &[],
+            &["channel", "inbox", "inspect", &inbox_path, &sequence],
+        )?,
+        "dispatch channel inbox inspect (after replay)",
+    )?)?;
+    assert_eq!(reinspected, Value::Null);
+
+    Ok(())
+}
+
+#[test]
+fn channel_poll_once_refuses_new_batch_reusing_accepted_event_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
+    let plugin = "channel-polling-conflict-test";
+    let registry_path = dir.path().join("channels.json");
+    let request_log = dir.path().join("poll.log");
+    let receipt_log = dir.path().join("receipts.log");
+    let first_batch = ChannelEventFixture::new(serde_json::json!({
+        "events": [poll_test_event("poll-evt-1")],
+        "state": polling_test_state("1"),
+        "poll_after_ms": 25,
+    }))?;
+    let mut changed_event = poll_test_event("poll-evt-1");
+    changed_event["message"]["content"] = Value::String("changed original content".into());
+    let conflicting_batch = ChannelEventFixture::with_previous(
+        serde_json::json!({
+            "events": [changed_event],
+            "state": polling_test_state("2"),
+            "poll_after_ms": 25,
+        }),
+        Some(first_batch.acceptance().unwrap()),
+    )?;
+    assert_ne!(first_batch.digest, conflicting_batch.digest);
+    let manifest_path = write_batch_polling_channel_test_plugin(
+        dir.path(),
+        plugin,
+        &request_log,
+        &receipt_log,
+        &first_batch,
+        &conflicting_batch,
+    )?;
+    install_channel_test_plugin(dir.path(), &manifest_path, &registry_path)?;
+
+    let first = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?,
+        "dispatch channel poll --once (first)",
+    )?)?;
+    assert_eq!(first["events"][0]["event_id"], "poll-evt-1");
+
+    let output = run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?;
+    let (stdout, stderr) = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "conflicting batch was unexpectedly accepted\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("poll-evt-1") || stderr.to_ascii_lowercase().contains("event id"),
+        "stderr did not mention the reused event identity\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let receipts = read_lines(&receipt_log)?;
+    assert_eq!(
+        receipts,
+        vec![first_batch.receipt.clone()],
+        "the conflicting batch must not receive a receipt"
+    );
+
+    let requests = read_lines(&request_log)?;
+    assert_eq!(requests.len(), 2, "unexpected poll log: {requests:?}");
+    let conflicting_request = decode_logged_channel_request(&requests[1])?;
+    assert_eq!(conflicting_request["request"]["kind"], "poll_ingress");
+    assert_eq!(
+        conflicting_request["request"]["state"]["metadata"]["cursor"],
+        "1"
+    );
+
+    let state_files = channel_state_json_files(dir.path(), plugin)?;
+    assert_eq!(
+        state_files.len(),
+        1,
+        "unexpected state files: {state_files:?}"
+    );
+    let persisted_state: Value = serde_json::from_str(&fs::read_to_string(&state_files[0])?)?;
+    assert_eq!(persisted_state["metadata"]["cursor"], "1");
+
+    let inbox_files = channel_inbox_files(dir.path(), plugin)?;
+    assert_eq!(
+        inbox_files.len(),
+        1,
+        "unexpected inbox files: {inbox_files:?}"
+    );
+    let inbox_path = inbox_files[0]
+        .to_str()
+        .ok_or("inbox path is not valid UTF-8")?;
+    let listed: Value = serde_json::from_str(&require_success(
+        run_dispatch(dir.path(), &[], &["channel", "inbox", "list", inbox_path])?,
+        "dispatch channel inbox list",
+    )?)?;
+    let descriptors = listed.as_array().ok_or("expected inbox descriptor array")?;
+    assert_eq!(descriptors.len(), 1, "unexpected descriptors: {listed}");
+    assert_eq!(descriptors[0]["batch_digest"], first_batch.digest.as_str());
+
+    Ok(())
+}
+
+#[test]
+fn channel_poll_once_deduplicates_later_host_observation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
+    let plugin = "channel-polling-observation-test";
+    let registry_path = dir.path().join("channels.json");
+    let request_log = dir.path().join("poll.log");
+    let receipt_log = dir.path().join("receipts.log");
+    let original_event = poll_test_event("poll-evt-1");
+    let first = ChannelEventFixture::new(serde_json::json!({
+        "events": [original_event.clone()],
+        "state": polling_test_state("1"),
+    }))?;
+    let mut observed = original_event;
+    observed["received_at"] = Value::String("2026-10-15T00:00:00Z".into());
+    let second = ChannelEventFixture::with_previous(
+        serde_json::json!({
+            "events": [observed],
+            "state": polling_test_state("2"),
+        }),
+        Some(first.acceptance()?),
+    )?;
+    let manifest = write_batch_polling_channel_test_plugin(
+        dir.path(),
+        plugin,
+        &request_log,
+        &receipt_log,
+        &first,
+        &second,
+    )?;
+    install_channel_test_plugin(dir.path(), &manifest, &registry_path)?;
+    let original = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?,
+        "dispatch channel poll --once (original observation)",
+    )?)?;
+    assert_eq!(original["events"][0]["event_id"], "poll-evt-1");
+    let repeated = last_json_object(&require_success(
+        run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?,
+        "dispatch channel poll --once (later observation)",
+    )?)?;
+    assert_eq!(repeated["events"], Value::Array(Vec::new()));
+    assert_eq!(repeated["parcel_runs"], Value::Array(Vec::new()));
+    assert_eq!(repeated["state"]["metadata"]["cursor"], "2");
+    assert_eq!(
+        read_lines(&receipt_log)?,
+        vec![first.receipt, second.receipt]
+    );
+    Ok(())
+}
+
+#[test]
+fn channel_poll_once_requires_initialized_inbox_key() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let plugin = "channel-polling-keyless-test";
+    let registry_path = dir.path().join("channels.json");
+    let request_log = dir.path().join("poll.log");
+    let receipt_log = dir.path().join("receipts.log");
+    let batch = ChannelEventFixture::new(serde_json::json!({
+        "events": [poll_test_event("poll-evt-1")],
+        "state": polling_test_state("1"),
+        "poll_after_ms": 25,
+    }))?;
+    let manifest_path = write_batch_polling_channel_test_plugin(
+        dir.path(),
+        plugin,
+        &request_log,
+        &receipt_log,
+        &batch,
+        &batch,
+    )?;
+    install_channel_test_plugin(dir.path(), &manifest_path, &registry_path)?;
+
+    let output = run_channel_poll_once_json(dir.path(), plugin, &registry_path, &[])?;
+    let (stdout, stderr) = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "poll unexpectedly succeeded without an inbox key\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !receipt_log.exists(),
+        "a receipt was written without a durable inbox"
+    );
+    assert!(channel_state_json_files(dir.path(), plugin)?.is_empty());
+    assert!(channel_inbox_files(dir.path(), plugin)?.is_empty());
+
+    Ok(())
+}
+
+#[test]
 #[serial_test::file_serial(channel_listener)]
 fn channel_listen_rejects_polling_plugins_and_stops_ingress()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let poll_log = dir.path().join("poll.log");
     let manifest_path = write_polling_channel_test_plugin(dir.path(), &poll_log)?;
@@ -2393,6 +3216,7 @@ fn channel_inspect_text_reports_fixed_timeout() -> Result<(), Box<dyn std::error
 fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let registry_path = dir.path().join("channels.json");
     let invocation_log = dir.path().join("plugin-invocations.log");
     let manifest_path = write_trusted_channel_test_plugin(
@@ -2462,6 +3286,7 @@ fn channel_listen_rejects_bad_host_managed_secret_before_plugin_invocation()
 #[serial_test::file_serial(channel_listener)]
 fn channel_listen_delivers_replies_through_plugin() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let channel_registry_path = dir.path().join("channels.json");
     let courier_registry_path = dir.path().join("couriers.json");
     let delivery_log = dir.path().join("deliver.log");
@@ -2630,6 +3455,7 @@ fn channel_listen_rejects_deliver_replies_without_parcel() -> Result<(), Box<dyn
 fn channel_listen_delivers_structured_channel_reply_envelope()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let channel_registry_path = dir.path().join("channels.json");
     let courier_registry_path = dir.path().join("couriers.json");
     let delivery_log = dir.path().join("deliver.log");
@@ -2771,6 +3597,7 @@ fn channel_listen_delivers_structured_channel_reply_envelope()
 fn channel_listen_delivers_first_class_channel_reply_event()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
+    init_channel_inbox_key(dir.path())?;
     let channel_registry_path = dir.path().join("channels.json");
     let courier_registry_path = dir.path().join("couriers.json");
     let delivery_log = dir.path().join("deliver.log");

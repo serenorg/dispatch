@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ring::{
     aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey},
+    hkdf, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ const SECRET_KEY_FILE: &str = "key";
 const SECRET_STORE_VERSION: u32 = 1;
 const SECRET_KEY_BYTES: usize = 32;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const LOCAL_TAG_SALT: &[u8] = b"dispatch local payload tag";
+const LOCAL_TAG_INFO: &[u8] = b"hmac-sha256";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretStorePaths {
@@ -81,6 +84,10 @@ pub enum SecretStoreError {
     DecryptStore { path: String },
     #[error("failed to generate random bytes for `{path}`")]
     Random { path: String },
+    #[error("local payload encryption requires a non-empty authenticated context")]
+    MissingPayloadContext,
+    #[error("failed to authenticate local payload with secret key `{path}`")]
+    DecryptLocalPayload { path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +95,84 @@ struct StoredSecretEnvelope {
     version: u32,
     nonce_b64: String,
     ciphertext_b64: String,
+}
+
+/// AES-256-GCM payload sealed with the existing local Dispatch secrets key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptedLocalPayload {
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+/// Seal `plaintext` with the initialized local key, authenticating `context`.
+///
+/// This never creates or changes the key or the secret store. The context must
+/// be non-empty, which keeps these payloads separate from secret-store records.
+pub fn encrypt_local_payload(
+    paths: &SecretStorePaths,
+    context: &[u8],
+    plaintext: &[u8],
+) -> Result<EncryptedLocalPayload, SecretStoreError> {
+    if context.is_empty() {
+        return Err(SecretStoreError::MissingPayloadContext);
+    }
+    let key = read_key(paths)?;
+    seal_local_payload(paths, &key, plaintext, context)
+}
+
+/// Open a payload sealed by [`encrypt_local_payload`] with the same context.
+pub fn decrypt_local_payload(
+    paths: &SecretStorePaths,
+    context: &[u8],
+    payload: &EncryptedLocalPayload,
+) -> Result<Vec<u8>, SecretStoreError> {
+    if context.is_empty() {
+        return Err(SecretStoreError::MissingPayloadContext);
+    }
+    let key = read_key(paths)?;
+    open_local_payload(paths, &key, payload, context).map_err(|error| match error {
+        SecretStoreError::DecryptStore { .. } => SecretStoreError::DecryptLocalPayload {
+            path: paths.key_path.display().to_string(),
+        },
+        other => other,
+    })
+}
+
+/// Keyed deterministic tag of `data` under the initialized local key.
+///
+/// The HMAC-SHA256 tag key is derived from the existing key with HKDF, so a
+/// tag reveals equality only to holders of that key. The context must be
+/// non-empty and separates unrelated tag uses.
+pub fn local_payload_tag(
+    paths: &SecretStorePaths,
+    context: &[u8],
+    data: &[u8],
+) -> Result<String, SecretStoreError> {
+    if context.is_empty() {
+        return Err(SecretStoreError::MissingPayloadContext);
+    }
+    let key = read_key(paths)?;
+    let info = [LOCAL_TAG_INFO];
+    let tag_prk = hkdf::Salt::new(hkdf::HKDF_SHA256, LOCAL_TAG_SALT).extract(&key);
+    let okm =
+        tag_prk
+            .expand(&info, hmac::HMAC_SHA256)
+            .map_err(|_| SecretStoreError::EncryptionInit {
+                path: paths.key_path.display().to_string(),
+                message: "failed to derive local tag key".to_string(),
+            })?;
+    let tag_key = hmac::Key::from(okm);
+    let mut tag = hmac::Context::with_key(&tag_key);
+    tag.update(&(context.len() as u64).to_be_bytes());
+    tag.update(context);
+    tag.update(data);
+    Ok(tag
+        .sign()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub fn init_secret_store(
@@ -349,6 +434,20 @@ fn encrypt_entries(
     key_bytes: &[u8; SECRET_KEY_BYTES],
     plaintext: &[u8],
 ) -> Result<StoredSecretEnvelope, SecretStoreError> {
+    let encrypted = seal_local_payload(paths, key_bytes, plaintext, &[])?;
+    Ok(StoredSecretEnvelope {
+        version: SECRET_STORE_VERSION,
+        nonce_b64: encrypted.nonce_b64,
+        ciphertext_b64: encrypted.ciphertext_b64,
+    })
+}
+
+fn seal_local_payload(
+    paths: &SecretStorePaths,
+    key_bytes: &[u8; SECRET_KEY_BYTES],
+    plaintext: &[u8],
+    context: &[u8],
+) -> Result<EncryptedLocalPayload, SecretStoreError> {
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|error| {
         SecretStoreError::EncryptionInit {
             path: paths.store_path.display().to_string(),
@@ -363,12 +462,11 @@ fn encrypt_entries(
         })?;
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
     let mut in_out = plaintext.to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+    key.seal_in_place_append_tag(nonce, Aad::from(context), &mut in_out)
         .map_err(|_| SecretStoreError::EncryptStore {
             path: paths.store_path.display().to_string(),
         })?;
-    Ok(StoredSecretEnvelope {
-        version: SECRET_STORE_VERSION,
+    Ok(EncryptedLocalPayload {
         nonce_b64: STANDARD.encode(nonce_bytes),
         ciphertext_b64: STANDARD.encode(in_out),
     })
@@ -378,6 +476,19 @@ fn decrypt_envelope(
     paths: &SecretStorePaths,
     key_bytes: &[u8; SECRET_KEY_BYTES],
     envelope: &StoredSecretEnvelope,
+) -> Result<Vec<u8>, SecretStoreError> {
+    let payload = EncryptedLocalPayload {
+        nonce_b64: envelope.nonce_b64.clone(),
+        ciphertext_b64: envelope.ciphertext_b64.clone(),
+    };
+    open_local_payload(paths, key_bytes, &payload, &[])
+}
+
+fn open_local_payload(
+    paths: &SecretStorePaths,
+    key_bytes: &[u8; SECRET_KEY_BYTES],
+    envelope: &EncryptedLocalPayload,
+    context: &[u8],
 ) -> Result<Vec<u8>, SecretStoreError> {
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|error| {
         SecretStoreError::EncryptionInit {
@@ -406,7 +517,7 @@ fn decrypt_envelope(
                 path: paths.store_path.display().to_string(),
             })?;
     let plaintext = key
-        .open_in_place(nonce, Aad::empty(), &mut ciphertext)
+        .open_in_place(nonce, Aad::from(context), &mut ciphertext)
         .map_err(|_| SecretStoreError::DecryptStore {
             path: paths.store_path.display().to_string(),
         })?;
@@ -454,6 +565,88 @@ fn set_secret_key_permissions(path: &Path) -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn local_payload_requires_an_existing_key_and_exact_authenticated_context() {
+        let dir = tempdir().unwrap();
+        let paths = paths_for_dispatch_root(dir.path().to_owned());
+        assert!(encrypt_local_payload(&paths, b"channel-a", b"private incoming content").is_err());
+        assert!(!paths.key_path.exists());
+        fs::create_dir_all(&paths.secrets_dir).unwrap();
+        fs::write(&paths.key_path, STANDARD.encode([9u8; 32])).unwrap();
+        write_store_entries(&paths, &BTreeMap::new()).unwrap();
+        let before = fs::read(&paths.store_path).unwrap();
+        let encrypted =
+            encrypt_local_payload(&paths, b"channel-a", b"private incoming content").unwrap();
+        let again =
+            encrypt_local_payload(&paths, b"channel-a", b"private incoming content").unwrap();
+        assert_ne!(encrypted.nonce_b64, again.nonce_b64);
+        assert_eq!(
+            decrypt_local_payload(&paths, b"channel-a", &encrypted).unwrap(),
+            b"private incoming content"
+        );
+        assert!(matches!(
+            decrypt_local_payload(&paths, b"channel-b", &encrypted),
+            Err(SecretStoreError::DecryptLocalPayload { .. })
+        ));
+        assert!(matches!(
+            encrypt_local_payload(&paths, b"", b"private incoming content"),
+            Err(SecretStoreError::MissingPayloadContext)
+        ));
+        assert!(decrypt_local_payload(&paths, b"", &encrypted).is_err());
+        assert!(
+            !serde_json::to_string(&encrypted)
+                .unwrap()
+                .contains("private incoming content")
+        );
+        assert_eq!(fs::read(&paths.store_path).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(&encrypted)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        fs::write(&paths.key_path, STANDARD.encode([7u8; 32])).unwrap();
+        assert!(decrypt_local_payload(&paths, b"channel-a", &encrypted).is_err());
+    }
+
+    #[test]
+    fn local_payload_tag_is_keyed_deterministic_and_context_separated() {
+        let dir = tempdir().unwrap();
+        let paths = paths_for_dispatch_root(dir.path().to_owned());
+        assert!(local_payload_tag(&paths, b"event", b"yes").is_err());
+        fs::create_dir_all(&paths.secrets_dir).unwrap();
+        fs::write(&paths.key_path, STANDARD.encode([9u8; 32])).unwrap();
+        let tag = local_payload_tag(&paths, b"event", b"yes").unwrap();
+        assert_eq!(tag.len(), 64);
+        assert_eq!(tag, local_payload_tag(&paths, b"event", b"yes").unwrap());
+        assert_ne!(tag, local_payload_tag(&paths, b"event", b"no").unwrap());
+        assert_ne!(tag, local_payload_tag(&paths, b"other", b"yes").unwrap());
+        // Length framing keeps context and data boundaries distinct.
+        assert_ne!(
+            local_payload_tag(&paths, b"ab", b"c").unwrap(),
+            local_payload_tag(&paths, b"a", b"bc").unwrap()
+        );
+        // An unkeyed digest of the same bytes does not reproduce the tag.
+        let unkeyed = unkeyed_sha256_hex(b"yes");
+        assert_ne!(tag, unkeyed);
+        assert!(matches!(
+            local_payload_tag(&paths, b"", b"yes"),
+            Err(SecretStoreError::MissingPayloadContext)
+        ));
+        fs::write(&paths.key_path, STANDARD.encode([7u8; 32])).unwrap();
+        assert_ne!(tag, local_payload_tag(&paths, b"event", b"yes").unwrap());
+    }
+
+    fn unkeyed_sha256_hex(data: &[u8]) -> String {
+        ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 
     #[test]
     fn secret_store_round_trip() {

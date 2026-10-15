@@ -1,4 +1,5 @@
 mod channel_cmds;
+mod channel_inbox;
 mod conformance;
 mod courier_cmds;
 mod deployment_cmds;
@@ -635,6 +636,11 @@ enum CourierCommand {
 
 #[derive(Debug, Subcommand)]
 enum ChannelCommand {
+    /// Inspect or explicitly retire locally accepted channel batches
+    Inbox {
+        #[command(subcommand)]
+        command: ChannelInboxCommand,
+    },
     /// List installed channel plugins
     Ls {
         /// Print full channel catalog as JSON
@@ -805,6 +811,37 @@ enum ChannelCommand {
         /// Override the channel plugin registry path
         #[arg(long)]
         registry: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ChannelInboxCommand {
+    /// List content-free descriptors without rerunning accepted work
+    List {
+        /// Channel inbox file (`<binding state>.inbox.sqlite`)
+        path: PathBuf,
+        /// Return descriptors after this receipt sequence
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Maximum descriptors to return (1-32)
+        #[arg(long, default_value_t = 32)]
+        limit: i64,
+    },
+    /// Read one retained original batch
+    Inspect {
+        /// Channel inbox file (`<binding state>.inbox.sqlite`)
+        path: PathBuf,
+        /// Positive receipt sequence from `dispatch channel inbox list`
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        sequence: u64,
+    },
+    /// Erase a batch payload by explicit owner choice; event receipts remain
+    Retire {
+        /// Channel inbox file (`<binding state>.inbox.sqlite`)
+        path: PathBuf,
+        /// Positive receipt sequence from `dispatch channel inbox list`
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        sequence: u64,
     },
 }
 
@@ -1661,12 +1698,12 @@ mod tests {
     use dispatch_core::agent_config::AGENT_CONFIG_FILE;
 
     use super::{
-        ChannelCommand, Cli, CliA2aPolicy, Command, ContainerCommand, CourierCommand,
-        DeploymentCommand, DepotCommand, EvalArgs, ExtensionCommand, ImageCommand, InspectArgs,
-        InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs, ParcelCommand, PruneArgs, PsArgs,
-        PullArgs, PushArgs, RemoveRunArgs, RestartArgs, SecretCommand, SignArgs, SkillCommand,
-        SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs, VerifyArgs,
-        WaitArgs, is_agent_config_target,
+        ChannelCommand, ChannelInboxCommand, Cli, CliA2aPolicy, Command, ContainerCommand,
+        CourierCommand, DeploymentCommand, DepotCommand, EvalArgs, ExtensionCommand, ImageCommand,
+        InspectArgs, InspectRunArgs, InternalCommand, KeygenArgs, LogsArgs, ParcelCommand,
+        PruneArgs, PsArgs, PullArgs, PushArgs, RemoveRunArgs, RestartArgs, SecretCommand, SignArgs,
+        SkillCommand, SkillSynthesisOverrideArgs, StateCommand, StopArgs, ValidateSkillArgs,
+        VerifyArgs, WaitArgs, is_agent_config_target,
     };
     use clap::Parser;
     use dispatch_core::{
@@ -2415,6 +2452,81 @@ mod tests {
         assert!(once);
         assert!(json);
         assert_eq!(registry, None);
+    }
+
+    #[test]
+    fn cli_parses_bounded_inbox_inspection_and_explicit_retirement() {
+        let list = Cli::try_parse_from([
+            "dispatch",
+            "channel",
+            "inbox",
+            "list",
+            "/tmp/owned.inbox.sqlite",
+            "--after",
+            "7",
+            "--limit",
+            "12",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Channel {
+                command: ChannelCommand::Inbox {
+                    command: ChannelInboxCommand::List {
+                        path,
+                        after: 7,
+                        limit: 12,
+                    },
+                },
+            } if path == PathBuf::from("/tmp/owned.inbox.sqlite")
+        ));
+        for operation in ["inspect", "retire"] {
+            let cli = Cli::try_parse_from([
+                "dispatch",
+                "channel",
+                "inbox",
+                operation,
+                "/tmp/owned.inbox.sqlite",
+                "7",
+            ])
+            .unwrap();
+            let Command::Channel {
+                command: ChannelCommand::Inbox { command },
+            } = cli.command
+            else {
+                panic!("expected inbox command");
+            };
+            match (operation, command) {
+                ("inspect", ChannelInboxCommand::Inspect { sequence, .. })
+                | ("retire", ChannelInboxCommand::Retire { sequence, .. }) => {
+                    assert_eq!(sequence, 7)
+                }
+                _ => panic!("wrong owner operation"),
+            }
+            for invalid in ["0", "-1", "original-digest"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "dispatch",
+                        "channel",
+                        "inbox",
+                        operation,
+                        "/tmp/owned.inbox.sqlite",
+                        invalid,
+                    ])
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from([
+                "dispatch",
+                "channel",
+                "inbox",
+                "retire",
+                "/tmp/owned.inbox.sqlite",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
