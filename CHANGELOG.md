@@ -2,6 +2,43 @@
 
 All notable changes to Dispatch are documented in this file.
 
+## [0.8.0] - 2026-10-15
+
+Durable channel acceptance release.
+
+Channel protocol 2 replaces unacknowledged event notifications with ID-bearing batch requests. A plugin keeps each batch in its own journal until a runtime returns the exact receipt for durable storage, and only accepted batches advance the channel cursor. A receipt confirms storage only. It does not confirm that a turn ran or a reply was delivered, and neither the protocol nor the CLI provides exactly-once side effects. Plugins own provider sessions and provider acknowledgment; provider data that a provider library acknowledges before the plugin's first journal write is outside this guarantee.
+
+Runtimes own accepted work and choose their own storage. The standalone CLI stores accepted work in an encrypted SQLite inbox before acknowledging it. Work whose handling fails, is interrupted, or never starts stays in that inbox for owner inspection and is not rerun automatically.
+
+### Added
+
+- `ChannelEventRequest`, `ChannelEventBatch`, `ChannelEventAcceptance`, and `ChannelIngressRecovery` define typed event batches, exact acceptance receipts with predecessor-checked sequences, and full-head recovery for persistent sessions, one-shot polling, and webhook ingress. A batch is identified by the SHA-256 digest of its canonical JSON; `canonical_channel_batch_bytes`, `canonical_channel_event_content_bytes`, and `is_channel_batch_digest` expose that form.
+- `ChannelIngressStorage` carries a host-owned absolute `journal_path` and the host's checked `recovery` head in `start_ingress`, `poll_ingress`, and `ingress_event` requests. Provider configuration and request JSON cannot choose either value.
+- `channel.heartbeat` liveness notifications (`ChannelHeartbeat`), which never carry cursor state or acceptance.
+- Batch bounds of 32 events with unique event IDs and 2 MiB of canonical JSON, enforced with a checked frame size: `MAX_CHANNEL_BATCH_EVENTS`, `MAX_CHANNEL_BATCH_BYTES`, and `MAX_CHANNEL_FRAME_BYTES`. A host accepts at most 32 batches per call.
+- The storage-independent `DurableChannelEventSink` trait and the sink-aware `call_channel_plugin_with_sink`, `call_persistent_channel_plugin_with_sink`, and `accept_persistent_channel_event`, which write a receipt only after the host's sink returns it. Runtime hosts supply their own durable store.
+- An encrypted SQLite acceptance inbox for the CLI. It commits each accepted original, its receipt, event-identity receipts, and the effective cursor in one transaction before acknowledging. An exact replay after a lost receipt returns the original receipt without offering the batch for execution again. The inbox retains one recovery head and at most 256 pending batches, and when full it refuses new executable work without a receipt so the plugin keeps it.
+- Event-identity receipts in the CLI inbox. A redelivered event whose ID was already accepted is not offered for execution again when its content matches, ignoring only the top-level `received_at`; changed content under an accepted ID is refused.
+- `dispatch channel inbox list`, `inspect`, and `retire` for reviewing retained work by receipt sequence. Retirement removes the pending payload and keeps the recovery head and event-identity receipts.
+- `encrypt_local_payload`, `decrypt_local_payload`, `local_payload_tag`, and `EncryptedLocalPayload` provide context-bound encryption and keyed tags with the existing Dispatch secrets key. They never create or replace the key.
+
+### Changed
+
+- **Breaking:** the channel plugin protocol version is now `2`, and the host rejects protocol 1 plugin manifests before launch. Plugins send batches as ID-bearing `channel.event` requests and wait for the exact receipt; notification-form `channel.event` and inline `events` in `ingress_events_received` are rejected. A `poll_ingress` or `ingress_event` success requires at least one batch receipt, which may be for an empty batch. Install protocol 2 releases of your channel plugins, or rebuild custom plugins against this protocol, implement the journal and receipt contract, and declare `protocol_version: 2`. See the [channel protocol guide](docs/extensions.md#durable-event-requests).
+- **Breaking:** Rust channel protocol types changed. `PluginRequest::StartIngress`, `PollIngress`, and `IngressEvent` (`ChannelPluginRequest` in `dispatch-core`) require `storage: ChannelIngressStorage`, and `PluginResponse::IngressEventsReceived` no longer has `events`. `PluginMessage::Notification` is replaced by `EventRequest` and `Heartbeat`. `ChannelEventNotification` is replaced by `ChannelEventRequest` and `ChannelEventBatch`, and `CHANNEL_EVENT_NOTIFICATION_METHOD` is renamed to `CHANNEL_EVENT_METHOD`. `notification_to_jsonrpc`, re-exported by `dispatch-core` as `channel_notification_to_jsonrpc`, is replaced by `event_request_to_jsonrpc`, `event_acceptance_to_jsonrpc`, and `heartbeat_to_jsonrpc`. Plugins read host input with `parse_plugin_input`.
+- **Breaking:** Rust channel hosts must acknowledge batches through a durable sink, and `poll_ingress` and `ingress_event` calls fail without one. `recv_persistent_channel_notification` and `drain_pending_channel_notifications` are replaced by `recv_persistent_channel_ingress` and `drain_pending_channel_ingress`, which return `ChannelIngressMessage`. `ChannelPluginCallError` has a new `DurableSink` variant.
+- **Breaking:** CLI channel ingress requires an initialized Dispatch secrets key for the project. If the project has none, run `dispatch secret init` before receiving messages. Do not run `dispatch secret init --force` on a project that already has a key: replacing the key makes the existing inbox unreadable. Preserve the key, the inbox, and the plugin journal across restarts.
+- To upgrade a 0.7.0 channel binding, stop it, upgrade Dispatch and install protocol 2 channel plugins, initialize the secrets key if the project has none, then start the binding. Until its first accepted batch, the binding starts from the cursor that 0.7.0 saved in its state file, and that batch inherits the cursor when it carries none of its own.
+- The CLI never reruns retained work automatically, including accepted batches whose handling never started, because the inbox does not distinguish them from interrupted work with uncertain side effects. It warns about pending work when a binding starts; inspect that work and retire finished or abandoned batches explicitly. Event-identity receipts are retained without automatic pruning.
+- The CLI refuses an inbox that is a symbolic link or not a regular file. On Unix, it restricts each channel scope directory to its owner (mode 0700), tightening an existing directory, and refuses an inbox that group or others can access. Windows directory permissions remain operator-provisioned: Dispatch does not configure or validate ACLs, and plugins built on `dispatch-channel-runtime` refuse a journal directory that is not owned by the running account and private to that account, SYSTEM, and Administrators. See the [storage requirements](docs/extensions.md#cli-acceptance-inbox).
+- Channel ingress refuses plugin names that could select a storage path: empty names, `.`, `..`, and names containing `/`, `\`, `:`, or control characters.
+
+### Fixed
+
+- Channel cursors advance only from durably accepted batches. Control responses and heartbeats no longer move the saved cursor, so the cursor never moves past events that are not durably stored. A batch without cursor state keeps the previous accepted cursor.
+- The poll, listen, and runtime paths handle durably accepted batches even when a later control response fails. `dispatch channel call` and `dispatch channel ingress` leave that work pending for inspection instead.
+- Mismatched sink receipts, unsolicited or malformed event frames, and oversized frames fail explicitly without acknowledging the batch, and a failed exchange ends the persistent plugin session.
+
 ## [0.7.0] - 2026-08-28
 
 Declarative agent configuration release.
